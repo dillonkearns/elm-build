@@ -22,12 +22,15 @@ import Cache exposing (FileOrDirectory)
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
+import DepGraph
+import Dict exposing (Dict)
 import Expect
 import FatalError exposing (FatalError)
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Random
 import SampleTests
+import Set exposing (Set)
 import Test
 import Test.Runner
 import Test.Runner.Failure
@@ -59,12 +62,12 @@ programConfig =
 task : Config -> BackendTask FatalError ()
 task config =
     BackendTask.Extra.profiling "pure-test-runner" <|
-        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Hashing source files") <| \_ ->
-        Do.do (hashSourceFiles (Path.path ".")) <| \sourceInputs ->
+        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Hashing source files and building dependency graph") <| \_ ->
+        Do.do (setupSourceFiles (Path.path ".")) <| \{ inputsByPath, depGraph } ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
         Do.do
             (Cache.run config.buildDirectory
-                (runAllTests sourceInputs
+                (runAllTests inputsByPath depGraph
                     |> Cache.timed "Running tests" "Ran tests"
                 )
             )
@@ -73,15 +76,28 @@ task config =
         displayPureResults jsonOutput
 
 
-{-| Hash the source files that tests depend on.
-Includes all .elm files in src/ plus elm.json (so dependency changes invalidate the cache).
+{-| Read source files, build a dependency graph, and hash all inputs.
+
+Returns the hashed inputs indexed by normalized file path (without leading "./"),
+plus the dependency graph for import-based transitive dependency analysis.
+
 -}
-hashSourceFiles : Path -> BackendTask FatalError (List ( Path, Cache.Monad FileOrDirectory ))
-hashSourceFiles projectDir =
+setupSourceFiles :
+    Path
+    ->
+        BackendTask FatalError
+            { inputsByPath : Dict String ( Path, Cache.Monad FileOrDirectory )
+            , depGraph : DepGraph.Graph
+            }
+setupSourceFiles projectDir =
     let
         p : String
         p =
             Path.toString projectDir
+
+        sourceDirectories : List String
+        sourceDirectories =
+            [ "src", "codegen" ]
     in
     Glob.fromStringWithOptions
         (let
@@ -94,24 +110,105 @@ hashSourceFiles projectDir =
         (p ++ "/src/**/*.elm")
         |> BackendTask.andThen
             (\files ->
-                files
-                    |> List.filter (\f -> not (String.contains "elm-stuff" f))
-                    |> (::) (p ++ "/elm.json")
-                    |> List.sort
-                    |> List.map Path.path
-                    |> Cache.inputs
+                let
+                    elmFiles : List String
+                    elmFiles =
+                        files
+                            |> List.filter (\f -> not (String.contains "elm-stuff" f))
+                            |> List.sort
+                in
+                -- Read file contents for dependency analysis
+                elmFiles
+                    |> List.map
+                        (\filePath ->
+                            File.rawFile filePath
+                                |> BackendTask.allowFatal
+                                |> BackendTask.map (\content -> ( filePath, content ))
+                        )
+                    |> BackendTask.sequence
+                    |> BackendTask.andThen
+                        (\fileContents ->
+                            let
+                                depGraph : DepGraph.Graph
+                                depGraph =
+                                    DepGraph.buildGraph
+                                        { sourceDirectories = sourceDirectories
+                                        , files =
+                                            fileContents
+                                                |> List.map
+                                                    (\( filePath, content ) ->
+                                                        { filePath = stripDotSlash filePath
+                                                        , content = content
+                                                        }
+                                                    )
+                                        }
+
+                                allPaths : List Path
+                                allPaths =
+                                    (elmFiles ++ [ p ++ "/elm.json" ])
+                                        |> List.sort
+                                        |> List.map Path.path
+                            in
+                            Cache.inputs allPaths
+                                |> BackendTask.map
+                                    (\sourceInputs ->
+                                        { inputsByPath =
+                                            sourceInputs
+                                                |> List.map
+                                                    (\( path, monad ) ->
+                                                        ( stripDotSlash (Path.toString path)
+                                                        , ( path, monad )
+                                                        )
+                                                    )
+                                                |> Dict.fromList
+                                        , depGraph = depGraph
+                                        }
+                                    )
+                        )
             )
 
 
+stripDotSlash : String -> String
+stripDotSlash s =
+    if String.startsWith "./" s then
+        String.dropLeft 2 s
+
+    else
+        s
+
+
 {-| Run all tests from SampleTests.suite, caching each individually.
+
+Uses the dependency graph to hash only the files that the test module
+transitively depends on, so changing an unrelated file won't invalidate
+the test cache.
+
 -}
-runAllTests : List ( Path, Cache.Monad FileOrDirectory ) -> Cache.Monad FileOrDirectory
-runAllTests sourceInputs =
+runAllTests : Dict String ( Path, Cache.Monad FileOrDirectory ) -> DepGraph.Graph -> Cache.Monad FileOrDirectory
+runAllTests inputsByPath depGraph =
     let
-        -- Hash all source files together as the dependency baseline
+        -- Get the transitive dependencies of the test module
+        testDeps : Set String
+        testDeps =
+            DepGraph.transitiveDeps depGraph "src/SampleTests.elm"
+
+        -- Filter inputs to only those in the test's dependency set,
+        -- always including elm.json for package version tracking
+        relevantInputs : List ( Path, Cache.Monad FileOrDirectory )
+        relevantInputs =
+            inputsByPath
+                |> Dict.toList
+                |> List.filter
+                    (\( normalizedPath, _ ) ->
+                        Set.member normalizedPath testDeps
+                            || normalizedPath == "elm.json"
+                    )
+                |> List.map Tuple.second
+
+        -- Hash only the relevant source files as the dependency baseline
         combinedDepsMonad : Cache.Monad FileOrDirectory
         combinedDepsMonad =
-            sourceInputs
+            relevantInputs
                 |> List.map
                     (\( absPath, monad ) ->
                         Cache.do monad <| \hash ->
