@@ -3,9 +3,10 @@ module Cache exposing
     , Monad, do, succeed, fail
     , writeFile, run
     , map, map2, andThen, combine, combineBy, each, sequence
-    , pipeThrough, commandWithFile, commandInFolder, withFile
+    , pipeThrough, commandWithFile, commandInFolder, commandInWorkspace, compute, withFile
     , withPrefix, timed
     , cpuCount, triggerDebugger
+    , hashToString
     )
 
 {-|
@@ -33,7 +34,7 @@ module Cache exposing
 
 ## Operations
 
-@docs pipeThrough, commandWithFile, commandInFolder, withFile
+@docs pipeThrough, commandWithFile, commandInFolder, commandInWorkspace, compute, withFile
 
 
 ## Output control
@@ -43,7 +44,7 @@ module Cache exposing
 
 ## Utils
 
-@docs cpuCount, triggerDebugger
+@docs cpuCount, triggerDebugger, hashToString
 
 -}
 
@@ -360,6 +361,78 @@ commandInFolder cmd args hash k =
         |> andThen k
 
 
+{-| Run a command in a writable workspace seeded from a cached folder.
+
+Unlike `commandInFolder` (which runs in the read-only cached folder),
+this creates a writable copy so the command can create temporary files
+(like `elm-stuff/` during compilation). Only stdout is captured and cached;
+the workspace is discarded after the command completes.
+
+This models commands as pure functions: given the same folder contents and
+arguments, the command produces the same stdout. The workspace handles the
+implementation detail that many tools need to write intermediate files.
+
+**IMPORTANT**: The command should only read files from the workspace folder,
+otherwise elm-build has no way to know when to re-run it.
+
+-}
+commandInWorkspace : String -> List String -> FileOrDirectory -> (FileOrDirectory -> Monad a) -> Monad a
+commandInWorkspace cmd args hash k =
+    let
+        outputHash : FileOrDirectory
+        outputHash =
+            extendHashWith (cmd :: args) hash
+    in
+    (derive outputHash <| \target prefix buildPath ->
+        let
+            workspacePath : String
+            workspacePath =
+                hashToPath buildPath target ++ "-workspace"
+        in
+        Do.exec "rm" [ "-rf", workspacePath ] <| \_ ->
+        Do.exec "cp" [ "-r", hashToPath buildPath hash, workspacePath ] <| \_ ->
+        Do.exec "chmod" [ "-R", "u+w", workspacePath ] <| \_ ->
+        Do.do
+            (commandLog prefix cmd args
+                |> BackendTask.inDir workspacePath
+                |> BackendTask.onError
+                    (\e ->
+                        Do.exec "rm" [ "-rf", workspacePath ] <| \_ ->
+                        BackendTask.fail e
+                    )
+            )
+        <| \output ->
+        Do.exec "rm" [ "-rf", workspacePath ] <| \_ ->
+        BackendTask.allowFatal (Script.writeFile { path = hashToPath buildPath target, body = output })
+    )
+        |> andThen k
+
+
+{-| Cache a pure Elm computation. This is the internal analog to the
+command-based primitives (`pipeThrough`, `commandWithFile`, etc.) — instead
+of piping through an external process, the result is computed in pure Elm.
+
+The output hash is derived from the label strings and the input dependency hash.
+If the output already exists in the cache, the computation is skipped entirely.
+
+This is the key primitive for caching pure functions: if the inputs haven't
+changed, the output is guaranteed to be the same (by Elm's purity), so we
+can safely return the cached result.
+
+-}
+compute : List String -> FileOrDirectory -> (() -> String) -> (FileOrDirectory -> Monad a) -> Monad a
+compute label depsHash fn k =
+    let
+        outputHash : FileOrDirectory
+        outputHash =
+            extendHashWith label depsHash
+    in
+    (derive outputHash <| \target _ buildPath ->
+        BackendTask.allowFatal (Script.writeFile { path = hashToPath buildPath target, body = fn () })
+    )
+        |> andThen k
+
+
 {-| Run a command passing in a file (or folder) as last argument and save the result to a file.
 
 **IMPORTANT**: The command should only read that file or folder, otherwise elm-build has no way to know when to re-run it.
@@ -538,7 +611,7 @@ cpuCount : (Int -> Monad a) -> Monad a
 cpuCount k =
     Monad
         (\deps _ _ _ ->
-            Do.command "nproc" [ "--all" ] <| \raw ->
+            Do.command "sh" [ "-c", "nproc --all 2>/dev/null || sysctl -n hw.logicalcpu" ] <| \raw ->
             let
                 trimmed : String
                 trimmed =
@@ -583,6 +656,7 @@ hashToPath buildPath (Hash hash) =
     Path.toString buildPath ++ "/" ++ hash
 
 
+{-| Get the string representation of a hash, useful for deriving deterministic values. -}
 hashToString : FileOrDirectory -> String
 hashToString (Hash hash) =
     hash

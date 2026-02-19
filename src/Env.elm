@@ -8,7 +8,7 @@ import Json.Encode
 
 parallelism : BackendTask FatalError Int
 parallelism =
-    Do.command "nproc" [ "--all" ] <| \raw ->
+    Do.command "sh" [ "-c", "nproc --all 2>/dev/null || sysctl -n hw.logicalcpu" ] <| \raw ->
     let
         trimmed : String
         trimmed =
