@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, getPackageEnv, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -39,6 +39,8 @@ type InterpreterProject
         , patchedPackageSources : List String
         , extraSources : List String
         , moduleGraph : ModuleGraph
+        , packageEnv : Eval.Module.ProjectEnv
+        , packageModuleNames : Set String
         }
 
 
@@ -192,32 +194,51 @@ loadWith config =
                                                                                     )
                                                                                 |> Dict.fromList
                                                                         }
+                                                                    allStableSources : List String
+                                                                    allStableSources =
+                                                                        patchedPackageSources ++ List.map Tuple.second extraFileContents
+
+                                                                    pkgModuleNames : Set String
+                                                                    pkgModuleNames =
+                                                                        allStableSources
+                                                                            |> List.filterMap DepGraph.parseModuleName
+                                                                            |> Set.fromList
                                                                 in
-                                                                Cache.inputs allUserPaths
-                                                                    |> BackendTask.map
-                                                                        (\sourceInputs ->
-                                                                            InterpreterProject
-                                                                                { sourceDirectories = sourceDirectories
-                                                                                , inputsByPath =
-                                                                                    sourceInputs
-                                                                                        |> List.map
-                                                                                            (\( pathVal, monad ) ->
-                                                                                                ( Path.toString pathVal
-                                                                                                , ( pathVal, monad )
-                                                                                                )
-                                                                                            )
-                                                                                        |> Dict.fromList
-                                                                                , userFileContents =
-                                                                                    userFileContents
-                                                                                        |> Dict.fromList
-                                                                                , depGraph = depGraph
-                                                                                , patchedPackageSources = patchedPackageSources
-                                                                                , extraSources =
-                                                                                    extraFileContents
-                                                                                        |> List.map Tuple.second
-                                                                                , moduleGraph = moduleGraph
-                                                                                }
-                                                                        )
+                                                                case Eval.Module.buildProjectEnv allStableSources of
+                                                                    Err err ->
+                                                                        BackendTask.fail
+                                                                            (FatalError.fromString
+                                                                                ("Failed to build package environment: " ++ Debug.toString err)
+                                                                            )
+
+                                                                    Ok pkgEnv ->
+                                                                        Cache.inputs allUserPaths
+                                                                            |> BackendTask.map
+                                                                                (\sourceInputs ->
+                                                                                    InterpreterProject
+                                                                                        { sourceDirectories = sourceDirectories
+                                                                                        , inputsByPath =
+                                                                                            sourceInputs
+                                                                                                |> List.map
+                                                                                                    (\( pathVal, monad ) ->
+                                                                                                        ( Path.toString pathVal
+                                                                                                        , ( pathVal, monad )
+                                                                                                        )
+                                                                                                    )
+                                                                                                |> Dict.fromList
+                                                                                        , userFileContents =
+                                                                                            userFileContents
+                                                                                                |> Dict.fromList
+                                                                                        , depGraph = depGraph
+                                                                                        , patchedPackageSources = patchedPackageSources
+                                                                                        , extraSources =
+                                                                                            extraFileContents
+                                                                                                |> List.map Tuple.second
+                                                                                        , moduleGraph = moduleGraph
+                                                                                        , packageEnv = pkgEnv
+                                                                                        , packageModuleNames = pkgModuleNames
+                                                                                        }
+                                                                                )
                                                             )
                                                 )
                                     )
@@ -344,10 +365,29 @@ evalWith (InterpreterProject project) { imports, expression } k =
         combinedHash
         (\() ->
             let
+                -- Filter out sources already in the package env
+                userFilteredSources : List String
+                userFilteredSources =
+                    filteredSources
+                        |> List.filter
+                            (\src ->
+                                case DepGraph.parseModuleName src of
+                                    Just name ->
+                                        not (Set.member name project.packageModuleNames)
+
+                                    Nothing ->
+                                        True
+                            )
+
+                additionalSources : List String
+                additionalSources =
+                    userFilteredSources ++ [ wrapperSource ]
+
                 result : Result Types.Error Types.Value
                 result =
-                    Eval.Module.evalProject
-                        allFilteredSources
+                    Eval.Module.evalWithEnv
+                        project.packageEnv
+                        additionalSources
                         (FunctionOrValue [] "results")
             in
             case result of
@@ -364,6 +404,55 @@ evalWith (InterpreterProject project) { imports, expression } k =
                     "ERROR: Eval error: " ++ Debug.toString evalErr.error
         )
         k
+
+
+
+{-| Get the pre-built package environment for direct eval calls.
+-}
+getPackageEnv : InterpreterProject -> Eval.Module.ProjectEnv
+getPackageEnv (InterpreterProject project) =
+    project.packageEnv
+
+
+{-| Prepare the source lists needed for eval, without actually evaluating.
+
+Returns `allSources` (everything needed, for `evalProject`) and
+`userSources` (only non-package modules, for `evalWithEnv`).
+
+-}
+prepareEvalSources :
+    InterpreterProject
+    -> { imports : List String, expression : String }
+    -> { allSources : List String, userSources : List String }
+prepareEvalSources (InterpreterProject project) { imports, expression } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        filteredSources =
+            topoSortModules project.moduleGraph neededModules
+
+        userFilteredSources =
+            filteredSources
+                |> List.filter
+                    (\src ->
+                        case DepGraph.parseModuleName src of
+                            Just name ->
+                                not (Set.member name project.packageModuleNames)
+
+                            Nothing ->
+                                True
+                    )
+    in
+    { allSources = filteredSources ++ [ wrapperSource ]
+    , userSources = userFilteredSources ++ [ wrapperSource ]
+    }
 
 
 

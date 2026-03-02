@@ -1,9 +1,8 @@
-module CoreExtraBenchmark exposing (run)
+module RunCoreExtraTests exposing (run)
 
-{-| Benchmark: run elmcraft/core-extra's test suite via the cached interpreter
-and compare cold vs warm run times.
+{-| Run elmcraft/core-extra's test suite via the cached interpreter.
 
-    bunx elm-pages run src/CoreExtraBenchmark.elm -- --build .build/bench
+    time bunx elm-pages run src/RunCoreExtraTests.elm -- --build .build/core-extra
 
 -}
 
@@ -11,20 +10,15 @@ import Ansi.Color
 import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
 import BackendTask.File as File
-import BackendTask.Time
 import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
-import Elm.Syntax.Expression exposing (Expression(..))
-import Eval.Module
 import FatalError exposing (FatalError)
 import InterpreterProject
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
-import Time
-import Types
 
 
 run : Script
@@ -45,7 +39,7 @@ programConfig =
                 |> OptionsParser.with
                     (Option.requiredKeywordArg "build"
                         |> Option.map Path.path
-                        |> Option.withDescription "Build folder for the benchmark cache"
+                        |> Option.withDescription "Build folder for the test cache"
                     )
             )
 
@@ -70,24 +64,6 @@ skipPackages =
         , "elm/file"
         , "elm/url"
         ]
-
-
-{-| Test modules that don't depend on Regex.
--}
-testModuleFiles : List String
-testModuleFiles =
-    [ "ArrayTests.elm"
-    , "BasicsTests.elm"
-    , "CharTests.elm"
-    , "DictTests.elm"
-    , "FloatTests.elm"
-    , "ListTests.elm"
-    , "MaybeTests.elm"
-    , "ResultTests.elm"
-    , "SetTests.elm"
-    , "TripleTests.elm"
-    , "Utils.elm"
-    ]
 
 
 {-| Module names to import in the wrapper.
@@ -138,9 +114,6 @@ wrapperImports =
 
 task : Config -> BackendTask FatalError ()
 task config =
-    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "\n=== Core-Extra Benchmark ===\n") <| \_ ->
-    -- Build InterpreterProject (loads packages, patches, globs user files)
-    Do.do BackendTask.Time.now <| \buildStart ->
     Do.do
         (InterpreterProject.loadWith
             { projectDir = Path.path "."
@@ -151,75 +124,7 @@ task config =
             }
         )
     <| \project ->
-    Do.do BackendTask.Time.now <| \buildEnd ->
-    let
-        buildMs : Int
-        buildMs =
-            Time.posixToMillis buildEnd - Time.posixToMillis buildStart
-    in
-    Do.log
-        (Ansi.Color.fontColor Ansi.Color.brightCyan
-            ("Build project: " ++ String.fromInt buildMs ++ "ms")
-        )
-    <| \_ ->
-    -- Direct eval timing (bypasses Cache IO)
-    let
-        sources =
-            InterpreterProject.prepareEvalSources project
-                { imports = wrapperImports, expression = buildExpression }
-
-        pkgEnv =
-            InterpreterProject.getPackageEnv project
-    in
-    Do.log
-        ("Source counts: all="
-            ++ String.fromInt (List.length sources.allSources)
-            ++ " user="
-            ++ String.fromInt (List.length sources.userSources)
-        )
-    <| \_ ->
-    -- Time evalProject (old approach - parses everything from scratch)
-    Do.do BackendTask.Time.now <| \epStart ->
-    let
-        epResult =
-            Eval.Module.evalProject sources.allSources (FunctionOrValue [] "results")
-
-        epStr =
-            formatEvalResult epResult
-    in
-    Do.do BackendTask.Time.now <| \epEnd ->
-    let
-        evalProjectMs =
-            Time.posixToMillis epEnd - Time.posixToMillis epStart
-    in
-    -- Time evalWithEnv (new approach - reuses pre-built package env)
-    Do.do BackendTask.Time.now <| \ewStart ->
-    let
-        ewResult =
-            Eval.Module.evalWithEnv pkgEnv sources.userSources (FunctionOrValue [] "results")
-
-        ewStr =
-            formatEvalResult ewResult
-    in
-    Do.do BackendTask.Time.now <| \ewEnd ->
-    let
-        evalWithEnvMs =
-            Time.posixToMillis ewEnd - Time.posixToMillis ewStart
-    in
-    Do.log
-        (Ansi.Color.fontColor Ansi.Color.brightCyan
-            ("Direct evalProject:  " ++ String.fromInt evalProjectMs ++ "ms (" ++ epStr ++ ")")
-        )
-    <| \_ ->
-    Do.log
-        (Ansi.Color.fontColor Ansi.Color.brightCyan
-            ("Direct evalWithEnv:  " ++ String.fromInt evalWithEnvMs ++ "ms (" ++ ewStr ++ ")")
-        )
-    <| \_ ->
     Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
-    -- Step 3: Cold run (timed)
-    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Running cold interpreter run...") <| \_ ->
-    Do.do BackendTask.Time.now <| \coldStart ->
     Do.do
         (Cache.run { jobs = Nothing } config.buildDirectory
             (InterpreterProject.evalWith project
@@ -229,101 +134,9 @@ task config =
                 Cache.succeed
             )
         )
-    <| \coldResult ->
-    Do.do BackendTask.Time.now <| \coldEnd ->
-    let
-        coldMs : Int
-        coldMs =
-            Time.posixToMillis coldEnd - Time.posixToMillis coldStart
-    in
-    -- Read and display cold result
-    Do.allowFatal (File.rawFile (Path.toString coldResult.output)) <| \coldOutput ->
-    Do.do (displayResults coldOutput) <| \_ ->
-    Do.log
-        (Ansi.Color.fontColor Ansi.Color.brightCyan
-            ("Cold run: " ++ String.fromInt coldMs ++ "ms")
-        )
-    <| \_ ->
-    -- Step 4: Warm run (should be near-instant from cache)
-    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "\nRunning warm interpreter run (cached)...") <| \_ ->
-    Do.do BackendTask.Time.now <| \warmStart ->
-    Do.do
-        (Cache.run { jobs = Nothing } config.buildDirectory
-            (InterpreterProject.evalWith project
-                { imports = wrapperImports
-                , expression = buildExpression
-                }
-                Cache.succeed
-            )
-        )
-    <| \warmResult ->
-    Do.do BackendTask.Time.now <| \warmEnd ->
-    let
-        warmMs : Int
-        warmMs =
-            Time.posixToMillis warmEnd - Time.posixToMillis warmStart
-    in
-    Do.allowFatal (File.rawFile (Path.toString warmResult.output)) <| \warmOutput ->
-    Do.do (displayResults warmOutput) <| \_ ->
-    Do.log
-        (Ansi.Color.fontColor Ansi.Color.brightCyan
-            ("Warm run: " ++ String.fromInt warmMs ++ "ms")
-        )
-    <| \_ ->
-    -- Step 5: Run elm-test for comparison
-    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "\nRunning elm-test for comparison...") <| \_ ->
-    Do.do BackendTask.Time.now <| \elmTestStart ->
-    Do.do (runElmTest |> BackendTask.toResult) <| \elmTestResult ->
-    Do.do BackendTask.Time.now <| \elmTestEnd ->
-    let
-        elmTestMs : Int
-        elmTestMs =
-            Time.posixToMillis elmTestEnd - Time.posixToMillis elmTestStart
-
-        elmTestSummary : String
-        elmTestSummary =
-            case elmTestResult of
-                Ok _ ->
-                    "elm-test passed"
-
-                Err _ ->
-                    "elm-test completed (may have failures)"
-    in
-    Do.log
-        (Ansi.Color.fontColor Ansi.Color.brightCyan
-            ("elm-test time: " ++ String.fromInt elmTestMs ++ "ms (" ++ elmTestSummary ++ ")")
-        )
-    <| \_ ->
-    Do.log
-        (Ansi.Color.fontColor Ansi.Color.brightYellow
-            ("\n=== Summary ===\n"
-                ++ "Build project:     "
-                ++ String.fromInt buildMs
-                ++ "ms\n"
-                ++ "Direct evalProject:  "
-                ++ String.fromInt evalProjectMs
-                ++ "ms\n"
-                ++ "Direct evalWithEnv:  "
-                ++ String.fromInt evalWithEnvMs
-                ++ "ms\n"
-                ++ "Cold interpreter:  "
-                ++ String.fromInt coldMs
-                ++ "ms\n"
-                ++ "Warm interpreter:  "
-                ++ String.fromInt warmMs
-                ++ "ms\n"
-                ++ "elm-test:          "
-                ++ String.fromInt elmTestMs
-                ++ "ms\n"
-                ++ "Cold/elm-test:     "
-                ++ formatFloat (toFloat coldMs / toFloat (max 1 elmTestMs))
-                ++ "x\n"
-                ++ "Warm/elm-test:     "
-                ++ formatFloat (toFloat warmMs / toFloat (max 1 elmTestMs))
-                ++ "x"
-            )
-        )
-    <| \_ ->
+    <| \result ->
+    Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
+    Do.do (displayResults output) <| \_ ->
     Do.noop
 
 
@@ -434,14 +247,6 @@ patchMicroBitwiseExtra source =
         source
 
 
-runElmTest : BackendTask FatalError ()
-runElmTest =
-    Script.exec "bash"
-        [ "-c"
-        , "cd " ++ coreExtraDir ++ " && npx elm-test"
-        ]
-
-
 displayResults : String -> BackendTask FatalError ()
 displayResults output =
     let
@@ -449,13 +254,9 @@ displayResults output =
         lines =
             String.lines output
 
-        summaryLine : String
-        summaryLine =
-            List.head lines |> Maybe.withDefault ""
-
         summaryParts : { passed : Int, failed : Int, total : Int }
         summaryParts =
-            case String.split "," summaryLine of
+            case String.split "," (List.head lines |> Maybe.withDefault "") of
                 [ p, f, t ] ->
                     { passed = String.toInt p |> Maybe.withDefault 0
                     , failed = String.toInt f |> Maybe.withDefault 0
@@ -465,14 +266,10 @@ displayResults output =
                 _ ->
                     { passed = 0, failed = 0, total = 0 }
 
-        testLines : List String
-        testLines =
-            List.drop 1 lines
-                |> List.filter (not << String.isEmpty)
-
         failLines : List String
         failLines =
-            List.filter (String.startsWith "FAIL:") testLines
+            List.drop 1 lines
+                |> List.filter (String.startsWith "FAIL:")
     in
     Do.each failLines
         (\line ->
@@ -504,39 +301,3 @@ displayResults output =
         )
     <| \_ ->
     Do.noop
-
-
-formatEvalResult : Result Types.Error Types.Value -> String
-formatEvalResult result =
-    case result of
-        Ok (Types.String s) ->
-            let
-                firstLine =
-                    String.lines s |> List.head |> Maybe.withDefault ""
-            in
-            firstLine
-
-        Ok other ->
-            "ERROR: " ++ Debug.toString other
-
-        Err e ->
-            "ERROR: " ++ Debug.toString e
-
-
-formatFloat : Float -> String
-formatFloat f =
-    let
-        whole =
-            floor f
-
-        frac =
-            round ((f - toFloat whole) * 100)
-
-        fracStr =
-            if frac < 10 then
-                "0" ++ String.fromInt frac
-
-            else
-                String.fromInt frac
-    in
-    String.fromInt whole ++ "." ++ fracStr
