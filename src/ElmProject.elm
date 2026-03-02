@@ -28,6 +28,7 @@ type ElmProject
         , sourceDirectories : List String
         , inputsByPath : Dict String ( Path, Cache.Monad FileOrDirectory )
         , depGraph : DepGraph.Graph
+        , elmJsonContent : String
         }
 
 
@@ -66,54 +67,65 @@ fromPath projectDir =
                             |> List.filter (\f -> not (String.contains "elm-stuff" f))
                             |> List.sort
                 in
-                elmFiles
-                    |> List.map
-                        (\filePath ->
-                            File.rawFile filePath
-                                |> BackendTask.allowFatal
-                                |> BackendTask.map (\content -> ( filePath, content ))
-                        )
-                    |> BackendTask.sequence
+                let
+                    elmJsonPath : String
+                    elmJsonPath =
+                        p ++ "/elm.json"
+                in
+                File.rawFile elmJsonPath
+                    |> BackendTask.allowFatal
                     |> BackendTask.andThen
-                        (\fileContents ->
-                            let
-                                depGraph : DepGraph.Graph
-                                depGraph =
-                                    DepGraph.buildGraph
-                                        { sourceDirectories = sourceDirectories
-                                        , files =
-                                            fileContents
-                                                |> List.map
-                                                    (\( filePath, content ) ->
-                                                        { filePath = stripDotSlash filePath
-                                                        , content = content
-                                                        }
-                                                    )
-                                        }
+                        (\elmJsonRaw ->
+                            elmFiles
+                                |> List.map
+                                    (\filePath ->
+                                        File.rawFile filePath
+                                            |> BackendTask.allowFatal
+                                            |> BackendTask.map (\content -> ( filePath, content ))
+                                    )
+                                |> BackendTask.sequence
+                                |> BackendTask.andThen
+                                    (\fileContents ->
+                                        let
+                                            depGraph : DepGraph.Graph
+                                            depGraph =
+                                                DepGraph.buildGraph
+                                                    { sourceDirectories = sourceDirectories
+                                                    , files =
+                                                        fileContents
+                                                            |> List.map
+                                                                (\( filePath, content ) ->
+                                                                    { filePath = stripDotSlash filePath
+                                                                    , content = content
+                                                                    }
+                                                                )
+                                                    }
 
-                                allPaths : List Path
-                                allPaths =
-                                    (elmFiles ++ [ p ++ "/elm.json" ])
-                                        |> List.sort
-                                        |> List.map Path.path
-                            in
-                            Cache.inputs allPaths
-                                |> BackendTask.map
-                                    (\sourceInputs ->
-                                        ElmProject
-                                            { projectDir = projectDir
-                                            , sourceDirectories = sourceDirectories
-                                            , inputsByPath =
-                                                sourceInputs
-                                                    |> List.map
-                                                        (\( pathVal, monad ) ->
-                                                            ( stripDotSlash (Path.toString pathVal)
-                                                            , ( pathVal, monad )
-                                                            )
-                                                        )
-                                                    |> Dict.fromList
-                                            , depGraph = depGraph
-                                            }
+                                            allPaths : List Path
+                                            allPaths =
+                                                (elmFiles ++ [ elmJsonPath ])
+                                                    |> List.sort
+                                                    |> List.map Path.path
+                                        in
+                                        Cache.inputs allPaths
+                                            |> BackendTask.map
+                                                (\sourceInputs ->
+                                                    ElmProject
+                                                        { projectDir = projectDir
+                                                        , sourceDirectories = sourceDirectories
+                                                        , inputsByPath =
+                                                            sourceInputs
+                                                                |> List.map
+                                                                    (\( pathVal, monad ) ->
+                                                                        ( stripDotSlash (Path.toString pathVal)
+                                                                        , ( pathVal, monad )
+                                                                        )
+                                                                    )
+                                                                |> Dict.fromList
+                                                        , depGraph = depGraph
+                                                        , elmJsonContent = elmJsonRaw
+                                                        }
+                                                )
                                     )
                         )
             )
@@ -157,7 +169,8 @@ evalWith (ElmProject project) { imports, expression } k =
                 |> List.map (DepGraph.transitiveDeps project.depGraph)
                 |> List.foldl Set.union Set.empty
 
-        -- Filter inputsByPath to relevant deps + elm.json
+        -- Filter inputsByPath to relevant source deps (excluding elm.json —
+        -- we generate a workspace-clean elm.json separately)
         relevantInputs : List ( String, Cache.Monad FileOrDirectory )
         relevantInputs =
             project.inputsByPath
@@ -165,9 +178,15 @@ evalWith (ElmProject project) { imports, expression } k =
                 |> List.filter
                     (\( normalizedPath, _ ) ->
                         Set.member normalizedPath transDeps
-                            || normalizedPath == "elm.json"
                     )
                 |> List.map (\( normalizedPath, ( _, monad ) ) -> ( normalizedPath, monad ))
+
+        -- Generate a workspace-clean elm.json with only ["src"] as source dirs.
+        -- The eval workspace only has src/ so we strip any extra source-directories
+        -- (like elm-interpreter paths) that don't exist in the workspace.
+        workspaceElmJson : String
+        workspaceElmJson =
+            cleanSourceDirectories project.elmJsonContent
 
         -- Generate the wrapper module source
         wrapperSource : String
@@ -187,6 +206,7 @@ evalWith (ElmProject project) { imports, expression } k =
                 ++ " && elm make --output=elm.js src/EvalWrapper__.elm 1>&2 && node -e \"const {Elm}=require('./elm.js');Elm.EvalWrapper__.init().ports.evalOutput__.subscribe(v=>{process.stdout.write(v);process.exit(0)})\""
     in
     Cache.do (Cache.writeFile wrapperSource Cache.succeed) <| \wrapperHash ->
+    Cache.do (Cache.writeFile workspaceElmJson Cache.succeed) <| \elmJsonHash ->
     -- Resolve all relevant inputs and combine with wrapper into a project directory
     Cache.do
         (relevantInputs
@@ -200,7 +220,9 @@ evalWith (ElmProject project) { imports, expression } k =
                 (\sourceFiles ->
                     Cache.combine
                         (sourceFiles
-                            ++ [ { filename = Path.path "src/EvalWrapper__.elm", hash = wrapperHash } ]
+                            ++ [ { filename = Path.path "src/EvalWrapper__.elm", hash = wrapperHash }
+                               , { filename = Path.path "elm.json", hash = elmJsonHash }
+                               ]
                         )
                 )
         )
@@ -261,6 +283,40 @@ generateWrapperWith imports expression =
                , ""
                ]
         )
+
+
+{-| Replace the "source-directories" field in elm.json with just ["src"].
+
+The eval workspace only contains a flat `src/` directory, so any extra
+source-directories from the host project (like submodule paths) would
+cause `elm make` to fail in the workspace.
+
+-}
+cleanSourceDirectories : String -> String
+cleanSourceDirectories elmJson =
+    case String.indexes "\"source-directories\"" elmJson of
+        startIdx :: _ ->
+            case String.indexes "[" (String.dropLeft startIdx elmJson) of
+                bracketStart :: _ ->
+                    let
+                        afterKey : String
+                        afterKey =
+                            String.dropLeft (startIdx + bracketStart) elmJson
+                    in
+                    case String.indexes "]" afterKey of
+                        bracketEnd :: _ ->
+                            String.left startIdx elmJson
+                                ++ "\"source-directories\": [\"src\"]"
+                                ++ String.dropLeft (bracketEnd + 1) afterKey
+
+                        _ ->
+                            elmJson
+
+                _ ->
+                    elmJson
+
+        _ ->
+            elmJson
 
 
 stripDotSlash : String -> String
