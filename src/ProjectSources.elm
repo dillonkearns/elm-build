@@ -1,4 +1,4 @@
-module ProjectSources exposing (loadProjectSources)
+module ProjectSources exposing (loadPackageDeps, loadProjectSources)
 
 {-| Load all source files for a project and its dependencies.
 
@@ -69,6 +69,39 @@ loadProjectSources { projectDir, userSourceDirectories, targetFile } =
             List.filter (\s -> s /= targetSource) userSources
     in
     BackendTask.succeed (packageSources ++ userSourcesWithoutTarget ++ [ targetSource ])
+
+
+{-| Load package dependency sources from a project's elm.json, with the ability
+to skip specific packages (e.g. those with unsupported kernel code).
+
+Returns source file contents in topologically sorted dependency order.
+
+-}
+loadPackageDeps : { projectDir : Path, skipPackages : Set String } -> BackendTask FatalError (List String)
+loadPackageDeps { projectDir, skipPackages } =
+    let
+        projectPath : String
+        projectPath =
+            Path.toString projectDir
+    in
+    Do.allowFatal (File.rawFile (projectPath ++ "/elm.json")) <| \elmJsonRaw ->
+    Do.do (decodeElmJson elmJsonRaw) <| \elmJson ->
+    Do.do resolveElmHome <| \elmHome ->
+    let
+        allDeps : Dict String String
+        allDeps =
+            Dict.union elmJson.directDeps elmJson.indirectDeps
+                |> Dict.remove "elm/core"
+                |> Dict.filter (\name _ -> not (Set.member name skipPackages))
+    in
+    Do.do (loadPackageDepGraphs elmHome allDeps) <| \pkgDepGraphs ->
+    let
+        sortedPackageNames : List String
+        sortedPackageNames =
+            topoSort allDeps pkgDepGraphs
+    in
+    Do.do (loadPackageSources elmHome allDeps sortedPackageNames) <| \packageSources ->
+    BackendTask.succeed packageSources
 
 
 {-| Decoded fields from the project elm.json.
