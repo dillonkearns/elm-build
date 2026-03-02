@@ -1,4 +1,4 @@
-module ElmProject exposing (ElmProject, fromPath, eval)
+module ElmProject exposing (ElmProject, fromPath, eval, evalWith)
 
 {-| Evaluate and cache Elm expressions.
 
@@ -129,73 +129,83 @@ the module, so changing an unrelated file won't cause re-evaluation.
 
 -}
 eval : ElmProject -> String -> (FileOrDirectory -> Cache.Monad a) -> Cache.Monad a
-eval (ElmProject project) expression k =
+eval project expression k =
     case parseExpression expression of
+        Just ( moduleName, _ ) ->
+            evalWith project { imports = [ moduleName ], expression = expression } k
+
         Nothing ->
             Cache.fail ("Invalid expression: " ++ expression ++ " (expected \"ModuleName.valueName\")")
 
-        Just ( moduleName, valueName ) ->
-            case DepGraph.moduleNameToFilePath project.depGraph moduleName of
-                Nothing ->
-                    Cache.fail ("Module not found in project: " ++ moduleName)
 
-                Just sourceFilePath ->
-                    let
-                        -- Get transitive deps of the target module
-                        transDeps : Set String
-                        transDeps =
-                            DepGraph.transitiveDeps project.depGraph sourceFilePath
+{-| Evaluate an arbitrary Elm expression with multiple imports.
 
-                        -- Filter inputsByPath to relevant deps + elm.json,
-                        -- keeping the normalized path (no "./" prefix) for directory layout
-                        relevantInputs : List ( String, Cache.Monad FileOrDirectory )
-                        relevantInputs =
-                            project.inputsByPath
-                                |> Dict.toList
-                                |> List.filter
-                                    (\( normalizedPath, _ ) ->
-                                        Set.member normalizedPath transDeps
-                                            || normalizedPath == "elm.json"
-                                    )
-                                |> List.map (\( normalizedPath, ( _, monad ) ) -> ( normalizedPath, monad ))
+The expression can reference any of the imported modules and must produce
+a `String`. Transitive dependencies are computed as the union across all
+imported modules. Package-only modules (not in the dep graph) are silently
+skipped for dependency tracking — `elm make` resolves them.
 
-                        -- Generate the wrapper module source
-                        wrapperSource : String
-                        wrapperSource =
-                            generateWrapper moduleName valueName
+-}
+evalWith : ElmProject -> { imports : List String, expression : String } -> (FileOrDirectory -> Cache.Monad a) -> Cache.Monad a
+evalWith (ElmProject project) { imports, expression } k =
+    let
+        -- Get transitive deps as the union across all imported modules
+        transDeps : Set String
+        transDeps =
+            imports
+                |> List.filterMap (DepGraph.moduleNameToFilePath project.depGraph)
+                |> List.map (DepGraph.transitiveDeps project.depGraph)
+                |> List.foldl Set.union Set.empty
 
-                        -- Shell script: ensure source dirs exist, compile + run
-                        mkdirs : String
-                        mkdirs =
-                            project.sourceDirectories
-                                |> List.map (\d -> "mkdir -p " ++ d)
-                                |> String.join " && "
+        -- Filter inputsByPath to relevant deps + elm.json
+        relevantInputs : List ( String, Cache.Monad FileOrDirectory )
+        relevantInputs =
+            project.inputsByPath
+                |> Dict.toList
+                |> List.filter
+                    (\( normalizedPath, _ ) ->
+                        Set.member normalizedPath transDeps
+                            || normalizedPath == "elm.json"
+                    )
+                |> List.map (\( normalizedPath, ( _, monad ) ) -> ( normalizedPath, monad ))
 
-                        script : String
-                        script =
-                            mkdirs
-                                ++ " && elm make --output=elm.js src/EvalWrapper__.elm 1>&2 && node -e \"const {Elm}=require('./elm.js');Elm.EvalWrapper__.init().ports.evalOutput__.subscribe(v=>{process.stdout.write(v);process.exit(0)})\""
-                    in
-                    Cache.do (Cache.writeFile wrapperSource Cache.succeed) <| \wrapperHash ->
-                    -- Resolve all relevant inputs and combine with wrapper into a project directory
-                    Cache.do
-                        (relevantInputs
-                            |> List.map
-                                (\( normalizedPath, monad ) ->
-                                    Cache.do monad <| \hash ->
-                                    Cache.succeed { filename = Path.path normalizedPath, hash = hash }
-                                )
-                            |> Cache.sequence
-                            |> Cache.andThen
-                                (\sourceFiles ->
-                                    Cache.combine
-                                        (sourceFiles
-                                            ++ [ { filename = Path.path "src/EvalWrapper__.elm", hash = wrapperHash } ]
-                                        )
-                                )
+        -- Generate the wrapper module source
+        wrapperSource : String
+        wrapperSource =
+            generateWrapperWith imports expression
+
+        -- Shell script: ensure source dirs exist, compile + run
+        mkdirs : String
+        mkdirs =
+            project.sourceDirectories
+                |> List.map (\d -> "mkdir -p " ++ d)
+                |> String.join " && "
+
+        script : String
+        script =
+            mkdirs
+                ++ " && elm make --output=elm.js src/EvalWrapper__.elm 1>&2 && node -e \"const {Elm}=require('./elm.js');Elm.EvalWrapper__.init().ports.evalOutput__.subscribe(v=>{process.stdout.write(v);process.exit(0)})\""
+    in
+    Cache.do (Cache.writeFile wrapperSource Cache.succeed) <| \wrapperHash ->
+    -- Resolve all relevant inputs and combine with wrapper into a project directory
+    Cache.do
+        (relevantInputs
+            |> List.map
+                (\( normalizedPath, monad ) ->
+                    Cache.do monad <| \hash ->
+                    Cache.succeed { filename = Path.path normalizedPath, hash = hash }
+                )
+            |> Cache.sequence
+            |> Cache.andThen
+                (\sourceFiles ->
+                    Cache.combine
+                        (sourceFiles
+                            ++ [ { filename = Path.path "src/EvalWrapper__.elm", hash = wrapperHash } ]
                         )
-                    <| \projectDirHash ->
-                    Cache.commandInWritableDirectory "sh" [ "-c", script ] projectDirHash k
+                )
+        )
+    <| \projectDirHash ->
+    Cache.commandInWritableDirectory "sh" [ "-c", script ] projectDirHash k
 
 
 {-| Parse "ModuleName.valueName" into its parts.
@@ -226,25 +236,31 @@ parseExpression expr =
             Nothing
 
 
-{-| Generate a port module that evaluates and outputs the given expression.
+{-| Generate a port module that evaluates and outputs an arbitrary expression.
+
+Supports multiple imports so the expression can reference any combination of
+modules (e.g., `TestRunnerHelper.runToJson SampleTests.suite`).
+
 -}
-generateWrapper : String -> String -> String
-generateWrapper moduleName valueName =
+generateWrapperWith : List String -> String -> String
+generateWrapperWith imports expression =
     String.join "\n"
-        [ "port module EvalWrapper__ exposing (main)"
-        , ""
-        , "import " ++ moduleName
-        , ""
-        , "port evalOutput__ : String -> Cmd msg"
-        , ""
-        , "main ="
-        , "    Platform.worker"
-        , "        { init = \\() -> ( (), evalOutput__ " ++ moduleName ++ "." ++ valueName ++ " )"
-        , "        , update = \\_ m -> ( m, Cmd.none )"
-        , "        , subscriptions = \\_ -> Sub.none"
-        , "        }"
-        , ""
-        ]
+        ([ "port module EvalWrapper__ exposing (main)"
+         , ""
+         ]
+            ++ List.map (\m -> "import " ++ m) imports
+            ++ [ ""
+               , "port evalOutput__ : String -> Cmd msg"
+               , ""
+               , "main ="
+               , "    Platform.worker"
+               , "        { init = \\() -> ( (), evalOutput__ (" ++ expression ++ ") )"
+               , "        , update = \\_ m -> ( m, Cmd.none )"
+               , "        , subscriptions = \\_ -> Sub.none"
+               , "        }"
+               , ""
+               ]
+        )
 
 
 stripDotSlash : String -> String

@@ -1,14 +1,11 @@
 module PureTestRunner exposing (run)
 
-{-| A proof-of-concept test runner built entirely in pure Elm.
+{-| A test runner that uses ElmProject.evalWith to run tests out-of-process.
 
-Instead of shelling out to elm-test, this uses Test.Runner to enumerate
-and execute test cases directly. Each test result is cached via the
-Cache.compute primitive — if the source files haven't changed, individual
-test results are returned from cache without re-execution.
-
-This demonstrates the key insight: Elm tests are pure functions, so their
-results can be content-addressed and cached just like any other build artifact.
+Instead of importing and executing tests directly, this generates a wrapper
+module that calls `TestRunnerHelper.runToJson SampleTests.suite`, compiles it
+with `elm make`, and runs it with `node`. The JSON results are cached via the
+eval infrastructure, so unchanged tests are instant on subsequent runs.
 
 -}
 
@@ -17,23 +14,15 @@ import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
-import BackendTask.Glob as Glob
-import Cache exposing (FileOrDirectory)
+import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
-import DepGraph
-import Dict exposing (Dict)
-import Expect
+import ElmProject
 import FatalError exposing (FatalError)
+import Json.Decode
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
-import Random
-import SampleTests
-import Set exposing (Set)
-import Test
-import Test.Runner
-import Test.Runner.Failure
 
 
 run : Script
@@ -63,336 +52,113 @@ task : Config -> BackendTask FatalError ()
 task config =
     BackendTask.Extra.profiling "pure-test-runner" <|
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Hashing source files and building dependency graph") <| \_ ->
-        Do.do (setupSourceFiles (Path.path ".")) <| \{ inputsByPath, depGraph } ->
+        Do.do (ElmProject.fromPath (Path.path ".")) <| \project ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
         Do.do
             (Cache.run { jobs = Nothing } config.buildDirectory
-                (runAllTests inputsByPath depGraph
+                (ElmProject.evalWith project
+                    { imports = [ "TestRunnerHelper", "SampleTests" ]
+                    , expression = "TestRunnerHelper.runToJson SampleTests.suite"
+                    }
+                    Cache.succeed
                     |> Cache.timed "Running tests" "Ran tests"
                 )
             )
         <| \result ->
         Do.allowFatal (File.rawFile (Path.toString result.output)) <| \jsonOutput ->
-        displayPureResults jsonOutput
+        displayResults jsonOutput
 
 
-{-| Read source files, build a dependency graph, and hash all inputs.
-
-Returns the hashed inputs indexed by normalized file path (without leading "./"),
-plus the dependency graph for import-based transitive dependency analysis.
-
--}
-setupSourceFiles :
-    Path
-    ->
-        BackendTask FatalError
-            { inputsByPath : Dict String ( Path, Cache.Monad FileOrDirectory )
-            , depGraph : DepGraph.Graph
-            }
-setupSourceFiles projectDir =
-    let
-        p : String
-        p =
-            Path.toString projectDir
-
-        sourceDirectories : List String
-        sourceDirectories =
-            [ "src", "codegen" ]
-    in
-    Glob.fromStringWithOptions
-        (let
-            o : Glob.Options
-            o =
-                Glob.defaultOptions
-         in
-         { o | include = Glob.OnlyFiles }
-        )
-        (p ++ "/src/**/*.elm")
-        |> BackendTask.andThen
-            (\files ->
-                let
-                    elmFiles : List String
-                    elmFiles =
-                        files
-                            |> List.filter (\f -> not (String.contains "elm-stuff" f))
-                            |> List.sort
-                in
-                -- Read file contents for dependency analysis
-                elmFiles
-                    |> List.map
-                        (\filePath ->
-                            File.rawFile filePath
-                                |> BackendTask.allowFatal
-                                |> BackendTask.map (\content -> ( filePath, content ))
-                        )
-                    |> BackendTask.sequence
-                    |> BackendTask.andThen
-                        (\fileContents ->
-                            let
-                                depGraph : DepGraph.Graph
-                                depGraph =
-                                    DepGraph.buildGraph
-                                        { sourceDirectories = sourceDirectories
-                                        , files =
-                                            fileContents
-                                                |> List.map
-                                                    (\( filePath, content ) ->
-                                                        { filePath = stripDotSlash filePath
-                                                        , content = content
-                                                        }
-                                                    )
-                                        }
-
-                                allPaths : List Path
-                                allPaths =
-                                    (elmFiles ++ [ p ++ "/elm.json" ])
-                                        |> List.sort
-                                        |> List.map Path.path
-                            in
-                            Cache.inputs allPaths
-                                |> BackendTask.map
-                                    (\sourceInputs ->
-                                        { inputsByPath =
-                                            sourceInputs
-                                                |> List.map
-                                                    (\( path, monad ) ->
-                                                        ( stripDotSlash (Path.toString path)
-                                                        , ( path, monad )
-                                                        )
-                                                    )
-                                                |> Dict.fromList
-                                        , depGraph = depGraph
-                                        }
-                                    )
-                        )
-            )
+type alias TestResult =
+    { passed : Bool
+    , labels : List String
+    , message : String
+    }
 
 
-stripDotSlash : String -> String
-stripDotSlash s =
-    if String.startsWith "./" s then
-        String.dropLeft 2 s
+testResultDecoder : Json.Decode.Decoder TestResult
+testResultDecoder =
+    Json.Decode.map3 TestResult
+        (Json.Decode.field "passed" Json.Decode.bool)
+        (Json.Decode.field "labels" (Json.Decode.list Json.Decode.string))
+        (Json.Decode.field "message" Json.Decode.string)
 
-    else
-        s
+
+type alias TestReport =
+    { passed : Int
+    , failed : Int
+    , total : Int
+    , results : List TestResult
+    }
 
 
-{-| Run all tests from SampleTests.suite, caching each individually.
+testReportDecoder : Json.Decode.Decoder TestReport
+testReportDecoder =
+    Json.Decode.map4 TestReport
+        (Json.Decode.field "passed" Json.Decode.int)
+        (Json.Decode.field "failed" Json.Decode.int)
+        (Json.Decode.field "total" Json.Decode.int)
+        (Json.Decode.field "results" (Json.Decode.list testResultDecoder))
 
-Uses the dependency graph to hash only the files that the test module
-transitively depends on, so changing an unrelated file won't invalidate
-the test cache.
 
--}
-runAllTests : Dict String ( Path, Cache.Monad FileOrDirectory ) -> DepGraph.Graph -> Cache.Monad FileOrDirectory
-runAllTests inputsByPath depGraph =
-    let
-        -- Get the transitive dependencies of the test module
-        testDeps : Set String
-        testDeps =
-            DepGraph.transitiveDeps depGraph "src/SampleTests.elm"
-
-        -- Filter inputs to only those in the test's dependency set,
-        -- always including elm.json for package version tracking
-        relevantInputs : List ( Path, Cache.Monad FileOrDirectory )
-        relevantInputs =
-            inputsByPath
-                |> Dict.toList
-                |> List.filter
-                    (\( normalizedPath, _ ) ->
-                        Set.member normalizedPath testDeps
-                            || normalizedPath == "elm.json"
-                    )
-                |> List.map Tuple.second
-
-        -- Hash only the relevant source files as the dependency baseline
-        combinedDepsMonad : Cache.Monad FileOrDirectory
-        combinedDepsMonad =
-            relevantInputs
-                |> List.map
-                    (\( absPath, monad ) ->
-                        Cache.do monad <| \hash ->
-                        Cache.succeed { filename = absPath, hash = hash }
-                    )
-                |> Cache.sequence
-                |> Cache.andThen Cache.combine
-
-        -- Use a deterministic seed derived from "pure-test-runner"
-        seed : Random.Seed
-        seed =
-            Random.initialSeed 42
-
-        -- Get all runners from the test suite
-        runners : List Test.Runner.Runner
-        runners =
-            case Test.Runner.fromTest 100 seed SampleTests.suite of
-                Test.Runner.Plain list ->
-                    list
-
-                Test.Runner.Only list ->
-                    list
-
-                Test.Runner.Skipping list ->
-                    list
-
-                Test.Runner.Invalid msg ->
-                    []
-    in
-    Cache.do combinedDepsMonad <| \depsHash ->
-    Cache.do
-        (runners
-            |> List.map (runSingleTest depsHash)
-            |> Cache.sequence
-        )
-    <| \testResults ->
-    -- Combine all test results into a single report
-    let
-        allResults : List String
-        allResults =
-            List.map Tuple.second testResults
-
-        passCount : Int
-        passCount =
-            List.length (List.filter Tuple.first testResults)
-
-        failCount : Int
-        failCount =
-            List.length testResults - passCount
-
-        report : String
-        report =
-            String.join "\n"
-                ([ "{ \"passed\": " ++ String.fromInt passCount
-                    ++ ", \"failed\": " ++ String.fromInt failCount
-                    ++ ", \"total\": " ++ String.fromInt (List.length testResults)
-                    ++ " }"
-                 ]
-                    ++ allResults
+displayResults : String -> BackendTask FatalError ()
+displayResults jsonOutput =
+    case Json.Decode.decodeString testReportDecoder jsonOutput of
+        Err err ->
+            BackendTask.fail
+                (FatalError.fromString
+                    ("Failed to decode test results: " ++ Json.Decode.errorToString err ++ "\nRaw output: " ++ jsonOutput)
                 )
-    in
-    Cache.writeFile report Cache.succeed
 
-
-{-| Run a single test case, caching the result via Cache.compute.
-
-The cache key is derived from:
-
-  - The test's label path (its unique identity)
-  - The hash of all source dependencies
-
-If the source files haven't changed, the test result is returned from
-cache without executing the test at all.
-
--}
-runSingleTest : FileOrDirectory -> Test.Runner.Runner -> Cache.Monad ( Bool, String )
-runSingleTest depsHash runner =
-    let
-        labelPath : List String
-        labelPath =
-            List.reverse runner.labels
-    in
-    Cache.compute labelPath depsHash
-        (\() ->
-            -- This thunk only executes on cache miss
+        Ok report ->
             let
-                expectations : List Expect.Expectation
-                expectations =
-                    runner.run ()
+                passResults : List TestResult
+                passResults =
+                    List.filter .passed report.results
 
-                failures : List { labels : List String, given : Maybe String, description : String }
-                failures =
-                    expectations
-                        |> List.filterMap
-                            (\expectation ->
-                                Test.Runner.getFailureReason expectation
-                                    |> Maybe.map
-                                        (\failure ->
-                                            { labels = labelPath
-                                            , given = failure.given
-                                            , description = failure.description
-                                            }
-                                        )
-                            )
-
-                passed : Bool
-                passed =
-                    List.isEmpty failures
-
-                status : String
-                status =
-                    if passed then
-                        "pass"
-
-                    else
-                        "FAIL"
+                failResults : List TestResult
+                failResults =
+                    List.filter (not << .passed) report.results
             in
-            status
-                ++ " | "
-                ++ String.join " > " labelPath
-                ++ (if passed then
-                        ""
-
-                    else
-                        failures
-                            |> List.map (\f -> "\n    " ++ f.description)
-                            |> String.join ""
-                   )
-        )
-    <| \resultHash ->
-    Cache.withFile resultHash
-        (\content ->
-            Cache.succeed
-                ( String.startsWith "pass" content
-                , content
+            Do.each passResults
+                (\result ->
+                    Script.log
+                        (Ansi.Color.fontColor Ansi.Color.green
+                            ("  ✓ " ++ String.join " > " result.labels)
+                        )
                 )
-        )
-        Cache.succeed
+            <| \_ ->
+            Do.each failResults
+                (\result ->
+                    Script.log
+                        (Ansi.Color.fontColor Ansi.Color.red
+                            ("  ✗ "
+                                ++ String.join " > " result.labels
+                                ++ "\n    "
+                                ++ result.message
+                            )
+                        )
+                )
+            <| \_ ->
+            Do.log
+                (let
+                    summary =
+                        "{ \"passed\": "
+                            ++ String.fromInt report.passed
+                            ++ ", \"failed\": "
+                            ++ String.fromInt report.failed
+                            ++ ", \"total\": "
+                            ++ String.fromInt report.total
+                            ++ " }"
 
+                    color =
+                        if report.failed == 0 then
+                            Ansi.Color.fontColor Ansi.Color.brightGreen
 
-displayPureResults : String -> BackendTask FatalError ()
-displayPureResults report =
-    let
-        lines : List String
-        lines =
-            String.lines report
-
-        summaryLine : String
-        summaryLine =
-            List.head lines |> Maybe.withDefault ""
-
-        testLines : List String
-        testLines =
-            List.drop 1 lines
-                |> List.filter (not << String.isEmpty)
-
-        passLines : List String
-        passLines =
-            List.filter (String.startsWith "pass") testLines
-
-        failLines : List String
-        failLines =
-            List.filter (String.startsWith "FAIL") testLines
-    in
-    Do.each passLines
-        (\line ->
-            Script.log (Ansi.Color.fontColor Ansi.Color.green ("  ✓ " ++ String.dropLeft 7 line))
-        )
-    <| \_ ->
-    Do.each failLines
-        (\line ->
-            Script.log (Ansi.Color.fontColor Ansi.Color.red ("  ✗ " ++ String.dropLeft 7 line))
-        )
-    <| \_ ->
-    Do.log
-        (let
-            color =
-                if List.isEmpty failLines then
-                    Ansi.Color.fontColor Ansi.Color.brightGreen
-
-                else
-                    Ansi.Color.fontColor Ansi.Color.brightRed
-         in
-         color ("\n" ++ summaryLine)
-        )
-    <| \_ ->
-    Do.noop
+                        else
+                            Ansi.Color.fontColor Ansi.Color.brightRed
+                 in
+                 color ("\n" ++ summary)
+                )
+            <| \_ ->
+            Do.noop
