@@ -1,4 +1,4 @@
-module ProjectSources exposing (loadPackageDeps, loadProjectSources)
+module ProjectSources exposing (loadPackageDeps, loadPackageDepsCached, loadProjectSources)
 
 {-| Load all source files for a project and its dependencies.
 
@@ -17,6 +17,7 @@ import BackendTask.Glob as Glob
 import Dict exposing (Dict)
 import FatalError exposing (FatalError)
 import Json.Decode as Decode
+import Pages.Script as Script
 import Path exposing (Path)
 import Set exposing (Set)
 
@@ -102,6 +103,78 @@ loadPackageDeps { projectDir, skipPackages } =
     in
     Do.do (loadPackageSources elmHome allDeps sortedPackageNames) <| \packageSources ->
     BackendTask.succeed packageSources
+
+
+{-| Like `loadPackageDeps` but caches raw package sources on disk.
+
+Cache key is elm.json content + sorted skipPackages. On hit, reads the
+cached blob (~5ms) instead of re-globbing ELM\_HOME (~150ms).
+
+-}
+loadPackageDepsCached :
+    { projectDir : Path, skipPackages : Set String }
+    -> BackendTask FatalError (List String)
+loadPackageDepsCached { projectDir, skipPackages } =
+    let
+        projectPath : String
+        projectPath =
+            Path.toString projectDir
+
+        cacheDir : String
+        cacheDir =
+            projectPath ++ "/.elm-build"
+
+        cacheKeyPath : String
+        cacheKeyPath =
+            cacheDir ++ "/package-sources.key"
+
+        cacheBlobPath : String
+        cacheBlobPath =
+            cacheDir ++ "/package-sources.blob"
+
+        separator : String
+        separator =
+            "\n---PKG_SEPARATOR---\n"
+    in
+    Do.allowFatal (File.rawFile (projectPath ++ "/elm.json")) <| \elmJsonContent ->
+    let
+        expectedKey : String
+        expectedKey =
+            elmJsonContent ++ "\n---SKIP---\n" ++ (skipPackages |> Set.toList |> String.join ",")
+    in
+    File.rawFile cacheKeyPath
+        |> BackendTask.toResult
+        |> BackendTask.andThen
+            (\keyResult ->
+                case keyResult of
+                    Ok storedKey ->
+                        if storedKey == expectedKey then
+                            File.rawFile cacheBlobPath
+                                |> BackendTask.allowFatal
+                                |> BackendTask.map
+                                    (\blob ->
+                                        if String.isEmpty blob then
+                                            []
+
+                                        else
+                                            String.split separator blob
+                                    )
+
+                        else
+                            loadAndWriteCache expectedKey separator cacheDir cacheKeyPath cacheBlobPath projectDir skipPackages
+
+                    Err _ ->
+                        loadAndWriteCache expectedKey separator cacheDir cacheKeyPath cacheBlobPath projectDir skipPackages
+            )
+
+
+loadAndWriteCache : String -> String -> String -> String -> String -> Path -> Set String -> BackendTask FatalError (List String)
+loadAndWriteCache expectedKey separator cacheDir cacheKeyPath cacheBlobPath projectDir skipPackages =
+    Do.do (loadPackageDeps { projectDir = projectDir, skipPackages = skipPackages }) <| \sources ->
+    Do.exec "mkdir" [ "-p", cacheDir ] <| \_ ->
+    Do.allowFatal (Script.writeFile { path = cacheKeyPath, body = expectedKey }) <| \_ ->
+    Do.allowFatal (Script.writeFile { path = cacheBlobPath, body = String.join separator sources }) <| \_ ->
+    BackendTask.succeed sources
 
 
 {-| Decoded fields from the project elm.json.

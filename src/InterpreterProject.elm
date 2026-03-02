@@ -89,7 +89,7 @@ loadWith config =
         |> BackendTask.andThen
             (\sourceDirectories ->
                 -- Load and patch package sources
-                ProjectSources.loadPackageDeps
+                ProjectSources.loadPackageDepsCached
                     { projectDir = config.projectDir
                     , skipPackages = config.skipPackages
                     }
