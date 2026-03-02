@@ -2,12 +2,13 @@ module RunCoreExtraTests exposing (run)
 
 {-| Run elmcraft/core-extra's test suite via the cached interpreter.
 
-    time bunx elm-pages run src/RunCoreExtraTests.elm -- --build .build/core-extra
+    NODE_OPTIONS="--max-old-space-size=8192 --expose-gc" time bunx elm-pages run src/RunCoreExtraTests.elm -- --build .build/core-extra
 
 -}
 
 import Ansi.Color
 import BackendTask exposing (BackendTask)
+import BackendTask.Custom
 import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
@@ -16,7 +17,9 @@ import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import FatalError exposing (FatalError)
-import InterpreterProject
+import InterpreterProject exposing (InterpreterProject)
+import Json.Decode
+import Json.Encode
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
@@ -67,44 +70,43 @@ skipPackages =
         ]
 
 
-{-| Module names to import in the wrapper.
+type alias TestModule =
+    { imports : List String
+    , suiteExpression : String
+    }
+
+
+{-| Each test module evaluated independently to avoid OOM.
 -}
-testModuleImports : List String
-testModuleImports =
-    [ "BasicsTests"
-    , "CharTests"
-    , "DictTests"
-    , "MaybeTests"
-    , "TripleTests"
+testModules : List TestModule
+testModules =
+    [ { imports = [ "ArrayTests" ], suiteExpression = "ArrayTests.suite" }
+    , { imports = [ "BasicsTests" ], suiteExpression = "BasicsTests.suite" }
+    , { imports = [ "CharTests" ], suiteExpression = "CharTests.suite" }
+    , { imports = [ "DictTests" ], suiteExpression = "DictTests.suite" }
+    , { imports = [ "FloatTests", "Utils" ]
+      , suiteExpression = "Test.describe \"Float.Extra\" [FloatTests.modByTests, FloatTests.testAboutEqual, FloatTests.testBoundaryValuesAsUnicode, FloatTests.testEqualWithin, FloatTests.testInterpolateFrom, FloatTests.testRange, FloatTests.testToFixedDecimalPlaces, FloatTests.testToFixedSignificantDigits]"
+      }
+    , { imports = [ "MaybeTests" ], suiteExpression = "MaybeTests.suite" }
+    , { imports = [ "OrderTests" ], suiteExpression = "OrderTests.all" }
+    , { imports = [ "String.NonEmptyTest" ], suiteExpression = "String.NonEmptyTest.nonEmptyTest" }
+    -- String.RemoveAccentsTest and String.RemoveDiacriticsTests skipped:
+    -- they use removeDiacritics which creates a 65K-element Array via
+    -- Array.initialize, too expensive for the interpreter.
+    , { imports = [ "String.ReplaceSliceTest" ], suiteExpression = "String.ReplaceSliceTest.replaceSliceTest" }
+    , { imports = [ "String.UnicodeTests" ], suiteExpression = "String.UnicodeTests.unicodeTests" }
+    , { imports = [ "String.UnindentTest" ], suiteExpression = "String.UnindentTest.unindentTest" }
+    , { imports = [ "TripleTests" ], suiteExpression = "TripleTests.suite" }
     ]
 
 
-{-| Suite expressions for each test module.
+{-| Build the expression and imports for a single test module.
 -}
-testModuleSuites : List String
-testModuleSuites =
-    [ "BasicsTests.suite"
-    , "CharTests.suite"
-    , "DictTests.suite"
-    , "MaybeTests.suite"
-    , "TripleTests.suite"
-    ]
-
-
-{-| The expression to evaluate in the wrapper module.
--}
-buildExpression : String
-buildExpression =
-    "SimpleTestRunner.runToString (Test.describe \"core-extra\" [ "
-        ++ (testModuleSuites |> String.join ", ")
-        ++ " ])"
-
-
-{-| The imports needed by the wrapper expression.
--}
-wrapperImports : List String
-wrapperImports =
-    testModuleImports ++ [ "SimpleTestRunner", "Test" ]
+buildModuleEval : TestModule -> { imports : List String, expression : String }
+buildModuleEval mod =
+    { imports = mod.imports ++ [ "SimpleTestRunner", "Test" ]
+    , expression = "SimpleTestRunner.runToString (" ++ mod.suiteExpression ++ ")"
+    }
 
 
 task : Config -> BackendTask FatalError ()
@@ -122,21 +124,119 @@ task config =
         )
     <| \project ->
     Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
-    Do.do
-        (BackendTask.Extra.timed "[profile] Cache.run (evalWith)" "[profile] Cache.run (evalWith) done"
-            (Cache.run { jobs = Nothing } config.buildDirectory
-                (InterpreterProject.evalWith project
-                    { imports = wrapperImports
-                    , expression = buildExpression
-                    }
-                    Cache.succeed
+    evalModulesWithGC project config testModules { passed = 0, failed = 0, total = 0, failLines = [] }
+    <| \combined ->
+    Do.each combined.failLines
+        (\line ->
+            Script.log
+                (Ansi.Color.fontColor Ansi.Color.red
+                    ("  ✗ " ++ String.dropLeft 5 line)
                 )
-            )
+        )
+    <| \_ ->
+    Do.log
+        (let
+            summary =
+                "{ \"passed\": "
+                    ++ String.fromInt combined.passed
+                    ++ ", \"failed\": "
+                    ++ String.fromInt combined.failed
+                    ++ ", \"total\": "
+                    ++ String.fromInt combined.total
+                    ++ " }"
+
+            color =
+                if combined.failed == 0 then
+                    Ansi.Color.fontColor Ansi.Color.brightGreen
+
+                else
+                    Ansi.Color.fontColor Ansi.Color.brightRed
+         in
+         color summary
+        )
+    <| \_ ->
+    Do.noop
+
+
+type alias ModuleResult =
+    { passed : Int
+    , failed : Int
+    , total : Int
+    , failLines : List String
+    }
+
+
+{-| Process modules one at a time with forced GC between evaluations to prevent OOM.
+-}
+evalModulesWithGC : InterpreterProject -> Config -> List TestModule -> ModuleResult -> (ModuleResult -> BackendTask FatalError a) -> BackendTask FatalError a
+evalModulesWithGC project config modules acc continuation =
+    case modules of
+        [] ->
+            continuation acc
+
+        mod :: rest ->
+            Do.do (evalModule project config mod) <| \result ->
+            let
+                newAcc =
+                    { passed = acc.passed + result.passed
+                    , failed = acc.failed + result.failed
+                    , total = acc.total + result.total
+                    , failLines = acc.failLines ++ result.failLines
+                    }
+            in
+            Do.do forceGC <| \_ ->
+            evalModulesWithGC project config rest newAcc continuation
+
+
+{-| Request V8 garbage collection. Requires node --expose-gc flag.
+-}
+forceGC : BackendTask FatalError ()
+forceGC =
+    BackendTask.Custom.run "forceGC" Json.Encode.null (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+evalModule : InterpreterProject -> Config -> TestModule -> BackendTask FatalError ModuleResult
+evalModule project config mod =
+    let
+        evalConfig =
+            buildModuleEval mod
+    in
+    Do.do
+        (Cache.run { jobs = Nothing } config.buildDirectory
+            (InterpreterProject.evalWith project evalConfig Cache.succeed)
         )
     <| \result ->
     Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
-    Do.do (displayResults output) <| \_ ->
-    Do.noop
+    BackendTask.succeed (parseOutput output)
+
+
+parseOutput : String -> ModuleResult
+parseOutput output =
+    let
+        lines =
+            String.lines output
+
+        summaryParts =
+            case String.split "," (List.head lines |> Maybe.withDefault "") of
+                [ p, f, t ] ->
+                    { passed = String.toInt p |> Maybe.withDefault 0
+                    , failed = String.toInt f |> Maybe.withDefault 0
+                    , total = String.toInt t |> Maybe.withDefault 0
+                    }
+
+                _ ->
+                    { passed = 0, failed = 0, total = 0 }
+
+        failLines =
+            List.drop 1 lines
+                |> List.filter (String.startsWith "FAIL:")
+    in
+    { passed = summaryParts.passed
+    , failed = summaryParts.failed
+    , total = summaryParts.total
+    , failLines = failLines
+    }
 
 
 {-| Patch source files for interpreter compatibility:
@@ -244,59 +344,3 @@ patchMicroBitwiseExtra source =
 
     else
         source
-
-
-displayResults : String -> BackendTask FatalError ()
-displayResults output =
-    let
-        lines : List String
-        lines =
-            String.lines output
-
-        summaryParts : { passed : Int, failed : Int, total : Int }
-        summaryParts =
-            case String.split "," (List.head lines |> Maybe.withDefault "") of
-                [ p, f, t ] ->
-                    { passed = String.toInt p |> Maybe.withDefault 0
-                    , failed = String.toInt f |> Maybe.withDefault 0
-                    , total = String.toInt t |> Maybe.withDefault 0
-                    }
-
-                _ ->
-                    { passed = 0, failed = 0, total = 0 }
-
-        failLines : List String
-        failLines =
-            List.drop 1 lines
-                |> List.filter (String.startsWith "FAIL:")
-    in
-    Do.each failLines
-        (\line ->
-            Script.log
-                (Ansi.Color.fontColor Ansi.Color.red
-                    ("  ✗ " ++ String.dropLeft 5 line)
-                )
-        )
-    <| \_ ->
-    Do.log
-        (let
-            summary =
-                "{ \"passed\": "
-                    ++ String.fromInt summaryParts.passed
-                    ++ ", \"failed\": "
-                    ++ String.fromInt summaryParts.failed
-                    ++ ", \"total\": "
-                    ++ String.fromInt summaryParts.total
-                    ++ " }"
-
-            color =
-                if summaryParts.failed == 0 then
-                    Ansi.Color.fontColor Ansi.Color.brightGreen
-
-                else
-                    Ansi.Color.fontColor Ansi.Color.brightRed
-         in
-         color summary
-        )
-    <| \_ ->
-    Do.noop
