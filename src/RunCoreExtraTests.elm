@@ -9,6 +9,7 @@ module RunCoreExtraTests exposing (run)
 import Ansi.Color
 import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
+import BackendTask.Extra
 import BackendTask.File as File
 import Cache
 import Cli.Option as Option
@@ -115,23 +116,27 @@ wrapperImports =
 task : Config -> BackendTask FatalError ()
 task config =
     Do.do
-        (InterpreterProject.loadWith
-            { projectDir = Path.path "."
-            , skipPackages = skipPackages
-            , patchSource = patchSource
-            , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
-            , sourceDirectories = Just [ coreExtraDir ++ "/tests" ]
-            }
+        (BackendTask.Extra.timed "[profile] InterpreterProject.loadWith" "[profile] InterpreterProject.loadWith done"
+            (InterpreterProject.loadWith
+                { projectDir = Path.path "."
+                , skipPackages = skipPackages
+                , patchSource = patchSource
+                , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
+                , sourceDirectories = Just [ coreExtraDir ++ "/tests" ]
+                }
+            )
         )
     <| \project ->
     Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
     Do.do
-        (Cache.run { jobs = Nothing } config.buildDirectory
-            (InterpreterProject.evalWith project
-                { imports = wrapperImports
-                , expression = buildExpression
-                }
-                Cache.succeed
+        (BackendTask.Extra.timed "[profile] Cache.run (evalWith)" "[profile] Cache.run (evalWith) done"
+            (Cache.run { jobs = Nothing } config.buildDirectory
+                (InterpreterProject.evalWith project
+                    { imports = wrapperImports
+                    , expression = buildExpression
+                    }
+                    Cache.succeed
+                )
             )
         )
     <| \result ->
