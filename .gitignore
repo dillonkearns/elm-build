@@ -1,5 +1,9 @@
 .elm-pages
+.build/
+.elm-build/
 codegen/Gen
+dist/
 *.cpuprofile
 elm-stuff
 node_modules
+bun.lockb
