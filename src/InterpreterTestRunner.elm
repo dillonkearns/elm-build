@@ -12,17 +12,15 @@ import Ansi.Color
 import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
 import BackendTask.Extra
-import BackendTask.File as File
-import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
-import ElmProject
 import Elm.Syntax.Expression exposing (Expression(..))
 import Eval.Module
 import FatalError exposing (FatalError)
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
+import ProjectSources
 import Types
 
 
@@ -52,20 +50,20 @@ programConfig =
 task : Config -> BackendTask FatalError ()
 task config =
     BackendTask.Extra.profiling "interpreter-test-runner" <|
-        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Reading test source files") <| \_ ->
-        Do.allowFatal (File.rawFile "src/SimpleSampleTests.elm") <| \testSource ->
+        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Loading project sources") <| \_ ->
+        Do.do (BackendTask.Extra.timed "Loading sources" "Loaded sources" (ProjectSources.loadProjectSources { projectDir = Path.path ".", userSourceDirectories = [ "src" ], targetFile = "src/SimpleSampleTests.elm" })) <| \allSources ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Evaluating tests via interpreter") <| \_ ->
-        Do.do (BackendTask.Extra.timed "Interpreting tests" "Interpreted tests" (interpretTests testSource)) <| \output ->
+        Do.do (BackendTask.Extra.timed "Interpreting tests" "Interpreted tests" (interpretTests allSources)) <| \output ->
         displayResults output
 
 
-interpretTests : String -> BackendTask FatalError String
-interpretTests testSource =
+interpretTests : List String -> BackendTask FatalError String
+interpretTests allSources =
     let
         result : Result Types.Error Types.Value
         result =
             Eval.Module.evalProject
-                [ testSource ]
+                allSources
                 (FunctionOrValue [] "results")
     in
     case result of
