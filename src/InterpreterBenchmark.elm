@@ -106,7 +106,7 @@ buildScenarios defaultIter baselineSource =
                     , iterations = defaultIter
                     }
                 )
-                [ 10, 50, 100, 200, 500, 1000 ]
+                [ 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000 ]
 
         stringRepeatScenarios : List Scenario
         stringRepeatScenarios =
@@ -130,7 +130,7 @@ buildScenarios defaultIter baselineSource =
                     , iterations = defaultIter
                     }
                 )
-                [ 10, 50, 100, 200, 500, 1000 ]
+                [ 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000 ]
 
         patternMatchScenarios : List Scenario
         patternMatchScenarios =
@@ -142,7 +142,7 @@ buildScenarios defaultIter baselineSource =
                     , iterations = defaultIter
                     }
                 )
-                [ 10, 50, 100, 200, 500 ]
+                [ 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000 ]
     in
     BackendTask.succeed
         ([ baselineScenario ]
