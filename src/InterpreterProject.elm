@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, eval, evalWith)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -17,7 +17,9 @@ import Dict exposing (Dict)
 import Elm.Syntax.Expression exposing (Expression(..))
 import Eval.Module
 import FatalError exposing (FatalError)
+import Json.Decode as Decode
 import Path exposing (Path)
+import ProjectSources
 import Set exposing (Set)
 import Types
 
@@ -40,136 +42,203 @@ type InterpreterProject
         }
 
 
-{-| Initialize an InterpreterProject.
+{-| Initialize an InterpreterProject with default settings.
 
-Globs for user source files, reads their contents for dependency analysis
-and interpreter evaluation, builds a dependency graph, and hashes all
-user source files via `Cache.inputs`.
+Reads elm.json for source directories, loads all package dependencies,
+and sets up the project for interpreter evaluation.
 
 -}
 load :
+    { projectDir : Path }
+    -> BackendTask FatalError InterpreterProject
+load { projectDir } =
+    loadWith
+        { projectDir = projectDir
+        , skipPackages = Set.empty
+        , patchSource = identity
+        , extraSourceFiles = []
+        , sourceDirectories = Nothing
+        }
+
+
+{-| Initialize an InterpreterProject with advanced options.
+
+  - `skipPackages` — package names to exclude (e.g. those with kernel code)
+  - `patchSource` — transform applied to each package source after loading
+  - `extraSourceFiles` — additional source files to include
+  - `sourceDirectories` — `Nothing` reads from elm.json, `Just` overrides
+
+-}
+loadWith :
     { projectDir : Path
-    , sourceDirectories : List String
-    , userSourceGlobs : List String
+    , skipPackages : Set String
+    , patchSource : String -> String
     , extraSourceFiles : List String
-    , patchedPackageSources : List String
+    , sourceDirectories : Maybe (List String)
     }
     -> BackendTask FatalError InterpreterProject
-load config =
-    -- Glob all user source globs for .elm files
-    config.userSourceGlobs
-        |> List.map
-            (\globPattern ->
-                Glob.fromStringWithOptions
-                    (let
-                        o : Glob.Options
-                        o =
-                            Glob.defaultOptions
-                     in
-                     { o | include = Glob.OnlyFiles }
-                    )
-                    globPattern
-            )
-        |> BackendTask.Extra.combine
-        |> BackendTask.map (List.concat >> List.sort)
+loadWith config =
+    -- Resolve source directories from config or elm.json
+    (case config.sourceDirectories of
+        Just dirs ->
+            BackendTask.succeed dirs
+
+        Nothing ->
+            readSourceDirectories config.projectDir
+    )
         |> BackendTask.andThen
-            (\elmFiles ->
-                -- Read each user source file's content
-                elmFiles
-                    |> List.map
-                        (\filePath ->
-                            File.rawFile filePath
-                                |> BackendTask.allowFatal
-                                |> BackendTask.map (\content -> ( filePath, content ))
-                        )
-                    |> BackendTask.Extra.combine
+            (\sourceDirectories ->
+                -- Load and patch package sources
+                ProjectSources.loadPackageDeps
+                    { projectDir = config.projectDir
+                    , skipPackages = config.skipPackages
+                    }
                     |> BackendTask.andThen
-                        (\userFileContents ->
-                            -- Read extra source files
-                            config.extraSourceFiles
+                        (\packageSources ->
+                            let
+                                patchedPackageSources : List String
+                                patchedPackageSources =
+                                    List.map config.patchSource packageSources
+
+                                -- Derive user source globs from source directories
+                                userSourceGlobs : List String
+                                userSourceGlobs =
+                                    sourceDirectories
+                                        |> List.map (\dir -> dir ++ "/**/*.elm")
+                            in
+                            -- Glob all user source globs for .elm files
+                            userSourceGlobs
                                 |> List.map
-                                    (\filePath ->
-                                        File.rawFile filePath
-                                            |> BackendTask.allowFatal
-                                            |> BackendTask.map (\content -> ( filePath, content ))
+                                    (\globPattern ->
+                                        Glob.fromStringWithOptions
+                                            (let
+                                                o : Glob.Options
+                                                o =
+                                                    Glob.defaultOptions
+                                             in
+                                             { o | include = Glob.OnlyFiles }
+                                            )
+                                            globPattern
                                     )
                                 |> BackendTask.Extra.combine
+                                |> BackendTask.map (List.concat >> List.sort)
                                 |> BackendTask.andThen
-                                    (\extraFileContents ->
-                                        let
-                                            depGraph : DepGraph.Graph
-                                            depGraph =
-                                                DepGraph.buildGraph
-                                                    { sourceDirectories = config.sourceDirectories
-                                                    , files =
-                                                        userFileContents
-                                                            |> List.map
-                                                                (\( filePath, content ) ->
-                                                                    { filePath = filePath
-                                                                    , content = content
-                                                                    }
-                                                                )
-                                                    }
-
-                                            allUserPaths : List Path
-                                            allUserPaths =
-                                                elmFiles
-                                                    |> List.map Path.path
-
-                                            allSourceStrings : List String
-                                            allSourceStrings =
-                                                config.patchedPackageSources
-                                                    ++ List.map Tuple.second extraFileContents
-                                                    ++ List.map Tuple.second userFileContents
-
-                                            allModules : List ( String, String )
-                                            allModules =
-                                                List.filterMap
-                                                    (\src ->
-                                                        DepGraph.parseModuleName src
-                                                            |> Maybe.map (\name -> ( name, src ))
-                                                    )
-                                                    allSourceStrings
-
-                                            moduleGraph : ModuleGraph
-                                            moduleGraph =
-                                                { moduleToSource = Dict.fromList allModules
-                                                , imports =
-                                                    allModules
+                                    (\elmFiles ->
+                                        -- Read each user source file's content
+                                        elmFiles
+                                            |> List.map
+                                                (\filePath ->
+                                                    File.rawFile filePath
+                                                        |> BackendTask.allowFatal
+                                                        |> BackendTask.map (\content -> ( filePath, content ))
+                                                )
+                                            |> BackendTask.Extra.combine
+                                            |> BackendTask.andThen
+                                                (\userFileContents ->
+                                                    -- Read extra source files
+                                                    config.extraSourceFiles
                                                         |> List.map
-                                                            (\( name, src ) ->
-                                                                ( name, DepGraph.parseImports src |> Set.fromList )
+                                                            (\filePath ->
+                                                                File.rawFile filePath
+                                                                    |> BackendTask.allowFatal
+                                                                    |> BackendTask.map (\content -> ( filePath, content ))
                                                             )
-                                                        |> Dict.fromList
-                                                }
-                                        in
-                                        Cache.inputs allUserPaths
-                                            |> BackendTask.map
-                                                (\sourceInputs ->
-                                                    InterpreterProject
-                                                        { sourceDirectories = config.sourceDirectories
-                                                        , inputsByPath =
-                                                            sourceInputs
-                                                                |> List.map
-                                                                    (\( pathVal, monad ) ->
-                                                                        ( Path.toString pathVal
-                                                                        , ( pathVal, monad )
+                                                        |> BackendTask.Extra.combine
+                                                        |> BackendTask.andThen
+                                                            (\extraFileContents ->
+                                                                let
+                                                                    depGraph : DepGraph.Graph
+                                                                    depGraph =
+                                                                        DepGraph.buildGraph
+                                                                            { sourceDirectories = sourceDirectories
+                                                                            , files =
+                                                                                userFileContents
+                                                                                    |> List.map
+                                                                                        (\( filePath, content ) ->
+                                                                                            { filePath = filePath
+                                                                                            , content = content
+                                                                                            }
+                                                                                        )
+                                                                            }
+
+                                                                    allUserPaths : List Path
+                                                                    allUserPaths =
+                                                                        elmFiles
+                                                                            |> List.map Path.path
+
+                                                                    allSourceStrings : List String
+                                                                    allSourceStrings =
+                                                                        patchedPackageSources
+                                                                            ++ List.map Tuple.second extraFileContents
+                                                                            ++ List.map Tuple.second userFileContents
+
+                                                                    allModules : List ( String, String )
+                                                                    allModules =
+                                                                        List.filterMap
+                                                                            (\src ->
+                                                                                DepGraph.parseModuleName src
+                                                                                    |> Maybe.map (\name -> ( name, src ))
+                                                                            )
+                                                                            allSourceStrings
+
+                                                                    moduleGraph : ModuleGraph
+                                                                    moduleGraph =
+                                                                        { moduleToSource = Dict.fromList allModules
+                                                                        , imports =
+                                                                            allModules
+                                                                                |> List.map
+                                                                                    (\( name, src ) ->
+                                                                                        ( name, DepGraph.parseImports src |> Set.fromList )
+                                                                                    )
+                                                                                |> Dict.fromList
+                                                                        }
+                                                                in
+                                                                Cache.inputs allUserPaths
+                                                                    |> BackendTask.map
+                                                                        (\sourceInputs ->
+                                                                            InterpreterProject
+                                                                                { sourceDirectories = sourceDirectories
+                                                                                , inputsByPath =
+                                                                                    sourceInputs
+                                                                                        |> List.map
+                                                                                            (\( pathVal, monad ) ->
+                                                                                                ( Path.toString pathVal
+                                                                                                , ( pathVal, monad )
+                                                                                                )
+                                                                                            )
+                                                                                        |> Dict.fromList
+                                                                                , userFileContents =
+                                                                                    userFileContents
+                                                                                        |> Dict.fromList
+                                                                                , depGraph = depGraph
+                                                                                , patchedPackageSources = patchedPackageSources
+                                                                                , extraSources =
+                                                                                    extraFileContents
+                                                                                        |> List.map Tuple.second
+                                                                                , moduleGraph = moduleGraph
+                                                                                }
                                                                         )
-                                                                    )
-                                                                |> Dict.fromList
-                                                        , userFileContents =
-                                                            userFileContents
-                                                                |> Dict.fromList
-                                                        , depGraph = depGraph
-                                                        , patchedPackageSources = config.patchedPackageSources
-                                                        , extraSources =
-                                                            extraFileContents
-                                                                |> List.map Tuple.second
-                                                        , moduleGraph = moduleGraph
-                                                        }
+                                                            )
                                                 )
                                     )
                         )
+            )
+
+
+{-| Read the "source-directories" field from elm.json in the given project directory.
+-}
+readSourceDirectories : Path -> BackendTask FatalError (List String)
+readSourceDirectories projectDir =
+    File.rawFile (Path.toString projectDir ++ "/elm.json")
+        |> BackendTask.allowFatal
+        |> BackendTask.andThen
+            (\raw ->
+                case Decode.decodeString (Decode.field "source-directories" (Decode.list Decode.string)) raw of
+                    Ok dirs ->
+                        BackendTask.succeed dirs
+
+                    Err err ->
+                        BackendTask.fail (FatalError.fromString ("Failed to decode source-directories from elm.json: " ++ Decode.errorToString err))
             )
 
 

@@ -21,7 +21,6 @@ import FatalError exposing (FatalError)
 import InterpreterProject
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
-import ProjectSources
 import Set
 import Time
 
@@ -138,30 +137,15 @@ wrapperImports =
 task : Config -> BackendTask FatalError ()
 task config =
     Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "\n=== Core-Extra Benchmark ===\n") <| \_ ->
-    -- Step 1: Load and patch package sources
-    Do.do
-        (BackendTask.Extra.timed "Loading package deps" "Loaded package deps"
-            (ProjectSources.loadPackageDeps
-                { projectDir = Path.path "."
-                , skipPackages = skipPackages
-                }
-            )
-        )
-    <| \packageSources ->
-    let
-        patchedPkgSources : List String
-        patchedPkgSources =
-            List.map patchSource packageSources
-    in
-    -- Step 2: Build InterpreterProject
+    -- Build InterpreterProject (loads packages, patches, globs user files)
     Do.do
         (BackendTask.Extra.timed "Building InterpreterProject" "Built InterpreterProject"
-            (InterpreterProject.load
+            (InterpreterProject.loadWith
                 { projectDir = Path.path "."
-                , sourceDirectories = [ coreExtraDir ++ "/tests" ]
-                , userSourceGlobs = [ coreExtraDir ++ "/tests/*.elm" ]
+                , skipPackages = skipPackages
+                , patchSource = patchSource
                 , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
-                , patchedPackageSources = patchedPkgSources
+                , sourceDirectories = Just [ coreExtraDir ++ "/tests" ]
                 }
             )
         )
