@@ -143,6 +143,53 @@ buildScenarios defaultIter baselineSource =
                     }
                 )
                 [ 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000 ]
+        countWithListScenarios : List Scenario
+        countWithListScenarios =
+            List.map
+                (\n ->
+                    { name = "count-with-list-" ++ String.fromInt n
+                    , source = countWithListSource n
+                    , expression = FunctionOrValue [] "result"
+                    , iterations = defaultIter
+                    }
+                )
+                [ 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000 ]
+
+        listRangeOnlyScenarios : List Scenario
+        listRangeOnlyScenarios =
+            List.map
+                (\n ->
+                    { name = "list-range-only-" ++ String.fromInt n
+                    , source = listRangeOnlySource n
+                    , expression = FunctionOrValue [] "result"
+                    , iterations = defaultIter
+                    }
+                )
+                [ 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000 ]
+
+        listAccumScenarios : List Scenario
+        listAccumScenarios =
+            List.map
+                (\n ->
+                    { name = "list-accum-" ++ String.fromInt n
+                    , source = listAccumSource n
+                    , expression = FunctionOrValue [] "result"
+                    , iterations = defaultIter
+                    }
+                )
+                [ 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000 ]
+
+        listFoldOnlyScenarios : List Scenario
+        listFoldOnlyScenarios =
+            List.map
+                (\n ->
+                    { name = "list-foldl-only-" ++ String.fromInt n
+                    , source = listFoldOnlySource n
+                    , expression = FunctionOrValue [] "result"
+                    , iterations = defaultIter
+                    }
+                )
+                [ 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000 ]
     in
     BackendTask.succeed
         ([ baselineScenario ]
@@ -151,6 +198,10 @@ buildScenarios defaultIter baselineSource =
             ++ stringRepeatScenarios
             ++ recursionScenarios
             ++ patternMatchScenarios
+            ++ countWithListScenarios
+            ++ listRangeOnlyScenarios
+            ++ listAccumScenarios
+            ++ listFoldOnlyScenarios
         )
 
 
@@ -262,6 +313,70 @@ sumList xs =
 result : String
 result =
     String.fromInt (sumList (List.range 1 """ ++ String.fromInt n ++ """))
+"""
+
+
+countWithListSource : Int -> String
+countWithListSource n =
+    """module BenchCountWithList exposing (result)
+
+
+countWithList : Int -> List Int -> Int
+countWithList n list =
+    if n <= 0 then
+        List.length list
+    else
+        countWithList (n - 1) list
+
+
+result : String
+result =
+    String.fromInt (countWithList """ ++ String.fromInt n ++ """ (List.range 1 100))
+"""
+
+
+listRangeOnlySource : Int -> String
+listRangeOnlySource n =
+    """module BenchListRangeOnly exposing (result)
+
+
+result : String
+result =
+    String.fromInt (List.length (List.range 1 """ ++ String.fromInt n ++ """))
+"""
+
+
+listAccumSource : Int -> String
+listAccumSource n =
+    """module BenchListAccum exposing (result)
+
+
+buildList : Int -> List Int -> List Int
+buildList n acc =
+    if n <= 0 then
+        acc
+    else
+        buildList (n - 1) (n :: acc)
+
+
+result : String
+result =
+    String.fromInt (List.length (buildList """ ++ String.fromInt n ++ """ []))
+"""
+
+
+listFoldOnlySource : Int -> String
+listFoldOnlySource n =
+    """module BenchListFoldOnly exposing (result)
+
+
+result : String
+result =
+    let
+        xs =
+            List.range 1 """ ++ String.fromInt n ++ """
+    in
+    String.fromInt (List.foldl (\\x acc -> x + acc) 0 xs)
 """
 
 
