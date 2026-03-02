@@ -68,19 +68,12 @@ skipPackages =
 
 
 {-| Module names to import in the wrapper.
-
-Tests we can run. Modules that use Fuzz.string, Fuzz.intRange with large
-ranges, or Fuzz.array trigger an interpreter bug with partial application of
-point-free kernel functions in Random.int's non-power-of-2 path.
-
-Working: BasicsTests, CharTests, MaybeTests, TripleTests (51 tests)
-Blocked: ArrayTests, DictTests, FloatTests, ListTests, ResultTests, SetTests
-
 -}
 testModuleImports : List String
 testModuleImports =
     [ "BasicsTests"
     , "CharTests"
+    , "DictTests"
     , "MaybeTests"
     , "TripleTests"
     ]
@@ -92,6 +85,7 @@ testModuleSuites : List String
 testModuleSuites =
     [ "BasicsTests.suite"
     , "CharTests.suite"
+    , "DictTests.suite"
     , "MaybeTests.suite"
     , "TripleTests.suite"
     ]
@@ -122,7 +116,7 @@ task config =
                 , skipPackages = skipPackages
                 , patchSource = patchSource
                 , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
-                , sourceDirectories = Just [ coreExtraDir ++ "/tests" ]
+                , sourceDirectories = Just [ coreExtraDir ++ "/src", coreExtraDir ++ "/tests" ]
                 }
             )
         )

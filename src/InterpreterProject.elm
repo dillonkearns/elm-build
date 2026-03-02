@@ -388,7 +388,14 @@ evalWith (InterpreterProject project) { imports, expression } k =
                     "ERROR: Parsing error: " ++ Debug.toString deadEnds
 
                 Err (Types.EvalError evalErr) ->
-                    "ERROR: Eval error: " ++ Debug.toString evalErr.error
+                    "ERROR: Eval error: "
+                        ++ Debug.toString evalErr.error
+                        ++ "\nCall stack:\n - "
+                        ++ String.join "\n - "
+                            (List.map
+                                (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name)
+                                (List.reverse evalErr.callStack)
+                            )
         )
         k
 

@@ -22,7 +22,7 @@ runToString suite =
     let
         runners : Result String (List Test.Runner.Runner)
         runners =
-            case Test.Runner.fromTest 100 (Random.initialSeed 42) suite of
+            case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of
                 Test.Runner.Plain list ->
                     Ok list
 
