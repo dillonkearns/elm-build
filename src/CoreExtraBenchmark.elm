@@ -1,7 +1,7 @@
 module CoreExtraBenchmark exposing (run)
 
-{-| Benchmark: run elmcraft/core-extra's test suite via the interpreter and
-compare against elm-test.
+{-| Benchmark: run elmcraft/core-extra's test suite via the cached interpreter
+and compare cold vs warm run times.
 
     bunx elm-pages run src/CoreExtraBenchmark.elm -- --build .build/bench
 
@@ -13,18 +13,17 @@ import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Time
+import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
-import Elm.Syntax.Expression exposing (Expression(..))
-import Eval.Module
 import FatalError exposing (FatalError)
+import InterpreterProject
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import ProjectSources
 import Set
 import Time
-import Types
 
 
 run : Script
@@ -90,10 +89,56 @@ testModuleFiles =
     ]
 
 
+{-| Module names to import in the wrapper.
+
+Tests we can run. Modules that use Fuzz.string, Fuzz.intRange with large
+ranges, or Fuzz.array trigger an interpreter bug with partial application of
+point-free kernel functions in Random.int's non-power-of-2 path.
+
+Working: BasicsTests, CharTests, MaybeTests, TripleTests (51 tests)
+Blocked: ArrayTests, DictTests, FloatTests, ListTests, ResultTests, SetTests
+
+-}
+testModuleImports : List String
+testModuleImports =
+    [ "BasicsTests"
+    , "CharTests"
+    , "MaybeTests"
+    , "TripleTests"
+    ]
+
+
+{-| Suite expressions for each test module.
+-}
+testModuleSuites : List String
+testModuleSuites =
+    [ "BasicsTests.suite"
+    , "CharTests.suite"
+    , "MaybeTests.suite"
+    , "TripleTests.suite"
+    ]
+
+
+{-| The expression to evaluate in the wrapper module.
+-}
+buildExpression : String
+buildExpression =
+    "SimpleTestRunner.runToString (Test.describe \"core-extra\" [ "
+        ++ (testModuleSuites |> String.join ", ")
+        ++ " ])"
+
+
+{-| The imports needed by the wrapper expression.
+-}
+wrapperImports : List String
+wrapperImports =
+    testModuleImports ++ [ "SimpleTestRunner", "Test" ]
+
+
 task : Config -> BackendTask FatalError ()
 task config =
     Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "\n=== Core-Extra Benchmark ===\n") <| \_ ->
-    -- Step 1: Load package dependencies (with skips)
+    -- Step 1: Load and patch package sources
     Do.do
         (BackendTask.Extra.timed "Loading package deps" "Loaded package deps"
             (ProjectSources.loadPackageDeps
@@ -103,52 +148,79 @@ task config =
             )
         )
     <| \packageSources ->
-    -- Step 2: Load test files from /tmp/core-extra/tests/
-    Do.do
-        (BackendTask.Extra.timed "Loading test files" "Loaded test files"
-            (loadTestFiles coreExtraDir)
-        )
-    <| \testFiles ->
-    -- Step 3: Load SimpleTestRunner source
-    Do.allowFatal (File.rawFile "src/SimpleTestRunner.elm") <| \simpleTestRunnerSource ->
     let
-        -- Step 4: Patch sources for interpreter compatibility
-        patchedPackageSources : List String
-        patchedPackageSources =
+        patchedPkgSources : List String
+        patchedPkgSources =
             List.map patchSource packageSources
-
-        -- Step 5: Create wrapper module
-        wrapperModule : String
-        wrapperModule =
-            buildWrapperModule
-
-        -- Step 6: Assemble all sources
-        allSources : List String
-        allSources =
-            patchedPackageSources ++ testFiles ++ [ simpleTestRunnerSource, wrapperModule ]
     in
-    Do.log
-        (Ansi.Color.fontColor Ansi.Color.brightBlue
-            ("Loaded " ++ String.fromInt (List.length allSources) ++ " source files")
+    -- Step 2: Build InterpreterProject
+    Do.do
+        (BackendTask.Extra.timed "Building InterpreterProject" "Built InterpreterProject"
+            (InterpreterProject.load
+                { projectDir = Path.path "."
+                , sourceDirectories = [ coreExtraDir ++ "/tests" ]
+                , userSourceGlobs = [ coreExtraDir ++ "/tests/*.elm" ]
+                , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
+                , patchedPackageSources = patchedPkgSources
+                }
+            )
         )
-    <| \_ ->
-    -- Step 7: Run interpreter and time it
-    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Running tests via interpreter...") <| \_ ->
-    Do.do BackendTask.Time.now <| \interpStart ->
-    Do.do (interpretTests allSources) <| \output ->
-    Do.do BackendTask.Time.now <| \interpEnd ->
+    <| \project ->
+    Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
+    -- Step 3: Cold run (timed)
+    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Running cold interpreter run...") <| \_ ->
+    Do.do BackendTask.Time.now <| \coldStart ->
+    Do.do
+        (Cache.run { jobs = Nothing } config.buildDirectory
+            (InterpreterProject.evalWith project
+                { imports = wrapperImports
+                , expression = buildExpression
+                }
+                Cache.succeed
+            )
+        )
+    <| \coldResult ->
+    Do.do BackendTask.Time.now <| \coldEnd ->
     let
-        interpMs : Int
-        interpMs =
-            Time.posixToMillis interpEnd - Time.posixToMillis interpStart
+        coldMs : Int
+        coldMs =
+            Time.posixToMillis coldEnd - Time.posixToMillis coldStart
     in
-    Do.do (displayResults output) <| \_ ->
+    -- Read and display cold result
+    Do.allowFatal (File.rawFile (Path.toString coldResult.output)) <| \coldOutput ->
+    Do.do (displayResults coldOutput) <| \_ ->
     Do.log
         (Ansi.Color.fontColor Ansi.Color.brightCyan
-            ("\nInterpreter time: " ++ String.fromInt interpMs ++ "ms")
+            ("Cold run: " ++ String.fromInt coldMs ++ "ms")
         )
     <| \_ ->
-    -- Step 8: Run elm-test for comparison
+    -- Step 4: Warm run (should be near-instant from cache)
+    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "\nRunning warm interpreter run (cached)...") <| \_ ->
+    Do.do BackendTask.Time.now <| \warmStart ->
+    Do.do
+        (Cache.run { jobs = Nothing } config.buildDirectory
+            (InterpreterProject.evalWith project
+                { imports = wrapperImports
+                , expression = buildExpression
+                }
+                Cache.succeed
+            )
+        )
+    <| \warmResult ->
+    Do.do BackendTask.Time.now <| \warmEnd ->
+    let
+        warmMs : Int
+        warmMs =
+            Time.posixToMillis warmEnd - Time.posixToMillis warmStart
+    in
+    Do.allowFatal (File.rawFile (Path.toString warmResult.output)) <| \warmOutput ->
+    Do.do (displayResults warmOutput) <| \_ ->
+    Do.log
+        (Ansi.Color.fontColor Ansi.Color.brightCyan
+            ("Warm run: " ++ String.fromInt warmMs ++ "ms")
+        )
+    <| \_ ->
+    -- Step 5: Run elm-test for comparison
     Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "\nRunning elm-test for comparison...") <| \_ ->
     Do.do BackendTask.Time.now <| \elmTestStart ->
     Do.do (runElmTest |> BackendTask.toResult) <| \elmTestResult ->
@@ -175,30 +247,25 @@ task config =
     Do.log
         (Ansi.Color.fontColor Ansi.Color.brightYellow
             ("\n=== Summary ===\n"
-                ++ "Interpreter: "
-                ++ String.fromInt interpMs
+                ++ "Cold interpreter:  "
+                ++ String.fromInt coldMs
                 ++ "ms\n"
-                ++ "elm-test:    "
+                ++ "Warm interpreter:  "
+                ++ String.fromInt warmMs
+                ++ "ms\n"
+                ++ "elm-test:          "
                 ++ String.fromInt elmTestMs
                 ++ "ms\n"
-                ++ "Ratio:       "
-                ++ formatFloat (toFloat interpMs / toFloat (max 1 elmTestMs))
+                ++ "Cold/elm-test:     "
+                ++ formatFloat (toFloat coldMs / toFloat (max 1 elmTestMs))
+                ++ "x\n"
+                ++ "Warm/elm-test:     "
+                ++ formatFloat (toFloat warmMs / toFloat (max 1 elmTestMs))
                 ++ "x"
             )
         )
     <| \_ ->
     Do.noop
-
-
-loadTestFiles : String -> BackendTask FatalError (List String)
-loadTestFiles projectDir =
-    testModuleFiles
-        |> List.map
-            (\name ->
-                File.rawFile (projectDir ++ "/tests/" ++ name)
-                    |> BackendTask.allowFatal
-            )
-        |> BackendTask.Extra.combine
 
 
 {-| Patch source files for interpreter compatibility:
@@ -306,98 +373,6 @@ patchMicroBitwiseExtra source =
 
     else
         source
-
-
-{-| Build the wrapper module that imports all test modules and runs them.
--}
-buildWrapperModule : String
-buildWrapperModule =
-    let
-        imports : String
-        imports =
-            testModuleImports
-                |> List.map (\m -> "import " ++ m)
-                |> String.join "\n"
-
-        testList : String
-        testList =
-            testModuleSuites
-                |> List.map (\s -> "            , " ++ s)
-                |> String.join "\n"
-                |> String.dropLeft 14
-    in
-    "module CoreExtraAllTests exposing (results)\n\n"
-        ++ "import SimpleTestRunner\n"
-        ++ "import Test exposing (Test, describe)\n"
-        ++ imports
-        ++ "\n\n\nresults : String\nresults =\n"
-        ++ "    SimpleTestRunner.runToString\n"
-        ++ "        (describe \"core-extra\"\n"
-        ++ "            [ "
-        ++ testList
-        ++ "\n            ]\n        )\n"
-
-
-{-| Module names to import in the wrapper.
-
-Tests we can run. Modules that use Fuzz.string, Fuzz.intRange with large
-ranges, or Fuzz.array trigger an interpreter bug with partial application of
-point-free kernel functions in Random.int's non-power-of-2 path.
-
-Working: BasicsTests, CharTests, MaybeTests, TripleTests (51 tests)
-Blocked: ArrayTests, DictTests, FloatTests, ListTests, ResultTests, SetTests
-
--}
-testModuleImports : List String
-testModuleImports =
-    [ "BasicsTests"
-    , "CharTests"
-    , "MaybeTests"
-    , "TripleTests"
-    ]
-
-
-{-| Suite expressions for each test module.
--}
-testModuleSuites : List String
-testModuleSuites =
-    [ "BasicsTests.suite"
-    , "CharTests.suite"
-    , "MaybeTests.suite"
-    , "TripleTests.suite"
-    ]
-
-
-interpretTests : List String -> BackendTask FatalError String
-interpretTests allSources =
-    let
-        result : Result Types.Error Types.Value
-        result =
-            Eval.Module.evalProject
-                allSources
-                (FunctionOrValue [] "results")
-    in
-    case result of
-        Ok (Types.String s) ->
-            BackendTask.succeed s
-
-        Ok other ->
-            BackendTask.fail
-                (FatalError.fromString
-                    ("Expected String result, got: " ++ Debug.toString other)
-                )
-
-        Err (Types.ParsingError deadEnds) ->
-            BackendTask.fail
-                (FatalError.fromString
-                    ("Parsing error: " ++ Debug.toString deadEnds)
-                )
-
-        Err (Types.EvalError evalErr) ->
-            BackendTask.fail
-                (FatalError.fromString
-                    ("Eval error: " ++ Debug.toString evalErr.error)
-                )
 
 
 runElmTest : BackendTask FatalError ()
