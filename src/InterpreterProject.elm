@@ -22,6 +22,12 @@ import Set exposing (Set)
 import Types
 
 
+type alias ModuleGraph =
+    { moduleToSource : Dict String String
+    , imports : Dict String (Set String)
+    }
+
+
 type InterpreterProject
     = InterpreterProject
         { sourceDirectories : List String
@@ -30,6 +36,7 @@ type InterpreterProject
         , depGraph : DepGraph.Graph
         , patchedPackageSources : List String
         , extraSources : List String
+        , moduleGraph : ModuleGraph
         }
 
 
@@ -108,6 +115,33 @@ load config =
                                             allUserPaths =
                                                 elmFiles
                                                     |> List.map Path.path
+
+                                            allSourceStrings : List String
+                                            allSourceStrings =
+                                                config.patchedPackageSources
+                                                    ++ List.map Tuple.second extraFileContents
+                                                    ++ List.map Tuple.second userFileContents
+
+                                            allModules : List ( String, String )
+                                            allModules =
+                                                List.filterMap
+                                                    (\src ->
+                                                        DepGraph.parseModuleName src
+                                                            |> Maybe.map (\name -> ( name, src ))
+                                                    )
+                                                    allSourceStrings
+
+                                            moduleGraph : ModuleGraph
+                                            moduleGraph =
+                                                { moduleToSource = Dict.fromList allModules
+                                                , imports =
+                                                    allModules
+                                                        |> List.map
+                                                            (\( name, src ) ->
+                                                                ( name, DepGraph.parseImports src |> Set.fromList )
+                                                            )
+                                                        |> Dict.fromList
+                                                }
                                         in
                                         Cache.inputs allUserPaths
                                             |> BackendTask.map
@@ -131,6 +165,7 @@ load config =
                                                         , extraSources =
                                                             extraFileContents
                                                                 |> List.map Tuple.second
+                                                        , moduleGraph = moduleGraph
                                                         }
                                                 )
                                     )
@@ -184,33 +219,37 @@ evalWith (InterpreterProject project) { imports, expression } k =
                     )
                 |> List.map (\( path, ( _, monad ) ) -> ( path, monad ))
 
-        -- Relevant user file contents for the interpreter thunk
-        relevantUserSources : List String
-        relevantUserSources =
-            project.inputsByPath
-                |> Dict.keys
-                |> List.filter (\path -> Set.member path transDeps)
-                |> List.filterMap (\path -> Dict.get path project.userFileContents)
-
         -- Generate wrapper module
         wrapperSource : String
         wrapperSource =
             generateWrapper imports expression
 
-        -- Package sources as a single blob for hashing
-        packageBlob : String
-        packageBlob =
-            String.join "\n---MODULE_SEPARATOR---\n" project.patchedPackageSources
+        -- Compute transitive module deps from the wrapper's imports through the module graph
+        wrapperImports : Set String
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
 
-        -- Extra sources as a single blob for hashing
-        extrasBlob : String
-        extrasBlob =
-            String.join "\n---MODULE_SEPARATOR---\n" project.extraSources
+        neededModules : Set String
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        -- Topologically sort needed modules and collect their sources
+        filteredSources : List String
+        filteredSources =
+            topoSortModules project.moduleGraph neededModules
+
+        -- All sources for hashing and evaluation: filtered modules + wrapper
+        allFilteredSources : List String
+        allFilteredSources =
+            filteredSources ++ [ wrapperSource ]
+
+        -- Single blob of all filtered sources for hashing
+        filteredBlob : String
+        filteredBlob =
+            String.join "\n---MODULE_SEPARATOR---\n" allFilteredSources
     in
-    -- Hash the package blob, extras blob, and wrapper module
-    Cache.do (Cache.writeFile packageBlob Cache.succeed) <| \packageHash ->
-    Cache.do (Cache.writeFile extrasBlob Cache.succeed) <| \extrasHash ->
-    Cache.do (Cache.writeFile wrapperSource Cache.succeed) <| \wrapperHash ->
+    -- Hash the filtered blob
+    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <| \filteredHash ->
     -- Resolve all relevant user file hashes
     Cache.do
         (relevantInputs
@@ -226,9 +265,7 @@ evalWith (InterpreterProject project) { imports, expression } k =
     Cache.do
         (Cache.combine
             (sourceFiles
-                ++ [ { filename = Path.path "packages.blob", hash = packageHash }
-                   , { filename = Path.path "extras.blob", hash = extrasHash }
-                   , { filename = Path.path "wrapper.elm", hash = wrapperHash }
+                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash }
                    ]
             )
         )
@@ -238,17 +275,10 @@ evalWith (InterpreterProject project) { imports, expression } k =
         combinedHash
         (\() ->
             let
-                allSources : List String
-                allSources =
-                    project.patchedPackageSources
-                        ++ project.extraSources
-                        ++ relevantUserSources
-                        ++ [ wrapperSource ]
-
                 result : Result Types.Error Types.Value
                 result =
                     Eval.Module.evalProject
-                        allSources
+                        allFilteredSources
                         (FunctionOrValue [] "results")
             in
             case result of
@@ -316,3 +346,76 @@ generateWrapper imports expression =
         ++ "\n\n\nresults : String\nresults =\n    "
         ++ expression
         ++ "\n"
+
+
+{-| BFS through the module import graph to find all transitively needed modules.
+-}
+transitiveModuleDeps : Dict String (Set String) -> Set String -> Set String
+transitiveModuleDeps importsGraph rootSet =
+    bfsModules importsGraph (Set.toList rootSet) rootSet
+
+
+bfsModules : Dict String (Set String) -> List String -> Set String -> Set String
+bfsModules importsGraph queue visited =
+    case queue of
+        [] ->
+            visited
+
+        current :: rest ->
+            let
+                directDeps =
+                    Dict.get current importsGraph
+                        |> Maybe.withDefault Set.empty
+
+                newDeps =
+                    Set.diff directDeps visited
+
+                newQueue =
+                    rest ++ Set.toList newDeps
+
+                newVisited =
+                    Set.union visited newDeps
+            in
+            bfsModules importsGraph newQueue newVisited
+
+
+{-| Topologically sort the needed modules using DFS post-order,
+returning their sources in dependency order.
+-}
+topoSortModules : ModuleGraph -> Set String -> List String
+topoSortModules graph needed =
+    let
+        dfs :
+            String
+            -> { visited : Set String, order : List String }
+            -> { visited : Set String, order : List String }
+        dfs moduleName acc =
+            if Set.member moduleName acc.visited then
+                acc
+
+            else
+                let
+                    withVisited =
+                        { acc | visited = Set.insert moduleName acc.visited }
+
+                    deps =
+                        Dict.get moduleName graph.imports
+                            |> Maybe.withDefault Set.empty
+                            |> Set.toList
+                            |> List.filter (\dep -> Set.member dep needed)
+
+                    afterDeps =
+                        List.foldl dfs withVisited deps
+                in
+                case Dict.get moduleName graph.moduleToSource of
+                    Just src ->
+                        { afterDeps | order = afterDeps.order ++ [ src ] }
+
+                    Nothing ->
+                        afterDeps
+
+        result =
+            Set.toList needed
+                |> List.foldl dfs { visited = Set.empty, order = [] }
+    in
+    result.order

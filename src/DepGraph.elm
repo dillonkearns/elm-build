@@ -1,6 +1,7 @@
 module DepGraph exposing
     ( Graph
     , parseImports
+    , parseModuleName
     , filePathToModuleName
     , buildGraph
     , transitiveDeps
@@ -39,6 +40,46 @@ parseImports source =
     source
         |> String.lines
         |> List.filterMap parseImportLine
+
+
+{-| Extract the module name from Elm source code by parsing the `module Foo.Bar exposing (...)` declaration.
+-}
+parseModuleName : String -> Maybe String
+parseModuleName source =
+    source
+        |> String.lines
+        |> List.filterMap parseModuleLine
+        |> List.head
+
+
+parseModuleLine : String -> Maybe String
+parseModuleLine line =
+    if String.startsWith "module " line then
+        case String.words (String.dropLeft 7 line) of
+            moduleName :: _ ->
+                Just moduleName
+
+            [] ->
+                Nothing
+
+    else if String.startsWith "port module " line then
+        case String.words (String.dropLeft 12 line) of
+            moduleName :: _ ->
+                Just moduleName
+
+            [] ->
+                Nothing
+
+    else if String.startsWith "effect module " line then
+        case String.words (String.dropLeft 14 line) of
+            moduleName :: _ ->
+                Just moduleName
+
+            [] ->
+                Nothing
+
+    else
+        Nothing
 
 
 parseImportLine : String -> Maybe String
