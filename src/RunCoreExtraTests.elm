@@ -87,7 +87,7 @@ testModules =
     , { imports = [ "FloatTests", "Utils" ]
       , suiteExpression = "Test.describe \"Float.Extra\" [FloatTests.modByTests, FloatTests.testAboutEqual, FloatTests.testBoundaryValuesAsUnicode, FloatTests.testEqualWithin, FloatTests.testInterpolateFrom, FloatTests.testRange, FloatTests.testToFixedDecimalPlaces, FloatTests.testToFixedSignificantDigits]"
       }
-    -- ListTests skipped: OOMs at 8GB (List.Extra has too many fuzz tests for a single eval).
+    , { imports = [ "ListTests" ], suiteExpression = "ListTests.all" }
     , { imports = [ "MaybeTests" ], suiteExpression = "MaybeTests.suite" }
     , { imports = [ "OrderTests" ], suiteExpression = "OrderTests.all" }
     , { imports = [ "SetTests" ], suiteExpression = "SetTests.all" }
