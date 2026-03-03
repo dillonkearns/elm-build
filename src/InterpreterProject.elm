@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, getPackageEnv, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithPackageEnv, getPackageEnv, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -399,6 +399,137 @@ evalWith (InterpreterProject project) { imports, expression } k =
         )
         k
 
+
+
+{-| Like `evalWith`, but reuses a pre-built `ProjectEnv` for package modules.
+
+Only the user-specific sources (non-package modules + wrapper) are parsed
+inside the `Cache.compute` thunk. This avoids re-parsing shared package
+modules on every call — build the `ProjectEnv` once with `getPackageEnv`
+and pass it to each `evalWithPackageEnv` call.
+
+-}
+evalWithPackageEnv : Eval.Module.ProjectEnv -> InterpreterProject -> { imports : List String, expression : String } -> (FileOrDirectory -> Cache.Monad a) -> Cache.Monad a
+evalWithPackageEnv packageEnv (InterpreterProject project) { imports, expression } k =
+    let
+        -- Get transitive user-source deps as the union across all imported modules
+        transDeps : Set String
+        transDeps =
+            imports
+                |> List.filterMap (DepGraph.moduleNameToFilePath project.depGraph)
+                |> List.map (DepGraph.transitiveDeps project.depGraph)
+                |> List.foldl Set.union Set.empty
+
+        -- Filter inputsByPath to relevant source deps
+        relevantInputs : List ( String, Cache.Monad FileOrDirectory )
+        relevantInputs =
+            project.inputsByPath
+                |> Dict.toList
+                |> List.filter
+                    (\( path, _ ) ->
+                        Set.member path transDeps
+                    )
+                |> List.map (\( path, ( _, monad ) ) -> ( path, monad ))
+
+        -- Generate wrapper module
+        wrapperSource : String
+        wrapperSource =
+            generateWrapper imports expression
+
+        -- Compute transitive module deps from the wrapper's imports through the module graph
+        wrapperImports : Set String
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules : Set String
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        -- Topologically sort needed modules and collect their sources
+        filteredSources : List String
+        filteredSources =
+            topoSortModules project.moduleGraph neededModules
+
+        -- Filter to only non-package (user) sources
+        userFilteredSources : List String
+        userFilteredSources =
+            filteredSources
+                |> List.filter
+                    (\src ->
+                        case DepGraph.parseModuleName src of
+                            Just name ->
+                                not (Set.member name project.packageModuleNames)
+
+                            Nothing ->
+                                True
+                    )
+
+        -- All sources for hashing (still includes everything for correct cache keys)
+        allFilteredSources : List String
+        allFilteredSources =
+            filteredSources ++ [ wrapperSource ]
+
+        -- Single blob of all filtered sources for hashing
+        filteredBlob : String
+        filteredBlob =
+            String.join "\n---MODULE_SEPARATOR---\n" allFilteredSources
+    in
+    -- Hash the filtered blob
+    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <| \filteredHash ->
+    -- Resolve all relevant user file hashes
+    Cache.do
+        (relevantInputs
+            |> List.map
+                (\( path, monad ) ->
+                    Cache.do monad <| \hash ->
+                    Cache.succeed { filename = Path.path path, hash = hash }
+                )
+            |> Cache.sequence
+        )
+    <| \sourceFiles ->
+    -- Combine all hashes into a single combined hash
+    Cache.do
+        (Cache.combine
+            (sourceFiles
+                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash }
+                   ]
+            )
+        )
+    <| \combinedHash ->
+    -- Cache the interpreter computation
+    Cache.compute [ "interpret" ]
+        combinedHash
+        (\() ->
+            let
+                -- Only parse user sources + wrapper; reuse the pre-built package env
+                result : Result Types.Error Types.Value
+                result =
+                    Eval.Module.evalWithEnv
+                        packageEnv
+                        (userFilteredSources ++ [ wrapperSource ])
+                        (FunctionOrValue [] "results")
+            in
+            case result of
+                Ok (Types.String s) ->
+                    s
+
+                Ok other ->
+                    "ERROR: Expected String result, got: " ++ Debug.toString other
+
+                Err (Types.ParsingError deadEnds) ->
+                    "ERROR: Parsing error: " ++ Debug.toString deadEnds
+
+                Err (Types.EvalError evalErr) ->
+                    "ERROR: Eval error: "
+                        ++ Debug.toString evalErr.error
+                        ++ "\nCall stack:\n - "
+                        ++ String.join "\n - "
+                            (List.map
+                                (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name)
+                                (List.reverse evalErr.callStack)
+                            )
+        )
+        k
 
 
 {-| Get the pre-built package environment for direct eval calls.
