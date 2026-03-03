@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithPackageEnv, getPackageEnv, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithPackageEnv, getPackageEnv, getPackageEnvFor, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -554,6 +554,50 @@ getPackageEnv (InterpreterProject project) =
             -- if buildProjectEnv failed. Since this is only used by
             -- CoreExtraBenchmark, a crash here is acceptable.
             Debug.todo "getPackageEnv: buildProjectEnv failed"
+
+
+{-| Build a package environment from only the package modules transitively
+needed by the given set of eval configs. This is more efficient than
+`getPackageEnv` when only a subset of packages is needed.
+-}
+getPackageEnvFor : InterpreterProject -> List { imports : List String, expression : String } -> Eval.Module.ProjectEnv
+getPackageEnvFor (InterpreterProject project) evalConfigs =
+    let
+        -- Compute the union of all transitively-needed modules across all configs
+        allNeededModules : Set String
+        allNeededModules =
+            evalConfigs
+                |> List.foldl
+                    (\{ imports, expression } acc ->
+                        let
+                            wrapperSource =
+                                generateWrapper imports expression
+
+                            wrapperImports =
+                                DepGraph.parseImports wrapperSource |> Set.fromList
+                        in
+                        Set.union acc
+                            (transitiveModuleDeps project.moduleGraph.imports wrapperImports)
+                    )
+                    Set.empty
+
+        -- Filter to only package modules and topo-sort them
+        packageSources : List String
+        packageSources =
+            topoSortModules project.moduleGraph
+                (Set.filter (\name -> Set.member name project.packageModuleNames) allNeededModules)
+
+        -- Include extra sources (like SimpleTestRunner) that are in the stable set
+        allStableSources : List String
+        allStableSources =
+            packageSources ++ project.extraSources
+    in
+    case Eval.Module.buildProjectEnv allStableSources of
+        Ok env ->
+            env
+
+        Err _ ->
+            Debug.todo "getPackageEnvFor: buildProjectEnv failed"
 
 
 {-| Prepare the source lists needed for eval, without actually evaluating.

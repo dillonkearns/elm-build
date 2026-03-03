@@ -129,7 +129,8 @@ task config =
     let
         packageEnv : Eval.Module.ProjectEnv
         packageEnv =
-            InterpreterProject.getPackageEnv project
+            InterpreterProject.getPackageEnvFor project
+                (List.map buildModuleEval testModules)
     in
     Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
     evalModulesWithGC packageEnv project config testModules { passed = 0, failed = 0, total = 0, failLines = [] }
