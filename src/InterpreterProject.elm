@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithPackageEnv, getPackageEnv, getPackageEnvFor, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, getPackageEnv, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -43,6 +43,7 @@ type InterpreterProject
         , extraSources : List String
         , moduleGraph : ModuleGraph
         , packageModuleNames : Set String
+        , packageEnv : Eval.Module.ProjectEnv
         }
 
 
@@ -206,6 +207,41 @@ loadWith config =
                                                                         allStableSources
                                                                             |> List.filterMap DepGraph.parseModuleName
                                                                             |> Set.fromList
+
+                                                                    -- Compute which package modules are reachable from any user module
+                                                                    userModuleNames : Set String
+                                                                    userModuleNames =
+                                                                        userFileContents
+                                                                            |> List.filterMap (\( _, src ) -> DepGraph.parseModuleName src)
+                                                                            |> Set.fromList
+
+                                                                    extraModuleNames : Set String
+                                                                    extraModuleNames =
+                                                                        extraFileContents
+                                                                            |> List.filterMap (\( _, src ) -> DepGraph.parseModuleName src)
+                                                                            |> Set.fromList
+
+                                                                    allUserRoots : Set String
+                                                                    allUserRoots =
+                                                                        Set.union userModuleNames extraModuleNames
+
+                                                                    reachableModules : Set String
+                                                                    reachableModules =
+                                                                        transitiveModuleDeps moduleGraph.imports allUserRoots
+
+                                                                    reachablePackageSources : List String
+                                                                    reachablePackageSources =
+                                                                        topoSortModules moduleGraph
+                                                                            (Set.filter (\name -> Set.member name pkgModuleNames) reachableModules)
+
+                                                                    pkgEnv : Eval.Module.ProjectEnv
+                                                                    pkgEnv =
+                                                                        case Eval.Module.buildProjectEnv reachablePackageSources of
+                                                                            Ok env ->
+                                                                                env
+
+                                                                            Err _ ->
+                                                                                Debug.todo "loadWith: buildProjectEnv for package sources failed"
                                                                 in
                                                                 Cache.inputs allUserPaths
                                                                     |> BackendTask.map
@@ -231,6 +267,7 @@ loadWith config =
                                                                                         |> List.map Tuple.second
                                                                                 , moduleGraph = moduleGraph
                                                                                 , packageModuleNames = pkgModuleNames
+                                                                                , packageEnv = pkgEnv
                                                                                 }
                                                                         )
                                                             )
@@ -280,137 +317,12 @@ a `String`. Transitive dependencies are computed as the union across all
 imported modules. The result is cached based on the combined hash of
 package sources, extra sources, relevant user sources, and the wrapper module.
 
-Parsing is deferred to this point — only the transitively-needed modules
-are parsed (typically ~35 out of ~339), giving a ~10x speedup over
-parsing everything upfront.
+Package modules are parsed once during `loadWith` and reused across all
+`evalWith` calls. Only user-specific sources are parsed per call.
 
 -}
 evalWith : InterpreterProject -> { imports : List String, expression : String } -> (FileOrDirectory -> Cache.Monad a) -> Cache.Monad a
 evalWith (InterpreterProject project) { imports, expression } k =
-    let
-        -- Get transitive user-source deps as the union across all imported modules
-        transDeps : Set String
-        transDeps =
-            imports
-                |> List.filterMap (DepGraph.moduleNameToFilePath project.depGraph)
-                |> List.map (DepGraph.transitiveDeps project.depGraph)
-                |> List.foldl Set.union Set.empty
-
-        -- Filter inputsByPath to relevant source deps
-        relevantInputs : List ( String, Cache.Monad FileOrDirectory )
-        relevantInputs =
-            project.inputsByPath
-                |> Dict.toList
-                |> List.filter
-                    (\( path, _ ) ->
-                        Set.member path transDeps
-                    )
-                |> List.map (\( path, ( _, monad ) ) -> ( path, monad ))
-
-        -- Generate wrapper module
-        wrapperSource : String
-        wrapperSource =
-            generateWrapper imports expression
-
-        -- Compute transitive module deps from the wrapper's imports through the module graph
-        wrapperImports : Set String
-        wrapperImports =
-            DepGraph.parseImports wrapperSource |> Set.fromList
-
-        neededModules : Set String
-        neededModules =
-            transitiveModuleDeps project.moduleGraph.imports wrapperImports
-
-        -- Topologically sort needed modules and collect their sources
-        filteredSources : List String
-        filteredSources =
-            topoSortModules project.moduleGraph neededModules
-
-        -- All sources for hashing and evaluation: filtered modules + wrapper
-        allFilteredSources : List String
-        allFilteredSources =
-            filteredSources ++ [ wrapperSource ]
-
-        -- Single blob of all filtered sources for hashing
-        filteredBlob : String
-        filteredBlob =
-            String.join "\n---MODULE_SEPARATOR---\n" allFilteredSources
-    in
-    -- Hash the filtered blob
-    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <| \filteredHash ->
-    -- Resolve all relevant user file hashes
-    Cache.do
-        (relevantInputs
-            |> List.map
-                (\( path, monad ) ->
-                    Cache.do monad <| \hash ->
-                    Cache.succeed { filename = Path.path path, hash = hash }
-                )
-            |> Cache.sequence
-        )
-    <| \sourceFiles ->
-    -- Combine all hashes into a single combined hash
-    Cache.do
-        (Cache.combine
-            (sourceFiles
-                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash }
-                   ]
-            )
-        )
-    <| \combinedHash ->
-    -- Cache the interpreter computation
-    Cache.compute [ "interpret" ]
-        combinedHash
-        (\() ->
-            let
-                -- Build ProjectEnv from only the needed sources (lazy parsing)
-                -- This parses ~35 modules instead of all ~339
-                result : Result Types.Error Types.Value
-                result =
-                    case Eval.Module.buildProjectEnv filteredSources of
-                        Err err ->
-                            Err err
-
-                        Ok projectEnv ->
-                            Eval.Module.evalWithEnv
-                                projectEnv
-                                [ wrapperSource ]
-                                (FunctionOrValue [] "results")
-            in
-            case result of
-                Ok (Types.String s) ->
-                    s
-
-                Ok other ->
-                    "ERROR: Expected String result, got: " ++ Debug.toString other
-
-                Err (Types.ParsingError deadEnds) ->
-                    "ERROR: Parsing error: " ++ Debug.toString deadEnds
-
-                Err (Types.EvalError evalErr) ->
-                    "ERROR: Eval error: "
-                        ++ Debug.toString evalErr.error
-                        ++ "\nCall stack:\n - "
-                        ++ String.join "\n - "
-                            (List.map
-                                (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name)
-                                (List.reverse evalErr.callStack)
-                            )
-        )
-        k
-
-
-
-{-| Like `evalWith`, but reuses a pre-built `ProjectEnv` for package modules.
-
-Only the user-specific sources (non-package modules + wrapper) are parsed
-inside the `Cache.compute` thunk. This avoids re-parsing shared package
-modules on every call — build the `ProjectEnv` once with `getPackageEnv`
-and pass it to each `evalWithPackageEnv` call.
-
--}
-evalWithPackageEnv : Eval.Module.ProjectEnv -> InterpreterProject -> { imports : List String, expression : String } -> (FileOrDirectory -> Cache.Monad a) -> Cache.Monad a
-evalWithPackageEnv packageEnv (InterpreterProject project) { imports, expression } k =
     let
         -- Get transitive user-source deps as the union across all imported modules
         transDeps : Set String
@@ -464,7 +376,7 @@ evalWithPackageEnv packageEnv (InterpreterProject project) { imports, expression
                                 True
                     )
 
-        -- All sources for hashing (still includes everything for correct cache keys)
+        -- All sources for hashing (includes everything for correct cache keys)
         allFilteredSources : List String
         allFilteredSources =
             filteredSources ++ [ wrapperSource ]
@@ -505,7 +417,7 @@ evalWithPackageEnv packageEnv (InterpreterProject project) { imports, expression
                 result : Result Types.Error Types.Value
                 result =
                     Eval.Module.evalWithEnv
-                        packageEnv
+                        project.packageEnv
                         (userFilteredSources ++ [ wrapperSource ])
                         (FunctionOrValue [] "results")
             in
@@ -532,72 +444,13 @@ evalWithPackageEnv packageEnv (InterpreterProject project) { imports, expression
         k
 
 
-{-| Get the pre-built package environment for direct eval calls.
 
-Note: This builds the env on-demand from all stable sources. Prefer using
-`evalWith` which only parses the needed subset.
-
+{-| Get the pre-built package environment. Useful for direct eval calls
+that bypass the caching layer (e.g. benchmarking).
 -}
 getPackageEnv : InterpreterProject -> Eval.Module.ProjectEnv
 getPackageEnv (InterpreterProject project) =
-    let
-        allStableSources : List String
-        allStableSources =
-            project.patchedPackageSources ++ project.extraSources
-    in
-    case Eval.Module.buildProjectEnv allStableSources of
-        Ok env ->
-            env
-
-        Err _ ->
-            -- This mirrors the old behavior where loadWith would fail
-            -- if buildProjectEnv failed. Since this is only used by
-            -- CoreExtraBenchmark, a crash here is acceptable.
-            Debug.todo "getPackageEnv: buildProjectEnv failed"
-
-
-{-| Build a package environment from only the package modules transitively
-needed by the given set of eval configs. This is more efficient than
-`getPackageEnv` when only a subset of packages is needed.
--}
-getPackageEnvFor : InterpreterProject -> List { imports : List String, expression : String } -> Eval.Module.ProjectEnv
-getPackageEnvFor (InterpreterProject project) evalConfigs =
-    let
-        -- Compute the union of all transitively-needed modules across all configs
-        allNeededModules : Set String
-        allNeededModules =
-            evalConfigs
-                |> List.foldl
-                    (\{ imports, expression } acc ->
-                        let
-                            wrapperSource =
-                                generateWrapper imports expression
-
-                            wrapperImports =
-                                DepGraph.parseImports wrapperSource |> Set.fromList
-                        in
-                        Set.union acc
-                            (transitiveModuleDeps project.moduleGraph.imports wrapperImports)
-                    )
-                    Set.empty
-
-        -- Filter to only package modules and topo-sort them
-        packageSources : List String
-        packageSources =
-            topoSortModules project.moduleGraph
-                (Set.filter (\name -> Set.member name project.packageModuleNames) allNeededModules)
-
-        -- Include extra sources (like SimpleTestRunner) that are in the stable set
-        allStableSources : List String
-        allStableSources =
-            packageSources ++ project.extraSources
-    in
-    case Eval.Module.buildProjectEnv allStableSources of
-        Ok env ->
-            env
-
-        Err _ ->
-            Debug.todo "getPackageEnvFor: buildProjectEnv failed"
+    project.packageEnv
 
 
 {-| Prepare the source lists needed for eval, without actually evaluating.

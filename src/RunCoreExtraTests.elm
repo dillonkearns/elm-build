@@ -17,7 +17,6 @@ import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import FatalError exposing (FatalError)
-import Eval.Module
 import InterpreterProject exposing (InterpreterProject)
 import Json.Decode
 import Json.Encode
@@ -126,14 +125,8 @@ task config =
             )
         )
     <| \project ->
-    let
-        packageEnv : Eval.Module.ProjectEnv
-        packageEnv =
-            InterpreterProject.getPackageEnvFor project
-                (List.map buildModuleEval testModules)
-    in
     Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
-    evalModulesWithGC packageEnv project config testModules { passed = 0, failed = 0, total = 0, failLines = [] }
+    evalModulesWithGC project config testModules { passed = 0, failed = 0, total = 0, failLines = [] }
     <| \combined ->
     Do.each combined.failLines
         (\line ->
@@ -177,14 +170,14 @@ type alias ModuleResult =
 
 {-| Process modules one at a time with forced GC between evaluations to prevent OOM.
 -}
-evalModulesWithGC : Eval.Module.ProjectEnv -> InterpreterProject -> Config -> List TestModule -> ModuleResult -> (ModuleResult -> BackendTask FatalError a) -> BackendTask FatalError a
-evalModulesWithGC packageEnv project config modules acc continuation =
+evalModulesWithGC : InterpreterProject -> Config -> List TestModule -> ModuleResult -> (ModuleResult -> BackendTask FatalError a) -> BackendTask FatalError a
+evalModulesWithGC project config modules acc continuation =
     case modules of
         [] ->
             continuation acc
 
         mod :: rest ->
-            Do.do (evalModule packageEnv project config mod) <| \result ->
+            Do.do (evalModule project config mod) <| \result ->
             let
                 newAcc =
                     { passed = acc.passed + result.passed
@@ -194,7 +187,7 @@ evalModulesWithGC packageEnv project config modules acc continuation =
                     }
             in
             Do.do forceGC <| \_ ->
-            evalModulesWithGC packageEnv project config rest newAcc continuation
+            evalModulesWithGC project config rest newAcc continuation
 
 
 {-| Request V8 garbage collection. Requires node --expose-gc flag.
@@ -205,15 +198,15 @@ forceGC =
         |> BackendTask.allowFatal
 
 
-evalModule : Eval.Module.ProjectEnv -> InterpreterProject -> Config -> TestModule -> BackendTask FatalError ModuleResult
-evalModule packageEnv project config mod =
+evalModule : InterpreterProject -> Config -> TestModule -> BackendTask FatalError ModuleResult
+evalModule project config mod =
     let
         evalConfig =
             buildModuleEval mod
     in
     Do.do
         (Cache.run { jobs = Nothing } config.buildDirectory
-            (InterpreterProject.evalWithPackageEnv packageEnv project evalConfig Cache.succeed)
+            (InterpreterProject.evalWith project evalConfig Cache.succeed)
         )
     <| \result ->
     Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
