@@ -16,6 +16,12 @@ export function triggerDebugger() {
     debugger;
 }
 
+export function forceGC() {
+    if (global.gc) {
+        global.gc();
+    }
+}
+
 /**
  * @param {string} path
  * @returns {Promise<string[]>}

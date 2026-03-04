@@ -1,9 +1,11 @@
 module DepGraph exposing
     ( Graph
     , parseImports
+    , parseModuleName
     , filePathToModuleName
     , buildGraph
     , transitiveDeps
+    , moduleNameToFilePath
     )
 
 {-| Pure dependency graph analysis for Elm source files.
@@ -22,6 +24,7 @@ import Set exposing (Set)
 type Graph
     = Graph
         { deps : Dict String (Set String)
+        , moduleToFile : Dict String String
         }
 
 
@@ -37,6 +40,46 @@ parseImports source =
     source
         |> String.lines
         |> List.filterMap parseImportLine
+
+
+{-| Extract the module name from Elm source code by parsing the `module Foo.Bar exposing (...)` declaration.
+-}
+parseModuleName : String -> Maybe String
+parseModuleName source =
+    source
+        |> String.lines
+        |> List.filterMap parseModuleLine
+        |> List.head
+
+
+parseModuleLine : String -> Maybe String
+parseModuleLine line =
+    if String.startsWith "module " line then
+        case String.words (String.dropLeft 7 line) of
+            moduleName :: _ ->
+                Just moduleName
+
+            [] ->
+                Nothing
+
+    else if String.startsWith "port module " line then
+        case String.words (String.dropLeft 12 line) of
+            moduleName :: _ ->
+                Just moduleName
+
+            [] ->
+                Nothing
+
+    else if String.startsWith "effect module " line then
+        case String.words (String.dropLeft 14 line) of
+            moduleName :: _ ->
+                Just moduleName
+
+            [] ->
+                Nothing
+
+    else
+        Nothing
 
 
 parseImportLine : String -> Maybe String
@@ -135,7 +178,7 @@ buildGraph { sourceDirectories, files } =
                     )
                 |> Dict.fromList
     in
-    Graph { deps = deps }
+    Graph { deps = deps, moduleToFile = moduleToFile }
 
 
 {-| Get all transitive dependencies of a file (including itself).
@@ -144,6 +187,11 @@ Uses BFS with a visited set to handle circular dependencies.
 Returns file paths. If the file path is unknown, returns a singleton set.
 
 -}
+moduleNameToFilePath : Graph -> String -> Maybe String
+moduleNameToFilePath (Graph { moduleToFile }) moduleName =
+    Dict.get moduleName moduleToFile
+
+
 transitiveDeps : Graph -> String -> Set String
 transitiveDeps (Graph { deps }) startFile =
     bfs deps [ startFile ] (Set.singleton startFile)
