@@ -14,6 +14,7 @@ import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
+import BackendTask.Random
 import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
@@ -23,6 +24,7 @@ import FatalError exposing (FatalError)
 import Json.Decode
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
+import TestAnalysis
 
 
 run : Script
@@ -54,14 +56,43 @@ task config =
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Hashing source files and building dependency graph") <| \_ ->
         Do.do (ElmProject.fromPath (Path.path ".")) <| \project ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
+        Do.allowFatal (File.rawFile "src/SampleTests.elm") <| \testSource ->
+        let
+            moduleUsesFuzz =
+                TestAnalysis.usesFuzz testSource
+        in
+        Do.do
+            (if moduleUsesFuzz then
+                BackendTask.Random.int32
+                    |> BackendTask.map String.fromInt
+
+             else
+                BackendTask.succeed ""
+            )
+        <| \seed ->
+        let
+            expression =
+                if moduleUsesFuzz then
+                    "TestRunnerHelper.runToJsonWithSeed " ++ seed ++ " SampleTests.suite"
+
+                else
+                    "TestRunnerHelper.runToJson SampleTests.suite"
+
+            ranMessage =
+                if moduleUsesFuzz then
+                    "Ran tests (seed: " ++ seed ++ ")"
+
+                else
+                    "Ran tests"
+        in
         Do.do
             (Cache.run { jobs = Nothing } config.buildDirectory
                 (ElmProject.evalWith project
                     { imports = [ "TestRunnerHelper", "SampleTests" ]
-                    , expression = "TestRunnerHelper.runToJson SampleTests.suite"
+                    , expression = expression
                     }
                     Cache.succeed
-                    |> Cache.timed "Running tests" "Ran tests"
+                    |> Cache.timed "Running tests" ranMessage
                 )
             )
         <| \result ->

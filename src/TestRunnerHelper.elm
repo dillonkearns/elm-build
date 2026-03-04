@@ -1,4 +1,4 @@
-module TestRunnerHelper exposing (runToJson)
+module TestRunnerHelper exposing (runToJson, runToJsonWithSeed)
 
 {-| Helper module that runs a Test suite and returns results as a JSON string.
 
@@ -23,12 +23,12 @@ JSON format:
       "results": [{ "passed": bool, "labels": [...], "message": "..." }] }
 
 -}
-runToJson : Test -> String
-runToJson suite =
+runToJsonWithSeed : Int -> Test -> String
+runToJsonWithSeed seedInt suite =
     let
         seed : Random.Seed
         seed =
-            Random.initialSeed 42
+            Random.initialSeed seedInt
 
         runners : Result String (List Test.Runner.Runner)
         runners =
@@ -92,6 +92,11 @@ runToJson suite =
                 )
 
 
+runToJson : Test -> String
+runToJson =
+    runToJsonWithSeed 42
+
+
 runOneRunner : Test.Runner.Runner -> { passed : Bool, labels : List String, message : String }
 runOneRunner runner =
     let
@@ -109,7 +114,15 @@ runOneRunner runner =
                 |> List.filterMap
                     (\expectation ->
                         Test.Runner.getFailureReason expectation
-                            |> Maybe.map .description
+                            |> Maybe.map
+                                (\failure ->
+                                    case failure.given of
+                                        Just given ->
+                                            "Given " ++ given ++ "\n\n" ++ failure.description
+
+                                        Nothing ->
+                                            failure.description
+                                )
                     )
 
         passed : Bool
