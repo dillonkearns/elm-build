@@ -5,6 +5,7 @@ module DepGraph exposing
     , filePathToModuleName
     , buildGraph
     , transitiveDeps
+    , reverseDeps
     , moduleNameToFilePath
     )
 
@@ -190,6 +191,24 @@ Returns file paths. If the file path is unknown, returns a singleton set.
 moduleNameToFilePath : Graph -> String -> Maybe String
 moduleNameToFilePath (Graph { moduleToFile }) moduleName =
     Dict.get moduleName moduleToFile
+
+
+{-| Get all files that transitively depend on the given file (including itself).
+
+This is the reverse of `transitiveDeps`: given a source file, which test files
+(or other files) would be affected by changing it?
+
+-}
+reverseDeps : Graph -> String -> Set String
+reverseDeps ((Graph { deps }) as graph) targetFile =
+    deps
+        |> Dict.keys
+        |> List.filter
+            (\file ->
+                Set.member targetFile (transitiveDeps graph file)
+            )
+        |> Set.fromList
+        |> Set.insert targetFile
 
 
 transitiveDeps : Graph -> String -> Set String
