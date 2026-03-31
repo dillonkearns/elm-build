@@ -9,6 +9,9 @@ interpreter. No files are written to disk — everything is in memory.
 A mutation is "killed" if any test fails (good — test suite caught it).
 A mutation "survives" if all tests still pass (bad — test suite has a gap).
 
+The test module just needs to expose `suite : Test` — the standard elm-test
+convention. The runner auto-generates the wrapper to evaluate it.
+
 -}
 
 import Ansi.Color
@@ -19,6 +22,7 @@ import BackendTask.File as File
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
+import DepGraph
 import Elm.Syntax.Expression exposing (Expression(..))
 import Eval.Module
 import FatalError exposing (FatalError)
@@ -48,7 +52,7 @@ programConfig =
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "test"
                         |> Option.map (Maybe.withDefault "src/MathLibTests.elm")
-                        |> Option.withDescription "The test file that exercises the mutated code"
+                        |> Option.withDescription "The test file (must expose suite : Test)"
                     )
             )
 
@@ -62,6 +66,13 @@ task : Config -> BackendTask FatalError ()
 task config =
     BackendTask.Extra.profiling "mutation-test-runner" <|
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Loading project sources for mutation testing") <| \_ ->
+        Do.allowFatal (File.rawFile config.testFile) <| \testSource ->
+        let
+            testModuleName : String
+            testModuleName =
+                DepGraph.parseModuleName testSource
+                    |> Maybe.withDefault "Tests"
+        in
         Do.do
             (BackendTask.Extra.timed "Loading sources" "Loaded sources"
                 (ProjectSources.loadProjectSources
@@ -69,11 +80,20 @@ task config =
                     , userSourceDirectories = [ "src" ]
                     , targetFile = config.testFile
                     }
-                    |> BackendTask.map (List.map patchSource)
+                    |> BackendTask.map
+                        (\sources ->
+                            let
+                                patched =
+                                    List.map patchSource sources
+
+                                wrapper =
+                                    generateTestWrapper testModuleName
+                            in
+                            patched ++ [ wrapper ]
+                        )
                 )
             )
         <| \allSources ->
-        -- Read the source file we want to mutate
         Do.allowFatal (File.rawFile config.mutateFile) <| \mutateSource ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Generating mutations for " ++ config.mutateFile)) <| \_ ->
         let
@@ -96,6 +116,28 @@ task config =
         displayMutationReport results
 
 
+{-| Generate a wrapper module that bridges SimpleTestRunner and the user's test module.
+
+The user's test module just needs `suite : Test`. This wrapper calls
+`SimpleTestRunner.runToString` on it so the interpreter can evaluate it
+as a String.
+
+-}
+generateTestWrapper : String -> String
+generateTestWrapper testModuleName =
+    String.join "\n"
+        [ "module MutationTestWrapper__ exposing (wrapperResult__)"
+        , ""
+        , "import SimpleTestRunner"
+        , "import " ++ testModuleName
+        , ""
+        , "wrapperResult__ : String"
+        , "wrapperResult__ ="
+        , "    SimpleTestRunner.runToString " ++ testModuleName ++ ".suite"
+        , ""
+        ]
+
+
 type MutationResult
     = Killed { mutation : Mutation, failCount : Int }
     | Survived { mutation : Mutation }
@@ -105,7 +147,6 @@ type MutationResult
 runMutation : List String -> String -> Mutation -> MutationResult
 runMutation allSources originalSource mutation =
     let
-        -- Replace the original source with the mutated version in the source list
         mutatedSources : List String
         mutatedSources =
             allSources
@@ -118,18 +159,14 @@ runMutation allSources originalSource mutation =
                             source
                     )
 
-        -- Evaluate the test module's `results` value with mutated sources.
-        -- The test module is last in the source list (loadProjectSources puts
-        -- targetFile last), so `FunctionOrValue [] "results"` resolves to it.
         result : Result Types.Error Types.Value
         result =
             Eval.Module.evalProject
                 mutatedSources
-                (FunctionOrValue [] "results")
+                (FunctionOrValue [] "wrapperResult__")
     in
     case result of
         Ok (Types.String output) ->
-            -- Parse the simple test output format: "passCount,failCount,totalCount\n..."
             case String.split "," (String.lines output |> List.head |> Maybe.withDefault "") of
                 [ _, failStr, _ ] ->
                     case String.toInt failStr of

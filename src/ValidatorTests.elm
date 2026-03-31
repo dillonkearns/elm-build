@@ -1,14 +1,8 @@
-module ValidatorTests exposing (results, suite)
+module ValidatorTests exposing (suite)
 
 import Expect
-import SimpleTestRunner
 import Test exposing (Test, describe, test)
 import Validator exposing (PasswordStrength(..))
-
-
-results : String
-results =
-    SimpleTestRunner.runToString suite
 
 
 suite : Test
