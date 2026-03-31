@@ -19,7 +19,6 @@ import BackendTask.File as File
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
-import DepGraph
 import Elm.Syntax.Expression exposing (Expression(..))
 import Eval.Module
 import FatalError exposing (FatalError)
@@ -31,7 +30,8 @@ import Types
 
 
 type alias Config =
-    { targetFile : String
+    { mutateFile : String
+    , testFile : String
     }
 
 
@@ -41,9 +41,14 @@ programConfig =
         |> Program.add
             (OptionsParser.build Config
                 |> OptionsParser.with
-                    (Option.optionalKeywordArg "target"
-                        |> Option.map (Maybe.withDefault "src/SimpleSampleTests.elm")
-                        |> Option.withDescription "The test file to mutate (default: src/SimpleSampleTests.elm)"
+                    (Option.optionalKeywordArg "mutate"
+                        |> Option.map (Maybe.withDefault "src/MathLib.elm")
+                        |> Option.withDescription "The source file to mutate"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "test"
+                        |> Option.map (Maybe.withDefault "src/MathLibTests.elm")
+                        |> Option.withDescription "The test file that exercises the mutated code"
                     )
             )
 
@@ -62,18 +67,19 @@ task config =
                 (ProjectSources.loadProjectSources
                     { projectDir = Path.path "."
                     , userSourceDirectories = [ "src" ]
-                    , targetFile = config.targetFile
+                    , targetFile = config.testFile
                     }
+                    |> BackendTask.map (List.map patchSource)
                 )
             )
         <| \allSources ->
         -- Read the source file we want to mutate
-        Do.allowFatal (File.rawFile config.targetFile) <| \targetSource ->
-        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Generating mutations") <| \_ ->
+        Do.allowFatal (File.rawFile config.mutateFile) <| \mutateSource ->
+        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Generating mutations for " ++ config.mutateFile)) <| \_ ->
         let
             mutations : List Mutation
             mutations =
-                Mutator.generateMutations targetSource
+                Mutator.generateMutations mutateSource
 
             mutationCount : Int
             mutationCount =
@@ -85,7 +91,7 @@ task config =
             results : List MutationResult
             results =
                 mutations
-                    |> List.map (runMutation allSources targetSource)
+                    |> List.map (runMutation allSources mutateSource)
         in
         displayMutationReport results
 
@@ -112,7 +118,9 @@ runMutation allSources originalSource mutation =
                             source
                     )
 
-        -- Evaluate the test module's `results` value with mutated sources
+        -- Evaluate the test module's `results` value with mutated sources.
+        -- The test module is last in the source list (loadProjectSources puts
+        -- targetFile last), so `FunctionOrValue [] "results"` resolves to it.
         result : Result Types.Error Types.Value
         result =
             Eval.Module.evalProject
@@ -145,8 +153,7 @@ runMutation allSources originalSource mutation =
             ErrorResult { mutation = mutation, error = "Parsing error in mutated source" }
 
         Err (Types.EvalError evalErr) ->
-            -- An eval error means the mutation broke something — treat as killed
-            Killed { mutation = mutation, failCount = 1 }
+            ErrorResult { mutation = mutation, error = "Eval error: " ++ Debug.toString evalErr.error }
 
 
 displayMutationReport : List MutationResult -> BackendTask FatalError ()
@@ -178,10 +185,10 @@ displayMutationReport results =
     Do.each killed
         (\r ->
             case r of
-                Killed { mutation } ->
+                Killed { mutation, failCount } ->
                     Script.log
                         (Ansi.Color.fontColor Ansi.Color.green
-                            ("  ✓ Killed: " ++ mutation.description ++ " (line " ++ String.fromInt mutation.line ++ ")")
+                            ("  ✓ Killed (" ++ String.fromInt failCount ++ " failed): " ++ mutation.description ++ " (line " ++ String.fromInt mutation.line ++ ")")
                         )
 
                 _ ->
@@ -269,3 +276,17 @@ isError r =
 
         _ ->
             False
+
+
+{-| Patch Test framework kernel code for interpreter compatibility.
+-}
+patchSource : String -> String
+patchSource source =
+    if String.contains "runThunk =\n    Elm.Kernel.Test.runThunk" source then
+        source
+            |> String.replace
+                "runThunk =\n    Elm.Kernel.Test.runThunk"
+                "runThunk fn =\n    Ok (fn ())"
+
+    else
+        source
