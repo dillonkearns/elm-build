@@ -12,6 +12,9 @@ A mutation "survives" if all tests still pass (bad — test suite has a gap).
 The test module just needs to expose `suite : Test` — the standard elm-test
 convention. The runner auto-generates the wrapper to evaluate it.
 
+Performance: sources are parsed once into a ProjectEnv via buildProjectEnv.
+Each mutation only re-parses the single mutated module via evalWithEnv.
+
 -}
 
 import Ansi.Color
@@ -19,6 +22,7 @@ import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
+import BackendTask.Time
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
@@ -30,6 +34,7 @@ import Mutator exposing (Mutation)
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import ProjectSources
+import Time
 import Types
 
 
@@ -72,6 +77,10 @@ task config =
             testModuleName =
                 DepGraph.parseModuleName testSource
                     |> Maybe.withDefault "Tests"
+
+            wrapperSource : String
+            wrapperSource =
+                generateTestWrapper testModuleName
         in
         Do.do
             (BackendTask.Extra.timed "Loading sources" "Loaded sources"
@@ -80,20 +89,25 @@ task config =
                     , userSourceDirectories = [ "src" ]
                     , targetFile = config.testFile
                     }
-                    |> BackendTask.map
-                        (\sources ->
-                            let
-                                patched =
-                                    List.map patchSource sources
-
-                                wrapper =
-                                    generateTestWrapper testModuleName
-                            in
-                            patched ++ [ wrapper ]
-                        )
+                    |> BackendTask.map (List.map patchSource)
                 )
             )
         <| \allSources ->
+        -- Build the project environment once (expensive parse phase)
+        Do.do
+            (BackendTask.Extra.timed "Building project env" "Built project env"
+                (case Eval.Module.buildProjectEnv (allSources ++ [ wrapperSource ]) of
+                    Ok env ->
+                        BackendTask.succeed env
+
+                    Err (Types.ParsingError deadEnds) ->
+                        BackendTask.fail (FatalError.fromString ("Failed to parse sources: " ++ "(parsing error)"))
+
+                    Err (Types.EvalError evalErr) ->
+                        BackendTask.fail (FatalError.fromString ("Failed to build env: " ++ "(eval error)"))
+                )
+            )
+        <| \projectEnv ->
         Do.allowFatal (File.rawFile config.mutateFile) <| \mutateSource ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Generating mutations for " ++ config.mutateFile)) <| \_ ->
         let
@@ -107,12 +121,35 @@ task config =
         in
         Do.log ("Found " ++ String.fromInt mutationCount ++ " mutations") <| \_ ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Running mutation tests via interpreter") <| \_ ->
+        Do.do BackendTask.Time.now <| \startTime ->
         let
             results : List MutationResult
             results =
                 mutations
-                    |> List.map (runMutation allSources mutateSource)
+                    |> List.map (runMutation projectEnv wrapperSource)
         in
+        Do.do BackendTask.Time.now <| \endTime ->
+        let
+            evalMs =
+                Time.posixToMillis endTime - Time.posixToMillis startTime
+
+            perMutation =
+                if mutationCount > 0 then
+                    evalMs // mutationCount
+
+                else
+                    0
+        in
+        Do.log
+            ("Evaluated "
+                ++ String.fromInt mutationCount
+                ++ " mutations in "
+                ++ String.fromInt evalMs
+                ++ "ms ("
+                ++ String.fromInt perMutation
+                ++ "ms/mutation)"
+            )
+        <| \_ ->
         displayMutationReport results
 
 
@@ -144,25 +181,24 @@ type MutationResult
     | ErrorResult { mutation : Mutation, error : String }
 
 
-runMutation : List String -> String -> Mutation -> MutationResult
-runMutation allSources originalSource mutation =
+{-| Run a single mutation using the pre-built ProjectEnv.
+
+Only the mutated module source is re-parsed — the rest of the environment
+is reused. The wrapper module is passed as the last additional source so
+its imports are used for expression resolution.
+
+-}
+runMutation : Eval.Module.ProjectEnv -> String -> Mutation -> MutationResult
+runMutation projectEnv wrapperSource mutation =
     let
-        mutatedSources : List String
-        mutatedSources =
-            allSources
-                |> List.map
-                    (\source ->
-                        if source == originalSource then
-                            mutation.mutatedSource
-
-                        else
-                            source
-                    )
-
+        -- Pass mutated source + wrapper as additional sources.
+        -- The mutated source overrides the original module in the env.
+        -- The wrapper is last so its imports resolve the expression.
         result : Result Types.Error Types.Value
         result =
-            Eval.Module.evalProject
-                mutatedSources
+            Eval.Module.evalWithEnv
+                projectEnv
+                [ mutation.mutatedSource, wrapperSource ]
                 (FunctionOrValue [] "wrapperResult__")
     in
     case result of
@@ -184,13 +220,13 @@ runMutation allSources originalSource mutation =
                     ErrorResult { mutation = mutation, error = "Unexpected output format: " ++ output }
 
         Ok other ->
-            ErrorResult { mutation = mutation, error = "Expected String result, got: " ++ Debug.toString other }
+            ErrorResult { mutation = mutation, error = "Expected String result, got: " ++ "(unexpected value type)" }
 
         Err (Types.ParsingError _) ->
             ErrorResult { mutation = mutation, error = "Parsing error in mutated source" }
 
         Err (Types.EvalError evalErr) ->
-            ErrorResult { mutation = mutation, error = "Eval error: " ++ Debug.toString evalErr.error }
+            ErrorResult { mutation = mutation, error = "Eval error: " ++ "(eval error)" }
 
 
 displayMutationReport : List MutationResult -> BackendTask FatalError ()
