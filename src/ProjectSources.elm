@@ -1,4 +1,4 @@
-module ProjectSources exposing (loadPackageDeps, loadPackageDepsCached, loadProjectSources)
+module ProjectSources exposing (loadPackageDeps, loadPackageDepsCached, loadProjectSources, resolvePackageVersions)
 
 {-| Load all source files for a project and its dependencies.
 
@@ -47,12 +47,15 @@ loadProjectSources { projectDir, userSourceDirectories, targetFile } =
     Do.allowFatal (File.rawFile (projectPath ++ "/elm.json")) <| \elmJsonRaw ->
     Do.do (decodeElmJson elmJsonRaw) <| \elmJson ->
     Do.do resolveElmHome <| \elmHome ->
-    let
-        allDeps : Dict String String
-        allDeps =
-            Dict.union elmJson.directDeps elmJson.indirectDeps
+    Do.do
+        (resolvePackageVersions elmHome
+            (Dict.union elmJson.directDeps elmJson.indirectDeps
                 |> Dict.remove "elm/core"
-    in
+            )
+        )
+    <| \directDeps ->
+    -- Recursively discover transitive deps (packages depend on other packages)
+    Do.do (resolveTransitiveDeps elmHome directDeps) <| \allDeps ->
     Do.do (loadPackageDepGraphs elmHome allDeps) <| \pkgDepGraphs ->
     let
         sortedPackageNames : List String
@@ -60,8 +63,24 @@ loadProjectSources { projectDir, userSourceDirectories, targetFile } =
             topoSort allDeps pkgDepGraphs
     in
     Do.do (loadPackageSources elmHome allDeps sortedPackageNames) <| \packageSources ->
-    Do.do (loadUserSources projectPath userSourceDirectories) <| \userSources ->
-    Do.allowFatal (File.rawFile (projectPath ++ "/" ++ targetFile)) <| \targetSource ->
+    let
+        -- Merge source directories from elm.json with any extra dirs from the caller.
+        -- Deduplicate so we don't load the same dir twice.
+        allUserSourceDirs =
+            (elmJson.sourceDirectories ++ userSourceDirectories)
+                |> Set.fromList
+                |> Set.toList
+    in
+    Do.do (loadUserSources projectPath allUserSourceDirs) <| \userSources ->
+    let
+        targetPath =
+            if String.startsWith "/" targetFile then
+                targetFile
+
+            else
+                projectPath ++ "/" ++ targetFile
+    in
+    Do.allowFatal (File.rawFile targetPath) <| \targetSource ->
     let
         -- Remove the target file from userSources (it was already read by glob)
         -- and append it at the end so evalProject uses it as the eval context
@@ -88,13 +107,14 @@ loadPackageDeps { projectDir, skipPackages } =
     Do.allowFatal (File.rawFile (projectPath ++ "/elm.json")) <| \elmJsonRaw ->
     Do.do (decodeElmJson elmJsonRaw) <| \elmJson ->
     Do.do resolveElmHome <| \elmHome ->
-    let
-        allDeps : Dict String String
-        allDeps =
-            Dict.union elmJson.directDeps elmJson.indirectDeps
+    Do.do
+        (resolvePackageVersions elmHome
+            (Dict.union elmJson.directDeps elmJson.indirectDeps
                 |> Dict.remove "elm/core"
                 |> Dict.filter (\name _ -> not (Set.member name skipPackages))
-    in
+            )
+        )
+    <| \allDeps ->
     Do.do (loadPackageDepGraphs elmHome allDeps) <| \pkgDepGraphs ->
     let
         sortedPackageNames : List String
@@ -198,10 +218,157 @@ decodeElmJson raw =
 
 elmJsonDecoder : Decode.Decoder ElmJsonDeps
 elmJsonDecoder =
+    Decode.field "type" Decode.string
+        |> Decode.andThen
+            (\elmJsonType ->
+                if elmJsonType == "package" then
+                    packageElmJsonDecoder
+
+                else
+                    applicationElmJsonDecoder
+            )
+
+
+applicationElmJsonDecoder : Decode.Decoder ElmJsonDeps
+applicationElmJsonDecoder =
     Decode.map3 ElmJsonDeps
         (Decode.field "source-directories" (Decode.list Decode.string))
         (Decode.at [ "dependencies", "direct" ] (Decode.dict Decode.string))
         (Decode.at [ "dependencies", "indirect" ] (Decode.dict Decode.string))
+
+
+{-| Package elm.json has version ranges, not exact versions.
+We store the ranges and resolve them later against ELM\_HOME.
+-}
+packageElmJsonDecoder : Decode.Decoder ElmJsonDeps
+packageElmJsonDecoder =
+    Decode.map2
+        (\deps testDeps ->
+            ElmJsonDeps
+                [ "src" ]
+                deps
+                testDeps
+        )
+        (Decode.field "dependencies" (Decode.dict Decode.string))
+        (Decode.oneOf
+            [ Decode.field "test-dependencies" (Decode.dict Decode.string)
+            , Decode.succeed Dict.empty
+            ]
+        )
+
+
+{-| Resolve version ranges to installed versions.
+
+Application elm.json has exact versions ("1.1.4") — these pass through unchanged.
+Package elm.json has ranges ("1.0.0 <= v < 2.0.0") — these are resolved to the
+latest installed version in ELM\_HOME.
+
+-}
+resolvePackageVersions : String -> Dict String String -> BackendTask FatalError (Dict String String)
+resolvePackageVersions elmHome deps =
+    deps
+        |> Dict.toList
+        |> List.map
+            (\( pkgName, versionOrRange ) ->
+                if String.isEmpty versionOrRange || String.contains "<" versionOrRange || String.contains ">" versionOrRange then
+                    -- It's a version range — resolve to latest installed
+                    let
+                        pkgDir =
+                            elmHome ++ "/0.19.1/packages/" ++ pkgName
+                    in
+                    Glob.fromStringWithOptions
+                        (let
+                            o =
+                                Glob.defaultOptions
+                         in
+                         { o | include = Glob.OnlyFolders }
+                        )
+                        (pkgDir ++ "/*")
+                        |> BackendTask.andThen
+                            (\versions ->
+                                case versions |> List.sort |> List.reverse |> List.head of
+                                    Just latestPath ->
+                                        let
+                                            version =
+                                                latestPath
+                                                    |> String.split "/"
+                                                    |> List.reverse
+                                                    |> List.head
+                                                    |> Maybe.withDefault versionOrRange
+                                        in
+                                        BackendTask.succeed ( pkgName, version )
+
+                                    Nothing ->
+                                        BackendTask.fail
+                                            (FatalError.fromString
+                                                ("Package " ++ pkgName ++ " not installed. Run elm install first.")
+                                            )
+                            )
+
+                else
+                    -- Exact version — pass through
+                    BackendTask.succeed ( pkgName, versionOrRange )
+            )
+        |> BackendTask.Extra.combine
+        |> BackendTask.map Dict.fromList
+
+
+{-| Recursively discover transitive package dependencies.
+
+Reads each package's elm.json, discovers its deps, resolves their versions,
+and repeats until no new packages are found. This ensures all transitive
+dependencies are included even for package-type projects.
+
+-}
+resolveTransitiveDeps : String -> Dict String String -> BackendTask FatalError (Dict String String)
+resolveTransitiveDeps elmHome knownDeps =
+    knownDeps
+        |> Dict.toList
+        |> List.map
+            (\( pkgName, version ) ->
+                let
+                    pkgElmJsonPath =
+                        packageBasePath elmHome pkgName version ++ "/elm.json"
+                in
+                File.rawFile pkgElmJsonPath
+                    |> BackendTask.allowFatal
+                    |> BackendTask.andThen
+                        (\raw ->
+                            case Decode.decodeString packageDepsDecoder raw of
+                                Ok depNames ->
+                                    BackendTask.succeed depNames
+
+                                Err _ ->
+                                    BackendTask.succeed Set.empty
+                        )
+            )
+        |> BackendTask.Extra.combine
+        |> BackendTask.map (List.foldl Set.union Set.empty)
+        |> BackendTask.andThen
+            (\transDepNames ->
+                let
+                    newDeps =
+                        transDepNames
+                            |> Set.toList
+                            |> List.filter
+                                (\name ->
+                                    not (Dict.member name knownDeps)
+                                        && name
+                                        /= "elm/core"
+                                )
+                in
+                if List.isEmpty newDeps then
+                    BackendTask.succeed knownDeps
+
+                else
+                    -- Resolve versions for newly discovered deps, then recurse
+                    resolvePackageVersions elmHome
+                        (newDeps |> List.map (\n -> ( n, "" )) |> Dict.fromList)
+                        |> BackendTask.andThen
+                            (\resolvedNew ->
+                                resolveTransitiveDeps elmHome (Dict.union knownDeps resolvedNew)
+                            )
+            )
 
 
 {-| Resolve ELM\_HOME — check the environment variable, fall back to $HOME/.elm.

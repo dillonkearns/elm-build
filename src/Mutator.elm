@@ -126,8 +126,18 @@ findMutationsInExpression source (Node range expr) =
                     [ negateCondition source condRange condExpr ]
 
                 OperatorApplication op _ left right ->
-                    comparisonSwaps op
+                    (comparisonSwaps op
                         |> List.map (swapComparisonMutation source left right op)
+                    )
+                        ++ (arithmeticSwaps op
+                                |> List.map (swapComparisonMutation source left right op)
+                           )
+
+                FunctionOrValue [] "True" ->
+                    [ swapBooleanLiteral source range "True" "False" ]
+
+                FunctionOrValue [] "False" ->
+                    [ swapBooleanLiteral source range "False" "True" ]
 
                 _ ->
                     []
@@ -184,6 +194,41 @@ comparisonSwaps op =
 
         _ ->
             []
+
+
+arithmeticSwaps : String -> List String
+arithmeticSwaps op =
+    case op of
+        "+" ->
+            [ "-" ]
+
+        "-" ->
+            [ "+" ]
+
+        "*" ->
+            [ "//" ]
+
+        "//" ->
+            [ "*" ]
+
+        "++" ->
+            []
+
+        "::" ->
+            []
+
+        _ ->
+            []
+
+
+swapBooleanLiteral : String -> Range -> String -> String -> Mutation
+swapBooleanLiteral source range oldVal newVal =
+    { line = range.start.row
+    , column = range.start.column
+    , operator = "swapBooleanLiteral"
+    , description = "Changed `" ++ oldVal ++ "` to `" ++ newVal ++ "`"
+    , mutatedSource = replaceRange source range newVal
+    }
 
 
 swapComparisonMutation : String -> Node Expression -> Node Expression -> String -> String -> Mutation

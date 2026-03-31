@@ -41,6 +41,8 @@ import Types
 type alias Config =
     { mutateFile : String
     , testFile : String
+    , suiteName : String
+    , sourceDirs : List String
     }
 
 
@@ -58,6 +60,16 @@ programConfig =
                     (Option.optionalKeywordArg "test"
                         |> Option.map (Maybe.withDefault "src/MathLibTests.elm")
                         |> Option.withDescription "The test file (must expose suite : Test)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "suite"
+                        |> Option.map (Maybe.withDefault "suite")
+                        |> Option.withDescription "The name of the test value (default: suite)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "source-dirs"
+                        |> Option.map (Maybe.map (String.split ",") >> Maybe.withDefault [])
+                        |> Option.withDescription "Extra source directories (comma-separated)"
                     )
             )
 
@@ -80,19 +92,20 @@ task config =
 
             wrapperSource : String
             wrapperSource =
-                generateTestWrapper testModuleName
+                generateTestWrapper testModuleName config.suiteName
         in
         Do.do
             (BackendTask.Extra.timed "Loading sources" "Loaded sources"
                 (ProjectSources.loadProjectSources
                     { projectDir = Path.path "."
-                    , userSourceDirectories = [ "src" ]
+                    , userSourceDirectories = "src" :: config.sourceDirs
                     , targetFile = config.testFile
                     }
                     |> BackendTask.map (List.map patchSource)
                 )
             )
         <| \allSources ->
+        Do.log ("Loaded " ++ String.fromInt (List.length allSources) ++ " source files") <| \_ ->
         -- Build the project environment once (expensive parse phase)
         Do.do
             (BackendTask.Extra.timed "Building project env" "Built project env"
@@ -160,8 +173,8 @@ The user's test module just needs `suite : Test`. This wrapper calls
 as a String.
 
 -}
-generateTestWrapper : String -> String
-generateTestWrapper testModuleName =
+generateTestWrapper : String -> String -> String
+generateTestWrapper testModuleName suiteName =
     String.join "\n"
         [ "module MutationTestWrapper__ exposing (wrapperResult__)"
         , ""
@@ -170,7 +183,7 @@ generateTestWrapper testModuleName =
         , ""
         , "wrapperResult__ : String"
         , "wrapperResult__ ="
-        , "    SimpleTestRunner.runToString " ++ testModuleName ++ ".suite"
+        , "    SimpleTestRunner.runToString " ++ testModuleName ++ "." ++ suiteName
         , ""
         ]
 
@@ -226,7 +239,7 @@ runMutation projectEnv wrapperSource mutation =
             ErrorResult { mutation = mutation, error = "Parsing error in mutated source" }
 
         Err (Types.EvalError evalErr) ->
-            ErrorResult { mutation = mutation, error = "Eval error: " ++ "(eval error)" }
+            ErrorResult { mutation = mutation, error = "Eval error" }
 
 
 displayMutationReport : List MutationResult -> BackendTask FatalError ()
