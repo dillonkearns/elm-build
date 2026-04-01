@@ -29,6 +29,7 @@ import Cli.Program as Program
 import DepGraph
 import Elm.Syntax.Expression exposing (Expression(..))
 import Eval.Module
+import TestAnalysis
 import FatalError exposing (FatalError)
 import Mutator exposing (Mutation)
 import Pages.Script as Script exposing (Script)
@@ -90,10 +91,24 @@ task config =
                 DepGraph.parseModuleName testSource
                     |> Maybe.withDefault "Tests"
 
+            discoveredValues : List String
+            discoveredValues =
+                TestAnalysis.discoverTestValues testSource
+
+            testValues : List String
+            testValues =
+                if List.isEmpty discoveredValues then
+                    -- Fallback: try the --suite name or "suite"
+                    [ config.suiteName ]
+
+                else
+                    discoveredValues
+
             wrapperSource : String
             wrapperSource =
-                generateTestWrapper testModuleName config.suiteName
+                generateTestWrapper testModuleName testValues
         in
+        Do.log ("Discovered test values: " ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) testValues)) <| \_ ->
         Do.do
             (BackendTask.Extra.timed "Loading sources" "Loaded sources"
                 (ProjectSources.loadProjectSources
@@ -173,17 +188,27 @@ The user's test module just needs `suite : Test`. This wrapper calls
 as a String.
 
 -}
-generateTestWrapper : String -> String -> String
-generateTestWrapper testModuleName suiteName =
+generateTestWrapper : String -> List String -> String
+generateTestWrapper testModuleName testValues =
+    let
+        suiteExpr =
+            case testValues of
+                [ single ] ->
+                    testModuleName ++ "." ++ single
+
+                multiple ->
+                    "Test.describe \"" ++ testModuleName ++ "\" [" ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) multiple) ++ "]"
+    in
     String.join "\n"
         [ "module MutationTestWrapper__ exposing (wrapperResult__)"
         , ""
         , "import SimpleTestRunner"
+        , "import Test"
         , "import " ++ testModuleName
         , ""
         , "wrapperResult__ : String"
         , "wrapperResult__ ="
-        , "    SimpleTestRunner.runToString " ++ testModuleName ++ "." ++ suiteName
+        , "    SimpleTestRunner.runToString (" ++ suiteExpr ++ ")"
         , ""
         ]
 

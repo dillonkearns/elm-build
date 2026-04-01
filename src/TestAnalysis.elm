@@ -1,10 +1,11 @@
-module TestAnalysis exposing (usesFuzz)
+module TestAnalysis exposing (discoverTestValues, usesFuzz)
 
-{-| Static analysis to detect whether an Elm test module uses fuzz tests.
+{-| Static analysis for Elm test modules.
 
-Parses the source with elm-syntax and walks expression ASTs to find references
-to `Test.fuzz`, `Test.fuzz2`, or `Test.fuzz3`, accounting for import aliases
-and exposing lists.
+Provides:
+
+  - `usesFuzz` — detect whether a module uses fuzz tests
+  - `discoverTestValues` — find exposed values of type `Test`
 
 -}
 
@@ -14,8 +15,121 @@ import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
 import Elm.Syntax.Expression exposing (Expression(..), LetDeclaration(..))
 import Elm.Syntax.File exposing (File)
 import Elm.Syntax.Import exposing (Import)
+import Elm.Syntax.Module
 import Elm.Syntax.Node as Node exposing (Node(..))
+import Elm.Syntax.Signature exposing (Signature)
+import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
 import Set exposing (Set)
+
+
+{-| Discover exposed values of type `Test` in a module.
+
+Parses the source, finds all top-level functions with a `Test` or `Test.Test`
+type annotation, and returns only those that are in the module's exposing list.
+
+-}
+discoverTestValues : String -> List String
+discoverTestValues source =
+    case Elm.Parser.parseToFile source of
+        Err _ ->
+            []
+
+        Ok file ->
+            let
+                exposedNames =
+                    getExposedNames file
+
+                testValueNames =
+                    file.declarations
+                        |> List.filterMap (isTestDeclaration >> Maybe.andThen (filterExposed exposedNames))
+            in
+            testValueNames
+
+
+{-| Get the set of explicitly exposed names, or Nothing if exposing (..).
+-}
+getExposedNames : File -> Maybe (Set String)
+getExposedNames file =
+    case Node.value file.moduleDefinition of
+        Elm.Syntax.Module.NormalModule { exposingList } ->
+            exposingListToNames exposingList
+
+        Elm.Syntax.Module.PortModule { exposingList } ->
+            exposingListToNames exposingList
+
+        Elm.Syntax.Module.EffectModule { exposingList } ->
+            exposingListToNames exposingList
+
+
+exposingListToNames : Node Exposing -> Maybe (Set String)
+exposingListToNames (Node _ exposing_) =
+    case exposing_ of
+        All _ ->
+            Nothing
+
+        Explicit exposes ->
+            exposes
+                |> List.filterMap
+                    (\(Node _ expose) ->
+                        case expose of
+                            FunctionExpose name ->
+                                Just name
+
+                            _ ->
+                                Nothing
+                    )
+                |> Set.fromList
+                |> Just
+
+
+{-| Check if a declaration is a function with Test type annotation.
+Returns the function name if so.
+-}
+isTestDeclaration : Node Declaration -> Maybe String
+isTestDeclaration (Node _ decl) =
+    case decl of
+        FunctionDeclaration function ->
+            case function.signature of
+                Just (Node _ sig) ->
+                    if isTestType (Node.value sig.typeAnnotation) then
+                        Just (Node.value sig.name)
+
+                    else
+                        Nothing
+
+                Nothing ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+isTestType : TypeAnnotation -> Bool
+isTestType typeAnnotation =
+    case typeAnnotation of
+        Typed (Node _ ( [], "Test" )) _ ->
+            True
+
+        Typed (Node _ ( [ "Test" ], "Test" )) _ ->
+            True
+
+        _ ->
+            False
+
+
+filterExposed : Maybe (Set String) -> String -> Maybe String
+filterExposed maybeExposedNames name =
+    case maybeExposedNames of
+        Nothing ->
+            -- exposing (..) — everything is exposed
+            Just name
+
+        Just exposedNames ->
+            if Set.member name exposedNames then
+                Just name
+
+            else
+                Nothing
 
 
 {-| Detect whether an Elm source file uses fuzz tests by checking for references
