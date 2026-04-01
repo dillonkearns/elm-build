@@ -9,3 +9,5 @@ myscript.mjs
 elm-stuff
 node_modules
 bun.lockb
+.elm-bench*
+.elm-mutation-test-debug*

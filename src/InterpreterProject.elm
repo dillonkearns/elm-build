@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithSourceOverrides, getPackageEnv, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -16,7 +16,9 @@ import BackendTask.Time
 import Cache exposing (FileOrDirectory)
 import DepGraph
 import Dict exposing (Dict)
+import Elm.Parser
 import Elm.Syntax.Expression exposing (Expression(..))
+import Elm.Syntax.File exposing (File)
 import Eval.Module
 import FatalError exposing (FatalError)
 import Json.Decode as Decode
@@ -536,6 +538,172 @@ evalWithSourceOverrides (InterpreterProject project) { imports, expression, sour
 
 
 
+{-| Evaluate an expression with pre-parsed File AST overrides.
+
+Like `evalWithSourceOverrides`, but accepts `File` ASTs directly instead of
+source strings for the overrides. Skips the write→parse round-trip for mutations.
+
+The `sourceOverrides` are the string sources that still need parsing (e.g. SimpleTestRunner).
+The `fileOverrides` are pre-parsed ASTs (e.g. mutated File from Mutator).
+
+-}
+evalWithFileOverrides :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , fileOverrides : List { file : File, hashKey : String }
+        }
+    -> (FileOrDirectory -> Cache.Monad a)
+    -> Cache.Monad a
+evalWithFileOverrides (InterpreterProject project) { imports, expression, sourceOverrides, fileOverrides } k =
+    let
+        transDeps : Set String
+        transDeps =
+            imports
+                |> List.filterMap (DepGraph.moduleNameToFilePath project.depGraph)
+                |> List.map (DepGraph.transitiveDeps project.depGraph)
+                |> List.foldl Set.union Set.empty
+
+        relevantInputs : List ( String, Cache.Monad FileOrDirectory )
+        relevantInputs =
+            project.inputsByPath
+                |> Dict.toList
+                |> List.filter (\( path, _ ) -> Set.member path transDeps)
+                |> List.map (\( path, ( _, monad ) ) -> ( path, monad ))
+
+        wrapperSource : String
+        wrapperSource =
+            generateWrapper imports expression
+
+        wrapperImports : Set String
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules : Set String
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        filteredSources : List String
+        filteredSources =
+            topoSortModules project.moduleGraph neededModules
+
+        userFilteredSources : List String
+        userFilteredSources =
+            filteredSources
+                |> List.filter
+                    (\src ->
+                        case DepGraph.parseModuleName src of
+                            Just name ->
+                                not (Set.member name project.packageModuleNames)
+
+                            Nothing ->
+                                True
+                    )
+
+        -- For hashing: include override hash keys (lightweight, no Elm.Writer needed)
+        fileOverrideHashKeys : List String
+        fileOverrideHashKeys =
+            fileOverrides |> List.map .hashKey
+
+        allFilteredSources : List String
+        allFilteredSources =
+            filteredSources ++ sourceOverrides ++ fileOverrideHashKeys ++ [ wrapperSource ]
+
+        filteredBlob : String
+        filteredBlob =
+            String.join "\n---MODULE_SEPARATOR---\n" allFilteredSources
+    in
+    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <| \filteredHash ->
+    Cache.do
+        (relevantInputs
+            |> List.map
+                (\( path, monad ) ->
+                    Cache.do monad <| \hash ->
+                    Cache.succeed { filename = Path.path path, hash = hash }
+                )
+            |> Cache.sequence
+        )
+    <| \sourceFiles ->
+    Cache.do
+        (Cache.combine
+            (sourceFiles
+                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash } ]
+            )
+        )
+    <| \combinedHash ->
+    Cache.compute [ "interpret-with-file-overrides" ]
+        combinedHash
+        (\() ->
+            let
+                -- Parse string sources into Files, then combine with pre-parsed overrides
+                parsedUserSources : Result Types.Error (List File)
+                parsedUserSources =
+                    (userFilteredSources ++ sourceOverrides ++ [ wrapperSource ])
+                        |> List.map
+                            (\src ->
+                                Elm.Parser.parseToFile src
+                                    |> Result.mapError Types.ParsingError
+                            )
+                        |> combineFileResults
+            in
+            case parsedUserSources of
+                Err err ->
+                    case err of
+                        Types.ParsingError _ ->
+                            "ERROR: Parsing error"
+
+                        Types.EvalError evalErr ->
+                            "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+
+                Ok parsedFiles ->
+                    let
+                        allButWrapper =
+                            List.take (List.length parsedFiles - 1) parsedFiles
+
+                        wrapperFile =
+                            List.drop (List.length parsedFiles - 1) parsedFiles
+
+                        allParsedModules =
+                            List.map Eval.Module.parsedModuleFromFile allButWrapper
+                                ++ List.map (\override -> Eval.Module.parsedModuleFromFile override.file) fileOverrides
+                                ++ List.map Eval.Module.parsedModuleFromFile wrapperFile
+
+                        result : Result Types.Error Types.Value
+                        result =
+                            Eval.Module.evalWithEnvFromParsed
+                                project.packageEnv
+                                allParsedModules
+                                (FunctionOrValue [] "results")
+                    in
+                    case result of
+                        Ok (Types.String s) ->
+                            s
+
+                        Ok _ ->
+                            "ERROR: Expected String result"
+
+                        Err (Types.ParsingError _) ->
+                            "ERROR: Parsing error"
+
+                        Err (Types.EvalError evalErr) ->
+                            "ERROR: Eval error: "
+                                ++ evalErrorKindToString evalErr.error
+        )
+        k
+
+
+combineFileResults : List (Result e a) -> Result e (List a)
+combineFileResults results =
+    List.foldr
+        (\result acc ->
+            Result.map2 (::) result acc
+        )
+        (Ok [])
+        results
+
+
 evalErrorKindToString : Types.EvalErrorKind -> String
 evalErrorKindToString kind =
     case kind of
@@ -558,6 +726,13 @@ that bypass the caching layer (e.g. benchmarking).
 getPackageEnv : InterpreterProject -> Eval.Module.ProjectEnv
 getPackageEnv (InterpreterProject project) =
     project.packageEnv
+
+
+{-| Get the dependency graph for the project's user source files.
+-}
+getDepGraph : InterpreterProject -> DepGraph.Graph
+getDepGraph (InterpreterProject project) =
+    project.depGraph
 
 
 {-| Prepare the source lists needed for eval, without actually evaluating.

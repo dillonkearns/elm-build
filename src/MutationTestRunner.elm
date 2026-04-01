@@ -3,7 +3,7 @@ module MutationTestRunner exposing (run)
 {-| Mutation testing runner that uses the elm-interpreter via InterpreterProject.
 
 For each mutation, swaps the mutated source into the interpreter evaluation
-via `evalWithSourceOverrides`. Results are cached via elm-build's
+via `evalWithFileOverrides`. Results are cached via elm-build's
 content-addressed Cache, so re-runs with unchanged code are instant.
 
 The test module just needs to expose `suite : Test` — the standard elm-test
@@ -37,7 +37,7 @@ import Types
 
 
 type alias Config =
-    { mutateFile : String
+    { mutateFile : Maybe String
     , testFile : Maybe String
     , suiteName : String
     , sourceDirs : List String
@@ -56,8 +56,7 @@ programConfig =
             (OptionsParser.build Config
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "mutate"
-                        |> Option.map (Maybe.withDefault "src/MathLib.elm")
-                        |> Option.withDescription "The source file to mutate"
+                        |> Option.withDescription "Source file to mutate (omit to auto-discover from test imports)"
                     )
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "test"
@@ -109,8 +108,28 @@ task : Config -> BackendTask FatalError ()
 task config =
     BackendTask.Extra.profiling "mutation-test-runner" <|
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Loading project sources for mutation testing") <| \_ ->
+        let
+            sourceDirectories =
+                "src" :: config.sourceDirs
+
+            allDirectories =
+                "tests" :: sourceDirectories
+        in
+        -- Load the project via InterpreterProject (packages parsed once, cached)
+        Do.do
+            (BackendTask.Extra.timed "Loading project" "Loaded project"
+                (InterpreterProject.loadWith
+                    { projectDir = Path.path "."
+                    , skipPackages = kernelPackages
+                    , patchSource = patchSource
+                    , extraSourceFiles = []
+                    , sourceDirectories = Just allDirectories
+                    }
+                )
+            )
+        <| \project ->
         -- Resolve the test file: either explicitly provided or auto-discovered
-        Do.do (resolveTestFile config) <| \testFile ->
+        Do.do (resolveTestFile config project) <| \testFile ->
         Do.allowFatal (File.rawFile testFile) <| \testSource ->
         let
             testModuleName : String
@@ -123,19 +142,6 @@ task config =
                 TestAnalysis.getCandidateNames testSource
         in
         Do.log ("Found " ++ String.fromInt (List.length candidateNames) ++ " candidate values in " ++ testModuleName) <| \_ ->
-        -- Load the project via InterpreterProject (packages parsed once, cached)
-        Do.do
-            (BackendTask.Extra.timed "Loading project" "Loaded project"
-                (InterpreterProject.loadWith
-                    { projectDir = Path.path "."
-                    , skipPackages = kernelPackages
-                    , patchSource = patchSource
-                    , extraSourceFiles = []
-                    , sourceDirectories = Just ("src" :: "tests" :: config.sourceDirs)
-                    }
-                )
-            )
-        <| \project ->
         -- Discover which candidates are actually Test values via the interpreter
         let
             packageEnv =
@@ -224,65 +230,74 @@ task config =
                 }
         in
         Do.log ("Discovered test values: " ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) testValues)) <| \_ ->
-        Do.allowFatal (File.rawFile config.mutateFile) <| \mutateSource ->
-        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Generating mutations for " ++ config.mutateFile)) <| \_ ->
-        let
-            allMutations : List Mutation
-            allMutations =
-                Mutator.generateMutations mutateSource
-
-            mutations : List Mutation
-            mutations =
-                allMutations
-                    |> filterMutations config
-
-            mutationCount : Int
-            mutationCount =
-                List.length mutations
-        in
-        Do.log ("Found " ++ String.fromInt mutationCount ++ " mutations" ++ (if List.length allMutations /= mutationCount then " (filtered from " ++ String.fromInt (List.length allMutations) ++ ")" else "")) <| \_ ->
+        -- Determine which files to mutate
+        Do.do (resolveFilesToMutate config project sourceDirectories testFile) <| \filesToMutate ->
+        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Mutating " ++ String.fromInt (List.length filesToMutate) ++ " source file(s): " ++ String.join ", " filesToMutate)) <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
-        Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Running mutation tests via interpreter (cached)") <| \_ ->
         Do.do BackendTask.Time.now <| \startTime ->
-        -- Run each mutation through Cache (independently cached)
+        -- Run mutations for each file and collect per-file results
         Do.do
-            (mutations
+            (filesToMutate
                 |> List.map
-                    (\mutation ->
+                    (\mutateFilePath ->
+                        Do.allowFatal (File.rawFile mutateFilePath) <| \mutateSource ->
+                        let
+                            allMutations =
+                                Mutator.generateMutations mutateSource
+
+                            mutations =
+                                filterMutations config allMutations
+                        in
+                        Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations" ++ (if List.length allMutations /= List.length mutations then " (filtered from " ++ String.fromInt (List.length allMutations) ++ ")" else "")) <| \_ ->
                         Do.do
-                            (Cache.run { jobs = Nothing } config.buildDirectory
-                                (InterpreterProject.evalWithSourceOverrides project
-                                    { imports = evalConfig.imports
-                                    , expression = evalConfig.expression
-                                    , sourceOverrides = [ simpleTestRunnerSource, Mutator.writeFile mutation.mutatedFile ]
-                                    }
-                                    Cache.succeed
-                                )
+                            (mutations
+                                |> List.map
+                                    (\mutation ->
+                                        Do.do
+                                            (Cache.run { jobs = Nothing } config.buildDirectory
+                                                (InterpreterProject.evalWithFileOverrides project
+                                                    { imports = evalConfig.imports
+                                                    , expression = evalConfig.expression
+                                                    , sourceOverrides = [ simpleTestRunnerSource ]
+                                                    , fileOverrides = [ { file = mutation.mutatedFile, hashKey = Mutator.hashKey mutation } ]
+                                                    }
+                                                    Cache.succeed
+                                                )
+                                            )
+                                        <| \result ->
+                                        Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
+                                        BackendTask.succeed (parseMutationResult mutation output)
+                                    )
+                                |> BackendTask.Extra.sequence
                             )
-                        <| \result ->
-                        Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
-                        BackendTask.succeed (parseMutationResult mutation output)
+                        <| \results ->
+                        BackendTask.succeed
+                            { filePath = mutateFilePath
+                            , sourceCode = mutateSource
+                            , results = results
+                            }
                     )
                 |> BackendTask.Extra.sequence
             )
-        <| \results ->
+        <| \allFileResults ->
         Do.do BackendTask.Time.now <| \endTime ->
         let
-            _ = results
+            totalMutations =
+                allFileResults |> List.map (.results >> List.length) |> List.sum
 
             evalMs =
                 Time.posixToMillis endTime - Time.posixToMillis startTime
 
             perMutation =
-                if mutationCount > 0 then
-                    evalMs // mutationCount
+                if totalMutations > 0 then
+                    evalMs // totalMutations
 
                 else
                     0
         in
         Do.log
             ("Evaluated "
-                ++ String.fromInt mutationCount
+                ++ String.fromInt totalMutations
                 ++ " mutations in "
                 ++ String.fromInt evalMs
                 ++ "ms ("
@@ -290,7 +305,41 @@ task config =
                 ++ "ms/mutation)"
             )
         <| \_ ->
-        displayMutationReport config mutateSource config.mutateFile results
+        displayMultiFileReport config allFileResults
+
+
+{-| Determine which source files to mutate.
+
+  - If --mutate is provided, use that single file.
+  - Otherwise, use the dep graph to find all source files the test imports.
+
+-}
+resolveFilesToMutate : Config -> InterpreterProject -> List String -> String -> BackendTask FatalError (List String)
+resolveFilesToMutate config project sourceDirectories testFile =
+    case config.mutateFile of
+        Just singleFile ->
+            BackendTask.succeed [ singleFile ]
+
+        Nothing ->
+            let
+                depGraph =
+                    InterpreterProject.getDepGraph project
+
+                sources =
+                    DepGraph.sourcesTestedBy sourceDirectories depGraph testFile
+            in
+            if List.isEmpty sources then
+                BackendTask.fail
+                    (FatalError.fromString
+                        ("No source files found to mutate. The test file "
+                            ++ testFile
+                            ++ " does not import any modules from: "
+                            ++ String.join ", " sourceDirectories
+                        )
+                    )
+
+            else
+                BackendTask.succeed sources
 
 
 filterMutations : Config -> List Mutation -> List Mutation
@@ -341,90 +390,157 @@ type MutationResult
     | ErrorResult { mutation : Mutation, error : String }
 
 
-displayMutationReport : Config -> String -> String -> List MutationResult -> BackendTask FatalError ()
-displayMutationReport config sourceCode filePath results =
+type alias FileResults =
+    { filePath : String
+    , sourceCode : String
+    , results : List MutationResult
+    }
+
+
+displayMultiFileReport : Config -> List FileResults -> BackendTask FatalError ()
+displayMultiFileReport config allFileResults =
     let
-        killed =
-            List.filter isKilled results
+        multiFile =
+            List.length allFileResults > 1
+    in
+    -- Display per-file details
+    Do.each allFileResults
+        (\fileResult ->
+            let
+                killed =
+                    List.filter isKilled fileResult.results
 
-        survived =
-            List.filter isSurvived results
+                survived =
+                    List.filter isSurvived fileResult.results
 
-        errors =
-            List.filter isError results
+                errors =
+                    List.filter isError fileResult.results
+
+                total =
+                    List.length fileResult.results
+            in
+            Do.do
+                (if multiFile then
+                    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("\n── " ++ fileResult.filePath ++ " ──")) <| \_ ->
+                    BackendTask.succeed ()
+
+                 else
+                    BackendTask.succeed ()
+                )
+            <| \_ ->
+            Do.do
+                (if config.verbose then
+                    Do.each killed
+                        (\r ->
+                            case r of
+                                Killed { mutation, failCount } ->
+                                    Script.log
+                                        (Ansi.Color.fontColor Ansi.Color.green
+                                            ("  ✓ Killed (" ++ String.fromInt failCount ++ " failed): " ++ mutation.description ++ " (line " ++ String.fromInt mutation.line ++ ")")
+                                        )
+
+                                _ ->
+                                    Script.log ""
+                        )
+                        (\_ -> BackendTask.succeed ())
+
+                 else
+                    BackendTask.succeed ()
+                )
+            <| \_ ->
+            Do.each survived
+                (\r ->
+                    case r of
+                        Survived { mutation } ->
+                            Script.log
+                                (Ansi.Color.fontColor Ansi.Color.red
+                                    ("  ✗ Survived: "
+                                        ++ mutation.description
+                                        ++ " ("
+                                        ++ fileResult.filePath
+                                        ++ ":"
+                                        ++ String.fromInt mutation.line
+                                        ++ ")"
+                                    )
+                                    ++ "\n"
+                                    ++ sourceContext fileResult.sourceCode mutation.line
+                                )
+
+                        _ ->
+                            Script.log ""
+                )
+            <| \_ ->
+            Do.each errors
+                (\r ->
+                    case r of
+                        ErrorResult { mutation, error } ->
+                            Script.log
+                                (Ansi.Color.fontColor Ansi.Color.yellow
+                                    ("  ? Error: " ++ mutation.description ++ " — " ++ error)
+                                )
+
+                        _ ->
+                            Script.log ""
+                )
+            <| \_ ->
+            if multiFile then
+                let
+                    fileScore =
+                        if total == 0 then
+                            "N/A"
+
+                        else
+                            String.fromInt (round (toFloat (List.length killed) / toFloat total * 100)) ++ "%"
+
+                    fileColor =
+                        if List.isEmpty survived && List.isEmpty errors then
+                            Ansi.Color.fontColor Ansi.Color.green
+
+                        else
+                            Ansi.Color.fontColor Ansi.Color.red
+                in
+                Script.log
+                    (fileColor
+                        ("  Score: "
+                            ++ fileScore
+                            ++ " ("
+                            ++ String.fromInt (List.length killed)
+                            ++ "/"
+                            ++ String.fromInt total
+                            ++ " killed)"
+                        )
+                    )
+
+            else
+                BackendTask.succeed ()
+        )
+    <| \_ ->
+    -- Overall summary
+    let
+        allResults =
+            allFileResults |> List.concatMap .results
+
+        totalKilled =
+            List.filter isKilled allResults |> List.length
+
+        totalSurvived =
+            List.filter isSurvived allResults |> List.length
+
+        totalErrors =
+            List.filter isError allResults |> List.length
 
         total =
-            List.length results
+            List.length allResults
 
         score =
             if total == 0 then
                 "N/A"
 
             else
-                let
-                    pct =
-                        toFloat (List.length killed) / toFloat total * 100
-                in
-                String.fromInt (round pct) ++ "%"
-    in
-    Do.do
-        (if config.verbose then
-            Do.each killed
-                (\r ->
-                    case r of
-                        Killed { mutation, failCount } ->
-                            Script.log
-                                (Ansi.Color.fontColor Ansi.Color.green
-                                    ("  ✓ Killed (" ++ String.fromInt failCount ++ " failed): " ++ mutation.description ++ " (line " ++ String.fromInt mutation.line ++ ")")
-                                )
+                String.fromInt (round (toFloat totalKilled / toFloat total * 100)) ++ "%"
 
-                        _ ->
-                            Script.log ""
-                )
-                (\_ -> BackendTask.succeed ())
-
-         else
-            BackendTask.succeed ()
-        )
-    <| \_ ->
-    Do.each survived
-        (\r ->
-            case r of
-                Survived { mutation } ->
-                    Script.log
-                        (Ansi.Color.fontColor Ansi.Color.red
-                            ("  ✗ Survived: "
-                                ++ mutation.description
-                                ++ " ("
-                                ++ filePath
-                                ++ ":"
-                                ++ String.fromInt mutation.line
-                                ++ ")"
-                            )
-                            ++ "\n"
-                            ++ sourceContext sourceCode mutation.line
-                        )
-
-                _ ->
-                    Script.log ""
-        )
-    <| \_ ->
-    Do.each errors
-        (\r ->
-            case r of
-                ErrorResult { mutation, error } ->
-                    Script.log
-                        (Ansi.Color.fontColor Ansi.Color.yellow
-                            ("  ? Error: " ++ mutation.description ++ " — " ++ error)
-                        )
-
-                _ ->
-                    Script.log ""
-        )
-    <| \_ ->
-    let
         summaryColor =
-            if List.isEmpty survived then
+            if totalSurvived == 0 && totalErrors == 0 then
                 Ansi.Color.fontColor Ansi.Color.brightGreen
 
             else
@@ -435,15 +551,50 @@ displayMutationReport config sourceCode filePath results =
             ("\nMutation Score: "
                 ++ score
                 ++ " ("
-                ++ String.fromInt (List.length killed)
+                ++ String.fromInt totalKilled
                 ++ " killed, "
-                ++ String.fromInt (List.length survived)
+                ++ String.fromInt totalSurvived
                 ++ " survived, "
-                ++ String.fromInt (List.length errors)
+                ++ String.fromInt totalErrors
                 ++ " errors, "
                 ++ String.fromInt total
                 ++ " total)"
             )
+        )
+    <| \_ ->
+    -- Per-file breakdown (only in multi-file mode)
+    Do.do
+        (if multiFile then
+            Do.log "\nPer-file breakdown:" <| \_ ->
+            Do.each allFileResults
+                (\fileResult ->
+                    let
+                        fKilled =
+                            List.filter isKilled fileResult.results |> List.length
+
+                        fTotal =
+                            List.length fileResult.results
+
+                        fScore =
+                            if fTotal == 0 then
+                                "N/A"
+
+                            else
+                                String.fromInt (round (toFloat fKilled / toFloat fTotal * 100)) ++ "%"
+
+                        fColor =
+                            if fKilled == fTotal then
+                                Ansi.Color.fontColor Ansi.Color.green
+
+                            else
+                                Ansi.Color.fontColor Ansi.Color.red
+                    in
+                    Script.log (fColor ("  " ++ fileResult.filePath ++ ": " ++ fScore ++ " (" ++ String.fromInt fKilled ++ "/" ++ String.fromInt fTotal ++ ")"))
+                )
+                (\_ -> BackendTask.succeed ())
+
+         else
+            BackendTask.succeed ()
         )
     <| \_ ->
     let
@@ -452,7 +603,7 @@ displayMutationReport config sourceCode filePath results =
                 100
 
             else
-                round (toFloat (List.length killed) / toFloat total * 100)
+                round (toFloat totalKilled / toFloat total * 100)
 
         shouldFail =
             case config.breakThreshold of
@@ -460,7 +611,7 @@ displayMutationReport config sourceCode filePath results =
                     scoreInt < threshold
 
                 Nothing ->
-                    not (List.isEmpty survived) || not (List.isEmpty errors)
+                    totalSurvived > 0 || totalErrors > 0
     in
     if shouldFail then
         BackendTask.fail
@@ -554,42 +705,67 @@ simpleTestRunnerSource =
         ]
 
 
-{-| Resolve the test file: use --test if provided, otherwise auto-discover
-by finding test files that import the mutated module.
+{-| Resolve the test file: use --test if provided, otherwise auto-discover.
+
+When --mutate is provided, finds test files that import the mutated module.
+When --mutate is omitted, finds all test files in tests/\*\*/\*.elm.
+
 -}
-resolveTestFile : Config -> BackendTask FatalError String
-resolveTestFile config =
+resolveTestFile : Config -> InterpreterProject -> BackendTask FatalError String
+resolveTestFile config project =
     case config.testFile of
         Just explicit ->
             Do.log ("Using test file: " ++ explicit) <| \_ ->
             BackendTask.succeed explicit
 
         Nothing ->
-            Do.allowFatal (File.rawFile config.mutateFile) <| \mutateSource ->
-            let
-                moduleName =
-                    DepGraph.parseModuleName mutateSource
-                        |> Maybe.withDefault ""
-            in
-            Do.log ("Auto-discovering test files that import " ++ moduleName ++ "...") <| \_ ->
-            Do.do (findTestFilesImporting moduleName) <| \testFiles ->
-            case testFiles of
-                [ single ] ->
-                    Do.log ("Found test file: " ++ single) <| \_ ->
-                    BackendTask.succeed single
+            case config.mutateFile of
+                Just mutateFile ->
+                    -- Single-file mode: find tests that import the mutated module
+                    Do.allowFatal (File.rawFile mutateFile) <| \mutateSource ->
+                    let
+                        moduleName =
+                            DepGraph.parseModuleName mutateSource
+                                |> Maybe.withDefault ""
+                    in
+                    Do.log ("Auto-discovering test files that import " ++ moduleName ++ "...") <| \_ ->
+                    Do.do (findTestFilesImporting moduleName) <| \testFiles ->
+                    case testFiles of
+                        [ single ] ->
+                            Do.log ("Found test file: " ++ single) <| \_ ->
+                            BackendTask.succeed single
 
-                first :: _ ->
-                    Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test files: " ++ String.join ", " testFiles ++ " (using first)") <| \_ ->
-                    BackendTask.succeed first
+                        first :: _ ->
+                            Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test files: " ++ String.join ", " testFiles ++ " (using first)") <| \_ ->
+                            BackendTask.succeed first
 
-                [] ->
-                    BackendTask.fail
-                        (FatalError.fromString
-                            ("No test files found that import "
-                                ++ moduleName
-                                ++ ". Looked in tests/**/*.elm. Use --test to specify manually."
-                            )
-                        )
+                        [] ->
+                            BackendTask.fail
+                                (FatalError.fromString
+                                    ("No test files found that import "
+                                        ++ moduleName
+                                        ++ ". Looked in tests/**/*.elm. Use --test to specify manually."
+                                    )
+                                )
+
+                Nothing ->
+                    -- Multi-file mode: find all test files
+                    Do.log "Auto-discovering test files..." <| \_ ->
+                    Do.do (findAllTestFiles project) <| \testFiles ->
+                    case testFiles of
+                        [ single ] ->
+                            Do.log ("Found test file: " ++ single) <| \_ ->
+                            BackendTask.succeed single
+
+                        first :: _ ->
+                            Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test files: " ++ String.join ", " testFiles ++ " (using first)") <| \_ ->
+                            BackendTask.succeed first
+
+                        [] ->
+                            BackendTask.fail
+                                (FatalError.fromString
+                                    "No test files found in tests/**/*.elm. Use --test to specify manually."
+                                )
 
 
 findTestFilesImporting : String -> BackendTask FatalError (List String)
@@ -618,6 +794,40 @@ findTestFilesImporting moduleName =
                                 |> List.filter
                                     (\( _, content ) ->
                                         List.member moduleName (DepGraph.parseImports content)
+                                    )
+                                |> List.map Tuple.first
+                        )
+            )
+
+
+{-| Find all test files by looking for .elm files in tests/ that import Test.
+-}
+findAllTestFiles : InterpreterProject -> BackendTask FatalError (List String)
+findAllTestFiles project =
+    Glob.fromStringWithOptions
+        (let
+            o =
+                Glob.defaultOptions
+         in
+         { o | include = Glob.OnlyFiles }
+        )
+        "tests/**/*.elm"
+        |> BackendTask.andThen
+            (\files ->
+                files
+                    |> List.map
+                        (\filePath ->
+                            File.rawFile filePath
+                                |> BackendTask.allowFatal
+                                |> BackendTask.map (\content -> ( filePath, content ))
+                        )
+                    |> BackendTask.sequence
+                    |> BackendTask.map
+                        (\pairs ->
+                            pairs
+                                |> List.filter
+                                    (\( _, content ) ->
+                                        List.member "Test" (DepGraph.parseImports content)
                                     )
                                 |> List.map Tuple.first
                         )

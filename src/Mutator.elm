@@ -1,4 +1,4 @@
-module Mutator exposing (Mutation, generateMutations, generateMutationsFromFile, writeFile)
+module Mutator exposing (Mutation, applyMutation, generateMutations, generateMutationsFromFile, hashKey, writeFile)
 
 {-| Mutation generator for Elm source code.
 
@@ -24,6 +24,8 @@ type alias Mutation =
     , operator : String
     , description : String
     , mutatedFile : File
+    , spliceRange : Range
+    , spliceText : String
     }
 
 
@@ -33,7 +35,7 @@ generateMutations : String -> List Mutation
 generateMutations source =
     case Elm.Parser.parseToFile source of
         Ok file ->
-            generateMutationsFromFile file
+            generateMutationsFromFile source file
 
         Err _ ->
             []
@@ -41,12 +43,12 @@ generateMutations source =
 
 {-| Generate all mutations from an already-parsed File AST.
 -}
-generateMutationsFromFile : File -> List Mutation
-generateMutationsFromFile file =
+generateMutationsFromFile : String -> File -> List Mutation
+generateMutationsFromFile source file =
     file.declarations
         |> List.indexedMap
             (\declIndex (Node declRange decl) ->
-                findMutationsInDeclaration file declIndex decl
+                findMutationsInDeclaration source file declIndex decl
             )
         |> List.concat
 
@@ -58,15 +60,83 @@ writeFile file =
     Elm.Writer.write (Elm.Writer.writeFile file)
 
 
-findMutationsInDeclaration : File -> Int -> Declaration -> List Mutation
-findMutationsInDeclaration file declIndex decl =
+{-| Compute a deterministic hash key for a mutation.
+
+Uses the splice range and replacement text to uniquely identify the mutation
+without serializing the full File AST via Elm.Writer.
+
+-}
+hashKey : Mutation -> String
+hashKey mutation =
+    mutation.operator
+        ++ "@"
+        ++ String.fromInt mutation.spliceRange.start.row
+        ++ ":"
+        ++ String.fromInt mutation.spliceRange.start.column
+        ++ "-"
+        ++ String.fromInt mutation.spliceRange.end.row
+        ++ ":"
+        ++ String.fromInt mutation.spliceRange.end.column
+        ++ "|"
+        ++ mutation.spliceText
+
+
+{-| Apply a mutation to the original source by splicing the replacement
+text into the source at the mutation's range. This avoids rewriting
+the entire file via Elm.Writer (which breaks multi-line exposing lists).
+-}
+applyMutation : String -> Mutation -> String
+applyMutation originalSource mutation =
+    spliceSource originalSource mutation.spliceRange mutation.spliceText
+
+
+{-| Replace text in source at the given Range with replacement text.
+
+Ranges use 1-based row and column numbers (elm-syntax convention).
+
+-}
+spliceSource : String -> Range -> String -> String
+spliceSource source range replacement =
+    let
+        lines =
+            String.lines source
+
+        -- Get everything before the range start
+        beforeLines =
+            List.take (range.start.row - 1) lines
+
+        startLine =
+            lines |> List.drop (range.start.row - 1) |> List.head |> Maybe.withDefault ""
+
+        beforeText =
+            String.left (range.start.column - 1) startLine
+
+        -- Get everything after the range end
+        endLine =
+            lines |> List.drop (range.end.row - 1) |> List.head |> Maybe.withDefault ""
+
+        afterText =
+            String.dropLeft (range.end.column - 1) endLine
+
+        afterLines =
+            List.drop range.end.row lines
+    in
+    (beforeLines
+        ++ [ beforeText ++ replacement ++ afterText ]
+        ++ afterLines
+    )
+        |> String.join "\n"
+
+
+findMutationsInDeclaration : String -> File -> Int -> Declaration -> List Mutation
+findMutationsInDeclaration source file declIndex decl =
     case decl of
         FunctionDeclaration function ->
             let
                 (Node _ impl) =
                     function.declaration
             in
-            findMutationsInExpression file declIndex [] impl.expression
+            findMutationsInExpression source file declIndex [] impl.expression
 
         _ ->
             []
@@ -78,15 +148,15 @@ Each mutation stores the full modified File AST — the original file with
 one expression node replaced.
 
 -}
-findMutationsInExpression : File -> Int -> List Int -> Node Expression -> List Mutation
-findMutationsInExpression file declIndex path (Node range expr) =
+findMutationsInExpression : String -> File -> Int -> List Int -> Node Expression -> List Mutation
+findMutationsInExpression source file declIndex path (Node range expr) =
     let
         recurse : List (Node Expression) -> List Mutation
         recurse nodes =
             nodes
                 |> List.indexedMap
                     (\i node ->
-                        findMutationsInExpression file declIndex (path ++ [ i ]) node
+                        findMutationsInExpression source file declIndex (path ++ [ i ]) node
                     )
                 |> List.concat
 
@@ -152,14 +222,34 @@ findMutationsInExpression file declIndex path (Node range expr) =
                 _ ->
                     []
 
-        -- Create a mutation by replacing the current expression with a new one
+        -- Create a mutation by replacing the current expression with a new one.
+        -- Uses Elm.Writer for the replacement text (works for single-line expressions).
         mutate : String -> String -> Expression -> Mutation
         mutate operator description newExpr =
+            let
+                replacement =
+                    Node range newExpr
+            in
+            { line = range.start.row
+            , column = range.start.column
+            , operator = operator
+            , description = description
+            , mutatedFile = replaceExpression file declIndex path replacement
+            , spliceRange = range
+            , spliceText = Elm.Writer.write (Elm.Writer.writeExpression replacement)
+            }
+
+        -- Create a mutation with explicit splice range and text.
+        -- Used for multi-line expressions where Elm.Writer would break formatting.
+        mutateWithSplice : String -> String -> Expression -> Range -> String -> Mutation
+        mutateWithSplice operator description newExpr sRange sText =
             { line = range.start.row
             , column = range.start.column
             , operator = operator
             , description = description
             , mutatedFile = replaceExpression file declIndex path (Node range newExpr)
+            , spliceRange = sRange
+            , spliceText = sText
             }
 
         thisMutation : List Mutation
@@ -167,45 +257,57 @@ findMutationsInExpression file declIndex path (Node range expr) =
             case expr of
                 IfBlock (Node condRange condExpr) (Node thenRange thenExpr) (Node elseRange elseExpr) ->
                     let
-                        wrappedCond =
+                        condText =
+                            extractSourceRange source condRange
+
+                        negatedCondText =
                             case condExpr of
                                 FunctionOrValue _ _ ->
-                                    -- Simple variable: not x (no parens needed)
-                                    Node condRange condExpr
+                                    "not " ++ condText
 
                                 _ ->
-                                    -- Complex expression: not (expr)
-                                    Node condRange (ParenthesizedExpression (Node condRange condExpr))
+                                    "not (" ++ condText ++ ")"
                     in
-                    [ -- negateCondition
-                      mutate "negateCondition"
+                    [ -- negateCondition: splice just the condition
+                      mutateWithSplice "negateCondition"
                         "Negated if-condition"
                         (IfBlock
                             (Node condRange
                                 (Application
                                     [ Node Range.empty (FunctionOrValue [] "not")
-                                    , wrappedCond
+                                    , (case condExpr of
+                                        FunctionOrValue _ _ -> Node condRange condExpr
+                                        _ -> Node condRange (ParenthesizedExpression (Node condRange condExpr))
+                                      )
                                     ]
                                 )
                             )
                             (Node thenRange thenExpr)
                             (Node elseRange elseExpr)
                         )
+                        condRange
+                        negatedCondText
 
-                    -- dropElseBranch
-                    , mutate "dropElseBranch"
+                    -- dropElseBranch: splice just the else branch with then branch text
+                    , mutateWithSplice "dropElseBranch"
                         "Replaced else branch with then branch"
                         (IfBlock (Node condRange condExpr) (Node thenRange thenExpr) (Node elseRange thenExpr))
+                        elseRange
+                        (extractSourceRange source thenRange)
 
-                    -- conditionalTrue
-                    , mutate "conditionalTrue"
+                    -- conditionalTrue: splice just the condition
+                    , mutateWithSplice "conditionalTrue"
                         "Replaced condition with `True`"
                         (IfBlock (Node condRange (FunctionOrValue [] "True")) (Node thenRange thenExpr) (Node elseRange elseExpr))
+                        condRange
+                        "True"
 
-                    -- conditionalFalse
-                    , mutate "conditionalFalse"
+                    -- conditionalFalse: splice just the condition
+                    , mutateWithSplice "conditionalFalse"
                         "Replaced condition with `False`"
                         (IfBlock (Node condRange (FunctionOrValue [] "False")) (Node thenRange thenExpr) (Node elseRange elseExpr))
+                        condRange
+                        "False"
                     ]
 
                 OperatorApplication op dir left right ->
@@ -220,7 +322,7 @@ findMutationsInExpression file declIndex path (Node range expr) =
                         ++ (comparisonNegations op |> List.map (\newOp -> swapOp newOp "negateComparison"))
                         ++ (arithmeticSwaps op |> List.map (\newOp -> swapOp newOp "replaceArithmetic"))
                         ++ (logicalSwaps op |> List.map (\newOp -> swapOp newOp "swapLogicalOperator"))
-                        ++ concatRemovalAst op dir left right range file declIndex path
+                        ++ concatRemovalAst source op dir left right range file declIndex path
 
                 FunctionOrValue [] "True" ->
                     [ mutate "swapBooleanLiteral" "Changed `True` to `False`" (FunctionOrValue [] "False") ]
@@ -243,10 +345,14 @@ findMutationsInExpression file declIndex path (Node range expr) =
                     ]
 
                 Application ((Node fnRange (FunctionOrValue fnMod fnName)) :: args) ->
-                    functionSwapMutations fnMod fnName fnRange args range file declIndex path
+                    functionSwapMutations source fnMod fnName fnRange args range file declIndex path
                         ++ (case ( fnMod, fnName, args ) of
-                                ( [], "not", [ _ ] ) ->
-                                    [ mutate "removeNot" "Removed `not` call" (Application args |> unwrapSingleApp) ]
+                                ( [], "not", [ Node argRange _ ] ) ->
+                                    [ mutateWithSplice "removeNot" "Removed `not` call"
+                                        (Application args |> unwrapSingleApp)
+                                        range
+                                        (extractSourceRange source argRange)
+                                    ]
 
                                 ( [], "Just", _ ) ->
                                     [ mutate "replaceWithNothing" "Replaced `Just ...` with `Nothing`" (FunctionOrValue [] "Nothing") ]
@@ -259,11 +365,15 @@ findMutationsInExpression file declIndex path (Node range expr) =
                            )
 
                 Negation (Node innerRange innerExpr) ->
-                    [ mutate "removeNegation" "Removed unary negation" innerExpr ]
+                    [ mutateWithSplice "removeNegation" "Removed unary negation"
+                        innerExpr
+                        range
+                        (extractSourceRange source innerRange)
+                    ]
 
                 ListExpr elements ->
                     if List.length elements >= 2 then
-                        removeListElementMutations elements range file declIndex path
+                        removeListElementMutations source elements range file declIndex path
                             ++ [ mutate "emptyList" "Replaced list with `[]`" (ListExpr []) ]
 
                     else
@@ -534,20 +644,24 @@ logicalSwaps op =
             []
 
 
-concatRemovalAst : String -> InfixDirection -> Node Expression -> Node Expression -> Range -> File -> Int -> List Int -> List Mutation
-concatRemovalAst op dir left right range file declIndex path =
+concatRemovalAst : String -> String -> InfixDirection -> Node Expression -> Node Expression -> Range -> File -> Int -> List Int -> List Mutation
+concatRemovalAst source op dir (Node leftRange _) (Node rightRange _) range file declIndex path =
     if op == "++" then
         [ { line = range.start.row
           , column = range.start.column
           , operator = "concatRemoval"
           , description = "Kept only left side of `++`"
-          , mutatedFile = replaceExpression file declIndex path left
+          , mutatedFile = replaceExpression file declIndex path (Node leftRange (FunctionOrValue [] "placeholder__"))
+          , spliceRange = range
+          , spliceText = extractSourceRange source leftRange
           }
         , { line = range.start.row
           , column = range.start.column
           , operator = "concatRemoval"
           , description = "Kept only right side of `++`"
-          , mutatedFile = replaceExpression file declIndex path right
+          , mutatedFile = replaceExpression file declIndex path (Node rightRange (FunctionOrValue [] "placeholder__"))
+          , spliceRange = range
+          , spliceText = extractSourceRange source rightRange
           }
         ]
 
@@ -555,8 +669,8 @@ concatRemovalAst op dir left right range file declIndex path =
         []
 
 
-removeListElementMutations : List (Node Expression) -> Range -> File -> Int -> List Int -> List Mutation
-removeListElementMutations elements range file declIndex path =
+removeListElementMutations : String -> List (Node Expression) -> Range -> File -> Int -> List Int -> List Mutation
+removeListElementMutations source elements range file declIndex path =
     let
         elementCount =
             List.length elements
@@ -569,12 +683,25 @@ removeListElementMutations elements range file declIndex path =
                         |> List.indexedMap Tuple.pair
                         |> List.filter (\( i, _ ) -> i /= index)
                         |> List.map Tuple.second
+
+                newExpr =
+                    Node range (ListExpr remaining)
+
+                -- Build splice text by extracting remaining elements from original source
+                remainingTexts =
+                    remaining
+                        |> List.map (\(Node r _) -> extractSourceRange source r)
+
+                listText =
+                    "[ " ++ String.join ", " remainingTexts ++ " ]"
             in
             { line = range.start.row
             , column = range.start.column
             , operator = "removeListElement"
             , description = "Removed element " ++ String.fromInt (index + 1) ++ " of " ++ String.fromInt elementCount ++ " from list"
-            , mutatedFile = replaceExpression file declIndex path (Node range (ListExpr remaining))
+            , mutatedFile = replaceExpression file declIndex path newExpr
+            , spliceRange = range
+            , spliceText = listText
             }
         )
         elements
@@ -600,8 +727,8 @@ functionSwapTable =
     ]
 
 
-functionSwapMutations : List String -> String -> Range -> List (Node Expression) -> Range -> File -> Int -> List Int -> List Mutation
-functionSwapMutations fnMod fnName fnRange args appRange file declIndex path =
+functionSwapMutations : String -> List String -> String -> Range -> List (Node Expression) -> Range -> File -> Int -> List Int -> List Mutation
+functionSwapMutations source fnMod fnName fnRange args appRange file declIndex path =
     functionSwapTable
         |> List.filterMap
             (\( ( fromMod, fromName ), ( toMod, toName ) ) ->
@@ -632,16 +759,61 @@ functionSwapMutations fnMod fnName fnRange args appRange file declIndex path =
                         else
                             String.join "." toMod ++ "." ++ toName
                 in
+                let
+                    newExpr =
+                        Node appRange
+                            (Application
+                                (Node fnRange (FunctionOrValue toMod toName) :: args)
+                            )
+                in
                 { line = fnRange.start.row
                 , column = fnRange.start.column
                 , operator = "functionSwap"
                 , description = "Swapped `" ++ fromQualified ++ "` to `" ++ toQualified ++ "`"
-                , mutatedFile =
-                    replaceExpression file declIndex path
-                        (Node appRange
-                            (Application
-                                (Node fnRange (FunctionOrValue toMod toName) :: args)
-                            )
-                        )
+                , mutatedFile = replaceExpression file declIndex path newExpr
+                , spliceRange = fnRange
+                , spliceText = toQualified
                 }
             )
+
+
+{-| Extract the text from a source string at the given Range.
+-}
+extractSourceRange : String -> Range -> String
+extractSourceRange source range =
+    let
+        lines =
+            String.lines source
+    in
+    if range.start.row == range.end.row then
+        -- Single line: extract from start column to end column
+        lines
+            |> List.drop (range.start.row - 1)
+            |> List.head
+            |> Maybe.withDefault ""
+            |> String.slice (range.start.column - 1) (range.end.column - 1)
+
+    else
+        -- Multi-line: first line from start column, middle lines fully, last line to end column
+        let
+            firstLine =
+                lines
+                    |> List.drop (range.start.row - 1)
+                    |> List.head
+                    |> Maybe.withDefault ""
+                    |> String.dropLeft (range.start.column - 1)
+
+            middleLines =
+                lines
+                    |> List.drop range.start.row
+                    |> List.take (range.end.row - range.start.row - 1)
+
+            lastLine =
+                lines
+                    |> List.drop (range.end.row - 1)
+                    |> List.head
+                    |> Maybe.withDefault ""
+                    |> String.left (range.end.column - 1)
+        in
+        (firstLine :: middleLines ++ [ lastLine ])
+            |> String.join "\n"

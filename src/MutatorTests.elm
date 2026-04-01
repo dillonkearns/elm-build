@@ -1,7 +1,9 @@
 module MutatorTests exposing (suite)
 
+import Elm.Parser
 import Expect
 import Mutator exposing (Mutation)
+import Set
 import Test exposing (Test, describe, test)
 
 
@@ -21,7 +23,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "not x"
                                 |> Expect.equal True
 
@@ -39,7 +41,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "not (x > 0)"
                                 |> Expect.equal True
 
@@ -59,7 +61,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "x >= 0"
                                 |> Expect.equal True
 
@@ -77,7 +79,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "x /= 0"
                                 |> Expect.equal True
 
@@ -97,7 +99,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "False"
                                 |> Expect.equal True
 
@@ -117,7 +119,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "a - b"
                                 |> Expect.equal True
 
@@ -139,7 +141,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "a || b"
                                 |> Expect.equal True
 
@@ -157,7 +159,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "a && b"
                                 |> Expect.equal True
 
@@ -177,7 +179,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "\n    1"
                                 |> Expect.equal True
 
@@ -195,7 +197,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "\n    2"
                                 |> Expect.equal True
 
@@ -213,7 +215,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "\n    43"
                                 |> Expect.equal True
 
@@ -233,7 +235,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "\n    \"\""
                                 |> Expect.equal True
 
@@ -251,7 +253,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            ((Mutator.writeFile m.mutatedFile) |> String.contains "\"\"")
+                            ((Mutator.applyMutation source m) |> String.contains "\"\"")
                                 |> Expect.equal False
 
                         _ ->
@@ -331,7 +333,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "Nothing"
                                 |> Expect.equal True
 
@@ -349,7 +351,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "Nothing"
                                 |> Expect.equal True
 
@@ -372,7 +374,7 @@ suite =
                             -- The else branch "no" should be replaced with the then branch "yes"
                             let
                                 lines =
-                                    String.lines (Mutator.writeFile m.mutatedFile)
+                                    String.lines (Mutator.applyMutation source m)
                             in
                             -- Both the then and else branches should now say "yes"
                             lines
@@ -396,7 +398,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "a >= b"
                                 |> Expect.equal True
 
@@ -414,7 +416,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "a <= b"
                                 |> Expect.equal True
 
@@ -435,7 +437,7 @@ suite =
                     case mutations of
                         [ m ] ->
                             -- "not x" should become just "x"
-                            ((Mutator.writeFile m.mutatedFile) |> String.contains "    not x")
+                            ((Mutator.applyMutation source m) |> String.contains "    not x")
                                 |> Expect.equal False
 
                         _ ->
@@ -452,7 +454,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "    (x > 0)"
                                 |> Expect.equal True
 
@@ -473,7 +475,7 @@ suite =
                     case mutations of
                         [ m ] ->
                             -- "-x" should become "x"
-                            ((Mutator.writeFile m.mutatedFile) |> String.contains "    -x")
+                            ((Mutator.applyMutation source m) |> String.contains "    -x")
                                 |> Expect.equal False
 
                         _ ->
@@ -492,7 +494,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "    []"
                                 |> Expect.equal True
 
@@ -549,7 +551,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "    \"hello\""
                                 |> Expect.equal True
 
@@ -569,7 +571,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "if True then"
                                 |> Expect.equal True
 
@@ -587,7 +589,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "if False then"
                                 |> Expect.equal True
 
@@ -607,7 +609,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "List.last xs"
                                 |> Expect.equal True
 
@@ -625,7 +627,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "String.toLower s"
                                 |> Expect.equal True
 
@@ -643,7 +645,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "List.reverse xs"
                                 |> Expect.equal True
 
@@ -661,7 +663,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "List.sort xs"
                                 |> Expect.equal True
 
@@ -679,7 +681,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (Mutator.writeFile m.mutatedFile)
+                            (Mutator.applyMutation source m)
                                 |> String.contains "List.maximum xs"
                                 |> Expect.equal True
 
@@ -697,6 +699,108 @@ suite =
                     in
                     List.length mutations
                         |> Expect.equal 0
+            ]
+        , describe "multi-line exposing"
+            [ test "mutations produce parseable source for multi-line exposing" <|
+                \_ ->
+                    let
+                        source =
+                            String.join "\n"
+                                [ "module Foo exposing"
+                                , "    ( bar"
+                                , "    , baz"
+                                , "    )"
+                                , ""
+                                , "bar x ="
+                                , "    if x then"
+                                , "        1"
+                                , "    else"
+                                , "        0"
+                                , ""
+                                , "baz ="
+                                , "    42"
+                                ]
+
+                        mutations =
+                            Mutator.generateMutations source
+
+                        firstFailure =
+                            mutations
+                                |> List.filterMap
+                                    (\m ->
+                                        let
+                                            applied =
+                                                Mutator.applyMutation source m
+                                        in
+                                        case Elm.Parser.parseToFile applied of
+                                            Ok _ ->
+                                                Nothing
+
+                                            Err _ ->
+                                                Just (m.operator ++ ": " ++ m.description ++ "\n---\n" ++ applied ++ "\n---")
+                                    )
+                                |> List.head
+                    in
+                    if List.isEmpty mutations then
+                        Expect.fail "Expected mutations to be generated"
+
+                    else
+                        case firstFailure of
+                            Just failInfo ->
+                                Expect.fail ("Mutation produced unparseable source:\n" ++ failInfo)
+
+                            Nothing ->
+                                Expect.pass
+            ]
+        , describe "hashKey"
+            [ test "all mutations for a module produce unique hash keys" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    if x > 0 then\n        1\n    else\n        0\n\nbar a b =\n    a + b"
+
+                        mutations =
+                            Mutator.generateMutations source
+
+                        hashKeys =
+                            List.map Mutator.hashKey mutations
+
+                        uniqueKeys =
+                            Set.fromList hashKeys
+
+                        debugInfo =
+                            mutations
+                                |> List.map (\m -> Mutator.hashKey m ++ " [" ++ m.operator ++ "]")
+                                |> String.join "\n"
+                    in
+                    if List.length mutations < 2 then
+                        Expect.fail "Expected multiple mutations"
+
+                    else if Set.size uniqueKeys /= List.length mutations then
+                        Expect.fail
+                            ("Expected "
+                                ++ String.fromInt (List.length mutations)
+                                ++ " unique keys, got "
+                                ++ String.fromInt (Set.size uniqueKeys)
+                                ++ "\n"
+                                ++ debugInfo
+                            )
+
+                    else
+                        Expect.pass
+            , test "same source produces same hash keys" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    x > 0"
+
+                        keys1 =
+                            Mutator.generateMutations source |> List.map Mutator.hashKey
+
+                        keys2 =
+                            Mutator.generateMutations source |> List.map Mutator.hashKey
+                    in
+                    keys1 |> Expect.equal keys2
             ]
         , describe "parse failure"
             [ test "returns empty list for invalid source" <|

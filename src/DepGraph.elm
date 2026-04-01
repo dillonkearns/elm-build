@@ -7,6 +7,7 @@ module DepGraph exposing
     , transitiveDeps
     , reverseDeps
     , moduleNameToFilePath
+    , sourcesTestedBy
     )
 
 {-| Pure dependency graph analysis for Elm source files.
@@ -238,3 +239,25 @@ bfs deps queue visited =
                     Set.union visited newDeps
             in
             bfs deps newQueue newVisited
+
+
+{-| Given a test file, find all source files it transitively depends on,
+filtered to only files in the given source directories (excluding test directories).
+
+The test file itself is excluded from results. Package imports (modules not in
+the graph) are silently ignored. Results are sorted alphabetically.
+
+-}
+sourcesTestedBy : List String -> Graph -> String -> List String
+sourcesTestedBy mutateDirectories graph testFile =
+    transitiveDeps graph testFile
+        |> Set.remove testFile
+        |> Set.filter
+            (\filePath ->
+                List.any
+                    (\dir ->
+                        String.startsWith (dir ++ "/") filePath
+                    )
+                    mutateDirectories
+            )
+        |> Set.toList
