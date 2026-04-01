@@ -115,6 +115,8 @@ task : Config -> BackendTask FatalError ()
 task config =
     BackendTask.Extra.profiling "mutation-test-runner" <|
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Loading project sources for mutation testing") <| \_ ->
+        -- Ensure dependencies are fetched into ELM_HOME
+        Do.do (ensureDependenciesFetched config) <| \_ ->
         let
             sourceDirectories =
                 "src" :: config.sourceDirs
@@ -800,11 +802,50 @@ simpleTestRunnerSource =
         ]
 
 
+{-| Ensure all Elm dependencies are fetched before loading the project.
+Uses `elm make` to trigger the Elm compiler's dependency resolver.
+No-op if everything is already cached.
+-}
+ensureDependenciesFetched : Config -> BackendTask FatalError ()
+ensureDependenciesFetched config =
+    File.rawFile "elm.json"
+        |> BackendTask.allowFatal
+        |> BackendTask.andThen
+            (\raw ->
+                let
+                    isPackage =
+                        String.contains "\"type\": \"package\"" raw
+                            || String.contains "\"type\":\"package\"" raw
+                in
+                if isPackage then
+                    -- Package project: `elm make --docs` fetches deps without needing source files
+                    BackendTask.Extra.timed "Fetching dependencies" "Dependencies ready"
+                        (Script.exec "elm" [ "make", "--docs", "/tmp/elm-mutation-docs.json" ])
+
+                else
+                    -- Application project: need a source file target for `elm make`
+                    Glob.fromStringWithOptions
+                        (let
+                            o =
+                                Glob.defaultOptions
+                         in
+                         { o | include = Glob.OnlyFiles }
+                        )
+                        "src/**/*.elm"
+                        |> BackendTask.andThen
+                            (\files ->
+                                case files of
+                                    first :: _ ->
+                                        BackendTask.Extra.timed "Fetching dependencies" "Dependencies ready"
+                                            (Script.exec "elm" [ "make", first, "--output", "/dev/null" ])
+
+                                    [] ->
+                                        BackendTask.succeed ()
+                            )
+            )
+
+
 {-| Resolve the test file: use --test if provided, otherwise auto-discover.
-
-When --mutate is provided, finds test files that import the mutated module.
-When --mutate is omitted, finds all test files in tests/\*\*/\*.elm.
-
 -}
 resolveTestFile : Config -> InterpreterProject -> BackendTask FatalError String
 resolveTestFile config project =
