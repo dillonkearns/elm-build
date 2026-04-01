@@ -590,6 +590,110 @@ suite =
                         _ ->
                             Expect.fail ("Expected 1 conditionalFalse, got " ++ String.fromInt (List.length mutations))
             ]
+        , describe "functionSwap"
+            [ test "swaps List.head to List.last" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo xs =\n    List.head xs"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "functionSwap")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "List.last xs"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 functionSwap, got " ++ String.fromInt (List.length mutations))
+            , test "swaps String.toUpper to String.toLower" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo s =\n    String.toUpper s"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "functionSwap")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "String.toLower s"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 functionSwap, got " ++ String.fromInt (List.length mutations))
+            , test "swaps List.sort to List.reverse" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo xs =\n    List.sort xs"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "functionSwap")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "List.reverse xs"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 functionSwap, got " ++ String.fromInt (List.length mutations))
+            , test "swaps List.reverse to List.sort" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo xs =\n    List.reverse xs"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "functionSwap")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "List.sort xs"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 functionSwap, got " ++ String.fromInt (List.length mutations))
+            , test "swaps List.minimum to List.maximum" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo xs =\n    List.minimum xs"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "functionSwap")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "List.maximum xs"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 functionSwap, got " ++ String.fromInt (List.length mutations))
+            , test "no swap for unknown function" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo xs =\n    List.map identity xs"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "functionSwap")
+                    in
+                    List.length mutations
+                        |> Expect.equal 0
+            ]
         , describe "parse failure"
             [ test "returns empty list for invalid source" <|
                 \_ ->

@@ -156,14 +156,21 @@ findMutationsInExpression source (Node range expr) =
                 Literal s ->
                     [ replaceStringLiteral source range s ]
 
-                Application ((Node _ (FunctionOrValue [] "not")) :: (Node argRange _) :: []) ->
-                    [ removeNot source range argRange ]
+                Application ((Node fnRange (FunctionOrValue moduleName fnName)) :: args) ->
+                    functionSwapMutation source fnRange moduleName fnName
+                        ++ (case ( moduleName, fnName, args ) of
+                                ( [], "not", (Node argRange _) :: [] ) ->
+                                    [ removeNot source range argRange ]
 
-                Application ((Node _ (FunctionOrValue [] "Just")) :: _) ->
-                    [ replaceWithNothing source range ]
+                                ( [], "Just", _ ) ->
+                                    [ replaceWithNothing source range ]
 
-                Application ((Node _ (FunctionOrValue [ "Maybe" ] "Just")) :: _) ->
-                    [ replaceWithNothing source range ]
+                                ( [ "Maybe" ], "Just", _ ) ->
+                                    [ replaceWithNothing source range ]
+
+                                _ ->
+                                    []
+                           )
 
                 Negation (Node innerRange _) ->
                     [ removeNegation source range innerRange ]
@@ -323,6 +330,72 @@ removeListElements source listRange elements =
             }
         )
         elements
+
+
+{-| Table of function swaps: (moduleName, fnName) -> (moduleName, fnName).
+These are bidirectional — each pair generates mutations in both directions.
+-}
+functionSwapTable : List ( ( List String, String ), ( List String, String ) )
+functionSwapTable =
+    [ -- List operations
+      ( ( [ "List" ], "head" ), ( [ "List" ], "last" ) )
+    , ( ( [ "List" ], "sort" ), ( [ "List" ], "reverse" ) )
+    , ( ( [ "List" ], "minimum" ), ( [ "List" ], "maximum" ) )
+    , ( ( [ "List" ], "any" ), ( [ "List" ], "all" ) )
+    , ( ( [ "List" ], "sum" ), ( [ "List" ], "product" ) )
+
+    -- String operations
+    , ( ( [ "String" ], "toUpper" ), ( [ "String" ], "toLower" ) )
+    , ( ( [ "String" ], "toFloat" ), ( [ "String" ], "toInt" ) )
+    , ( ( [ "String" ], "left" ), ( [ "String" ], "right" ) )
+    , ( ( [ "String" ], "trimLeft" ), ( [ "String" ], "trimRight" ) )
+    , ( ( [ "String" ], "startsWith" ), ( [ "String" ], "endsWith" ) )
+    , ( ( [ "String" ], "cons" ), ( [ "String" ], "append" ) )
+
+    -- Maybe operations
+    , ( ( [ "Maybe" ], "withDefault" ), ( [ "Maybe" ], "withDefault" ) )
+
+    -- Basics
+    , ( ( [], "min" ), ( [], "max" ) )
+    , ( ( [ "Basics" ], "min" ), ( [ "Basics" ], "max" ) )
+    , ( ( [], "ceiling" ), ( [], "floor" ) )
+    , ( ( [ "Basics" ], "ceiling" ), ( [ "Basics" ], "floor" ) )
+    ]
+
+
+functionSwapMutation : String -> Range -> List String -> String -> List Mutation
+functionSwapMutation source fnRange moduleName fnName =
+    functionSwapTable
+        |> List.filterMap
+            (\( ( fromMod, fromName ), ( toMod, toName ) ) ->
+                if fromMod == moduleName && fromName == fnName then
+                    Just ( toMod, toName )
+
+                else if toMod == moduleName && toName == fnName then
+                    Just ( fromMod, fromName )
+
+                else
+                    Nothing
+            )
+        -- Deduplicate (some pairs are self-referencing like withDefault)
+        |> List.filter (\( toMod, toName ) -> not (toMod == moduleName && toName == fnName))
+        |> List.map
+            (\( toMod, toName ) ->
+                let
+                    replacement =
+                        if List.isEmpty toMod then
+                            toName
+
+                        else
+                            String.join "." toMod ++ "." ++ toName
+                in
+                { line = fnRange.start.row
+                , column = fnRange.start.column
+                , operator = "functionSwap"
+                , description = "Swapped `" ++ extractRange source fnRange ++ "` to `" ++ replacement ++ "`"
+                , mutatedSource = replaceRange source fnRange replacement
+                }
+            )
 
 
 conditionalToConstant : String -> Range -> String -> String -> Mutation
