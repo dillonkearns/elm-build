@@ -1003,6 +1003,32 @@ suite =
                     firstSwapApplied
                         |> String.contains "        0 ->\n            \"one\""
                         |> Expect.equal True
+            , test "no swap when adjacent branches have identical bodies" <|
+                \_ ->
+                    let
+                        source =
+                            String.join "\n"
+                                [ "module Foo exposing (..)"
+                                , ""
+                                , "isGood x ="
+                                , "    case x of"
+                                , "        A ->"
+                                , "            True"
+                                , ""
+                                , "        B ->"
+                                , "            True"
+                                , ""
+                                , "        _ ->"
+                                , "            False"
+                                ]
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "swapCaseBranches")
+                    in
+                    -- A->True and B->True have same body, so only the B<->_ swap should exist
+                    List.length mutations
+                        |> Expect.equal 1
             , test "no swap for single-branch case" <|
                 \_ ->
                     let

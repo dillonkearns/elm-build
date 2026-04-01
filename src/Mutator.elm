@@ -846,47 +846,51 @@ swapCaseBranchMutations source caseBlock range file declIndex path =
         pairs =
             List.map2 Tuple.pair cases (List.drop 1 cases)
     in
-    List.indexedMap
-        (\i ( ( pat1, Node expr1Range _ ), ( pat2, Node expr2Range _ ) ) ->
-            let
-                expr1Text =
-                    extractSourceRange source expr1Range
-
-                expr2Text =
-                    extractSourceRange source expr2Range
-            in
-            { line = expr1Range.start.row
-            , column = expr1Range.start.column
-            , operator = "swapCaseBranches"
-            , description =
-                "Swapped case branch "
-                    ++ String.fromInt (i + 1)
-                    ++ " with branch "
-                    ++ String.fromInt (i + 2)
-            , mutatedFile =
-                -- For the AST, swap the expressions in the case block
+    List.indexedMap Tuple.pair pairs
+        |> List.filterMap
+            (\( i, ( ( pat1, Node expr1Range _ ), ( pat2, Node expr2Range _ ) ) ) ->
                 let
-                    swappedCases =
-                        cases
-                            |> List.indexedMap
-                                (\j ( pat, expr ) ->
-                                    if j == i then
-                                        ( pat, Tuple.second (Maybe.withDefault ( pat, expr ) (List.head (List.drop (i + 1) cases))) )
+                    expr1Text =
+                        extractSourceRange source expr1Range
 
-                                    else if j == i + 1 then
-                                        ( pat, Tuple.second (Maybe.withDefault ( pat, expr ) (List.head (List.drop i cases))) )
-
-                                    else
-                                        ( pat, expr )
-                                )
+                    expr2Text =
+                        extractSourceRange source expr2Range
                 in
-                replaceExpression file declIndex path
-                    (Node range (CaseExpression { caseBlock | cases = swappedCases }))
-            , spliceRange = expr1Range
-            , spliceText = expr2Text
-            }
-        )
-        pairs
+                if expr1Text == expr2Text then
+                    Nothing
+
+                else
+                    let
+                        swappedCases =
+                            cases
+                                |> List.indexedMap
+                                    (\j ( pat, expr ) ->
+                                        if j == i then
+                                            ( pat, Tuple.second (Maybe.withDefault ( pat, expr ) (List.head (List.drop (i + 1) cases))) )
+
+                                        else if j == i + 1 then
+                                            ( pat, Tuple.second (Maybe.withDefault ( pat, expr ) (List.head (List.drop i cases))) )
+
+                                        else
+                                            ( pat, expr )
+                                    )
+                    in
+                    Just
+                        { line = expr1Range.start.row
+                        , column = expr1Range.start.column
+                        , operator = "swapCaseBranches"
+                        , description =
+                            "Swapped case branch "
+                                ++ String.fromInt (i + 1)
+                                ++ " with branch "
+                                ++ String.fromInt (i + 2)
+                        , mutatedFile =
+                            replaceExpression file declIndex path
+                                (Node range (CaseExpression { caseBlock | cases = swappedCases }))
+                        , spliceRange = expr1Range
+                        , spliceText = expr2Text
+                        }
+            )
 
 
 functionSwapTable : List ( ( List String, String ), ( List String, String ) )
