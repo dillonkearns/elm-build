@@ -91,24 +91,11 @@ task config =
                 DepGraph.parseModuleName testSource
                     |> Maybe.withDefault "Tests"
 
-            discoveredValues : List String
-            discoveredValues =
-                TestAnalysis.discoverTestValues testSource
-
-            testValues : List String
-            testValues =
-                if List.isEmpty discoveredValues then
-                    -- Fallback: try the --suite name or "suite"
-                    [ config.suiteName ]
-
-                else
-                    discoveredValues
-
-            wrapperSource : String
-            wrapperSource =
-                generateTestWrapper testModuleName testValues
+            candidateNames : List String
+            candidateNames =
+                TestAnalysis.getCandidateNames testSource
         in
-        Do.log ("Discovered test values: " ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) testValues)) <| \_ ->
+        Do.log ("Found " ++ String.fromInt (List.length candidateNames) ++ " candidate values in " ++ testModuleName) <| \_ ->
         Do.do
             (BackendTask.Extra.timed "Loading sources" "Loaded sources"
                 (ProjectSources.loadProjectSources
@@ -124,18 +111,39 @@ task config =
         -- Build the project environment once (expensive parse phase)
         Do.do
             (BackendTask.Extra.timed "Building project env" "Built project env"
-                (case Eval.Module.buildProjectEnv (allSources ++ [ wrapperSource ]) of
+                (case Eval.Module.buildProjectEnv allSources of
                     Ok env ->
                         BackendTask.succeed env
 
-                    Err (Types.ParsingError deadEnds) ->
-                        BackendTask.fail (FatalError.fromString ("Failed to parse sources: " ++ "(parsing error)"))
+                    Err (Types.ParsingError _) ->
+                        BackendTask.fail (FatalError.fromString "Failed to parse sources")
 
-                    Err (Types.EvalError evalErr) ->
-                        BackendTask.fail (FatalError.fromString ("Failed to build env: " ++ "(eval error)"))
+                    Err (Types.EvalError _) ->
+                        BackendTask.fail (FatalError.fromString "Failed to build env")
                 )
             )
         <| \projectEnv ->
+        -- Discover which candidates are actually Test values via the interpreter
+        Do.do
+            (BackendTask.Extra.timed "Discovering test values" "Discovered test values"
+                (let
+                    testValues =
+                        TestAnalysis.discoverTestValuesViaInterpreter projectEnv testModuleName candidateNames
+                 in
+                 if List.isEmpty testValues then
+                    BackendTask.fail (FatalError.fromString ("No Test values found in " ++ testModuleName ++ ". Candidates tried: " ++ String.join ", " candidateNames))
+
+                 else
+                    BackendTask.succeed testValues
+                )
+            )
+        <| \testValues ->
+        let
+            wrapperSource : String
+            wrapperSource =
+                generateTestWrapper testModuleName testValues
+        in
+        Do.log ("Discovered test values: " ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) testValues)) <| \_ ->
         Do.allowFatal (File.rawFile config.mutateFile) <| \mutateSource ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Generating mutations for " ++ config.mutateFile)) <| \_ ->
         let

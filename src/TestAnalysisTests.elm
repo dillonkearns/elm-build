@@ -8,7 +8,48 @@ import TestAnalysis
 suite : Test
 suite =
     describe "TestAnalysis"
-        [ describe "discoverTestValues"
+        [ describe "getCandidateNames"
+            [ test "finds all zero-arg exposed values" <|
+                \_ ->
+                    TestAnalysis.getCandidateNames
+                        (String.join "\n"
+                            [ "module M exposing (..)"
+                            , ""
+                            , "foo = 1"
+                            , "bar = 2"
+                            , "baz x = x"
+                            ]
+                        )
+                        |> Expect.equal [ "foo", "bar" ]
+            , test "respects explicit exposing list" <|
+                \_ ->
+                    TestAnalysis.getCandidateNames
+                        (String.join "\n"
+                            [ "module M exposing (foo)"
+                            , ""
+                            , "foo = 1"
+                            , "bar = 2"
+                            ]
+                        )
+                        |> Expect.equal [ "foo" ]
+            , test "excludes functions with arguments" <|
+                \_ ->
+                    TestAnalysis.getCandidateNames
+                        (String.join "\n"
+                            [ "module M exposing (..)"
+                            , ""
+                            , "value = 1"
+                            , "func x = x"
+                            , "func2 a b = a + b"
+                            ]
+                        )
+                        |> Expect.equal [ "value" ]
+            , test "returns empty for invalid source" <|
+                \_ ->
+                    TestAnalysis.getCandidateNames "not valid"
+                        |> Expect.equal []
+            ]
+        , describe "discoverTestValues (heuristic)"
             [ test "finds suite : Test" <|
                 \_ ->
                     TestAnalysis.discoverTestValues

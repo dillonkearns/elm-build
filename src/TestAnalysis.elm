@@ -1,4 +1,4 @@
-module TestAnalysis exposing (discoverTestValues, usesFuzz)
+module TestAnalysis exposing (discoverTestValues, discoverTestValuesViaInterpreter, getCandidateNames, usesFuzz)
 
 {-| Static analysis for Elm test modules.
 
@@ -19,7 +19,9 @@ import Elm.Syntax.Module
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Signature exposing (Signature)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
+import Eval.Module
 import Set exposing (Set)
+import Types
 
 
 {-| Discover exposed values of type `Test` in a module.
@@ -130,6 +132,88 @@ filterExposed maybeExposedNames name =
 
             else
                 Nothing
+
+
+{-| Get all exposed zero-argument value names from a module.
+
+These are candidates for Test discovery — we'll try evaluating each one
+via the interpreter to see if it's a Test.
+
+-}
+getCandidateNames : String -> List String
+getCandidateNames source =
+    case Elm.Parser.parseToFile source of
+        Err _ ->
+            []
+
+        Ok file ->
+            let
+                exposedNames =
+                    getExposedNames file
+            in
+            file.declarations
+                |> List.filterMap (isZeroArgDeclaration >> Maybe.andThen (filterExposed exposedNames))
+
+
+{-| Check if a declaration is a zero-argument function (a value, not a function).
+Returns the name if so.
+-}
+isZeroArgDeclaration : Node Declaration -> Maybe String
+isZeroArgDeclaration (Node _ decl) =
+    case decl of
+        FunctionDeclaration function ->
+            let
+                (Node _ impl) =
+                    function.declaration
+            in
+            if List.isEmpty impl.arguments then
+                Just (Node.value impl.name)
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+{-| Discover Test values by evaluating candidates via the interpreter.
+
+For each candidate name, tries `SimpleTestRunner.runToString ModuleName.name`.
+If the interpreter returns a String result, the value is a Test.
+This is 100% accurate — no heuristics, no type annotation needed.
+
+-}
+discoverTestValuesViaInterpreter : Eval.Module.ProjectEnv -> String -> List String -> List String
+discoverTestValuesViaInterpreter projectEnv testModuleName candidateNames =
+    candidateNames
+        |> List.filter
+            (\name ->
+                let
+                    probeWrapper =
+                        String.join "\n"
+                            [ "module Probe__ exposing (probe__)"
+                            , "import SimpleTestRunner"
+                            , "import " ++ testModuleName
+                            , ""
+                            , "probe__ : String"
+                            , "probe__ ="
+                            , "    SimpleTestRunner.runToString " ++ testModuleName ++ "." ++ name
+                            , ""
+                            ]
+
+                    result =
+                        Eval.Module.evalWithEnv
+                            projectEnv
+                            [ probeWrapper ]
+                            (Elm.Syntax.Expression.FunctionOrValue [] "probe__")
+                in
+                case result of
+                    Ok (Types.String _) ->
+                        True
+
+                    _ ->
+                        False
+            )
 
 
 {-| Detect whether an Elm source file uses fuzz tests by checking for references
