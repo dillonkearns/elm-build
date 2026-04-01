@@ -208,35 +208,16 @@ loadWith config =
                                                                             |> List.filterMap DepGraph.parseModuleName
                                                                             |> Set.fromList
 
-                                                                    -- Compute which package modules are reachable from any user module
-                                                                    userModuleNames : Set String
-                                                                    userModuleNames =
-                                                                        userFileContents
-                                                                            |> List.filterMap (\( _, src ) -> DepGraph.parseModuleName src)
-                                                                            |> Set.fromList
-
-                                                                    extraModuleNames : Set String
-                                                                    extraModuleNames =
-                                                                        extraFileContents
-                                                                            |> List.filterMap (\( _, src ) -> DepGraph.parseModuleName src)
-                                                                            |> Set.fromList
-
-                                                                    allUserRoots : Set String
-                                                                    allUserRoots =
-                                                                        Set.union userModuleNames extraModuleNames
-
-                                                                    reachableModules : Set String
-                                                                    reachableModules =
-                                                                        transitiveModuleDeps moduleGraph.imports allUserRoots
-
-                                                                    reachablePackageSources : List String
-                                                                    reachablePackageSources =
-                                                                        topoSortModules moduleGraph
-                                                                            (Set.filter (\name -> Set.member name pkgModuleNames) reachableModules)
+                                                                    -- Include ALL package sources in the env (not just reachable from user code).
+                                                                    -- This ensures that source overrides added at eval time (e.g. SimpleTestRunner)
+                                                                    -- can reference any package module without the env missing dependencies.
+                                                                    allPackageSources : List String
+                                                                    allPackageSources =
+                                                                        topoSortModules moduleGraph pkgModuleNames
 
                                                                     pkgEnvResult : Result Types.Error Eval.Module.ProjectEnv
                                                                     pkgEnvResult =
-                                                                        Eval.Module.buildProjectEnv reachablePackageSources
+                                                                        Eval.Module.buildProjectEnv allPackageSources
                                                                 in
                                                                 case pkgEnvResult of
                                                                     Err _ ->

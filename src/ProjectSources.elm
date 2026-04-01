@@ -117,10 +117,15 @@ loadPackageDeps { projectDir, skipPackages } =
         (resolvePackageVersions elmHome
             (Dict.union elmJson.directDeps elmJson.indirectDeps
                 |> Dict.remove "elm/core"
-                |> Dict.filter (\name _ -> not (Set.member name skipPackages))
             )
         )
-    <| \allDeps ->
+    <| \directDeps ->
+    Do.do (resolveTransitiveDeps elmHome directDeps) <| \allDepsWithKernel ->
+    let
+        allDeps =
+            allDepsWithKernel
+                |> Dict.filter (\name _ -> not (Set.member name skipPackages))
+    in
     Do.do (loadPackageDepGraphs elmHome allDeps) <| \pkgDepGraphs ->
     let
         sortedPackageNames : List String
