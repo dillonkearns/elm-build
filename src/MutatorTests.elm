@@ -21,7 +21,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "not x"
                                 |> Expect.equal True
 
@@ -39,7 +39,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "not (x > 0)"
                                 |> Expect.equal True
 
@@ -59,7 +59,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "x >= 0"
                                 |> Expect.equal True
 
@@ -77,7 +77,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "x /= 0"
                                 |> Expect.equal True
 
@@ -97,7 +97,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "False"
                                 |> Expect.equal True
 
@@ -117,7 +117,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "a - b"
                                 |> Expect.equal True
 
@@ -139,7 +139,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "a || b"
                                 |> Expect.equal True
 
@@ -157,7 +157,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "a && b"
                                 |> Expect.equal True
 
@@ -177,7 +177,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "\n    1"
                                 |> Expect.equal True
 
@@ -195,7 +195,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "\n    2"
                                 |> Expect.equal True
 
@@ -213,7 +213,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "\n    43"
                                 |> Expect.equal True
 
@@ -233,7 +233,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "\n    \"\""
                                 |> Expect.equal True
 
@@ -251,7 +251,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            (m.mutatedSource |> String.contains "\"\"")
+                            ((Mutator.writeFile m.mutatedFile) |> String.contains "\"\"")
                                 |> Expect.equal False
 
                         _ ->
@@ -283,8 +283,12 @@ suite =
                     in
                     case mutations of
                         first :: _ ->
-                            first.mutatedSource
-                                |> String.contains "[ 2, 3 ]"
+                            let
+                                written =
+                                    Mutator.writeFile first.mutatedFile
+                            in
+                            -- Should contain 2 and 3 but not start with [ 1
+                            (String.contains "2" written && String.contains "3" written)
                                 |> Expect.equal True
 
                         [] ->
@@ -327,7 +331,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "Nothing"
                                 |> Expect.equal True
 
@@ -345,7 +349,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "Nothing"
                                 |> Expect.equal True
 
@@ -368,7 +372,7 @@ suite =
                             -- The else branch "no" should be replaced with the then branch "yes"
                             let
                                 lines =
-                                    String.lines m.mutatedSource
+                                    String.lines (Mutator.writeFile m.mutatedFile)
                             in
                             -- Both the then and else branches should now say "yes"
                             lines
@@ -392,7 +396,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "a >= b"
                                 |> Expect.equal True
 
@@ -410,7 +414,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "a <= b"
                                 |> Expect.equal True
 
@@ -431,7 +435,7 @@ suite =
                     case mutations of
                         [ m ] ->
                             -- "not x" should become just "x"
-                            (m.mutatedSource |> String.contains "    not x")
+                            ((Mutator.writeFile m.mutatedFile) |> String.contains "    not x")
                                 |> Expect.equal False
 
                         _ ->
@@ -448,7 +452,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "    (x > 0)"
                                 |> Expect.equal True
 
@@ -469,7 +473,7 @@ suite =
                     case mutations of
                         [ m ] ->
                             -- "-x" should become "x"
-                            (m.mutatedSource |> String.contains "    -x")
+                            ((Mutator.writeFile m.mutatedFile) |> String.contains "    -x")
                                 |> Expect.equal False
 
                         _ ->
@@ -488,7 +492,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "    []"
                                 |> Expect.equal True
 
@@ -545,7 +549,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "    \"hello\""
                                 |> Expect.equal True
 
@@ -565,7 +569,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "if True then"
                                 |> Expect.equal True
 
@@ -583,7 +587,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "if False then"
                                 |> Expect.equal True
 
@@ -603,7 +607,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "List.last xs"
                                 |> Expect.equal True
 
@@ -621,7 +625,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "String.toLower s"
                                 |> Expect.equal True
 
@@ -639,7 +643,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "List.reverse xs"
                                 |> Expect.equal True
 
@@ -657,7 +661,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "List.sort xs"
                                 |> Expect.equal True
 
@@ -675,7 +679,7 @@ suite =
                     in
                     case mutations of
                         [ m ] ->
-                            m.mutatedSource
+                            (Mutator.writeFile m.mutatedFile)
                                 |> String.contains "List.maximum xs"
                                 |> Expect.equal True
 

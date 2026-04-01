@@ -254,7 +254,7 @@ task config =
                                 (InterpreterProject.evalWithSourceOverrides project
                                     { imports = evalConfig.imports
                                     , expression = evalConfig.expression
-                                    , sourceOverrides = [ simpleTestRunnerSource, mutation.mutatedSource ]
+                                    , sourceOverrides = [ simpleTestRunnerSource, Mutator.writeFile mutation.mutatedFile ]
                                     }
                                     Cache.succeed
                                 )
