@@ -101,7 +101,7 @@ task config =
             (BackendTask.Extra.timed "Loading sources" "Loaded sources"
                 (ProjectSources.loadProjectSources
                     { projectDir = Path.path "."
-                    , userSourceDirectories = "src" :: config.sourceDirs
+                    , userSourceDirectories = "src" :: "tests" :: config.sourceDirs
                     , targetFile = config.testFile
                     , skipPackages = kernelPackages
                     }
@@ -232,7 +232,7 @@ task config =
                 ++ "ms/mutation)"
             )
         <| \_ ->
-        displayMutationReport results
+        displayMutationReport mutateSource config.mutateFile results
 
 
 {-| Generate a wrapper module that bridges SimpleTestRunner and the user's test module.
@@ -321,8 +321,8 @@ runMutation projectEnv wrapperSource mutation =
             ErrorResult { mutation = mutation, error = "Eval error" }
 
 
-displayMutationReport : List MutationResult -> BackendTask FatalError ()
-displayMutationReport results =
+displayMutationReport : String -> String -> List MutationResult -> BackendTask FatalError ()
+displayMutationReport sourceCode filePath results =
     let
         killed =
             List.filter isKilled results
@@ -366,7 +366,16 @@ displayMutationReport results =
                 Survived { mutation } ->
                     Script.log
                         (Ansi.Color.fontColor Ansi.Color.red
-                            ("  ✗ Survived: " ++ mutation.description ++ " (line " ++ String.fromInt mutation.line ++ ")")
+                            ("  ✗ Survived: "
+                                ++ mutation.description
+                                ++ " ("
+                                ++ filePath
+                                ++ ":"
+                                ++ String.fromInt mutation.line
+                                ++ ")"
+                            )
+                            ++ "\n"
+                            ++ sourceContext sourceCode mutation.line
                         )
 
                 _ ->
@@ -410,7 +419,24 @@ displayMutationReport results =
             )
         )
     <| \_ ->
-    Do.noop
+    if List.isEmpty survived && List.isEmpty errors then
+        Do.noop
+
+    else
+        BackendTask.fail
+            (FatalError.build
+                { title = "Mutation testing incomplete"
+                , body =
+                    String.fromInt (List.length survived)
+                        ++ " surviving mutant(s)"
+                        ++ (if List.isEmpty errors then
+                                ""
+
+                            else
+                                ", " ++ String.fromInt (List.length errors) ++ " error(s)"
+                           )
+                }
+            )
 
 
 isKilled : MutationResult -> Bool
@@ -482,6 +508,47 @@ simpleTestRunnerSource =
         , "    in"
         , "    { passed = passed, label = labelPath, message = if passed then \"\" else String.join \"; \" failures }"
         ]
+
+
+{-| Show 1 line of context around the mutation line, with line numbers.
+-}
+sourceContext : String -> Int -> String
+sourceContext source line =
+    let
+        lines =
+            String.lines source
+
+        getLine n =
+            lines
+                |> List.drop (n - 1)
+                |> List.head
+                |> Maybe.withDefault ""
+
+        pad n =
+            let
+                s =
+                    String.fromInt n
+            in
+            String.repeat (4 - String.length s) " " ++ s
+
+        showLine n =
+            if n >= 1 && n <= List.length lines then
+                let
+                    prefix =
+                        if n == line then
+                            Ansi.Color.fontColor Ansi.Color.red ("  > " ++ pad n ++ " | ")
+
+                        else
+                            "    " ++ pad n ++ " | "
+                in
+                prefix ++ getLine n
+
+            else
+                ""
+    in
+    [ showLine (line - 1), showLine line, showLine (line + 1) ]
+        |> List.filter (not << String.isEmpty)
+        |> String.join "\n"
 
 
 {-| Packages with kernel/native JS code that the interpreter can't handle.
