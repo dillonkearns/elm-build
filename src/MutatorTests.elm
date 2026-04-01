@@ -965,6 +965,54 @@ suite =
                         _ ->
                             Expect.fail ("Expected 1 removePipelineStep, got " ++ String.fromInt (List.length mutations))
             ]
+        , describe "removeRecordUpdate"
+            [ test "removes a field from a record update" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nupdate r =\n    { r | x = 1, y = 2 }"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeRecordUpdate")
+                    in
+                    -- Should generate 2 mutations: remove x update, remove y update
+                    List.length mutations
+                        |> Expect.equal 2
+            , test "removing first field keeps second" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nupdate r =\n    { r | x = 1, y = 2 }"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeRecordUpdate")
+                    in
+                    case mutations of
+                        first :: _ ->
+                            let
+                                applied =
+                                    Mutator.applyMutation source first
+                            in
+                            (String.contains "y = 2" applied && not (String.contains "x = 1" applied))
+                                |> Expect.equal True
+
+                        [] ->
+                            Expect.fail "Expected at least 1 removeRecordUpdate"
+            , test "does not generate for single-field update" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nupdate r =\n    { r | x = 1 }"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeRecordUpdate")
+                    in
+                    List.length mutations
+                        |> Expect.equal 0
+            ]
         , describe "swapCaseBranches"
             [ test "swaps bodies of adjacent case branches" <|
                 \_ ->

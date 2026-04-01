@@ -479,6 +479,13 @@ findMutationsInExpression source file declIndex path (Node range expr) =
                     else
                         []
 
+                RecordUpdateExpression recordName setters ->
+                    if List.length setters >= 2 then
+                        removeRecordUpdateMutations source recordName setters range file declIndex path
+
+                    else
+                        []
+
                 CaseExpression caseBlock ->
                     if List.length caseBlock.cases >= 2 then
                         swapCaseBranchMutations source caseBlock range file declIndex path
@@ -856,6 +863,54 @@ removeListElementMutations source elements range file declIndex path =
         [ removeAt 0 "first"
         , removeAt lastIndex "last"
         ]
+
+
+{-| Generate mutations that remove individual field updates from a record update.
+`{ r | x = 1, y = 2 }` generates two mutations: one keeping only y, one keeping only x.
+Tests whether each field update is actually needed.
+-}
+removeRecordUpdateMutations : String -> Node String -> List (Node ( Node String, Node Expression )) -> Range -> File -> Int -> List Int -> List Mutation
+removeRecordUpdateMutations source recordName setters range file declIndex path =
+    let
+        setterCount =
+            List.length setters
+    in
+    List.indexedMap
+        (\index (Node _ ( Node fieldNameRange fieldName, _ )) ->
+            let
+                remaining =
+                    setters
+                        |> List.indexedMap Tuple.pair
+                        |> List.filter (\( i, _ ) -> i /= index)
+                        |> List.map Tuple.second
+
+                newExpr =
+                    Node range (RecordUpdateExpression recordName remaining)
+
+                -- Build splice text: { recordName | field1 = val1, field2 = val2 }
+                remainingTexts =
+                    remaining
+                        |> List.map
+                            (\(Node setterRange _) ->
+                                extractSourceRange source setterRange
+                            )
+
+                recName =
+                    Node.value recordName
+
+                recordText =
+                    "{ " ++ recName ++ " | " ++ String.join ", " remainingTexts ++ " }"
+            in
+            { line = range.start.row
+            , column = range.start.column
+            , operator = "removeRecordUpdate"
+            , description = "Removed `" ++ fieldName ++ "` field update from record"
+            , mutatedFile = replaceExpression file declIndex path newExpr
+            , spliceRange = range
+            , spliceText = recordText
+            }
+        )
+        setters
 
 
 {-| Generate mutations that swap bodies of adjacent case branches.
