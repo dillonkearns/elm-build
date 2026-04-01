@@ -125,18 +125,24 @@ findMutationsInExpression source (Node range expr) =
                 IfBlock (Node condRange condExpr) (Node thenRange _) (Node elseRange _) ->
                     [ negateCondition source condRange condExpr
                     , dropElseBranch source thenRange elseRange
+                    , conditionalToConstant source condRange "True" "conditionalTrue"
+                    , conditionalToConstant source condRange "False" "conditionalFalse"
                     ]
 
                 OperatorApplication op _ left right ->
                     (comparisonSwaps op
                         |> List.map (operatorMutation "swapComparison" source left right op)
                     )
+                        ++ (comparisonNegations op
+                                |> List.map (operatorMutation "negateComparison" source left right op)
+                           )
                         ++ (arithmeticSwaps op
                                 |> List.map (operatorMutation "replaceArithmetic" source left right op)
                            )
                         ++ (logicalSwaps op
                                 |> List.map (operatorMutation "swapLogicalOperator" source left right op)
                            )
+                        ++ concatRemoval source range op left right
 
                 FunctionOrValue [] "True" ->
                     [ swapBooleanLiteral source range "True" "False" ]
@@ -150,18 +156,30 @@ findMutationsInExpression source (Node range expr) =
                 Literal s ->
                     [ replaceStringLiteral source range s ]
 
+                Application ((Node _ (FunctionOrValue [] "not")) :: (Node argRange _) :: []) ->
+                    [ removeNot source range argRange ]
+
                 Application ((Node _ (FunctionOrValue [] "Just")) :: _) ->
                     [ replaceWithNothing source range ]
 
                 Application ((Node _ (FunctionOrValue [ "Maybe" ] "Just")) :: _) ->
                     [ replaceWithNothing source range ]
 
-                ListExpr elements ->
-                    if List.length elements >= 2 then
-                        removeListElements source range elements
+                Negation (Node innerRange _) ->
+                    [ removeNegation source range innerRange ]
 
-                    else
+                ListExpr elements ->
+                    let
+                        elementCount =
+                            List.length elements
+                    in
+                    (if elementCount >= 2 then
+                        removeListElements source range elements
+                            ++ [ emptyList source range ]
+
+                     else
                         []
+                    )
 
                 _ ->
                     []
@@ -305,6 +323,94 @@ removeListElements source listRange elements =
             }
         )
         elements
+
+
+conditionalToConstant : String -> Range -> String -> String -> Mutation
+conditionalToConstant source condRange replacement operatorName =
+    { line = condRange.start.row
+    , column = condRange.start.column
+    , operator = operatorName
+    , description = "Replaced condition with `" ++ replacement ++ "`"
+    , mutatedSource = replaceRange source condRange replacement
+    }
+
+
+concatRemoval : String -> Range -> String -> Node Expression -> Node Expression -> List Mutation
+concatRemoval source fullRange op (Node leftRange _) (Node rightRange _) =
+    if op == "++" then
+        [ { line = fullRange.start.row
+          , column = fullRange.start.column
+          , operator = "concatRemoval"
+          , description = "Kept only left side of `++`"
+          , mutatedSource = replaceRange source fullRange (extractRange source leftRange)
+          }
+        , { line = fullRange.start.row
+          , column = fullRange.start.column
+          , operator = "concatRemoval"
+          , description = "Kept only right side of `++`"
+          , mutatedSource = replaceRange source fullRange (extractRange source rightRange)
+          }
+        ]
+
+    else
+        []
+
+
+comparisonNegations : String -> List String
+comparisonNegations op =
+    case op of
+        "<" ->
+            [ ">=" ]
+
+        "<=" ->
+            [ ">" ]
+
+        ">" ->
+            [ "<=" ]
+
+        ">=" ->
+            [ "<" ]
+
+        _ ->
+            []
+
+
+removeNot : String -> Range -> Range -> Mutation
+removeNot source applicationRange argRange =
+    let
+        argText =
+            extractRange source argRange
+    in
+    { line = applicationRange.start.row
+    , column = applicationRange.start.column
+    , operator = "removeNot"
+    , description = "Removed `not` call"
+    , mutatedSource = replaceRange source applicationRange argText
+    }
+
+
+removeNegation : String -> Range -> Range -> Mutation
+removeNegation source negationRange innerRange =
+    let
+        innerText =
+            extractRange source innerRange
+    in
+    { line = negationRange.start.row
+    , column = negationRange.start.column
+    , operator = "removeNegation"
+    , description = "Removed unary negation"
+    , mutatedSource = replaceRange source negationRange innerText
+    }
+
+
+emptyList : String -> Range -> Mutation
+emptyList source range =
+    { line = range.start.row
+    , column = range.start.column
+    , operator = "emptyList"
+    , description = "Replaced list with `[]`"
+    , mutatedSource = replaceRange source range "[]"
+    }
 
 
 logicalSwaps : String -> List String

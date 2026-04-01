@@ -379,6 +379,217 @@ suite =
                         _ ->
                             Expect.fail ("Expected 1 dropElseBranch, got " ++ String.fromInt (List.length mutations))
             ]
+        , describe "fullComparisonNegation"
+            [ test "negates < to >=" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo a b =\n    a < b"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "negateComparison" && String.contains ">=" m.description)
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "a >= b"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 negateComparison >=, got " ++ String.fromInt (List.length mutations))
+            , test "negates > to <=" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo a b =\n    a > b"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "negateComparison" && String.contains "<=" m.description)
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "a <= b"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 negateComparison <=, got " ++ String.fromInt (List.length mutations))
+            ]
+        , describe "removeNot"
+            [ test "removes not from function call" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    not x"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeNot")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            -- "not x" should become just "x"
+                            (m.mutatedSource |> String.contains "    not x")
+                                |> Expect.equal False
+
+                        _ ->
+                            Expect.fail ("Expected 1 removeNot, got " ++ String.fromInt (List.length mutations))
+            , test "removes not with parens" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    not (x > 0)"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeNot")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "    (x > 0)"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 removeNot, got " ++ String.fromInt (List.length mutations))
+            ]
+        , describe "removeNegation"
+            [ test "removes unary minus" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    -x"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeNegation")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            -- "-x" should become "x"
+                            (m.mutatedSource |> String.contains "    -x")
+                                |> Expect.equal False
+
+                        _ ->
+                            Expect.fail ("Expected 1 removeNegation, got " ++ String.fromInt (List.length mutations))
+            ]
+        , describe "emptyList"
+            [ test "replaces list with empty" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    [ 1, 2, 3 ]"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "emptyList")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "    []"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 emptyList, got " ++ String.fromInt (List.length mutations))
+            , test "does not generate for empty list" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    []"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "emptyList")
+                    in
+                    List.length mutations
+                        |> Expect.equal 0
+            , test "does not generate for single-element list" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    [ 1 ]"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "emptyList")
+                    in
+                    List.length mutations
+                        |> Expect.equal 0
+            ]
+        , describe "concatRemoval"
+            [ test "replaces a ++ b with a" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo a b =\n    a ++ b"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "concatRemoval")
+                    in
+                    -- Should produce 2: keep left, keep right
+                    List.length mutations
+                        |> Expect.equal 2
+            , test "first keeps left side" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    \"hello\" ++ \" world\""
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "concatRemoval" && String.contains "left" m.description)
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "    \"hello\""
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 concatRemoval left, got " ++ String.fromInt (List.length mutations))
+            ]
+        , describe "conditionalToConstant"
+            [ test "replaces condition with True" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    if x > 0 then\n        \"yes\"\n    else\n        \"no\""
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "conditionalTrue")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "if True then"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 conditionalTrue, got " ++ String.fromInt (List.length mutations))
+            , test "replaces condition with False" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    if x > 0 then\n        \"yes\"\n    else\n        \"no\""
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "conditionalFalse")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "if False then"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 conditionalFalse, got " ++ String.fromInt (List.length mutations))
+            ]
         , describe "parse failure"
             [ test "returns empty list for invalid source" <|
                 \_ ->

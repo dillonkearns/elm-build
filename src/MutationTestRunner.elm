@@ -43,6 +43,9 @@ type alias Config =
     , sourceDirs : List String
     , buildDirectory : Path
     , verbose : Bool
+    , breakThreshold : Maybe Int
+    , excludeOperators : List String
+    , onlyOperators : List String
     }
 
 
@@ -78,6 +81,21 @@ programConfig =
                 |> OptionsParser.with
                     (Option.flag "verbose"
                         |> Option.withDescription "Show killed mutants (default: only show survivors)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "break"
+                        |> Option.map (Maybe.andThen String.toInt)
+                        |> Option.withDescription "Fail if mutation score is below this percentage"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "exclude"
+                        |> Option.map (Maybe.map (String.split ",") >> Maybe.withDefault [])
+                        |> Option.withDescription "Exclude mutation operators (comma-separated)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "only"
+                        |> Option.map (Maybe.map (String.split ",") >> Maybe.withDefault [])
+                        |> Option.withDescription "Only run these mutation operators (comma-separated)"
                     )
             )
 
@@ -209,15 +227,20 @@ task config =
         Do.allowFatal (File.rawFile config.mutateFile) <| \mutateSource ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Generating mutations for " ++ config.mutateFile)) <| \_ ->
         let
+            allMutations : List Mutation
+            allMutations =
+                Mutator.generateMutations mutateSource
+
             mutations : List Mutation
             mutations =
-                Mutator.generateMutations mutateSource
+                allMutations
+                    |> filterMutations config
 
             mutationCount : Int
             mutationCount =
                 List.length mutations
         in
-        Do.log ("Found " ++ String.fromInt mutationCount ++ " mutations") <| \_ ->
+        Do.log ("Found " ++ String.fromInt mutationCount ++ " mutations" ++ (if List.length allMutations /= mutationCount then " (filtered from " ++ String.fromInt (List.length allMutations) ++ ")" else "")) <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Running mutation tests via interpreter (cached)") <| \_ ->
         Do.do BackendTask.Time.now <| \startTime ->
@@ -267,7 +290,26 @@ task config =
                 ++ "ms/mutation)"
             )
         <| \_ ->
-        displayMutationReport config.verbose mutateSource config.mutateFile results
+        displayMutationReport config mutateSource config.mutateFile results
+
+
+filterMutations : Config -> List Mutation -> List Mutation
+filterMutations config mutations =
+    mutations
+        |> (\ms ->
+                if List.isEmpty config.onlyOperators then
+                    ms
+
+                else
+                    List.filter (\m -> List.member m.operator config.onlyOperators) ms
+           )
+        |> (\ms ->
+                if List.isEmpty config.excludeOperators then
+                    ms
+
+                else
+                    List.filter (\m -> not (List.member m.operator config.excludeOperators)) ms
+           )
 
 
 parseMutationResult : Mutation -> String -> MutationResult
@@ -299,8 +341,8 @@ type MutationResult
     | ErrorResult { mutation : Mutation, error : String }
 
 
-displayMutationReport : Bool -> String -> String -> List MutationResult -> BackendTask FatalError ()
-displayMutationReport verbose sourceCode filePath results =
+displayMutationReport : Config -> String -> String -> List MutationResult -> BackendTask FatalError ()
+displayMutationReport config sourceCode filePath results =
     let
         killed =
             List.filter isKilled results
@@ -326,7 +368,7 @@ displayMutationReport verbose sourceCode filePath results =
                 String.fromInt (round pct) ++ "%"
     in
     Do.do
-        (if verbose then
+        (if config.verbose then
             Do.each killed
                 (\r ->
                     case r of
@@ -404,24 +446,42 @@ displayMutationReport verbose sourceCode filePath results =
             )
         )
     <| \_ ->
-    if List.isEmpty survived && List.isEmpty errors then
-        Do.noop
+    let
+        scoreInt =
+            if total == 0 then
+                100
 
-    else
+            else
+                round (toFloat (List.length killed) / toFloat total * 100)
+
+        shouldFail =
+            case config.breakThreshold of
+                Just threshold ->
+                    scoreInt < threshold
+
+                Nothing ->
+                    not (List.isEmpty survived) || not (List.isEmpty errors)
+    in
+    if shouldFail then
         BackendTask.fail
             (FatalError.build
                 { title = "Mutation testing incomplete"
                 , body =
-                    String.fromInt (List.length survived)
-                        ++ " surviving mutant(s)"
-                        ++ (if List.isEmpty errors then
-                                ""
+                    "Score: "
+                        ++ String.fromInt scoreInt
+                        ++ "%"
+                        ++ (case config.breakThreshold of
+                                Just threshold ->
+                                    " (threshold: " ++ String.fromInt threshold ++ "%)"
 
-                            else
-                                ", " ++ String.fromInt (List.length errors) ++ " error(s)"
+                                Nothing ->
+                                    ""
                            )
                 }
             )
+
+    else
+        Do.noop
 
 
 isKilled : MutationResult -> Bool
