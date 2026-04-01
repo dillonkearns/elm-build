@@ -1077,6 +1077,76 @@ suite =
                     List.length mutations
                         |> Expect.atLeast 1
             ]
+        , describe "no-op mutations"
+            [ test "no mutation should ever produce identical replacement text" <|
+                \_ ->
+                    let
+                        sources =
+                            [ -- Case with duplicate branches
+                              String.join "\n"
+                                [ "module Foo exposing (..)"
+                                , ""
+                                , "isGood x ="
+                                , "    case x of"
+                                , "        A ->"
+                                , "            True"
+                                , ""
+                                , "        B ->"
+                                , "            True"
+                                , ""
+                                , "        _ ->"
+                                , "            False"
+                                ]
+
+                            -- Function with various operators
+                            , String.join "\n"
+                                [ "module Bar exposing (..)"
+                                , ""
+                                , "compute : Int -> Int -> Bool"
+                                , "compute a b ="
+                                , "    if a > b then"
+                                , "        a + b"
+                                , "    else"
+                                , "        a - b"
+                                ]
+
+                            -- Pipeline and concat
+                            , String.join "\n"
+                                [ "module Baz exposing (..)"
+                                , ""
+                                , "process x ="
+                                , "    x |> String.toUpper |> String.reverse"
+                                , ""
+                                , "greeting name ="
+                                , "    \"Hello \" ++ name"
+                                ]
+                            ]
+
+                        allNoOps =
+                            sources
+                                |> List.concatMap
+                                    (\source ->
+                                        Mutator.generateMutations source
+                                            |> List.filterMap
+                                                (\m ->
+                                                    let
+                                                        originalText =
+                                                            Mutator.extractOriginalText source m
+                                                    in
+                                                    if originalText == m.spliceText then
+                                                        Just (m.operator ++ ": " ++ m.description ++ " [" ++ m.spliceText ++ "]")
+
+                                                    else
+                                                        Nothing
+                                                )
+                                    )
+                    in
+                    if List.isEmpty allNoOps then
+                        Expect.pass
+
+                    else
+                        Expect.fail ("Found no-op mutations:\n" ++ String.join "\n" allNoOps)
+            ]
         , describe "parse failure"
             [ test "returns empty list for invalid source" <|
                 \_ ->

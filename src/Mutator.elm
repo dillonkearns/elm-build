@@ -1,4 +1,4 @@
-module Mutator exposing (Mutation, applyMutation, generateMutations, generateMutationsFromFile, hashKey, writeFile)
+module Mutator exposing (Mutation, applyMutation, extractOriginalText, generateMutations, generateMutationsFromFile, hashKey, writeFile)
 
 {-| Mutation generator for Elm source code.
 
@@ -81,6 +81,14 @@ hashKey mutation =
         ++ String.fromInt mutation.spliceRange.end.column
         ++ "|"
         ++ mutation.spliceText
+
+
+{-| Extract the original text at a mutation's splice range from the source.
+Useful for detecting no-op mutations (where replacement equals original).
+-}
+extractOriginalText : String -> Mutation -> String
+extractOriginalText source mutation =
+    extractSourceRange source mutation.spliceRange
 
 
 {-| Apply a mutation to the original source by splicing the replacement
