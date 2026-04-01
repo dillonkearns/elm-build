@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, getPackageEnv, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithSourceOverrides, getPackageEnv, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -234,42 +234,42 @@ loadWith config =
                                                                         topoSortModules moduleGraph
                                                                             (Set.filter (\name -> Set.member name pkgModuleNames) reachableModules)
 
-                                                                    pkgEnv : Eval.Module.ProjectEnv
-                                                                    pkgEnv =
-                                                                        case Eval.Module.buildProjectEnv reachablePackageSources of
-                                                                            Ok env ->
-                                                                                env
-
-                                                                            Err _ ->
-                                                                                Debug.todo "loadWith: buildProjectEnv for package sources failed"
+                                                                    pkgEnvResult : Result Types.Error Eval.Module.ProjectEnv
+                                                                    pkgEnvResult =
+                                                                        Eval.Module.buildProjectEnv reachablePackageSources
                                                                 in
-                                                                Cache.inputs allUserPaths
-                                                                    |> BackendTask.map
-                                                                        (\sourceInputs ->
-                                                                            InterpreterProject
-                                                                                { sourceDirectories = sourceDirectories
-                                                                                , inputsByPath =
-                                                                                    sourceInputs
-                                                                                        |> List.map
-                                                                                            (\( pathVal, monad ) ->
-                                                                                                ( Path.toString pathVal
-                                                                                                , ( pathVal, monad )
-                                                                                                )
-                                                                                            )
-                                                                                        |> Dict.fromList
-                                                                                , userFileContents =
-                                                                                    userFileContents
-                                                                                        |> Dict.fromList
-                                                                                , depGraph = depGraph
-                                                                                , patchedPackageSources = patchedPackageSources
-                                                                                , extraSources =
-                                                                                    extraFileContents
-                                                                                        |> List.map Tuple.second
-                                                                                , moduleGraph = moduleGraph
-                                                                                , packageModuleNames = pkgModuleNames
-                                                                                , packageEnv = pkgEnv
-                                                                                }
-                                                                        )
+                                                                case pkgEnvResult of
+                                                                    Err _ ->
+                                                                        BackendTask.fail (FatalError.fromString "Failed to build package environment")
+
+                                                                    Ok pkgEnv ->
+                                                                        Cache.inputs allUserPaths
+                                                                            |> BackendTask.map
+                                                                                (\sourceInputs ->
+                                                                                    InterpreterProject
+                                                                                        { sourceDirectories = sourceDirectories
+                                                                                        , inputsByPath =
+                                                                                            sourceInputs
+                                                                                                |> List.map
+                                                                                                    (\( pathVal, monad ) ->
+                                                                                                        ( Path.toString pathVal
+                                                                                                        , ( pathVal, monad )
+                                                                                                        )
+                                                                                                    )
+                                                                                                |> Dict.fromList
+                                                                                        , userFileContents =
+                                                                                            userFileContents
+                                                                                                |> Dict.fromList
+                                                                                        , depGraph = depGraph
+                                                                                        , patchedPackageSources = patchedPackageSources
+                                                                                        , extraSources =
+                                                                                            extraFileContents
+                                                                                                |> List.map Tuple.second
+                                                                                        , moduleGraph = moduleGraph
+                                                                                        , packageModuleNames = pkgModuleNames
+                                                                                        , packageEnv = pkgEnv
+                                                                                        }
+                                                                                )
                                                             )
                                                 )
                                     )
@@ -426,23 +426,148 @@ evalWith (InterpreterProject project) { imports, expression } k =
                     s
 
                 Ok other ->
-                    "ERROR: Expected String result, got: " ++ Debug.toString other
+                    "ERROR: Expected String result"
 
-                Err (Types.ParsingError deadEnds) ->
-                    "ERROR: Parsing error: " ++ Debug.toString deadEnds
+                Err (Types.ParsingError _) ->
+                    "ERROR: Parsing error"
 
                 Err (Types.EvalError evalErr) ->
                     "ERROR: Eval error: "
-                        ++ Debug.toString evalErr.error
-                        ++ "\nCall stack:\n - "
-                        ++ String.join "\n - "
-                            (List.map
-                                (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name)
-                                (List.reverse evalErr.callStack)
-                            )
+                        ++ evalErrorKindToString evalErr.error
         )
         k
 
+
+
+{-| Evaluate an expression with source overrides.
+
+Like `evalWith`, but allows overriding specific module sources before
+evaluation. Override sources take precedence over existing modules with
+the same name. Useful for mutation testing, where you want to evaluate
+the same expression with a modified version of one module.
+
+The cache key includes the override source hashes, so each unique
+mutation gets its own cached result.
+
+-}
+evalWithSourceOverrides : InterpreterProject -> { imports : List String, expression : String, sourceOverrides : List String } -> (FileOrDirectory -> Cache.Monad a) -> Cache.Monad a
+evalWithSourceOverrides (InterpreterProject project) { imports, expression, sourceOverrides } k =
+    let
+        transDeps : Set String
+        transDeps =
+            imports
+                |> List.filterMap (DepGraph.moduleNameToFilePath project.depGraph)
+                |> List.map (DepGraph.transitiveDeps project.depGraph)
+                |> List.foldl Set.union Set.empty
+
+        relevantInputs : List ( String, Cache.Monad FileOrDirectory )
+        relevantInputs =
+            project.inputsByPath
+                |> Dict.toList
+                |> List.filter (\( path, _ ) -> Set.member path transDeps)
+                |> List.map (\( path, ( _, monad ) ) -> ( path, monad ))
+
+        wrapperSource : String
+        wrapperSource =
+            generateWrapper imports expression
+
+        wrapperImports : Set String
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules : Set String
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        filteredSources : List String
+        filteredSources =
+            topoSortModules project.moduleGraph neededModules
+
+        userFilteredSources : List String
+        userFilteredSources =
+            filteredSources
+                |> List.filter
+                    (\src ->
+                        case DepGraph.parseModuleName src of
+                            Just name ->
+                                not (Set.member name project.packageModuleNames)
+
+                            Nothing ->
+                                True
+                    )
+
+        -- Include overrides in the content blob for hashing
+        allFilteredSources : List String
+        allFilteredSources =
+            filteredSources ++ sourceOverrides ++ [ wrapperSource ]
+
+        filteredBlob : String
+        filteredBlob =
+            String.join "\n---MODULE_SEPARATOR---\n" allFilteredSources
+    in
+    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <| \filteredHash ->
+    Cache.do
+        (relevantInputs
+            |> List.map
+                (\( path, monad ) ->
+                    Cache.do monad <| \hash ->
+                    Cache.succeed { filename = Path.path path, hash = hash }
+                )
+            |> Cache.sequence
+        )
+    <| \sourceFiles ->
+    Cache.do
+        (Cache.combine
+            (sourceFiles
+                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash } ]
+            )
+        )
+    <| \combinedHash ->
+    Cache.compute [ "interpret-with-overrides" ]
+        combinedHash
+        (\() ->
+            let
+                -- User sources first, then overrides (which replace same-named
+                -- modules since evalWithEnv processes in order, last wins).
+                -- Wrapper goes last for import resolution.
+                result : Result Types.Error Types.Value
+                result =
+                    Eval.Module.evalWithEnv
+                        project.packageEnv
+                        (userFilteredSources ++ sourceOverrides ++ [ wrapperSource ])
+                        (FunctionOrValue [] "results")
+            in
+            case result of
+                Ok (Types.String s) ->
+                    s
+
+                Ok _ ->
+                    "ERROR: Expected String result"
+
+                Err (Types.ParsingError _) ->
+                    "ERROR: Parsing error"
+
+                Err (Types.EvalError evalErr) ->
+                    "ERROR: Eval error: "
+                        ++ evalErrorKindToString evalErr.error
+        )
+        k
+
+
+evalErrorKindToString : Types.EvalErrorKind -> String
+evalErrorKindToString kind =
+    case kind of
+        Types.TypeError msg ->
+            "type error: " ++ msg
+
+        Types.Unsupported msg ->
+            "unsupported: " ++ msg
+
+        Types.NameError name ->
+            "could not resolve '" ++ name ++ "'"
+
+        Types.Todo msg ->
+            "hit Debug.todo: " ++ msg
 
 
 {-| Get the pre-built package environment. Useful for direct eval calls

@@ -183,12 +183,12 @@ If the interpreter returns a String result, the value is a Test.
 This is 100% accurate — no heuristics, no type annotation needed.
 
 -}
-discoverTestValuesViaInterpreter : Eval.Module.ProjectEnv -> String -> List String -> List String
-discoverTestValuesViaInterpreter projectEnv testModuleName candidateNames =
+discoverTestValuesViaInterpreter : Eval.Module.ProjectEnv -> String -> List String -> List String -> List String
+discoverTestValuesViaInterpreter projectEnv testModuleName candidateNames extraSources =
     candidateNames
         |> List.filter
             (\name ->
-                case probeCandidate projectEnv testModuleName name of
+                case probeCandidate projectEnv testModuleName name extraSources of
                     Ok _ ->
                         True
 
@@ -202,8 +202,8 @@ discoverTestValuesViaInterpreter projectEnv testModuleName candidateNames =
 Returns Ok if it's a Test (with the result string), or Err with a reason why not.
 
 -}
-probeCandidate : Eval.Module.ProjectEnv -> String -> String -> Result String String
-probeCandidate projectEnv testModuleName name =
+probeCandidate : Eval.Module.ProjectEnv -> String -> String -> List String -> Result String String
+probeCandidate projectEnv testModuleName name extraSources =
     let
         probeWrapper =
             String.join "\n"
@@ -220,7 +220,7 @@ probeCandidate projectEnv testModuleName name =
         result =
             Eval.Module.evalWithEnv
                 projectEnv
-                [ probeWrapper ]
+                (extraSources ++ [ probeWrapper ])
                 (Elm.Syntax.Expression.FunctionOrValue [] "probe__")
     in
     case result of
