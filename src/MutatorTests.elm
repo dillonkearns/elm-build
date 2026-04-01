@@ -257,6 +257,128 @@ suite =
                         _ ->
                             Expect.fail ("Expected 1 replaceStringLiteral, got " ++ String.fromInt (List.length mutations))
             ]
+        , describe "removeListElement"
+            [ test "removes an element from a 3-element list" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    [ 1, 2, 3 ]"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeListElement")
+                    in
+                    -- Should generate 3 mutations: remove each element
+                    List.length mutations
+                        |> Expect.equal 3
+            , test "first removal drops the first element" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    [ 1, 2, 3 ]"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeListElement")
+                    in
+                    case mutations of
+                        first :: _ ->
+                            first.mutatedSource
+                                |> String.contains "[ 2, 3 ]"
+                                |> Expect.equal True
+
+                        [] ->
+                            Expect.fail "Expected at least 1 removeListElement"
+            , test "does not generate for single-element list" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    [ 1 ]"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeListElement")
+                    in
+                    List.length mutations
+                        |> Expect.equal 0
+            , test "does not generate for empty list" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    []"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeListElement")
+                    in
+                    List.length mutations
+                        |> Expect.equal 0
+            ]
+        , describe "replaceWithNothing"
+            [ test "replaces Just x with Nothing" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    Just 42"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "replaceWithNothing")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "Nothing"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 replaceWithNothing, got " ++ String.fromInt (List.length mutations))
+            , test "replaces Just with a complex argument" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    Just (x + 1)"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "replaceWithNothing")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            m.mutatedSource
+                                |> String.contains "Nothing"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 replaceWithNothing, got " ++ String.fromInt (List.length mutations))
+            ]
+        , describe "dropElseBranch"
+            [ test "replaces else branch with then branch" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    if x then\n        \"yes\"\n    else\n        \"no\""
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "dropElseBranch")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            -- The else branch "no" should be replaced with the then branch "yes"
+                            let
+                                lines =
+                                    String.lines m.mutatedSource
+                            in
+                            -- Both the then and else branches should now say "yes"
+                            lines
+                                |> List.filter (String.contains "\"yes\"")
+                                |> List.length
+                                |> Expect.equal 2
+
+                        _ ->
+                            Expect.fail ("Expected 1 dropElseBranch, got " ++ String.fromInt (List.length mutations))
+            ]
         , describe "parse failure"
             [ test "returns empty list for invalid source" <|
                 \_ ->

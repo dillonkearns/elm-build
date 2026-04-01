@@ -122,8 +122,10 @@ findMutationsInExpression source (Node range expr) =
         thisMutation : List Mutation
         thisMutation =
             case expr of
-                IfBlock (Node condRange condExpr) _ _ ->
-                    [ negateCondition source condRange condExpr ]
+                IfBlock (Node condRange condExpr) (Node thenRange _) (Node elseRange _) ->
+                    [ negateCondition source condRange condExpr
+                    , dropElseBranch source thenRange elseRange
+                    ]
 
                 OperatorApplication op _ left right ->
                     (comparisonSwaps op
@@ -147,6 +149,19 @@ findMutationsInExpression source (Node range expr) =
 
                 Literal s ->
                     [ replaceStringLiteral source range s ]
+
+                Application ((Node _ (FunctionOrValue [] "Just")) :: _) ->
+                    [ replaceWithNothing source range ]
+
+                Application ((Node _ (FunctionOrValue [ "Maybe" ] "Just")) :: _) ->
+                    [ replaceWithNothing source range ]
+
+                ListExpr elements ->
+                    if List.length elements >= 2 then
+                        removeListElements source range elements
+
+                    else
+                        []
 
                 _ ->
                     []
@@ -238,6 +253,58 @@ swapBooleanLiteral source range oldVal newVal =
     , description = "Changed `" ++ oldVal ++ "` to `" ++ newVal ++ "`"
     , mutatedSource = replaceRange source range newVal
     }
+
+
+dropElseBranch : String -> Range -> Range -> Mutation
+dropElseBranch source thenRange elseRange =
+    let
+        thenText =
+            extractRange source thenRange
+    in
+    { line = elseRange.start.row
+    , column = elseRange.start.column
+    , operator = "dropElseBranch"
+    , description = "Replaced else branch with then branch"
+    , mutatedSource = replaceRange source elseRange thenText
+    }
+
+
+replaceWithNothing : String -> Range -> Mutation
+replaceWithNothing source range =
+    { line = range.start.row
+    , column = range.start.column
+    , operator = "replaceWithNothing"
+    , description = "Changed `" ++ extractRange source range ++ "` to `Nothing`"
+    , mutatedSource = replaceRange source range "Nothing"
+    }
+
+
+removeListElements : String -> Range -> List (Node Expression) -> List Mutation
+removeListElements source listRange elements =
+    let
+        elementCount =
+            List.length elements
+    in
+    List.indexedMap
+        (\index _ ->
+            let
+                -- Rebuild the list without the element at this index
+                remaining =
+                    List.indexedMap Tuple.pair elements
+                        |> List.filter (\( i, _ ) -> i /= index)
+                        |> List.map (\( _, Node r _ ) -> extractRange source r)
+
+                replacement =
+                    "[ " ++ String.join ", " remaining ++ " ]"
+            in
+            { line = listRange.start.row
+            , column = listRange.start.column
+            , operator = "removeListElement"
+            , description = "Removed element " ++ String.fromInt (index + 1) ++ " of " ++ String.fromInt elementCount ++ " from list"
+            , mutatedSource = replaceRange source listRange replacement
+            }
+        )
+        elements
 
 
 logicalSwaps : String -> List String
