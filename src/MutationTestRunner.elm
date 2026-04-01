@@ -46,6 +46,7 @@ type alias Config =
     , testFile : Maybe String
     , suiteName : String
     , sourceDirs : List String
+    , verbose : Bool
     }
 
 
@@ -72,6 +73,10 @@ programConfig =
                     (Option.optionalKeywordArg "source-dirs"
                         |> Option.map (Maybe.map (String.split ",") >> Maybe.withDefault [])
                         |> Option.withDescription "Extra source directories (comma-separated)"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "verbose"
+                        |> Option.withDescription "Show killed mutants (default: only show survivors)"
                     )
             )
 
@@ -234,7 +239,7 @@ task config =
                 ++ "ms/mutation)"
             )
         <| \_ ->
-        displayMutationReport mutateSource config.mutateFile results
+        displayMutationReport config.verbose mutateSource config.mutateFile results
 
 
 {-| Generate a wrapper module that bridges SimpleTestRunner and the user's test module.
@@ -323,8 +328,8 @@ runMutation projectEnv wrapperSource mutation =
             ErrorResult { mutation = mutation, error = "Eval error" }
 
 
-displayMutationReport : String -> String -> List MutationResult -> BackendTask FatalError ()
-displayMutationReport sourceCode filePath results =
+displayMutationReport : Bool -> String -> String -> List MutationResult -> BackendTask FatalError ()
+displayMutationReport verbose sourceCode filePath results =
     let
         killed =
             List.filter isKilled results
@@ -349,17 +354,24 @@ displayMutationReport sourceCode filePath results =
                 in
                 String.fromInt (round pct) ++ "%"
     in
-    Do.each killed
-        (\r ->
-            case r of
-                Killed { mutation, failCount } ->
-                    Script.log
-                        (Ansi.Color.fontColor Ansi.Color.green
-                            ("  ✓ Killed (" ++ String.fromInt failCount ++ " failed): " ++ mutation.description ++ " (line " ++ String.fromInt mutation.line ++ ")")
-                        )
+    Do.do
+        (if verbose then
+            Do.each killed
+                (\r ->
+                    case r of
+                        Killed { mutation, failCount } ->
+                            Script.log
+                                (Ansi.Color.fontColor Ansi.Color.green
+                                    ("  ✓ Killed (" ++ String.fromInt failCount ++ " failed): " ++ mutation.description ++ " (line " ++ String.fromInt mutation.line ++ ")")
+                                )
 
-                _ ->
-                    Script.log ""
+                        _ ->
+                            Script.log ""
+                )
+                (\_ -> BackendTask.succeed ())
+
+         else
+            BackendTask.succeed ()
         )
     <| \_ ->
     Do.each survived

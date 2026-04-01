@@ -127,10 +127,13 @@ findMutationsInExpression source (Node range expr) =
 
                 OperatorApplication op _ left right ->
                     (comparisonSwaps op
-                        |> List.map (swapComparisonMutation source left right op)
+                        |> List.map (operatorMutation "swapComparison" source left right op)
                     )
                         ++ (arithmeticSwaps op
-                                |> List.map (swapComparisonMutation source left right op)
+                                |> List.map (operatorMutation "replaceArithmetic" source left right op)
+                           )
+                        ++ (logicalSwaps op
+                                |> List.map (operatorMutation "swapLogicalOperator" source left right op)
                            )
 
                 FunctionOrValue [] "True" ->
@@ -138,6 +141,12 @@ findMutationsInExpression source (Node range expr) =
 
                 FunctionOrValue [] "False" ->
                     [ swapBooleanLiteral source range "False" "True" ]
+
+                Integer n ->
+                    [ replaceIntLiteral source range n ]
+
+                Literal s ->
+                    [ replaceStringLiteral source range s ]
 
                 _ ->
                     []
@@ -231,8 +240,65 @@ swapBooleanLiteral source range oldVal newVal =
     }
 
 
-swapComparisonMutation : String -> Node Expression -> Node Expression -> String -> String -> Mutation
-swapComparisonMutation source (Node leftRange _) (Node rightRange _) oldOp newOp =
+logicalSwaps : String -> List String
+logicalSwaps op =
+    case op of
+        "&&" ->
+            [ "||" ]
+
+        "||" ->
+            [ "&&" ]
+
+        _ ->
+            []
+
+
+replaceIntLiteral : String -> Range -> Int -> Mutation
+replaceIntLiteral source range n =
+    let
+        replacement =
+            if n == 0 then
+                "1"
+
+            else if n == 1 then
+                "0"
+
+            else
+                "0"
+    in
+    { line = range.start.row
+    , column = range.start.column
+    , operator = "replaceIntLiteral"
+    , description = "Changed `" ++ String.fromInt n ++ "` to `" ++ replacement ++ "`"
+    , mutatedSource = replaceRange source range replacement
+    }
+
+
+replaceStringLiteral : String -> Range -> String -> Mutation
+replaceStringLiteral source range s =
+    let
+        replacement =
+            if String.isEmpty s then
+                "\"mutated!\""
+
+            else
+                "\"\""
+    in
+    { line = range.start.row
+    , column = range.start.column
+    , operator = "replaceStringLiteral"
+    , description =
+        if String.isEmpty s then
+            "Changed `\"\"` to `\"mutated!\"`"
+
+        else
+            "Changed `\"" ++ s ++ "\"` to `\"\"`"
+    , mutatedSource = replaceRange source range replacement
+    }
+
+
+operatorMutation : String -> String -> Node Expression -> Node Expression -> String -> String -> Mutation
+operatorMutation operatorName source (Node leftRange _) (Node rightRange _) oldOp newOp =
     let
         ( _, leftEnd ) =
             rangeToOffsets source leftRange
@@ -248,7 +314,7 @@ swapComparisonMutation source (Node leftRange _) (Node rightRange _) oldOp newOp
     in
     { line = leftRange.start.row
     , column = leftRange.start.column
-    , operator = "swapComparison"
+    , operator = operatorName
     , description = "Changed `" ++ oldOp ++ "` to `" ++ newOp ++ "`"
     , mutatedSource = String.left leftEnd source ++ newGap ++ String.dropLeft rightStart source
     }
