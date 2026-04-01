@@ -22,6 +22,7 @@ import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
+import BackendTask.Glob as Glob
 import BackendTask.Time
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
@@ -42,7 +43,7 @@ import Types
 
 type alias Config =
     { mutateFile : String
-    , testFile : String
+    , testFile : Maybe String
     , suiteName : String
     , sourceDirs : List String
     }
@@ -60,8 +61,7 @@ programConfig =
                     )
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "test"
-                        |> Option.map (Maybe.withDefault "src/MathLibTests.elm")
-                        |> Option.withDescription "The test file (must expose suite : Test)"
+                        |> Option.withDescription "The test file (auto-discovered if omitted)"
                     )
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "suite"
@@ -85,7 +85,9 @@ task : Config -> BackendTask FatalError ()
 task config =
     BackendTask.Extra.profiling "mutation-test-runner" <|
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Loading project sources for mutation testing") <| \_ ->
-        Do.allowFatal (File.rawFile config.testFile) <| \testSource ->
+        -- Resolve the test file: either explicitly provided or auto-discovered
+        Do.do (resolveTestFile config) <| \testFile ->
+        Do.allowFatal (File.rawFile testFile) <| \testSource ->
         let
             testModuleName : String
             testModuleName =
@@ -102,7 +104,7 @@ task config =
                 (ProjectSources.loadProjectSources
                     { projectDir = Path.path "."
                     , userSourceDirectories = "src" :: "tests" :: config.sourceDirs
-                    , targetFile = config.testFile
+                    , targetFile = testFile
                     , skipPackages = kernelPackages
                     }
                     |> BackendTask.map
@@ -508,6 +510,78 @@ simpleTestRunnerSource =
         , "    in"
         , "    { passed = passed, label = labelPath, message = if passed then \"\" else String.join \"; \" failures }"
         ]
+
+
+{-| Resolve the test file: use --test if provided, otherwise auto-discover
+by finding test files that import the mutated module.
+-}
+resolveTestFile : Config -> BackendTask FatalError String
+resolveTestFile config =
+    case config.testFile of
+        Just explicit ->
+            Do.log ("Using test file: " ++ explicit) <| \_ ->
+            BackendTask.succeed explicit
+
+        Nothing ->
+            Do.allowFatal (File.rawFile config.mutateFile) <| \mutateSource ->
+            let
+                moduleName =
+                    DepGraph.parseModuleName mutateSource
+                        |> Maybe.withDefault ""
+            in
+            Do.log ("Auto-discovering test files that import " ++ moduleName ++ "...") <| \_ ->
+            Do.do (findTestFilesImporting moduleName) <| \testFiles ->
+            case testFiles of
+                [ single ] ->
+                    Do.log ("Found test file: " ++ single) <| \_ ->
+                    BackendTask.succeed single
+
+                first :: rest ->
+                    Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test files: " ++ String.join ", " testFiles ++ " (using first)") <| \_ ->
+                    BackendTask.succeed first
+
+                [] ->
+                    BackendTask.fail
+                        (FatalError.fromString
+                            ("No test files found that import "
+                                ++ moduleName
+                                ++ ". Looked in tests/**/*.elm. Use --test to specify manually."
+                            )
+                        )
+
+
+{-| Find .elm files in tests/ that import the given module name.
+-}
+findTestFilesImporting : String -> BackendTask FatalError (List String)
+findTestFilesImporting moduleName =
+    Glob.fromStringWithOptions
+        (let
+            o =
+                Glob.defaultOptions
+         in
+         { o | include = Glob.OnlyFiles }
+        )
+        "tests/**/*.elm"
+        |> BackendTask.andThen
+            (\files ->
+                files
+                    |> List.map
+                        (\filePath ->
+                            File.rawFile filePath
+                                |> BackendTask.allowFatal
+                                |> BackendTask.map (\content -> ( filePath, content ))
+                        )
+                    |> BackendTask.sequence
+                    |> BackendTask.map
+                        (\pairs ->
+                            pairs
+                                |> List.filter
+                                    (\( _, content ) ->
+                                        List.member moduleName (DepGraph.parseImports content)
+                                    )
+                                |> List.map Tuple.first
+                        )
+            )
 
 
 {-| Show 1 line of context around the mutation line, with line numbers.
