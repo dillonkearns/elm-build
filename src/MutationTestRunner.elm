@@ -27,6 +27,8 @@ import Elm.Syntax.Expression exposing (Expression(..))
 import Eval.Module
 import FatalError exposing (FatalError)
 import InterpreterProject exposing (InterpreterProject)
+import Json.Encode
+import MutationReport
 import Mutator exposing (Mutation)
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
@@ -46,6 +48,7 @@ type alias Config =
     , breakThreshold : Maybe Int
     , excludeOperators : List String
     , onlyOperators : List String
+    , reportFile : Maybe String
     }
 
 
@@ -95,6 +98,10 @@ programConfig =
                     (Option.optionalKeywordArg "only"
                         |> Option.map (Maybe.map (String.split ",") >> Maybe.withDefault [])
                         |> Option.withDescription "Only run these mutation operators (comma-separated)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "report"
+                        |> Option.withDescription "Write mutation testing report JSON to this path"
                     )
             )
 
@@ -305,6 +312,7 @@ task config =
                 ++ "ms/mutation)"
             )
         <| \_ ->
+        Do.do (writeReportFile config allFileResults) <| \_ ->
         displayMultiFileReport config allFileResults
 
 
@@ -395,6 +403,93 @@ type alias FileResults =
     , sourceCode : String
     , results : List MutationResult
     }
+
+
+{-| Write mutation testing report JSON to disk if --report is specified.
+-}
+writeReportFile : Config -> List FileResults -> BackendTask FatalError ()
+writeReportFile config allFileResults =
+    case config.reportFile of
+        Nothing ->
+            BackendTask.succeed ()
+
+        Just reportPath ->
+            let
+                reportJson =
+                    MutationReport.toJson
+                        { thresholds = { high = 80, low = 60 } }
+                        (List.map toFileReport allFileResults)
+
+                jsonString =
+                    Json.Encode.encode 2 reportJson
+            in
+            Do.do
+                (File.rawFile reportPath
+                    |> BackendTask.allowFatal
+                    |> BackendTask.onError (\_ -> BackendTask.succeed "")
+                    |> BackendTask.andThen (\_ -> BackendTask.succeed ())
+                )
+            <| \_ ->
+            Do.exec "mkdir" [ "-p", reportPath |> String.split "/" |> List.reverse |> List.drop 1 |> List.reverse |> String.join "/" ] <| \_ ->
+            Script.writeFile
+                { path = reportPath
+                , body = jsonString
+                }
+                |> BackendTask.allowFatal
+                |> BackendTask.andThen
+                    (\() ->
+                        Script.log ("Report written to " ++ reportPath)
+                    )
+
+
+{-| Convert internal FileResults to MutationReport.FileReport.
+-}
+toFileReport : FileResults -> MutationReport.FileReport
+toFileReport fileResults =
+    { filePath = fileResults.filePath
+    , sourceCode = fileResults.sourceCode
+    , mutants =
+        fileResults.results
+            |> List.indexedMap toMutantReport
+    }
+
+
+toMutantReport : Int -> MutationResult -> MutationReport.MutantReport
+toMutantReport index result =
+    let
+        mutation =
+            case result of
+                Killed r ->
+                    r.mutation
+
+                Survived r ->
+                    r.mutation
+
+                ErrorResult r ->
+                    r.mutation
+
+        status =
+            case result of
+                Killed _ ->
+                    MutationReport.Killed
+
+                Survived _ ->
+                    MutationReport.Survived
+
+                ErrorResult _ ->
+                    MutationReport.RuntimeError
+    in
+    { id = String.fromInt (index + 1)
+    , status = status
+    , mutatorName = mutation.operator
+    , description = mutation.description
+    , location =
+        { start = { line = mutation.spliceRange.start.row, column = mutation.spliceRange.start.column }
+        , end_ = { line = mutation.spliceRange.end.row, column = mutation.spliceRange.end.column }
+        }
+    , replacement = mutation.spliceText
+    }
+
 
 
 displayMultiFileReport : Config -> List FileResults -> BackendTask FatalError ()
