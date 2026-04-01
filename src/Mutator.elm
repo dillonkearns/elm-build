@@ -807,14 +807,21 @@ pipelineRemoval source op (Node leftRange _) (Node rightRange _) range file decl
         []
 
 
+{-| Generate mutations that remove the first and last elements of a list.
+Only first/last — per-element removal for every element is too noisy for
+large lists (Infection PHP's approach with cap). Combined with emptyList,
+this gives 3 mutations max per list regardless of size.
+-}
 removeListElementMutations : String -> List (Node Expression) -> Range -> File -> Int -> List Int -> List Mutation
 removeListElementMutations source elements range file declIndex path =
     let
         elementCount =
             List.length elements
-    in
-    List.indexedMap
-        (\index _ ->
+
+        lastIndex =
+            elementCount - 1
+
+        removeAt index label =
             let
                 remaining =
                     elements
@@ -825,7 +832,6 @@ removeListElementMutations source elements range file declIndex path =
                 newExpr =
                     Node range (ListExpr remaining)
 
-                -- Build splice text by extracting remaining elements from original source
                 remainingTexts =
                     remaining
                         |> List.map (\(Node r _) -> extractSourceRange source r)
@@ -836,13 +842,20 @@ removeListElementMutations source elements range file declIndex path =
             { line = range.start.row
             , column = range.start.column
             , operator = "removeListElement"
-            , description = "Removed element " ++ String.fromInt (index + 1) ++ " of " ++ String.fromInt elementCount ++ " from list"
+            , description = "Removed " ++ label ++ " element from list of " ++ String.fromInt elementCount
             , mutatedFile = replaceExpression file declIndex path newExpr
             , spliceRange = range
             , spliceText = listText
             }
-        )
-        elements
+    in
+    if lastIndex == 0 then
+        -- First and last are the same element — just one removal
+        [ removeAt 0 "first" ]
+
+    else
+        [ removeAt 0 "first"
+        , removeAt lastIndex "last"
+        ]
 
 
 {-| Generate mutations that swap bodies of adjacent case branches.

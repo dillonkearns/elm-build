@@ -260,7 +260,7 @@ suite =
                             Expect.fail ("Expected 1 replaceStringLiteral, got " ++ String.fromInt (List.length mutations))
             ]
         , describe "removeListElement"
-            [ test "removes an element from a 3-element list" <|
+            [ test "generates first and last removal for 3-element list" <|
                 \_ ->
                     let
                         source =
@@ -270,9 +270,8 @@ suite =
                             Mutator.generateMutations source
                                 |> List.filter (\m -> m.operator == "removeListElement")
                     in
-                    -- Should generate 3 mutations: remove each element
                     List.length mutations
-                        |> Expect.equal 3
+                        |> Expect.equal 2
             , test "first removal drops the first element" <|
                 \_ ->
                     let
@@ -285,16 +284,42 @@ suite =
                     in
                     case mutations of
                         first :: _ ->
-                            let
-                                written =
-                                    Mutator.writeFile first.mutatedFile
-                            in
-                            -- Should contain 2 and 3 but not start with [ 1
-                            (String.contains "2" written && String.contains "3" written)
+                            Mutator.applyMutation source first
+                                |> String.contains "[ 2, 3 ]"
                                 |> Expect.equal True
 
                         [] ->
                             Expect.fail "Expected at least 1 removeListElement"
+            , test "second removal drops the last element" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    [ 1, 2, 3 ]"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeListElement")
+                    in
+                    case mutations of
+                        _ :: [ second ] ->
+                            Mutator.applyMutation source second
+                                |> String.contains "[ 1, 2 ]"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail "Expected exactly 2 removeListElement"
+            , test "generates only 2 removals even for large lists" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ]"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removeListElement")
+                    in
+                    List.length mutations
+                        |> Expect.equal 2
             , test "does not generate for single-element list" <|
                 \_ ->
                     let
