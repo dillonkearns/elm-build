@@ -1,4 +1,4 @@
-module TestAnalysis exposing (discoverTestValues, discoverTestValuesViaInterpreter, getCandidateNames, usesFuzz)
+module TestAnalysis exposing (discoverTestValues, discoverTestValuesViaInterpreter, getCandidateNames, probeCandidate, usesFuzz)
 
 {-| Static analysis for Elm test modules.
 
@@ -188,32 +188,69 @@ discoverTestValuesViaInterpreter projectEnv testModuleName candidateNames =
     candidateNames
         |> List.filter
             (\name ->
-                let
-                    probeWrapper =
-                        String.join "\n"
-                            [ "module Probe__ exposing (probe__)"
-                            , "import SimpleTestRunner"
-                            , "import " ++ testModuleName
-                            , ""
-                            , "probe__ : String"
-                            , "probe__ ="
-                            , "    SimpleTestRunner.runToString " ++ testModuleName ++ "." ++ name
-                            , ""
-                            ]
-
-                    result =
-                        Eval.Module.evalWithEnv
-                            projectEnv
-                            [ probeWrapper ]
-                            (Elm.Syntax.Expression.FunctionOrValue [] "probe__")
-                in
-                case result of
-                    Ok (Types.String _) ->
+                case probeCandidate projectEnv testModuleName name of
+                    Ok _ ->
                         True
 
-                    _ ->
+                    Err _ ->
                         False
             )
+
+
+{-| Try evaluating a candidate value as a Test.
+
+Returns Ok if it's a Test (with the result string), or Err with a reason why not.
+
+-}
+probeCandidate : Eval.Module.ProjectEnv -> String -> String -> Result String String
+probeCandidate projectEnv testModuleName name =
+    let
+        probeWrapper =
+            String.join "\n"
+                [ "module Probe__ exposing (probe__)"
+                , "import SimpleTestRunner"
+                , "import " ++ testModuleName
+                , ""
+                , "probe__ : String"
+                , "probe__ ="
+                , "    SimpleTestRunner.runToString " ++ testModuleName ++ "." ++ name
+                , ""
+                ]
+
+        result =
+            Eval.Module.evalWithEnv
+                projectEnv
+                [ probeWrapper ]
+                (Elm.Syntax.Expression.FunctionOrValue [] "probe__")
+    in
+    case result of
+        Ok (Types.String s) ->
+            Ok s
+
+        Ok _ ->
+            Err "returned non-String value"
+
+        Err (Types.ParsingError _) ->
+            Err "could not parse probe wrapper"
+
+        Err (Types.EvalError evalErr) ->
+            Err ("eval error: " ++ evalErrorToString evalErr)
+
+
+evalErrorToString : Types.EvalErrorData -> String
+evalErrorToString err =
+    case err.error of
+        Types.NameError name ->
+            "could not resolve '" ++ name ++ "'"
+
+        Types.TypeError msg ->
+            "type error: " ++ msg
+
+        Types.Unsupported msg ->
+            "unsupported: " ++ msg
+
+        Types.Todo msg ->
+            "hit Debug.todo: " ++ msg
 
 
 {-| Detect whether an Elm source file uses fuzz tests by checking for references

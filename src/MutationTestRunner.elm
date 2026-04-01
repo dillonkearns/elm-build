@@ -35,6 +35,7 @@ import Mutator exposing (Mutation)
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import ProjectSources
+import Set
 import Time
 import Types
 
@@ -102,8 +103,12 @@ task config =
                     { projectDir = Path.path "."
                     , userSourceDirectories = "src" :: config.sourceDirs
                     , targetFile = config.testFile
+                    , skipPackages = kernelPackages
                     }
-                    |> BackendTask.map (List.map patchSource)
+                    |> BackendTask.map
+                        (\sources ->
+                            List.map patchSource sources ++ [ simpleTestRunnerSource ]
+                        )
                 )
             )
         <| \allSources ->
@@ -127,14 +132,55 @@ task config =
         Do.do
             (BackendTask.Extra.timed "Discovering test values" "Discovered test values"
                 (let
+                    probeResults =
+                        candidateNames
+                            |> List.map
+                                (\name ->
+                                    ( name, TestAnalysis.probeCandidate projectEnv testModuleName name )
+                                )
+
                     testValues =
-                        TestAnalysis.discoverTestValuesViaInterpreter projectEnv testModuleName candidateNames
+                        probeResults
+                            |> List.filterMap
+                                (\( name, result ) ->
+                                    case result of
+                                        Ok _ ->
+                                            Just name
+
+                                        Err _ ->
+                                            Nothing
+                                )
+
+                    rejections =
+                        probeResults
+                            |> List.filterMap
+                                (\( name, result ) ->
+                                    case result of
+                                        Err reason ->
+                                            Just (testModuleName ++ "." ++ name ++ ": " ++ reason)
+
+                                        Ok _ ->
+                                            Nothing
+                                )
                  in
                  if List.isEmpty testValues then
-                    BackendTask.fail (FatalError.fromString ("No Test values found in " ++ testModuleName ++ ". Candidates tried: " ++ String.join ", " candidateNames))
+                    BackendTask.fail
+                        (FatalError.fromString
+                            ("No Test values found in "
+                                ++ testModuleName
+                                ++ ".\nCandidates rejected:\n  "
+                                ++ String.join "\n  " rejections
+                            )
+                        )
 
                  else
-                    BackendTask.succeed testValues
+                    (if List.isEmpty rejections then
+                        BackendTask.succeed ()
+
+                     else
+                        Script.log ("Rejected candidates: " ++ String.join ", " rejections)
+                    )
+                        |> BackendTask.map (\() -> testValues)
                 )
             )
         <| \testValues ->
@@ -395,6 +441,65 @@ isError r =
 
         _ ->
             False
+
+
+
+{-| The SimpleTestRunner module source, embedded so it's available regardless
+of what project directory the tool runs from.
+-}
+simpleTestRunnerSource : String
+simpleTestRunnerSource =
+    String.join "\n"
+        [ "module SimpleTestRunner exposing (runToString)"
+        , "import Expect"
+        , "import Random"
+        , "import Test exposing (Test)"
+        , "import Test.Runner"
+        , "runToString suite ="
+        , "    let"
+        , "        runners = case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of"
+        , "            Test.Runner.Plain list -> Ok list"
+        , "            Test.Runner.Only list -> Ok list"
+        , "            Test.Runner.Skipping list -> Ok list"
+        , "            Test.Runner.Invalid msg -> Err msg"
+        , "    in"
+        , "    case runners of"
+        , "        Err msg -> \"0,1,1\\nFAIL:Invalid test suite: \" ++ msg"
+        , "        Ok runnerList ->"
+        , "            let"
+        , "                results = List.map runOneRunner runnerList"
+        , "                passCount = List.length (List.filter .passed results)"
+        , "                failCount = List.length results - passCount"
+        , "                formatResult r = if r.passed then \"PASS:\" ++ r.label else \"FAIL:\" ++ r.label ++ \" | \" ++ r.message"
+        , "            in"
+        , "            String.fromInt passCount ++ \",\" ++ String.fromInt failCount ++ \",\" ++ String.fromInt (List.length results) ++ \"\\n\" ++ (List.map formatResult results |> String.join \"\\n\")"
+        , "runOneRunner runner ="
+        , "    let"
+        , "        labelPath = List.reverse runner.labels |> String.join \" > \""
+        , "        expectations = runner.run ()"
+        , "        failures = expectations |> List.filterMap (\\expectation -> Test.Runner.getFailureReason expectation |> Maybe.map .description)"
+        , "        passed = List.isEmpty failures"
+        , "    in"
+        , "    { passed = passed, label = labelPath, message = if passed then \"\" else String.join \"; \" failures }"
+        ]
+
+
+{-| Packages with kernel/native JS code that the interpreter can't handle.
+The interpreter has built-in implementations for elm/core.
+-}
+kernelPackages : Set.Set String
+kernelPackages =
+    Set.fromList
+        [ "elm/json"
+        , "elm/regex"
+        , "elm/html"
+        , "elm/virtual-dom"
+        , "elm/bytes"
+        , "elm/browser"
+        , "elm/http"
+        , "elm/file"
+        , "elm/url"
+        ]
 
 
 {-| Patch Test framework kernel code for interpreter compatibility.

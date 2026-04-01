@@ -37,8 +37,8 @@ to interpret (e.g. `["src"]`). Package dependencies are resolved from elm.json.
 placed last in the returned list so `evalProject` uses it as the eval context.
 
 -}
-loadProjectSources : { projectDir : Path, userSourceDirectories : List String, targetFile : String } -> BackendTask FatalError (List String)
-loadProjectSources { projectDir, userSourceDirectories, targetFile } =
+loadProjectSources : { projectDir : Path, userSourceDirectories : List String, targetFile : String, skipPackages : Set String } -> BackendTask FatalError (List String)
+loadProjectSources { projectDir, userSourceDirectories, targetFile, skipPackages } =
     let
         projectPath : String
         projectPath =
@@ -51,11 +51,17 @@ loadProjectSources { projectDir, userSourceDirectories, targetFile } =
         (resolvePackageVersions elmHome
             (Dict.union elmJson.directDeps elmJson.indirectDeps
                 |> Dict.remove "elm/core"
+                |> Dict.filter (\name _ -> not (Set.member name skipPackages))
             )
         )
     <| \directDeps ->
     -- Recursively discover transitive deps (packages depend on other packages)
-    Do.do (resolveTransitiveDeps elmHome directDeps) <| \allDeps ->
+    Do.do (resolveTransitiveDeps elmHome directDeps) <| \allDepsWithKernel ->
+    let
+        allDeps =
+            allDepsWithKernel
+                |> Dict.filter (\name _ -> not (Set.member name skipPackages))
+    in
     Do.do (loadPackageDepGraphs elmHome allDeps) <| \pkgDepGraphs ->
     let
         sortedPackageNames : List String
