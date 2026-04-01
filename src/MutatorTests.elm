@@ -802,6 +802,227 @@ suite =
                     in
                     keys1 |> Expect.equal keys2
             ]
+        , describe "extremeMutation"
+            [ test "replaces Int-returning function body with 0" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo : Int -> Int\nfoo x =\n    x + 1"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "extremeMutation")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            Mutator.applyMutation source m
+                                |> String.contains "    0"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 extremeMutation, got " ++ String.fromInt (List.length mutations))
+            , test "replaces String-returning function body with empty string" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\ngreet : String -> String\ngreet name =\n    \"Hello, \" ++ name"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "extremeMutation")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            Mutator.applyMutation source m
+                                |> String.contains "    \"\""
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 extremeMutation, got " ++ String.fromInt (List.length mutations))
+            , test "replaces Bool-returning function body with False" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nisPositive : Int -> Bool\nisPositive n =\n    n > 0"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "extremeMutation")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            Mutator.applyMutation source m
+                                |> String.contains "    False"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 extremeMutation, got " ++ String.fromInt (List.length mutations))
+            , test "replaces List-returning function body with []" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\ndouble : List Int -> List Int\ndouble xs =\n    List.map (\\x -> x * 2) xs"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "extremeMutation")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            Mutator.applyMutation source m
+                                |> String.contains "    []"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 extremeMutation, got " ++ String.fromInt (List.length mutations))
+            , test "replaces Maybe-returning function body with Nothing" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfindFirst : List a -> Maybe a\nfindFirst xs =\n    List.head xs"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "extremeMutation")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            Mutator.applyMutation source m
+                                |> String.contains "    Nothing"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 extremeMutation, got " ++ String.fromInt (List.length mutations))
+            , test "does not generate for functions without type annotations" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    x + 1"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "extremeMutation")
+                    in
+                    List.length mutations
+                        |> Expect.equal 0
+            ]
+        , describe "removePipelineStep"
+            [ test "removes a |> step" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    x |> List.sort |> List.reverse"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removePipelineStep")
+                    in
+                    -- x |> sort |> reverse should generate removals for sort and reverse
+                    List.length mutations
+                        |> Expect.atLeast 1
+            , test "keeps input when removing step" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    x |> String.toUpper"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removePipelineStep")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            -- Should just keep `x` (the input)
+                            Mutator.applyMutation source m
+                                |> String.contains "    x"
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 removePipelineStep, got " ++ String.fromInt (List.length mutations))
+            ]
+        , describe "swapCaseBranches"
+            [ test "swaps bodies of adjacent case branches" <|
+                \_ ->
+                    let
+                        source =
+                            String.join "\n"
+                                [ "module Foo exposing (..)"
+                                , ""
+                                , "describe x ="
+                                , "    case x of"
+                                , "        0 ->"
+                                , "            \"zero\""
+                                , ""
+                                , "        1 ->"
+                                , "            \"one\""
+                                , ""
+                                , "        _ ->"
+                                , "            \"other\""
+                                ]
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "swapCaseBranches")
+                    in
+                    -- With 3 branches, should get 2 swaps (0<->1, 1<->2)
+                    List.length mutations
+                        |> Expect.atLeast 2
+            , test "swap replaces first branch body with second" <|
+                \_ ->
+                    let
+                        source =
+                            String.join "\n"
+                                [ "module Foo exposing (..)"
+                                , ""
+                                , "describe x ="
+                                , "    case x of"
+                                , "        0 ->"
+                                , "            \"zero\""
+                                , ""
+                                , "        1 ->"
+                                , "            \"one\""
+                                , ""
+                                , "        _ ->"
+                                , "            \"other\""
+                                ]
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "swapCaseBranches")
+
+                        firstSwapApplied =
+                            case mutations of
+                                m :: _ ->
+                                    Mutator.applyMutation source m
+
+                                [] ->
+                                    ""
+                    in
+                    -- The first branch (0 -> "zero") should now have "one" as its body
+                    -- The pattern `0 ->` should be followed by "one" instead of "zero"
+                    firstSwapApplied
+                        |> String.contains "        0 ->\n            \"one\""
+                        |> Expect.equal True
+            , test "no swap for single-branch case" <|
+                \_ ->
+                    let
+                        source =
+                            String.join "\n"
+                                [ "module Foo exposing (..)"
+                                , ""
+                                , "unwrap x ="
+                                , "    case x of"
+                                , "        Just v ->"
+                                , "            v"
+                                ]
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "swapCaseBranches")
+                    in
+                    List.length mutations
+                        |> Expect.equal 0
+            ]
         , describe "timeout detection"
             [ test "infinite recursion mutation is detected as error, not a hang" <|
                 \_ ->

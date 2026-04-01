@@ -14,7 +14,9 @@ import Elm.Syntax.Expression exposing (Expression(..), Function, FunctionImpleme
 import Elm.Syntax.File exposing (File)
 import Elm.Syntax.Infix exposing (InfixDirection(..))
 import Elm.Syntax.Node as Node exposing (Node(..))
+import Elm.Syntax.Pattern
 import Elm.Syntax.Range as Range exposing (Range)
+import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
 import Elm.Writer
 
 
@@ -135,11 +137,89 @@ findMutationsInDeclaration source file declIndex decl =
             let
                 (Node _ impl) =
                     function.declaration
+
+                (Node exprRange _) =
+                    impl.expression
+
+                expressionMutations =
+                    findMutationsInExpression source file declIndex [] impl.expression
+
+                extremeMutations =
+                    case function.signature of
+                        Just (Node _ sig) ->
+                            case defaultForType (Node.value sig.typeAnnotation) of
+                                Just ( defaultExpr, defaultText ) ->
+                                    [ { line = exprRange.start.row
+                                      , column = exprRange.start.column
+                                      , operator = "extremeMutation"
+                                      , description = "Replaced function body with default value"
+                                      , mutatedFile = replaceExpression file declIndex [] (Node exprRange defaultExpr)
+                                      , spliceRange = exprRange
+                                      , spliceText = defaultText
+                                      }
+                                    ]
+
+                                Nothing ->
+                                    []
+
+                        Nothing ->
+                            []
             in
-            findMutationsInExpression source file declIndex [] impl.expression
+            extremeMutations ++ expressionMutations
 
         _ ->
             []
+
+
+{-| Get a default value for a type annotation's return type.
+Walks through function arrows to find the final return type.
+Returns the default Expression AST and its text representation.
+-}
+defaultForType : TypeAnnotation -> Maybe ( Expression, String )
+defaultForType typeAnnotation =
+    case typeAnnotation of
+        -- Function type: recurse into the return type
+        FunctionTypeAnnotation _ (Node _ returnType) ->
+            defaultForType returnType
+
+        -- Known types with sensible defaults
+        Typed (Node _ ( [], "Int" )) _ ->
+            Just ( Integer 0, "0" )
+
+        Typed (Node _ ( [], "Float" )) _ ->
+            Just ( Floatable 0, "0.0" )
+
+        Typed (Node _ ( [], "String" )) _ ->
+            Just ( Literal "", "\"\"" )
+
+        Typed (Node _ ( [], "Bool" )) _ ->
+            Just ( FunctionOrValue [] "False", "False" )
+
+        Typed (Node _ ( [], "List" )) _ ->
+            Just ( ListExpr [], "[]" )
+
+        Typed (Node _ ( [], "Maybe" )) _ ->
+            Just ( FunctionOrValue [] "Nothing", "Nothing" )
+
+        -- Qualified versions
+        Typed (Node _ ( [ "Basics" ], "Int" )) _ ->
+            Just ( Integer 0, "0" )
+
+        Typed (Node _ ( [ "Basics" ], "Float" )) _ ->
+            Just ( Floatable 0, "0.0" )
+
+        Typed (Node _ ( [ "Basics" ], "Bool" )) _ ->
+            Just ( FunctionOrValue [] "False", "False" )
+
+        Typed (Node _ ( [ "String" ], "String" )) _ ->
+            Just ( Literal "", "\"\"" )
+
+        -- Result -> Err "mutation"
+        Typed (Node _ ( [], "Result" )) _ ->
+            Just ( Application [ Node Range.empty (FunctionOrValue [] "Err"), Node Range.empty (Literal "extreme mutation") ], "Err \"extreme mutation\"" )
+
+        _ ->
+            Nothing
 
 
 {-| Walk the expression AST and collect mutations.
@@ -323,6 +403,7 @@ findMutationsInExpression source file declIndex path (Node range expr) =
                         ++ (arithmeticSwaps op |> List.map (\newOp -> swapOp newOp "replaceArithmetic"))
                         ++ (logicalSwaps op |> List.map (\newOp -> swapOp newOp "swapLogicalOperator"))
                         ++ concatRemovalAst source op dir left right range file declIndex path
+                        ++ pipelineRemoval source op left right range file declIndex path
 
                 FunctionOrValue [] "True" ->
                     [ mutate "swapBooleanLiteral" "Changed `True` to `False`" (FunctionOrValue [] "False") ]
@@ -375,6 +456,13 @@ findMutationsInExpression source file declIndex path (Node range expr) =
                     if List.length elements >= 2 then
                         removeListElementMutations source elements range file declIndex path
                             ++ [ mutate "emptyList" "Replaced list with `[]`" (ListExpr []) ]
+
+                    else
+                        []
+
+                CaseExpression caseBlock ->
+                    if List.length caseBlock.cases >= 2 then
+                        swapCaseBranchMutations source caseBlock range file declIndex path
 
                     else
                         []
@@ -669,6 +757,37 @@ concatRemovalAst source op dir (Node leftRange _) (Node rightRange _) range file
         []
 
 
+{-| For `a |> f`, generate a mutation that removes the pipeline step,
+keeping just `a`. Tests whether the pipeline step matters.
+-}
+pipelineRemoval : String -> String -> Node Expression -> Node Expression -> Range -> File -> Int -> List Int -> List Mutation
+pipelineRemoval source op (Node leftRange _) (Node rightRange _) range file declIndex path =
+    if op == "|>" then
+        [ { line = range.start.row
+          , column = range.start.column
+          , operator = "removePipelineStep"
+          , description = "Removed `|>` pipeline step"
+          , mutatedFile = replaceExpression file declIndex path (Node leftRange (FunctionOrValue [] "placeholder__"))
+          , spliceRange = range
+          , spliceText = extractSourceRange source leftRange
+          }
+        ]
+
+    else if op == "<|" then
+        [ { line = range.start.row
+          , column = range.start.column
+          , operator = "removePipelineStep"
+          , description = "Removed `<|` pipeline step"
+          , mutatedFile = replaceExpression file declIndex path (Node rightRange (FunctionOrValue [] "placeholder__"))
+          , spliceRange = range
+          , spliceText = extractSourceRange source rightRange
+          }
+        ]
+
+    else
+        []
+
+
 removeListElementMutations : String -> List (Node Expression) -> Range -> File -> Int -> List Int -> List Mutation
 removeListElementMutations source elements range file declIndex path =
     let
@@ -705,6 +824,69 @@ removeListElementMutations source elements range file declIndex path =
             }
         )
         elements
+
+
+{-| Generate mutations that swap bodies of adjacent case branches.
+For N branches, generates N-1 mutations (each swaps branch i with branch i+1).
+Uses source extraction to preserve original formatting.
+-}
+swapCaseBranchMutations :
+    String
+    -> { expression : Node Expression, cases : List ( Node Elm.Syntax.Pattern.Pattern, Node Expression ) }
+    -> Range
+    -> File
+    -> Int
+    -> List Int
+    -> List Mutation
+swapCaseBranchMutations source caseBlock range file declIndex path =
+    let
+        cases =
+            caseBlock.cases
+
+        pairs =
+            List.map2 Tuple.pair cases (List.drop 1 cases)
+    in
+    List.indexedMap
+        (\i ( ( pat1, Node expr1Range _ ), ( pat2, Node expr2Range _ ) ) ->
+            let
+                expr1Text =
+                    extractSourceRange source expr1Range
+
+                expr2Text =
+                    extractSourceRange source expr2Range
+            in
+            { line = expr1Range.start.row
+            , column = expr1Range.start.column
+            , operator = "swapCaseBranches"
+            , description =
+                "Swapped case branch "
+                    ++ String.fromInt (i + 1)
+                    ++ " with branch "
+                    ++ String.fromInt (i + 2)
+            , mutatedFile =
+                -- For the AST, swap the expressions in the case block
+                let
+                    swappedCases =
+                        cases
+                            |> List.indexedMap
+                                (\j ( pat, expr ) ->
+                                    if j == i then
+                                        ( pat, Tuple.second (Maybe.withDefault ( pat, expr ) (List.head (List.drop (i + 1) cases))) )
+
+                                    else if j == i + 1 then
+                                        ( pat, Tuple.second (Maybe.withDefault ( pat, expr ) (List.head (List.drop i cases))) )
+
+                                    else
+                                        ( pat, expr )
+                                )
+                in
+                replaceExpression file declIndex path
+                    (Node range (CaseExpression { caseBlock | cases = swappedCases }))
+            , spliceRange = expr1Range
+            , spliceText = expr2Text
+            }
+        )
+        pairs
 
 
 functionSwapTable : List ( ( List String, String ), ( List String, String ) )
