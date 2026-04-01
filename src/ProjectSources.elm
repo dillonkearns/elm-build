@@ -237,10 +237,26 @@ elmJsonDecoder =
 
 applicationElmJsonDecoder : Decode.Decoder ElmJsonDeps
 applicationElmJsonDecoder =
-    Decode.map3 ElmJsonDeps
+    Decode.map5
+        (\sourceDirs directDeps indirectDeps testDirectDeps testIndirectDeps ->
+            ElmJsonDeps
+                sourceDirs
+                (Dict.union directDeps testDirectDeps)
+                (Dict.union indirectDeps testIndirectDeps)
+        )
         (Decode.field "source-directories" (Decode.list Decode.string))
         (Decode.at [ "dependencies", "direct" ] (Decode.dict Decode.string))
         (Decode.at [ "dependencies", "indirect" ] (Decode.dict Decode.string))
+        (Decode.oneOf
+            [ Decode.at [ "test-dependencies", "direct" ] (Decode.dict Decode.string)
+            , Decode.succeed Dict.empty
+            ]
+        )
+        (Decode.oneOf
+            [ Decode.at [ "test-dependencies", "indirect" ] (Decode.dict Decode.string)
+            , Decode.succeed Dict.empty
+            ]
+        )
 
 
 {-| Package elm.json has version ranges, not exact versions.
