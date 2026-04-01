@@ -1,8 +1,10 @@
 .elm-pages
 .build/
 .elm-build/
+.elm-mutation-test/
 codegen/Gen
 dist/
+myscript.mjs
 *.cpuprofile
 elm-stuff
 node_modules
