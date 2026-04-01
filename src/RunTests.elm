@@ -6,6 +6,7 @@ import BackendTask.Do as Do
 import FatalError exposing (FatalError)
 import Pages.Script as Script exposing (Script)
 import Random
+import MutationTestRunnerTest
 import MutatorTests
 import Test
 import Test.Runner
@@ -24,7 +25,7 @@ runAll =
             Random.initialSeed 42
 
         allSuites =
-            Test.describe "All" [ TestAnalysisTests.suite, MutatorTests.suite ]
+            Test.describe "All" [ TestAnalysisTests.suite, MutatorTests.suite, MutationTestRunnerTest.suite ]
 
         runners =
             case Test.Runner.fromTest 100 seed allSuites of
