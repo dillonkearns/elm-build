@@ -183,7 +183,7 @@ suite =
 
                         _ ->
                             Expect.fail ("Expected 1 replaceIntLiteral, got " ++ String.fromInt (List.length mutations))
-            , test "replaces 1 with 0" <|
+            , test "replaces 1 with 2" <|
                 \_ ->
                     let
                         source =
@@ -196,12 +196,12 @@ suite =
                     case mutations of
                         [ m ] ->
                             m.mutatedSource
-                                |> String.contains "\n    0"
+                                |> String.contains "\n    2"
                                 |> Expect.equal True
 
                         _ ->
                             Expect.fail ("Expected 1 replaceIntLiteral, got " ++ String.fromInt (List.length mutations))
-            , test "replaces other int with 0" <|
+            , test "replaces 42 with 43" <|
                 \_ ->
                     let
                         source =
@@ -214,7 +214,7 @@ suite =
                     case mutations of
                         [ m ] ->
                             m.mutatedSource
-                                |> String.contains "\n    0"
+                                |> String.contains "\n    43"
                                 |> Expect.equal True
 
                         _ ->

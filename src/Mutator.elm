@@ -502,15 +502,11 @@ logicalSwaps op =
 replaceIntLiteral : String -> Range -> Int -> Mutation
 replaceIntLiteral source range n =
     let
+        -- Always increment by 1 to avoid producing 0 (which crashes the
+        -- interpreter on modBy/division). This is still a meaningful mutation
+        -- that tests should catch.
         replacement =
-            if n == 0 then
-                "1"
-
-            else if n == 1 then
-                "0"
-
-            else
-                "0"
+            String.fromInt (n + 1)
     in
     { line = range.start.row
     , column = range.start.column

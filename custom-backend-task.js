@@ -23,6 +23,22 @@ export function forceGC() {
 }
 
 /**
+ * Evaluate a function that might crash (e.g. modBy 0) and return the
+ * result or an error string. Used by InterpreterProject.evalWithSourceOverrides
+ * to catch runtime crashes from mutated code.
+ *
+ * @param {function} thunk - a zero-argument function to call
+ * @returns {string} the result string, or "ERROR: Runtime crash: ..." on failure
+ */
+export function safeEval(thunk) {
+    try {
+        return thunk();
+    } catch (e) {
+        return "ERROR: Runtime crash: " + (e.message || String(e));
+    }
+}
+
+/**
  * @param {string} path
  * @returns {Promise<string[]>}
  */
