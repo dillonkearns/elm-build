@@ -32,7 +32,8 @@
             "stil4m/elm-syntax": "7.3.9",
             "the-sett/elm-pretty-printer": "3.3.1",
             "the-sett/elm-syntax-dsl": "6.0.5",
-            "wolfadex/elm-ansi": "3.0.1"
+            "wolfadex/elm-ansi": "3.0.1",
+            "elm/regex": "1.0.0"
         },
         "indirect": {
             "Chadtech/elm-bool-extra": "2.4.2",
@@ -48,7 +49,6 @@
             "elm/file": "1.0.5",
             "elm/html": "1.0.1",
             "elm/http": "2.0.0",
-            "elm/regex": "1.0.0",
             "elm/url": "1.0.0",
             "elm/virtual-dom": "1.0.5",
             "elm-community/dict-extra": "2.4.0",

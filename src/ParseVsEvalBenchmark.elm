@@ -4,7 +4,7 @@ module ParseVsEvalBenchmark exposing (run)
 
 Runs the same mutation both ways:
 1. String-based: evalWithEnv parses the source string each time
-2. AST-based: parseProjectSources once, evalWithEnvFromParsed per mutation
+2. AST-based: parseProjectSources once, evalWithEnvFromFiles per mutation
 
 -}
 
@@ -126,7 +126,7 @@ task config =
                             allPreParsed
                                 |> List.map
                                     (\parsed ->
-                                        Eval.Module.evalWithEnvFromParsed projectEnv parsed (FunctionOrValue [] "wrapperResult__")
+                                        Eval.Module.evalWithEnvFromFiles projectEnv (List.map .file parsed) (FunctionOrValue [] "wrapperResult__")
                                     )
                     in
                     Do.do BackendTask.Time.now <| \t3 ->

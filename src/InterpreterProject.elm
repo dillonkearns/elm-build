@@ -667,16 +667,16 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                         wrapperFile =
                             List.drop (List.length parsedFiles - 1) parsedFiles
 
-                        allParsedModules =
-                            List.map Eval.Module.parsedModuleFromFile allButWrapper
-                                ++ List.map (\override -> Eval.Module.parsedModuleFromFile override.file) fileOverrides
-                                ++ List.map Eval.Module.parsedModuleFromFile wrapperFile
+                        allFiles =
+                            allButWrapper
+                                ++ List.map .file fileOverrides
+                                ++ wrapperFile
 
                         result : Result Types.Error Types.Value
                         result =
-                            Eval.Module.evalWithEnvFromParsed
+                            Eval.Module.evalWithEnvFromFiles
                                 project.packageEnv
-                                allParsedModules
+                                allFiles
                                 (FunctionOrValue [] "results")
                     in
                     case result of
@@ -743,58 +743,33 @@ evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverr
                     )
     in
     let
-        parsedUserSources : Result Types.Error (List File)
-        parsedUserSources =
-            (userFilteredSources ++ sourceOverrides ++ [ wrapperSource ])
-                |> List.map
-                    (\src ->
-                        Elm.Parser.parseToFile src
-                            |> Result.mapError Types.ParsingError
-                    )
-                |> combineFileResults
+        allSources =
+            userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
+
+        ( result, callTrees, _ ) =
+            Eval.Module.traceWithEnv
+                project.packageEnv
+                allSources
+                (FunctionOrValue [] "results")
+
+        resultString =
+            case result of
+                Ok (Types.String s) ->
+                    s
+
+                Ok _ ->
+                    "ERROR: Expected String result"
+
+                Err (Types.ParsingError _) ->
+                    "ERROR: Parsing error"
+
+                Err (Types.EvalError evalErr) ->
+                    "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+
+        coveredRanges =
+            Coverage.extractRanges callTrees
     in
-    case parsedUserSources of
-        Err err ->
-            BackendTask.succeed
-                { result =
-                    case err of
-                        Types.ParsingError _ ->
-                            "ERROR: Parsing error"
-
-                        Types.EvalError evalErr ->
-                            "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
-                , coveredRanges = []
-                }
-
-        Ok parsedFiles ->
-            let
-                allParsedModules =
-                    List.map Eval.Module.parsedModuleFromFile parsedFiles
-
-                ( result, callTrees, _ ) =
-                    Eval.Module.traceWithEnvFromParsed
-                        project.packageEnv
-                        allParsedModules
-                        (FunctionOrValue [] "results")
-
-                resultString =
-                    case result of
-                        Ok (Types.String s) ->
-                            s
-
-                        Ok _ ->
-                            "ERROR: Expected String result"
-
-                        Err (Types.ParsingError _) ->
-                            "ERROR: Parsing error"
-
-                        Err (Types.EvalError evalErr) ->
-                            "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
-
-                coveredRanges =
-                    Coverage.extractRanges callTrees
-            in
-            BackendTask.succeed { result = resultString, coveredRanges = coveredRanges }
+    BackendTask.succeed { result = resultString, coveredRanges = coveredRanges }
 
 
 combineFileResults : List (Result e a) -> Result e (List a)
