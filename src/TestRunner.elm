@@ -16,12 +16,12 @@ import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
 import BackendTask.Time
+import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import DepGraph
 import Elm.Syntax.Expression exposing (Expression(..))
-import Eval.Module
 import FatalError exposing (FatalError)
 import InterpreterProject exposing (InterpreterProject)
 import Pages.Script as Script exposing (Script)
@@ -35,6 +35,7 @@ import Types exposing (Value(..))
 type alias Config =
     { testFile : Maybe String
     , sourceDirs : List String
+    , buildDirectory : Path
     }
 
 
@@ -51,6 +52,11 @@ programConfig =
                     (Option.optionalKeywordArg "source-dirs"
                         |> Option.map (Maybe.map (String.split ",") >> Maybe.withDefault [])
                         |> Option.withDescription "Extra source directories (comma-separated)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "build"
+                        |> Option.map (Maybe.withDefault ".elm-build" >> Path.path)
+                        |> Option.withDescription "Build/cache directory (default: .elm-build)"
                     )
             )
 
@@ -89,7 +95,7 @@ task config =
     -- Run each test file
     Do.do
         (testFiles
-            |> List.map (\testFile -> runTestFile project testFile)
+            |> List.map (\testFile -> runTestFile config project testFile)
             |> BackendTask.Extra.sequence
         )
     <| \allResults ->
@@ -154,8 +160,8 @@ type alias TestFileResult =
     }
 
 
-runTestFile : InterpreterProject -> String -> BackendTask FatalError TestFileResult
-runTestFile project testFile =
+runTestFile : Config -> InterpreterProject -> String -> BackendTask FatalError TestFileResult
+runTestFile config project testFile =
     Do.allowFatal (File.rawFile testFile) <| \testSource ->
     let
         testModuleName =
@@ -229,38 +235,18 @@ runTestFile project testFile =
                 "SimpleTestRunner.runToString (" ++ suiteExpr ++ ")"
         in
         Do.do
-            (let
-                allSources =
-                    let
-                        { userSources } =
-                            InterpreterProject.prepareEvalSources project
-                                { imports = [ "SimpleTestRunner", "Test", testModuleName ]
-                                , expression = evalExpression
-                                }
-                    in
-                    simpleTestRunnerSource :: userSources
-
-                result =
-                    Eval.Module.evalWithEnvAndLimit
-                        (Just 5000000)
-                        (InterpreterProject.getPackageEnv project)
-                        allSources
-                        (FunctionOrValue [] "results")
-             in
-             case result of
-                Ok (Types.String s) ->
-                    BackendTask.succeed s
-
-                Ok _ ->
-                    BackendTask.succeed "ERROR: Expected String result"
-
-                Err (Types.ParsingError _) ->
-                    BackendTask.succeed "ERROR: Parsing error"
-
-                Err (Types.EvalError evalErr) ->
-                    BackendTask.succeed ("ERROR: Eval error: " ++ evalErrorKindToString evalErr.error)
+            (Cache.run { jobs = Nothing } config.buildDirectory
+                (InterpreterProject.evalWithFileOverrides project
+                    { imports = [ "SimpleTestRunner", "Test", testModuleName ]
+                    , expression = evalExpression
+                    , sourceOverrides = [ simpleTestRunnerSource ]
+                    , fileOverrides = []
+                    }
+                    Cache.succeed
+                )
             )
-        <| \output ->
+        <| \cacheResult ->
+        Do.allowFatal (File.rawFile (Path.toString cacheResult.output)) <| \output ->
         if String.startsWith "ERROR:" output then
             Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 60 output ++ ")")) <| \_ ->
             BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = 1 }
