@@ -817,31 +817,36 @@ ensureDependenciesFetched config =
                         String.contains "\"type\": \"package\"" raw
                             || String.contains "\"type\":\"package\"" raw
                 in
-                if isPackage then
-                    -- Package project: `elm make --docs` fetches deps without needing source files
-                    BackendTask.Extra.timed "Fetching dependencies" "Dependencies ready"
-                        (Script.exec "elm" [ "make", "--docs", "/tmp/elm-mutation-docs.json" ])
+                let
+                    fetchCmd =
+                        if isPackage then
+                            Script.exec "elm" [ "make", "--docs", "/tmp/elm-mutation-docs.json" ]
 
-                else
-                    -- Application project: need a source file target for `elm make`
-                    Glob.fromStringWithOptions
-                        (let
-                            o =
-                                Glob.defaultOptions
-                         in
-                         { o | include = Glob.OnlyFiles }
-                        )
-                        "src/**/*.elm"
-                        |> BackendTask.andThen
-                            (\files ->
-                                case files of
-                                    first :: _ ->
-                                        BackendTask.Extra.timed "Fetching dependencies" "Dependencies ready"
-                                            (Script.exec "elm" [ "make", first, "--output", "/dev/null" ])
+                        else
+                            Glob.fromStringWithOptions
+                                (let
+                                    o =
+                                        Glob.defaultOptions
+                                 in
+                                 { o | include = Glob.OnlyFiles }
+                                )
+                                "src/**/*.elm"
+                                |> BackendTask.andThen
+                                    (\files ->
+                                        case files of
+                                            first :: _ ->
+                                                Script.exec "elm" [ "make", first, "--output", "/dev/null" ]
 
-                                    [] ->
-                                        BackendTask.succeed ()
-                            )
+                                            [] ->
+                                                BackendTask.succeed ()
+                                    )
+                in
+                -- Non-fatal: if elm make fails (e.g. unrelated compile errors in the project),
+                -- continue anyway. The real error will surface during project loading if deps
+                -- are truly missing.
+                fetchCmd
+                    |> BackendTask.toResult
+                    |> BackendTask.map (\_ -> ())
             )
 
 

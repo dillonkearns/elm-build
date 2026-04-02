@@ -4,7 +4,7 @@
   "workspaces": {
     "": {
       "devDependencies": {
-        "elm-pages": "^3.1.1",
+        "elm-pages": "3.1.4",
       },
     },
   },
@@ -283,7 +283,7 @@
 
     "elm-hot": ["elm-hot@1.1.6", "", {}, "sha512-zYZJlfs7Gt4BdjA+D+857K+XAWzwwySJmXCgFpHW1dIEfaHSZCIPYPf7/jinZBLfKRkOAlKzI32AA84DY50g7Q=="],
 
-    "elm-pages": ["elm-pages@3.1.1", "", { "dependencies": { "@sindresorhus/merge-streams": "^4.0.0", "busboy": "^1.6.0", "chokidar": "^5.0.0", "cli-cursor": "^5.0.0", "commander": "^14.0.3", "connect": "^3.7.0", "cookie-signature": "^1.2.2", "cross-spawn": "7.0.6", "devcert": "^1.2.2", "elm-doc-preview": "^6.0.1", "elm-hot": "^1.1.6", "esbuild": "^0.27.3", "fs-extra": "^11.3.3", "globby": "16.1.0", "gray-matter": "^4.0.3", "jsesc": "^3.1.0", "kleur": "^4.1.5", "make-fetch-happen": "^15.0.3", "memfs": "^4.56.10", "micromatch": "^4.0.8", "serve-static": "^2.2.1", "terser": "^5.44.1", "vite": "^7.3.1", "which": "^6.0.1" }, "optionalDependencies": { "@rollup/rollup-linux-x64-gnu": "4.55.1" }, "bin": { "elm-pages": "generator/src/cli.js" } }, "sha512-cikCE5gjJpBjxhkcxbZUynojq/pyWvl+uGwXsWnJsyQNYYCgOY/HcNjwue8T2LlbhOQED4FTnyMSMRuY7dqDuQ=="],
+    "elm-pages": ["elm-pages@3.1.4", "", { "dependencies": { "@sindresorhus/merge-streams": "^4.0.0", "busboy": "^1.6.0", "chokidar": "^5.0.0", "cli-cursor": "^5.0.0", "commander": "^14.0.3", "connect": "^3.7.0", "cookie-signature": "^1.2.2", "cross-spawn": "7.0.6", "devcert": "^1.2.2", "elm-doc-preview": "^6.0.1", "elm-hot": "^1.1.6", "esbuild": "^0.27.3", "fs-extra": "^11.3.3", "globby": "16.1.0", "gray-matter": "^4.0.3", "jsesc": "^3.1.0", "kleur": "^4.1.5", "make-fetch-happen": "^15.0.3", "memfs": "^4.56.10", "micromatch": "^4.0.8", "serve-static": "^2.2.1", "terser": "^5.44.1", "vite": "^7.3.1", "which": "^6.0.1" }, "optionalDependencies": { "@rollup/rollup-linux-x64-gnu": "4.55.1" }, "bin": { "elm-pages": "generator/src/cli.js" } }, "sha512-4edRt+Kfzks7nMhDyboUCtcM/cTcgR7HJSx00MgwcnVnEWeUha7jmli+CpGF82auNGY+RBgAIK1mTvj9p/iTLw=="],
 
     "encodeurl": ["encodeurl@2.0.0", "", {}, "sha512-Q0n9HRi4m6JuGIV1eFlmvJB7ZEVxu93IrMyiMsGC0lrMJMWzRgx6WGquyfQgZVb31vhGgXnfmPNNXmxnOkRBrg=="],
 
