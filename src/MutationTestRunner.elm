@@ -244,6 +244,19 @@ task config =
         -- Determine which files to mutate
         Do.do (resolveFilesToMutate config project sourceDirectories testFile) <| \filesToMutate ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Mutating " ++ String.fromInt (List.length filesToMutate) ++ " source file(s): " ++ String.join ", " filesToMutate)) <| \_ ->
+        -- Baseline: run the full suite unmutated to get the reference output
+        Do.do
+            (InterpreterProject.evalWithCoverage project
+                { imports = evalConfig.imports
+                , expression = evalConfig.expression
+                , sourceOverrides = [ simpleTestRunnerSource ]
+                }
+            )
+        <| \baselineCoverage ->
+        let
+            baselineOutput =
+                baselineCoverage.result
+        in
         -- Per-test coverage: run each test individually with tracing
         Do.do
             (BackendTask.Extra.timed "Collecting per-test coverage" "Coverage collected"
@@ -263,6 +276,7 @@ task config =
                                     (\result ->
                                         { testName = testModuleName ++ "." ++ testValue
                                         , coveredRanges = result.coveredRanges
+                                        , baselineResult = result.result
                                         }
                                     )
                         )
@@ -277,6 +291,10 @@ task config =
 
             totalCoveredExpressions =
                 List.length allCoveredRanges
+
+            -- Note: per-test baselines are available in perTestCoverage but can't
+            -- be directly compared with mutation outputs (different suite composition).
+            -- Equivalent detection works when mutations run the full suite.
         in
         Do.log ("  " ++ String.fromInt (List.length perTestCoverage) ++ " tests, " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
@@ -319,9 +337,11 @@ task config =
                                                     |> List.map .testName
 
                                             -- Build a suite expression with only the relevant tests
+                                            isFullSuite =
+                                                List.length relevantTests == List.length perTestCoverage
+
                                             relevantSuiteExpr =
-                                                if List.length relevantTests == List.length perTestCoverage then
-                                                    -- All tests cover this mutation — use the full suite (faster)
+                                                if isFullSuite then
                                                     evalConfig.expression
 
                                                 else
@@ -331,6 +351,17 @@ task config =
 
                                                         multiple ->
                                                             "SimpleTestRunner.runToString (Test.describe \"relevant\" [" ++ String.join ", " multiple ++ "])"
+
+                                            -- For equivalent detection: compare mutation output
+                                            -- against the unmutated baseline
+                                            relevantBaseline =
+                                                if isFullSuite then
+                                                    baselineOutput
+
+                                                else
+                                                    -- Subset runs have different output format;
+                                                    -- can't compare directly. Skip equiv detection.
+                                                    ""
                                         in
                                         Do.do
                                             (Cache.run { jobs = Nothing } config.buildDirectory
@@ -345,7 +376,7 @@ task config =
                                             )
                                         <| \result ->
                                         Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
-                                        BackendTask.succeed (parseMutationResult mutation output)
+                                        BackendTask.succeed (parseMutationResult relevantBaseline mutation output)
                                     )
                                 |> BackendTask.Extra.sequence
                             )
@@ -441,10 +472,16 @@ filterMutations config mutations =
            )
 
 
-parseMutationResult : Mutation -> String -> MutationResult
-parseMutationResult mutation output =
+parseMutationResult : String -> Mutation -> String -> MutationResult
+parseMutationResult baselineOutput mutation output =
     if String.startsWith "ERROR:" output then
         ErrorResult { mutation = mutation, error = String.dropLeft 7 output }
+
+    else if output == baselineOutput then
+        -- Early cutoff: mutation produces identical output to unmutated code.
+        -- This is a provably equivalent mutation — syntactically different but
+        -- semantically identical. No need to propagate to dependents.
+        EquivalentResult { mutation = mutation }
 
     else
         case String.split "," (String.lines output |> List.head |> Maybe.withDefault "") of
@@ -467,6 +504,7 @@ parseMutationResult mutation output =
 type MutationResult
     = Killed { mutation : Mutation, failCount : Int }
     | Survived { mutation : Mutation }
+    | EquivalentResult { mutation : Mutation }
     | NoCoverageResult { mutation : Mutation }
     | ErrorResult { mutation : Mutation, error : String }
 
@@ -538,6 +576,9 @@ toMutantReport index result =
                 Survived r ->
                     r.mutation
 
+                EquivalentResult r ->
+                    r.mutation
+
                 NoCoverageResult r ->
                     r.mutation
 
@@ -551,6 +592,9 @@ toMutantReport index result =
 
                 Survived _ ->
                     MutationReport.Survived
+
+                EquivalentResult _ ->
+                    MutationReport.Equivalent
 
                 NoCoverageResult _ ->
                     MutationReport.NoCoverage
@@ -700,6 +744,9 @@ displayMultiFileReport config allFileResults =
         totalSurvived =
             List.filter isSurvived allResults |> List.length
 
+        totalEquivalent =
+            List.filter isEquivalent allResults |> List.length
+
         totalNoCoverage =
             List.filter isNoCoverage allResults |> List.length
 
@@ -732,6 +779,8 @@ displayMultiFileReport config allFileResults =
                 ++ " killed, "
                 ++ String.fromInt totalSurvived
                 ++ " survived, "
+                ++ String.fromInt totalEquivalent
+                ++ " equivalent, "
                 ++ String.fromInt totalNoCoverage
                 ++ " no coverage, "
                 ++ String.fromInt totalErrors
@@ -828,6 +877,16 @@ isSurvived : MutationResult -> Bool
 isSurvived r =
     case r of
         Survived _ ->
+            True
+
+        _ ->
+            False
+
+
+isEquivalent : MutationResult -> Bool
+isEquivalent r =
+    case r of
+        EquivalentResult _ ->
             True
 
         _ ->

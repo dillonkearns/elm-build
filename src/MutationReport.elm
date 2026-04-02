@@ -40,6 +40,7 @@ type MutantStatus
     | NoCoverage
     | RuntimeError
     | Timeout
+    | Equivalent
 
 
 {-| Encode mutation results into the Stryker mutation testing report schema (v2).
@@ -119,3 +120,6 @@ statusToString status =
 
         Timeout ->
             "Timeout"
+
+        Equivalent ->
+            "Survived"
