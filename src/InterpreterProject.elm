@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -16,9 +16,11 @@ import BackendTask.Time
 import Cache exposing (FileOrDirectory)
 import DepGraph
 import Dict exposing (Dict)
+import Coverage
 import Elm.Parser
 import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.File exposing (File)
+import Elm.Syntax.Range exposing (Range)
 import Eval.Module
 import FatalError exposing (FatalError)
 import Json.Decode as Decode
@@ -692,6 +694,107 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                 ++ evalErrorKindToString evalErr.error
         )
         k
+
+
+{-| Evaluate a test expression with tracing to collect coverage data.
+
+Runs the test suite once (unmutated) with the interpreter's trace mode enabled,
+then walks the resulting CallTree to extract all evaluated source ranges.
+Returns both the test result string and the list of covered ranges.
+
+-}
+evalWithCoverage :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        }
+    -> BackendTask FatalError { result : String, coveredRanges : List Range }
+evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverrides } =
+    let
+        wrapperSource : String
+        wrapperSource =
+            generateWrapper imports expression
+
+        wrapperImports : Set String
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules : Set String
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        filteredSources : List String
+        filteredSources =
+            topoSortModules project.moduleGraph neededModules
+
+        userFilteredSources : List String
+        userFilteredSources =
+            filteredSources
+                |> List.filter
+                    (\src ->
+                        case DepGraph.parseModuleName src of
+                            Just name ->
+                                not (Set.member name project.packageModuleNames)
+
+                            Nothing ->
+                                True
+                    )
+    in
+    let
+        parsedUserSources : Result Types.Error (List File)
+        parsedUserSources =
+            (userFilteredSources ++ sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parsedUserSources of
+        Err err ->
+            BackendTask.succeed
+                { result =
+                    case err of
+                        Types.ParsingError _ ->
+                            "ERROR: Parsing error"
+
+                        Types.EvalError evalErr ->
+                            "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+                , coveredRanges = []
+                }
+
+        Ok parsedFiles ->
+            let
+                allParsedModules =
+                    List.map Eval.Module.parsedModuleFromFile parsedFiles
+
+                ( result, callTrees, _ ) =
+                    Eval.Module.traceWithEnvFromParsed
+                        project.packageEnv
+                        allParsedModules
+                        (FunctionOrValue [] "results")
+
+                resultString =
+                    case result of
+                        Ok (Types.String s) ->
+                            s
+
+                        Ok _ ->
+                            "ERROR: Expected String result"
+
+                        Err (Types.ParsingError _) ->
+                            "ERROR: Parsing error"
+
+                        Err (Types.EvalError evalErr) ->
+                            "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+
+                coveredRanges =
+                    Coverage.extractRanges callTrees
+            in
+            BackendTask.succeed { result = resultString, coveredRanges = coveredRanges }
 
 
 combineFileResults : List (Result e a) -> Result e (List a)

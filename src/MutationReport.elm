@@ -37,6 +37,7 @@ type alias MutantReport =
 type MutantStatus
     = Killed
     | Survived
+    | NoCoverage
     | RuntimeError
     | Timeout
 
@@ -109,6 +110,9 @@ statusToString status =
 
         Survived ->
             "Survived"
+
+        NoCoverage ->
+            "NoCoverage"
 
         RuntimeError ->
             "RuntimeError"

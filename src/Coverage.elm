@@ -1,0 +1,62 @@
+module Coverage exposing (extractRanges, isCovered)
+
+{-| Coverage analysis for mutation testing.
+
+Extracts covered source ranges from the interpreter's CallTree (produced
+by tracing), and checks whether a mutation's range is covered by any test.
+
+-}
+
+import Elm.Syntax.Node exposing (Node(..))
+import Elm.Syntax.Range exposing (Range)
+import Rope exposing (Rope)
+import Types exposing (CallTree(..))
+
+
+{-| Extract all evaluated expression ranges from a CallTree.
+
+Walks the tree recursively to collect every Range that was evaluated.
+Returns a flat list (not a Set, since Range isn't comparable in Elm).
+
+-}
+extractRanges : Rope CallTree -> List Range
+extractRanges trees =
+    Rope.toList trees
+        |> List.concatMap extractFromNode
+
+
+extractFromNode : CallTree -> List Range
+extractFromNode (CallNode node) =
+    let
+        (Node range _) =
+            node.expression
+    in
+    range :: extractRanges node.children
+
+
+{-| Check if a target range is covered by any range in the covered list.
+
+A range is "covered" if any covered range contains or overlaps with it.
+Uses simple containment: the target's start must be >= a covered range's start
+AND the target's end must be <= that covered range's end.
+
+-}
+isCovered : List Range -> Range -> Bool
+isCovered coveredRanges target =
+    List.any (\covered -> rangeContains covered target) coveredRanges
+
+
+{-| Does `outer` contain `inner`?
+
+A range A contains range B if A.start <= B.start and A.end >= B.end.
+Uses row-major comparison (row first, then column).
+
+-}
+rangeContains : Range -> Range -> Bool
+rangeContains outer inner =
+    positionLte outer.start inner.start && positionLte inner.end outer.end
+
+
+positionLte : { row : Int, column : Int } -> { row : Int, column : Int } -> Bool
+positionLte a b =
+    a.row < b.row || (a.row == b.row && a.column <= b.column)

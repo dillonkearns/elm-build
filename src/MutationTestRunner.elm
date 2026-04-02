@@ -26,6 +26,8 @@ import DepGraph
 import Elm.Syntax.Expression exposing (Expression(..))
 import Eval.Module
 import FatalError exposing (FatalError)
+import Coverage
+import Elm.Syntax.Range exposing (Range)
 import InterpreterProject exposing (InterpreterProject)
 import Json.Encode
 import MutationReport
@@ -242,6 +244,22 @@ task config =
         -- Determine which files to mutate
         Do.do (resolveFilesToMutate config project sourceDirectories testFile) <| \filesToMutate ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Mutating " ++ String.fromInt (List.length filesToMutate) ++ " source file(s): " ++ String.join ", " filesToMutate)) <| \_ ->
+        -- Coverage pass: run tests once unmutated with tracing to collect covered ranges
+        Do.do
+            (BackendTask.Extra.timed "Collecting coverage" "Coverage collected"
+                (InterpreterProject.evalWithCoverage project
+                    { imports = evalConfig.imports
+                    , expression = evalConfig.expression
+                    , sourceOverrides = [ simpleTestRunnerSource ]
+                    }
+                )
+            )
+        <| \coverageResult ->
+        let
+            coveredRanges =
+                coverageResult.coveredRanges
+        in
+        Do.log ("  Covered " ++ String.fromInt (List.length coveredRanges) ++ " expression ranges") <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
         Do.do BackendTask.Time.now <| \startTime ->
         -- Run mutations for each file and collect per-file results
@@ -256,10 +274,22 @@ task config =
 
                             mutations =
                                 filterMutations config allMutations
+
+                            coveredMutations =
+                                mutations
+                                    |> List.filter (\m -> Coverage.isCovered coveredRanges m.spliceRange)
+
+                            uncoveredMutations =
+                                mutations
+                                    |> List.filter (\m -> not (Coverage.isCovered coveredRanges m.spliceRange))
+
+                            uncoveredResults =
+                                uncoveredMutations
+                                    |> List.map (\m -> NoCoverageResult { mutation = m })
                         in
-                        Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations" ++ (if List.length allMutations /= List.length mutations then " (filtered from " ++ String.fromInt (List.length allMutations) ++ ")" else "")) <| \_ ->
+                        Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations (" ++ String.fromInt (List.length coveredMutations) ++ " covered, " ++ String.fromInt (List.length uncoveredMutations) ++ " no coverage)") <| \_ ->
                         Do.do
-                            (mutations
+                            (coveredMutations
                                 |> List.map
                                     (\mutation ->
                                         Do.do
@@ -279,11 +309,11 @@ task config =
                                     )
                                 |> BackendTask.Extra.sequence
                             )
-                        <| \results ->
+                        <| \coveredResults ->
                         BackendTask.succeed
                             { filePath = mutateFilePath
                             , sourceCode = mutateSource
-                            , results = results
+                            , results = coveredResults ++ uncoveredResults
                             }
                     )
                 |> BackendTask.Extra.sequence
@@ -397,6 +427,7 @@ parseMutationResult mutation output =
 type MutationResult
     = Killed { mutation : Mutation, failCount : Int }
     | Survived { mutation : Mutation }
+    | NoCoverageResult { mutation : Mutation }
     | ErrorResult { mutation : Mutation, error : String }
 
 
@@ -467,6 +498,9 @@ toMutantReport index result =
                 Survived r ->
                     r.mutation
 
+                NoCoverageResult r ->
+                    r.mutation
+
                 ErrorResult r ->
                     r.mutation
 
@@ -477,6 +511,9 @@ toMutantReport index result =
 
                 Survived _ ->
                     MutationReport.Survived
+
+                NoCoverageResult _ ->
+                    MutationReport.NoCoverage
 
                 ErrorResult _ ->
                     MutationReport.RuntimeError
@@ -623,6 +660,9 @@ displayMultiFileReport config allFileResults =
         totalSurvived =
             List.filter isSurvived allResults |> List.length
 
+        totalNoCoverage =
+            List.filter isNoCoverage allResults |> List.length
+
         totalErrors =
             List.filter isError allResults |> List.length
 
@@ -652,6 +692,8 @@ displayMultiFileReport config allFileResults =
                 ++ " killed, "
                 ++ String.fromInt totalSurvived
                 ++ " survived, "
+                ++ String.fromInt totalNoCoverage
+                ++ " no coverage, "
                 ++ String.fromInt totalErrors
                 ++ " errors, "
                 ++ String.fromInt total
@@ -746,6 +788,16 @@ isSurvived : MutationResult -> Bool
 isSurvived r =
     case r of
         Survived _ ->
+            True
+
+        _ ->
+            False
+
+
+isNoCoverage : MutationResult -> Bool
+isNoCoverage r =
+    case r of
+        NoCoverageResult _ ->
             True
 
         _ ->
