@@ -197,8 +197,22 @@ runTestFile project testFile =
                     )
     in
     if List.isEmpty testValues then
+        let
+            rejections =
+                probeResults
+                    |> List.filterMap
+                        (\( name, result ) ->
+                            case result of
+                                Err reason ->
+                                    Just (name ++ ": " ++ reason)
+
+                                Ok _ ->
+                                    Nothing
+                        )
+                    |> String.join "; "
+        in
         -- Can't run this test file (interpreter limitation)
-        Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (skipped — interpreter limitation)")) <| \_ ->
+        Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (skipped: " ++ rejections ++ ")")) <| \_ ->
         BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = List.length candidateNames }
 
     else
