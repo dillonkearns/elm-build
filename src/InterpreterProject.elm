@@ -20,7 +20,9 @@ import Coverage
 import Elm.Parser
 import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.File exposing (File)
+import Elm.Syntax.Node
 import Elm.Syntax.Range exposing (Range)
+import SemanticHash
 import Eval.Module
 import FatalError exposing (FatalError)
 import Json.Decode as Decode
@@ -48,6 +50,7 @@ type InterpreterProject
         , moduleGraph : ModuleGraph
         , packageModuleNames : Set String
         , packageEnv : Eval.Module.ProjectEnv
+        , semanticIndex : SemanticHash.DeclarationIndex
         }
 
 
@@ -253,6 +256,17 @@ loadWith config =
                                                                                         , moduleGraph = moduleGraph
                                                                                         , packageModuleNames = pkgModuleNames
                                                                                         , packageEnv = pkgEnv
+                                                                                        , semanticIndex =
+                                                                                            userFileContents
+                                                                                                |> List.map
+                                                                                                    (\( filePath, content ) ->
+                                                                                                        { moduleName =
+                                                                                                            DepGraph.parseModuleName content
+                                                                                                                |> Maybe.withDefault filePath
+                                                                                                        , source = content
+                                                                                                        }
+                                                                                                    )
+                                                                                                |> SemanticHash.buildMultiModuleIndex
                                                                                         }
                                                                                 )
                                                             )
@@ -604,39 +618,59 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                 True
                     )
 
-        -- For hashing: include override hash keys (lightweight, no Elm.Writer needed)
+        -- Semantic hash: hash the wrapper expression's semantic dependencies
+        -- + override hash keys. Only invalidates when actually-called functions change.
         fileOverrideHashKeys : List String
         fileOverrideHashKeys =
             fileOverrides |> List.map .hashKey
 
-        allFilteredSources : List String
-        allFilteredSources =
-            filteredSources ++ sourceOverrides ++ fileOverrideHashKeys ++ [ wrapperSource ]
-
-        filteredBlob : String
-        filteredBlob =
-            String.join "\n---MODULE_SEPARATOR---\n" allFilteredSources
-    in
-    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <| \filteredHash ->
-    Cache.do
-        (relevantInputs
-            |> List.map
-                (\( path, monad ) ->
-                    Cache.do monad <| \hash ->
-                    Cache.succeed { filename = Path.path path, hash = hash }
+        -- The semantic hash captures exactly which user functions are transitively
+        -- called by the wrapper expression. Changes to unrelated functions don't
+        -- affect this hash.
+        wrapperSemanticKey : String
+        wrapperSemanticKey =
+            SemanticHash.hashExpression
+                (Elm.Syntax.Node.Node
+                    { start = { row = 0, column = 0 }, end = { row = 0, column = 0 } }
+                    (FunctionOrValue [] "results")
                 )
-            |> Cache.sequence
-        )
-    <| \sourceFiles ->
-    Cache.do
-        (Cache.combine
-            (sourceFiles
-                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash } ]
-            )
-        )
-    <| \combinedHash ->
+
+        semanticCacheKey : String
+        semanticCacheKey =
+            let
+                -- Get semantic hashes of all user declarations that are transitively needed
+                neededDeclHashes =
+                    neededModules
+                        |> Set.toList
+                        |> List.sort
+                        |> List.filterMap
+                            (\moduleName ->
+                                -- Get all declarations from this module in the semantic index
+                                project.semanticIndex
+                                    |> Dict.toList
+                                    |> List.filter (\( key, _ ) -> String.startsWith (moduleName ++ ".") key)
+                                    |> List.map (\( _, info ) -> info.semanticHash)
+                                    |> (\hashes ->
+                                            if List.isEmpty hashes then
+                                                Nothing
+
+                                            else
+                                                Just (String.join "|" (List.sort hashes))
+                                       )
+                            )
+
+                overrideKey =
+                    String.join "|" fileOverrideHashKeys
+
+                sourceOverrideKey =
+                    String.join "|" (List.map (\s -> String.left 100 s) sourceOverrides)
+            in
+            String.join "\n"
+                (neededDeclHashes ++ [ overrideKey, sourceOverrideKey, wrapperSource ])
+    in
+    Cache.do (Cache.writeFile semanticCacheKey Cache.succeed) <| \semanticHash ->
     Cache.compute [ "interpret-with-file-overrides" ]
-        combinedHash
+        semanticHash
         (\() ->
             let
                 -- Parse string sources into Files, then combine with pre-parsed overrides

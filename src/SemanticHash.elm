@@ -1,4 +1,4 @@
-module SemanticHash exposing (buildIndexFromSource, extractDependencies, getSemanticHash, hashExpression)
+module SemanticHash exposing (DeclarationIndex, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, extractDependencies, getSemanticHash, hashExpression)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -355,52 +355,6 @@ buildIndexFromFile file =
                     )
                 |> Dict.fromList
 
-        -- Topological sort: process leaves first, then their dependents
-        -- Simple iterative approach: keep resolving declarations whose deps are all resolved
-        resolveAll : Dict String { astHash : String, deps : Set String } -> Dict String String -> Dict String String
-        resolveAll remaining resolved =
-            let
-                -- Find declarations whose deps are all resolved
-                ready =
-                    remaining
-                        |> Dict.filter
-                            (\_ info ->
-                                Set.toList info.deps
-                                    |> List.all (\dep -> Dict.member dep resolved)
-                            )
-            in
-            if Dict.isEmpty ready then
-                -- Either done or have a cycle — resolve remaining with just AST hash
-                Dict.foldl
-                    (\name info acc -> Dict.insert name info.astHash acc)
-                    resolved
-                    remaining
-
-            else
-                let
-                    newResolved =
-                        Dict.foldl
-                            (\name info acc ->
-                                let
-                                    depHashes =
-                                        info.deps
-                                            |> Set.toList
-                                            |> List.sort
-                                            |> List.filterMap (\dep -> Dict.get dep acc)
-
-                                    semanticHash =
-                                        info.astHash ++ "|" ++ String.join "|" depHashes
-                                in
-                                Dict.insert name semanticHash acc
-                            )
-                            resolved
-                            ready
-
-                    newRemaining =
-                        Dict.filter (\name _ -> not (Dict.member name ready)) remaining
-                in
-                resolveAll newRemaining newResolved
-
         semanticHashes : Dict String String
         semanticHashes =
             resolveAll rawIndex Dict.empty
@@ -419,8 +373,204 @@ buildIndexFromFile file =
 
 
 {-| Look up a declaration's semantic hash in the index.
+Accepts either "funcName" (single-module) or "ModuleName.funcName" (multi-module).
 -}
 getSemanticHash : DeclarationIndex -> String -> Maybe String
 getSemanticHash index name =
     Dict.get name index
         |> Maybe.map .semanticHash
+
+
+{-| Build a semantic hash index from multiple modules.
+Cross-module references are resolved to their semantic hashes (Merkle property).
+-}
+buildMultiModuleIndex : List { moduleName : String, source : String } -> DeclarationIndex
+buildMultiModuleIndex modules =
+    buildMultiModuleIndexWithPackages { packageVersions = [], modules = modules }
+
+
+{-| Build a semantic hash index with package version info.
+Package references are hashed as `packageVersion.ModuleName.functionName`.
+-}
+buildMultiModuleIndexWithPackages :
+    { packageVersions : List ( String, String )
+    , modules : List { moduleName : String, source : String }
+    }
+    -> DeclarationIndex
+buildMultiModuleIndexWithPackages { packageVersions, modules } =
+    let
+        packageVersionDict : Dict String String
+        packageVersionDict =
+            Dict.fromList packageVersions
+
+        -- Parse all modules and extract declarations with qualified names
+        allDeclarations : List ( String, { expr : Node Expression, moduleName : String } )
+        allDeclarations =
+            modules
+                |> List.concatMap
+                    (\mod ->
+                        case Elm.Parser.parseToFile mod.source of
+                            Ok file ->
+                                file.declarations
+                                    |> List.filterMap
+                                        (\(Node _ decl) ->
+                                            case decl of
+                                                FunctionDeclaration func ->
+                                                    let
+                                                        impl =
+                                                            Node.value func.declaration
+                                                    in
+                                                    Just
+                                                        ( mod.moduleName ++ "." ++ Node.value impl.name
+                                                        , { expr = impl.expression, moduleName = mod.moduleName }
+                                                        )
+
+                                                _ ->
+                                                    Nothing
+                                        )
+
+                            Err _ ->
+                                []
+                    )
+
+        -- All qualified declaration names
+        allDeclNames : Set String
+        allDeclNames =
+            allDeclarations |> List.map Tuple.first |> Set.fromList
+
+        -- Build raw index: AST hash + qualified dependencies
+        rawIndex : Dict String { astHash : String, deps : Set String }
+        rawIndex =
+            allDeclarations
+                |> List.map
+                    (\( qualName, { expr, moduleName } ) ->
+                        let
+                            astHash =
+                                hashExpressionWithPackages packageVersionDict expr
+
+                            deps =
+                                extractDependencies expr
+                                    |> List.filterMap
+                                        (\( modName, funcName ) ->
+                                            if isUppercase funcName then
+                                                Nothing
+
+                                            else
+                                                let
+                                                    qualRef =
+                                                        if List.isEmpty modName then
+                                                            -- Unqualified: could be same module or local
+                                                            moduleName ++ "." ++ funcName
+
+                                                        else
+                                                            String.join "." modName ++ "." ++ funcName
+                                                in
+                                                if Set.member qualRef allDeclNames && qualRef /= qualName then
+                                                    Just qualRef
+
+                                                else
+                                                    Nothing
+                                        )
+                                    |> Set.fromList
+                        in
+                        ( qualName, { astHash = astHash, deps = deps } )
+                    )
+                |> Dict.fromList
+
+        -- Topological resolution (same algorithm as single-module)
+        semanticHashes : Dict String String
+        semanticHashes =
+            resolveAll rawIndex Dict.empty
+    in
+    rawIndex
+        |> Dict.map
+            (\name info ->
+                { astHash = info.astHash
+                , dependencies = info.deps
+                , semanticHash =
+                    Dict.get name semanticHashes
+                        |> Maybe.withDefault info.astHash
+                }
+            )
+
+
+{-| Hash an expression, replacing package references with versioned names.
+-}
+hashExpressionWithPackages : Dict String String -> Node Expression -> String
+hashExpressionWithPackages packageVersions (Node _ expr) =
+    case expr of
+        FunctionOrValue moduleName name ->
+            let
+                moduleStr =
+                    String.join "." moduleName
+            in
+            case Dict.get moduleStr packageVersions of
+                Just version ->
+                    "P" ++ version ++ "." ++ moduleStr ++ "." ++ name
+
+                Nothing ->
+                    "V" ++ moduleStr ++ "." ++ name
+
+        OperatorApplication op _ left right ->
+            "(" ++ hashExpressionWithPackages packageVersions left ++ op ++ hashExpressionWithPackages packageVersions right ++ ")"
+
+        Application exprs ->
+            "A(" ++ String.join " " (List.map (hashExpressionWithPackages packageVersions) exprs) ++ ")"
+
+        IfBlock cond thenExpr elseExpr ->
+            "IF(" ++ hashExpressionWithPackages packageVersions cond ++ "," ++ hashExpressionWithPackages packageVersions thenExpr ++ "," ++ hashExpressionWithPackages packageVersions elseExpr ++ ")"
+
+        Negation inner ->
+            "NEG(" ++ hashExpressionWithPackages packageVersions inner ++ ")"
+
+        _ ->
+            -- Fall back to base hashExpression for all other cases
+            hashExpression (Node { start = { row = 0, column = 0 }, end = { row = 0, column = 0 } } expr)
+
+
+{-| Resolve semantic hashes iteratively in topological order.
+Process declarations whose deps are all resolved first, then their dependents.
+Handles cycles by falling back to AST-only hashes.
+-}
+resolveAll : Dict String { astHash : String, deps : Set String } -> Dict String String -> Dict String String
+resolveAll remaining resolved =
+    let
+        ready =
+            remaining
+                |> Dict.filter
+                    (\_ info ->
+                        Set.toList info.deps
+                            |> List.all (\dep -> Dict.member dep resolved)
+                    )
+    in
+    if Dict.isEmpty ready then
+        -- Either done or have a cycle — resolve remaining with just AST hash
+        Dict.foldl
+            (\name info acc -> Dict.insert name info.astHash acc)
+            resolved
+            remaining
+
+    else
+        let
+            newResolved =
+                Dict.foldl
+                    (\name info acc ->
+                        let
+                            depHashes =
+                                info.deps
+                                    |> Set.toList
+                                    |> List.sort
+                                    |> List.filterMap (\dep -> Dict.get dep acc)
+
+                            semanticHash =
+                                info.astHash ++ "|" ++ String.join "|" depHashes
+                        in
+                        Dict.insert name semanticHash acc
+                    )
+                    resolved
+                    ready
+
+            newRemaining =
+                Dict.filter (\name _ -> not (Dict.member name ready)) remaining
+        in
+        resolveAll newRemaining newResolved

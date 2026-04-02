@@ -171,6 +171,83 @@ suite =
 
                         _ ->
                             Expect.fail "Expected both hashes to exist"
+            , test "cross-module: changing a dep in another module changes caller hash" <|
+                \_ ->
+                    let
+                        mathLib1 =
+                            { moduleName = "MathLib", source = "module MathLib exposing (..)\n\nabs n = if n < 0 then negate n else n\n\nclamp lo hi x = x" }
+
+                        mathLib2 =
+                            { moduleName = "MathLib", source = "module MathLib exposing (..)\n\nabs n = if n < 0 then negate n else n\n\nclamp lo hi x = lo" }
+
+                        tests_ =
+                            { moduleName = "Tests", source = "module Tests exposing (..)\n\nimport MathLib\n\nmyTest = MathLib.abs 5" }
+
+                        hash1 =
+                            SemanticHash.buildMultiModuleIndex [ mathLib1, tests_ ]
+                                |> (\idx -> SemanticHash.getSemanticHash idx "Tests.myTest")
+
+                        hash2 =
+                            SemanticHash.buildMultiModuleIndex [ mathLib2, tests_ ]
+                                |> (\idx -> SemanticHash.getSemanticHash idx "Tests.myTest")
+                    in
+                    case ( hash1, hash2 ) of
+                        ( Just h1, Just h2 ) ->
+                            -- myTest calls MathLib.abs which didn't change → hash unchanged
+                            h1 |> Expect.equal h2
+
+                        _ ->
+                            Expect.fail "Expected both hashes to exist"
+            , test "cross-module: changing called function changes caller hash" <|
+                \_ ->
+                    let
+                        mathLib1 =
+                            { moduleName = "MathLib", source = "module MathLib exposing (..)\n\nabs n = if n < 0 then negate n else n" }
+
+                        mathLib2 =
+                            { moduleName = "MathLib", source = "module MathLib exposing (..)\n\nabs n = if n < 0 then 0 - n else n" }
+
+                        tests_ =
+                            { moduleName = "Tests", source = "module Tests exposing (..)\n\nimport MathLib\n\nmyTest = MathLib.abs 5" }
+
+                        hash1 =
+                            SemanticHash.buildMultiModuleIndex [ mathLib1, tests_ ]
+                                |> (\idx -> SemanticHash.getSemanticHash idx "Tests.myTest")
+
+                        hash2 =
+                            SemanticHash.buildMultiModuleIndex [ mathLib2, tests_ ]
+                                |> (\idx -> SemanticHash.getSemanticHash idx "Tests.myTest")
+                    in
+                    case ( hash1, hash2 ) of
+                        ( Just h1, Just h2 ) ->
+                            -- myTest calls MathLib.abs which DID change → hash must change
+                            h1 |> Expect.notEqual h2
+
+                        _ ->
+                            Expect.fail "Expected both hashes to exist"
+            , test "package deps use version-qualified name" <|
+                \_ ->
+                    let
+                        source =
+                            { moduleName = "Foo", source = "module Foo exposing (..)\n\nfoo x = List.map identity x" }
+
+                        index =
+                            SemanticHash.buildMultiModuleIndexWithPackages
+                                { packageVersions = [ ( "List", "elm/core/1.0.5" ) ]
+                                , modules = [ source ]
+                                }
+
+                        hash =
+                            SemanticHash.getSemanticHash index "Foo.foo"
+                    in
+                    case hash of
+                        Just h ->
+                            -- Hash should contain the versioned package reference
+                            String.contains "elm/core/1.0.5" h
+                                |> Expect.equal True
+
+                        Nothing ->
+                            Expect.fail "Expected hash to exist"
             , test "changing an unrelated function does NOT change the caller's hash" <|
                 \_ ->
                     let
