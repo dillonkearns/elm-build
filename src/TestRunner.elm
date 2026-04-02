@@ -29,7 +29,7 @@ import Path exposing (Path)
 import Set
 import TestAnalysis
 import Time
-import Types
+import Types exposing (Value(..))
 
 
 type alias Config =
@@ -215,17 +215,37 @@ runTestFile project testFile =
                 "SimpleTestRunner.runToString (" ++ suiteExpr ++ ")"
         in
         Do.do
-            (InterpreterProject.evalWithCoverage project
-                { imports = [ "SimpleTestRunner", "Test", testModuleName ]
-                , expression = evalExpression
-                , sourceOverrides = [ simpleTestRunnerSource ]
-                }
+            (let
+                allSources =
+                    let
+                        { userSources } =
+                            InterpreterProject.prepareEvalSources project
+                                { imports = [ "SimpleTestRunner", "Test", testModuleName ]
+                                , expression = evalExpression
+                                }
+                    in
+                    simpleTestRunnerSource :: userSources
+
+                result =
+                    Eval.Module.evalWithEnv
+                        (InterpreterProject.getPackageEnv project)
+                        allSources
+                        (FunctionOrValue [] "results")
+             in
+             case result of
+                Ok (Types.String s) ->
+                    BackendTask.succeed s
+
+                Ok _ ->
+                    BackendTask.succeed "ERROR: Expected String result"
+
+                Err (Types.ParsingError _) ->
+                    BackendTask.succeed "ERROR: Parsing error"
+
+                Err (Types.EvalError evalErr) ->
+                    BackendTask.succeed ("ERROR: Eval error: " ++ evalErrorKindToString evalErr.error)
             )
-        <| \result ->
-        let
-            output =
-                result.result
-        in
+        <| \output ->
         if String.startsWith "ERROR:" output then
             Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 60 output ++ ")")) <| \_ ->
             BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = 1 }
@@ -448,6 +468,22 @@ kernelPackages =
         , "elm/file"
         , "elm/url"
         ]
+
+
+evalErrorKindToString : Types.EvalErrorKind -> String
+evalErrorKindToString kind =
+    case kind of
+        Types.TypeError msg ->
+            "type error: " ++ msg
+
+        Types.Unsupported msg ->
+            "unsupported: " ++ msg
+
+        Types.NameError name ->
+            "could not resolve '" ++ name ++ "'"
+
+        Types.Todo msg ->
+            "hit Debug.todo: " ++ msg
 
 
 patchSource : String -> String
