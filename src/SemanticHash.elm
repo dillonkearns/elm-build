@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, extractDependencies, getSemanticHash, hashExpression)
+module SemanticHash exposing (DeclarationIndex, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, extractDependencies, getSemanticHash, hashExpression, semanticHashForEntry)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -379,6 +379,22 @@ getSemanticHash : DeclarationIndex -> String -> Maybe String
 getSemanticHash index name =
     Dict.get name index
         |> Maybe.map .semanticHash
+
+
+{-| Compute a cache-key hash for a specific entry-point declaration.
+
+This returns the declaration's semantic hash, which by the Merkle property
+already transitively includes the hashes of all functions it calls.
+Changes to unrelated functions (not in the transitive closure) don't
+affect this hash.
+
+This is the function to use as a cache key: if this hash hasn't changed,
+the evaluation result is provably unchanged (Elm's purity guarantees this).
+
+-}
+semanticHashForEntry : DeclarationIndex -> String -> Maybe String
+semanticHashForEntry index entryPoint =
+    getSemanticHash index entryPoint
 
 
 {-| Build a semantic hash index from multiple modules.

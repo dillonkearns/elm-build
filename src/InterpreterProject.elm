@@ -18,9 +18,10 @@ import DepGraph
 import Dict exposing (Dict)
 import Coverage
 import Elm.Parser
+import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.File exposing (File)
-import Elm.Syntax.Node
+import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
 import SemanticHash
 import Eval.Module
@@ -624,40 +625,49 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
         fileOverrideHashKeys =
             fileOverrides |> List.map .hashKey
 
-        -- The semantic hash captures exactly which user functions are transitively
-        -- called by the wrapper expression. Changes to unrelated functions don't
-        -- affect this hash.
-        wrapperSemanticKey : String
-        wrapperSemanticKey =
-            SemanticHash.hashExpression
-                (Elm.Syntax.Node.Node
-                    { start = { row = 0, column = 0 }, end = { row = 0, column = 0 } }
-                    (FunctionOrValue [] "results")
-                )
-
         semanticCacheKey : String
         semanticCacheKey =
             let
-                -- Get semantic hashes of all user declarations that are transitively needed
-                neededDeclHashes =
-                    neededModules
-                        |> Set.toList
-                        |> List.sort
-                        |> List.filterMap
-                            (\moduleName ->
-                                -- Get all declarations from this module in the semantic index
-                                project.semanticIndex
-                                    |> Dict.toList
-                                    |> List.filter (\( key, _ ) -> String.startsWith (moduleName ++ ".") key)
-                                    |> List.map (\( _, info ) -> info.semanticHash)
-                                    |> (\hashes ->
-                                            if List.isEmpty hashes then
-                                                Nothing
+                -- Extract function references from the wrapper expression to find
+                -- entry-point declarations, then use their semantic hashes (which
+                -- transitively include all dependencies via the Merkle property)
+                wrapperDeps =
+                    case Elm.Parser.parseToFile wrapperSource of
+                        Ok wrapperFile ->
+                            wrapperFile.declarations
+                                |> List.concatMap
+                                    (\(Node _ decl) ->
+                                        case decl of
+                                            FunctionDeclaration func ->
+                                                SemanticHash.extractDependencies
+                                                    (Node
+                                                        { start = { row = 0, column = 0 }, end = { row = 0, column = 0 } }
+                                                        (Node.value func.declaration |> .expression |> Node.value)
+                                                    )
 
-                                            else
-                                                Just (String.join "|" (List.sort hashes))
-                                       )
+                                            _ ->
+                                                []
+                                    )
+
+                        Err _ ->
+                            []
+
+                -- Resolve each dependency to its semantic hash from the index
+                entryPointHashes =
+                    wrapperDeps
+                        |> List.filterMap
+                            (\( modName, funcName ) ->
+                                let
+                                    qualName =
+                                        if List.isEmpty modName then
+                                            funcName
+
+                                        else
+                                            String.join "." modName ++ "." ++ funcName
+                                in
+                                SemanticHash.semanticHashForEntry project.semanticIndex qualName
                             )
+                        |> List.sort
 
                 overrideKey =
                     String.join "|" fileOverrideHashKeys
@@ -666,7 +676,7 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                     String.join "|" (List.map (\s -> String.left 100 s) sourceOverrides)
             in
             String.join "\n"
-                (neededDeclHashes ++ [ overrideKey, sourceOverrideKey, wrapperSource ])
+                (entryPointHashes ++ [ overrideKey, sourceOverrideKey, wrapperSource ])
     in
     Cache.do (Cache.writeFile semanticCacheKey Cache.succeed) <| \semanticHash ->
     Cache.compute [ "interpret-with-file-overrides" ]

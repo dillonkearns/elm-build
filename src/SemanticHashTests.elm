@@ -225,6 +225,48 @@ suite =
 
                         _ ->
                             Expect.fail "Expected both hashes to exist"
+            , test "semanticHashForExpression only includes transitive deps" <|
+                \_ ->
+                    let
+                        modules =
+                            [ { moduleName = "MathLib"
+                              , source = "module MathLib exposing (..)\n\nabs n = if n < 0 then negate n else n\n\nclamp lo hi x = x"
+                              }
+                            , { moduleName = "Tests"
+                              , source = "module Tests exposing (..)\n\nimport MathLib\n\ntestAbs = MathLib.abs 5\n\ntestClamp = MathLib.clamp 0 10 5"
+                              }
+                            ]
+
+                        index =
+                            SemanticHash.buildMultiModuleIndex modules
+
+                        -- Hash for testAbs should NOT include clamp
+                        hashForTestAbs =
+                            SemanticHash.semanticHashForEntry index "Tests.testAbs"
+
+                        -- Now change clamp — testAbs hash should be unchanged
+                        modules2 =
+                            [ { moduleName = "MathLib"
+                              , source = "module MathLib exposing (..)\n\nabs n = if n < 0 then negate n else n\n\nclamp lo hi x = lo"
+                              }
+                            , { moduleName = "Tests"
+                              , source = "module Tests exposing (..)\n\nimport MathLib\n\ntestAbs = MathLib.abs 5\n\ntestClamp = MathLib.clamp 0 10 5"
+                              }
+                            ]
+
+                        index2 =
+                            SemanticHash.buildMultiModuleIndex modules2
+
+                        hashForTestAbs2 =
+                            SemanticHash.semanticHashForEntry index2 "Tests.testAbs"
+                    in
+                    case ( hashForTestAbs, hashForTestAbs2 ) of
+                        ( Just h1, Just h2 ) ->
+                            -- testAbs doesn't call clamp, so changing clamp shouldn't change testAbs's entry hash
+                            h1 |> Expect.equal h2
+
+                        _ ->
+                            Expect.fail "Expected both hashes"
             , test "package deps use version-qualified name" <|
                 \_ ->
                     let
