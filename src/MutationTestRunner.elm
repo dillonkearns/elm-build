@@ -244,22 +244,41 @@ task config =
         -- Determine which files to mutate
         Do.do (resolveFilesToMutate config project sourceDirectories testFile) <| \filesToMutate ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Mutating " ++ String.fromInt (List.length filesToMutate) ++ " source file(s): " ++ String.join ", " filesToMutate)) <| \_ ->
-        -- Coverage pass: run tests once unmutated with tracing to collect covered ranges
+        -- Per-test coverage: run each test individually with tracing
         Do.do
-            (BackendTask.Extra.timed "Collecting coverage" "Coverage collected"
-                (InterpreterProject.evalWithCoverage project
-                    { imports = evalConfig.imports
-                    , expression = evalConfig.expression
-                    , sourceOverrides = [ simpleTestRunnerSource ]
-                    }
+            (BackendTask.Extra.timed "Collecting per-test coverage" "Coverage collected"
+                (testValues
+                    |> List.map
+                        (\testValue ->
+                            let
+                                singleTestExpr =
+                                    "SimpleTestRunner.runToString (" ++ testModuleName ++ "." ++ testValue ++ ")"
+                            in
+                            InterpreterProject.evalWithCoverage project
+                                { imports = evalConfig.imports
+                                , expression = singleTestExpr
+                                , sourceOverrides = [ simpleTestRunnerSource ]
+                                }
+                                |> BackendTask.map
+                                    (\result ->
+                                        { testName = testModuleName ++ "." ++ testValue
+                                        , coveredRanges = result.coveredRanges
+                                        }
+                                    )
+                        )
+                    |> BackendTask.Extra.combine
                 )
             )
-        <| \coverageResult ->
+        <| \perTestCoverage ->
         let
-            coveredRanges =
-                coverageResult.coveredRanges
+            -- Flatten all covered ranges (union across all tests)
+            allCoveredRanges =
+                perTestCoverage |> List.concatMap .coveredRanges
+
+            totalCoveredExpressions =
+                List.length allCoveredRanges
         in
-        Do.log ("  Covered " ++ String.fromInt (List.length coveredRanges) ++ " expression ranges") <| \_ ->
+        Do.log ("  " ++ String.fromInt (List.length perTestCoverage) ++ " tests, " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
         Do.do BackendTask.Time.now <| \startTime ->
         -- Run mutations for each file and collect per-file results
@@ -277,11 +296,11 @@ task config =
 
                             coveredMutations =
                                 mutations
-                                    |> List.filter (\m -> Coverage.isCovered coveredRanges m.spliceRange)
+                                    |> List.filter (\m -> Coverage.isCovered allCoveredRanges m.spliceRange)
 
                             uncoveredMutations =
                                 mutations
-                                    |> List.filter (\m -> not (Coverage.isCovered coveredRanges m.spliceRange))
+                                    |> List.filter (\m -> not (Coverage.isCovered allCoveredRanges m.spliceRange))
 
                             uncoveredResults =
                                 uncoveredMutations
@@ -292,11 +311,32 @@ task config =
                             (coveredMutations
                                 |> List.map
                                     (\mutation ->
+                                        let
+                                            -- Find tests whose coverage includes this mutation's range
+                                            relevantTests =
+                                                perTestCoverage
+                                                    |> List.filter (\tc -> Coverage.isCovered tc.coveredRanges mutation.spliceRange)
+                                                    |> List.map .testName
+
+                                            -- Build a suite expression with only the relevant tests
+                                            relevantSuiteExpr =
+                                                if List.length relevantTests == List.length perTestCoverage then
+                                                    -- All tests cover this mutation — use the full suite (faster)
+                                                    evalConfig.expression
+
+                                                else
+                                                    case relevantTests of
+                                                        [ single ] ->
+                                                            "SimpleTestRunner.runToString (" ++ single ++ ")"
+
+                                                        multiple ->
+                                                            "SimpleTestRunner.runToString (Test.describe \"relevant\" [" ++ String.join ", " multiple ++ "])"
+                                        in
                                         Do.do
                                             (Cache.run { jobs = Nothing } config.buildDirectory
                                                 (InterpreterProject.evalWithFileOverrides project
                                                     { imports = evalConfig.imports
-                                                    , expression = evalConfig.expression
+                                                    , expression = relevantSuiteExpr
                                                     , sourceOverrides = [ simpleTestRunnerSource ]
                                                     , fileOverrides = [ { file = mutation.mutatedFile, hashKey = Mutator.hashKey mutation } ]
                                                     }
