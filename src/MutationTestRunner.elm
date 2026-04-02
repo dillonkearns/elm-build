@@ -327,9 +327,12 @@ task config =
                         Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations (" ++ String.fromInt (List.length coveredMutations) ++ " covered, " ++ String.fromInt (List.length uncoveredMutations) ++ " no coverage)") <| \_ ->
                         Do.do
                             (coveredMutations
-                                |> List.map
-                                    (\mutation ->
+                                |> List.indexedMap
+                                    (\mutIndex mutation ->
                                         let
+                                            mutationProgress =
+                                                "    [" ++ String.fromInt (mutIndex + 1) ++ "/" ++ String.fromInt (List.length coveredMutations) ++ "] " ++ mutation.operator ++ " " ++ mutateFilePath ++ ":" ++ String.fromInt mutation.line
+
                                             -- Find tests whose coverage includes this mutation's range
                                             relevantTests =
                                                 perTestCoverage
@@ -376,7 +379,29 @@ task config =
                                             )
                                         <| \result ->
                                         Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
-                                        BackendTask.succeed (parseMutationResult relevantBaseline mutation output)
+                                        let
+                                            mutResult =
+                                                parseMutationResult relevantBaseline mutation output
+
+                                            statusStr =
+                                                case mutResult of
+                                                    Killed _ ->
+                                                        Ansi.Color.fontColor Ansi.Color.green "KILLED"
+
+                                                    Survived _ ->
+                                                        Ansi.Color.fontColor Ansi.Color.red "SURVIVED"
+
+                                                    EquivalentResult _ ->
+                                                        Ansi.Color.fontColor Ansi.Color.yellow "EQUIVALENT"
+
+                                                    NoCoverageResult _ ->
+                                                        "NO COVERAGE"
+
+                                                    ErrorResult _ ->
+                                                        Ansi.Color.fontColor Ansi.Color.yellow "ERROR"
+                                        in
+                                        Do.log (mutationProgress ++ " " ++ statusStr) <| \_ ->
+                                        BackendTask.succeed mutResult
                                     )
                                 |> BackendTask.Extra.sequence
                             )
@@ -1174,7 +1199,6 @@ kernelPackages =
         , "elm/regex"
         , "elm/html"
         , "elm/virtual-dom"
-        , "elm/bytes"
         , "elm/browser"
         , "elm/http"
         , "elm/file"

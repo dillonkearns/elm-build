@@ -463,7 +463,6 @@ kernelPackages =
     Set.fromList
         [ "elm/html"
         , "elm/virtual-dom"
-        , "elm/bytes"
         , "elm/browser"
         , "elm/http"
         , "elm/file"
