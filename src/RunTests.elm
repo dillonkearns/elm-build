@@ -8,6 +8,7 @@ import Pages.Script as Script exposing (Script)
 import Random
 import CoverageTests
 import DepGraphTests
+import SemanticHashTests
 import MutationReportTests
 import MutationTestRunnerTest
 import MutatorTests
@@ -28,7 +29,7 @@ runAll =
             Random.initialSeed 42
 
         allSuites =
-            Test.describe "All" [ TestAnalysisTests.suite, MutatorTests.suite, MutationTestRunnerTest.suite, DepGraphTests.suite, MutationReportTests.suite, CoverageTests.suite ]
+            Test.describe "All" [ TestAnalysisTests.suite, MutatorTests.suite, MutationTestRunnerTest.suite, DepGraphTests.suite, MutationReportTests.suite, CoverageTests.suite, SemanticHashTests.suite ]
 
         runners =
             case Test.Runner.fromTest 100 seed allSuites of
