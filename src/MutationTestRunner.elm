@@ -110,7 +110,7 @@ programConfig =
 
 run : Script
 run =
-    Script.withCliOptions programConfig task
+    Script.withCliOptions programConfig (task >> BackendTask.quiet)
 
 
 task : Config -> BackendTask FatalError ()
