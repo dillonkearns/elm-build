@@ -756,12 +756,17 @@ displayMultiFileReport config allFileResults =
         total =
             List.length allResults
 
+        -- Score excludes equivalent + NoCoverage from denominator
+        -- (equivalent can't be caught; uncovered can't be reached)
+        actionableTotal =
+            total - totalEquivalent - totalNoCoverage
+
         score =
-            if total == 0 then
+            if actionableTotal == 0 then
                 "N/A"
 
             else
-                String.fromInt (round (toFloat totalKilled / toFloat total * 100)) ++ "%"
+                String.fromInt (round (toFloat totalKilled / toFloat actionableTotal * 100)) ++ "%"
 
         summaryColor =
             if totalSurvived == 0 && totalErrors == 0 then
@@ -827,11 +832,11 @@ displayMultiFileReport config allFileResults =
     <| \_ ->
     let
         scoreInt =
-            if total == 0 then
+            if actionableTotal == 0 then
                 100
 
             else
-                round (toFloat totalKilled / toFloat total * 100)
+                round (toFloat totalKilled / toFloat actionableTotal * 100)
 
         shouldFail =
             case config.breakThreshold of
