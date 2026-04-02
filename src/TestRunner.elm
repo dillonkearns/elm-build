@@ -241,7 +241,8 @@ runTestFile project testFile =
                     simpleTestRunnerSource :: userSources
 
                 result =
-                    Eval.Module.evalWithEnv
+                    Eval.Module.evalWithEnvAndLimit
+                        (Just 5000000)
                         (InterpreterProject.getPackageEnv project)
                         allSources
                         (FunctionOrValue [] "results")
