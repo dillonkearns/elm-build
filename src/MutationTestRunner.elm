@@ -375,7 +375,7 @@ task config =
                                                     { imports = evalConfig.imports
                                                     , expression = relevantSuiteExpr
                                                     , sourceOverrides = [ simpleTestRunnerSource ]
-                                                    , fileOverrides = [ { file = mutation.mutatedFile, hashKey = Mutator.hashKey mutation } ]
+                                                    , fileOverrides = [ { file = mutation.getMutatedFile (), hashKey = Mutator.hashKey mutation } ]
                                                     }
                                                     Cache.succeed
                                                 )

@@ -25,7 +25,7 @@ type alias Mutation =
     , column : Int
     , operator : String
     , description : String
-    , mutatedFile : File
+    , getMutatedFile : () -> File
     , spliceRange : Range
     , spliceText : String
     }
@@ -172,7 +172,7 @@ findMutationsInDeclaration source file declIndex decl =
                                       , column = exprRange.start.column
                                       , operator = "extremeMutation"
                                       , description = "Replaced function body with default value"
-                                      , mutatedFile = replaceExpression file declIndex [] (Node exprRange defaultExpr)
+                                      , getMutatedFile = \() -> replaceExpression file declIndex [] (Node exprRange defaultExpr)
                                       , spliceRange = exprRange
                                       , spliceText = defaultText
                                       }
@@ -333,7 +333,7 @@ findMutationsInExpression source file declIndex path (Node range expr) =
             , column = range.start.column
             , operator = operator
             , description = description
-            , mutatedFile = replaceExpression file declIndex path replacement
+            , getMutatedFile = \() -> replaceExpression file declIndex path replacement
             , spliceRange = range
             , spliceText = Elm.Writer.write (Elm.Writer.writeExpression replacement)
             }
@@ -346,7 +346,7 @@ findMutationsInExpression source file declIndex path (Node range expr) =
             , column = range.start.column
             , operator = operator
             , description = description
-            , mutatedFile = replaceExpression file declIndex path (Node range newExpr)
+            , getMutatedFile = \() -> replaceExpression file declIndex path (Node range newExpr)
             , spliceRange = sRange
             , spliceText = sText
             }
@@ -765,7 +765,7 @@ concatRemovalAst source op dir (Node leftRange _) (Node rightRange _) range file
           , column = range.start.column
           , operator = "concatRemoval"
           , description = "Kept only left side of `++`"
-          , mutatedFile = replaceExpression file declIndex path (Node leftRange (FunctionOrValue [] "placeholder__"))
+          , getMutatedFile = \() -> replaceExpression file declIndex path (Node leftRange (FunctionOrValue [] "placeholder__"))
           , spliceRange = range
           , spliceText = extractSourceRange source leftRange
           }
@@ -773,7 +773,7 @@ concatRemovalAst source op dir (Node leftRange _) (Node rightRange _) range file
           , column = range.start.column
           , operator = "concatRemoval"
           , description = "Kept only right side of `++`"
-          , mutatedFile = replaceExpression file declIndex path (Node rightRange (FunctionOrValue [] "placeholder__"))
+          , getMutatedFile = \() -> replaceExpression file declIndex path (Node rightRange (FunctionOrValue [] "placeholder__"))
           , spliceRange = range
           , spliceText = extractSourceRange source rightRange
           }
@@ -793,7 +793,7 @@ pipelineRemoval source op (Node leftRange _) (Node rightRange _) range file decl
           , column = range.start.column
           , operator = "removePipelineStep"
           , description = "Removed `|>` pipeline step"
-          , mutatedFile = replaceExpression file declIndex path (Node leftRange (FunctionOrValue [] "placeholder__"))
+          , getMutatedFile = \() -> replaceExpression file declIndex path (Node leftRange (FunctionOrValue [] "placeholder__"))
           , spliceRange = range
           , spliceText = extractSourceRange source leftRange
           }
@@ -804,7 +804,7 @@ pipelineRemoval source op (Node leftRange _) (Node rightRange _) range file decl
           , column = range.start.column
           , operator = "removePipelineStep"
           , description = "Removed `<|` pipeline step"
-          , mutatedFile = replaceExpression file declIndex path (Node rightRange (FunctionOrValue [] "placeholder__"))
+          , getMutatedFile = \() -> replaceExpression file declIndex path (Node rightRange (FunctionOrValue [] "placeholder__"))
           , spliceRange = range
           , spliceText = extractSourceRange source rightRange
           }
@@ -850,7 +850,7 @@ removeListElementMutations source elements range file declIndex path =
             , column = range.start.column
             , operator = "removeListElement"
             , description = "Removed " ++ label ++ " element from list of " ++ String.fromInt elementCount
-            , mutatedFile = replaceExpression file declIndex path newExpr
+            , getMutatedFile = \() -> replaceExpression file declIndex path newExpr
             , spliceRange = range
             , spliceText = listText
             }
@@ -905,7 +905,7 @@ removeRecordUpdateMutations source recordName setters range file declIndex path 
             , column = range.start.column
             , operator = "removeRecordUpdate"
             , description = "Removed `" ++ fieldName ++ "` field update from record"
-            , mutatedFile = replaceExpression file declIndex path newExpr
+            , getMutatedFile = \() -> replaceExpression file declIndex path newExpr
             , spliceRange = range
             , spliceText = recordText
             }
@@ -961,9 +961,10 @@ swapCaseBranchMutations source caseBlock range file declIndex path =
                     ++ String.fromInt (i + 1)
                     ++ " with branch "
                     ++ String.fromInt (i + 2)
-            , mutatedFile =
-                replaceExpression file declIndex path
-                    (Node range (CaseExpression { caseBlock | cases = swappedCases }))
+            , getMutatedFile =
+                \() ->
+                    replaceExpression file declIndex path
+                        (Node range (CaseExpression { caseBlock | cases = swappedCases }))
             , spliceRange = expr1Range
             , spliceText = expr2Text
             }
@@ -1034,7 +1035,7 @@ functionSwapMutations source fnMod fnName fnRange args appRange file declIndex p
                 , column = fnRange.start.column
                 , operator = "functionSwap"
                 , description = "Swapped `" ++ fromQualified ++ "` to `" ++ toQualified ++ "`"
-                , mutatedFile = replaceExpression file declIndex path newExpr
+                , getMutatedFile = \() -> replaceExpression file declIndex path newExpr
                 , spliceRange = fnRange
                 , spliceText = toQualified
                 }
