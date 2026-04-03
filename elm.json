@@ -12,11 +12,12 @@
         "direct": {
             "arowM/elm-multiline-string": "1.0.0",
             "dillonkearns/elm-cli-options-parser": "5.0.1",
-            "dillonkearns/elm-pages": "12.1.1",
+            "dillonkearns/elm-pages": "12.1.2",
             "elm/core": "1.0.5",
             "elm/json": "1.1.4",
             "elm/parser": "1.1.0",
             "elm/random": "1.0.0",
+            "elm/regex": "1.0.0",
             "elm/time": "1.0.0",
             "elm-explorations/test": "2.2.1",
             "elmcraft/core-extra": "2.3.0",
@@ -32,8 +33,7 @@
             "stil4m/elm-syntax": "7.3.9",
             "the-sett/elm-pretty-printer": "3.3.1",
             "the-sett/elm-syntax-dsl": "6.0.5",
-            "wolfadex/elm-ansi": "3.0.1",
-            "elm/regex": "1.0.0"
+            "wolfadex/elm-ansi": "3.0.1"
         },
         "indirect": {
             "Chadtech/elm-bool-extra": "2.4.2",
