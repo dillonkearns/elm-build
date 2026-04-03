@@ -582,6 +582,50 @@ suite =
 
                         _ ->
                             Expect.fail ("Expected 1 concatRemoval left, got " ++ String.fromInt (List.length mutations))
+            , test "getMutatedFile keeps left side (no placeholder__)" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    \"hello\" ++ \" world\""
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "concatRemoval" && String.contains "left" m.description)
+                    in
+                    case mutations of
+                        [ m ] ->
+                            let
+                                mutatedSource =
+                                    Mutator.writeFile (m.getMutatedFile ())
+                            in
+                            mutatedSource
+                                |> String.contains "placeholder__"
+                                |> Expect.equal False
+
+                        _ ->
+                            Expect.fail ("Expected 1 concatRemoval left, got " ++ String.fromInt (List.length mutations))
+            , test "getMutatedFile keeps right side (no placeholder__)" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo =\n    \"hello\" ++ \" world\""
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "concatRemoval" && String.contains "right" m.description)
+                    in
+                    case mutations of
+                        [ m ] ->
+                            let
+                                mutatedSource =
+                                    Mutator.writeFile (m.getMutatedFile ())
+                            in
+                            mutatedSource
+                                |> String.contains "placeholder__"
+                                |> Expect.equal False
+
+                        _ ->
+                            Expect.fail ("Expected 1 concatRemoval right, got " ++ String.fromInt (List.length mutations))
             ]
         , describe "conditionalToConstant"
             [ test "replaces condition with True" <|
@@ -961,6 +1005,50 @@ suite =
                             Mutator.applyMutation source m
                                 |> String.contains "    x"
                                 |> Expect.equal True
+
+                        _ ->
+                            Expect.fail ("Expected 1 removePipelineStep, got " ++ String.fromInt (List.length mutations))
+            , test "getMutatedFile keeps input for |> (no placeholder__)" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    x |> String.toUpper"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removePipelineStep")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            let
+                                mutatedSource =
+                                    Mutator.writeFile (m.getMutatedFile ())
+                            in
+                            mutatedSource
+                                |> String.contains "placeholder__"
+                                |> Expect.equal False
+
+                        _ ->
+                            Expect.fail ("Expected 1 removePipelineStep, got " ++ String.fromInt (List.length mutations))
+            , test "getMutatedFile keeps argument for <| (no placeholder__)" <|
+                \_ ->
+                    let
+                        source =
+                            "module Foo exposing (..)\n\nfoo x =\n    String.toUpper <| x"
+
+                        mutations =
+                            Mutator.generateMutations source
+                                |> List.filter (\m -> m.operator == "removePipelineStep")
+                    in
+                    case mutations of
+                        [ m ] ->
+                            let
+                                mutatedSource =
+                                    Mutator.writeFile (m.getMutatedFile ())
+                            in
+                            mutatedSource
+                                |> String.contains "placeholder__"
+                                |> Expect.equal False
 
                         _ ->
                             Expect.fail ("Expected 1 removePipelineStep, got " ++ String.fromInt (List.length mutations))

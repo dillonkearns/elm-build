@@ -759,13 +759,13 @@ logicalSwaps op =
 
 
 concatRemovalAst : String -> String -> InfixDirection -> Node Expression -> Node Expression -> Range -> File -> Int -> List Int -> List Mutation
-concatRemovalAst source op dir (Node leftRange _) (Node rightRange _) range file declIndex path =
+concatRemovalAst source op dir ((Node leftRange _) as left) ((Node rightRange _) as right) range file declIndex path =
     if op == "++" then
         [ { line = range.start.row
           , column = range.start.column
           , operator = "concatRemoval"
           , description = "Kept only left side of `++`"
-          , getMutatedFile = \() -> replaceExpression file declIndex path (Node leftRange (FunctionOrValue [] "placeholder__"))
+          , getMutatedFile = \() -> replaceExpression file declIndex path left
           , spliceRange = range
           , spliceText = extractSourceRange source leftRange
           }
@@ -773,7 +773,7 @@ concatRemovalAst source op dir (Node leftRange _) (Node rightRange _) range file
           , column = range.start.column
           , operator = "concatRemoval"
           , description = "Kept only right side of `++`"
-          , getMutatedFile = \() -> replaceExpression file declIndex path (Node rightRange (FunctionOrValue [] "placeholder__"))
+          , getMutatedFile = \() -> replaceExpression file declIndex path right
           , spliceRange = range
           , spliceText = extractSourceRange source rightRange
           }
@@ -787,13 +787,13 @@ concatRemovalAst source op dir (Node leftRange _) (Node rightRange _) range file
 keeping just `a`. Tests whether the pipeline step matters.
 -}
 pipelineRemoval : String -> String -> Node Expression -> Node Expression -> Range -> File -> Int -> List Int -> List Mutation
-pipelineRemoval source op (Node leftRange _) (Node rightRange _) range file declIndex path =
+pipelineRemoval source op ((Node leftRange _) as left) ((Node rightRange _) as right) range file declIndex path =
     if op == "|>" then
         [ { line = range.start.row
           , column = range.start.column
           , operator = "removePipelineStep"
           , description = "Removed `|>` pipeline step"
-          , getMutatedFile = \() -> replaceExpression file declIndex path (Node leftRange (FunctionOrValue [] "placeholder__"))
+          , getMutatedFile = \() -> replaceExpression file declIndex path left
           , spliceRange = range
           , spliceText = extractSourceRange source leftRange
           }
@@ -804,7 +804,7 @@ pipelineRemoval source op (Node leftRange _) (Node rightRange _) range file decl
           , column = range.start.column
           , operator = "removePipelineStep"
           , description = "Removed `<|` pipeline step"
-          , getMutatedFile = \() -> replaceExpression file declIndex path (Node rightRange (FunctionOrValue [] "placeholder__"))
+          , getMutatedFile = \() -> replaceExpression file declIndex path right
           , spliceRange = range
           , spliceText = extractSourceRange source rightRange
           }
