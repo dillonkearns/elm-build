@@ -1,7 +1,7 @@
 module Cache exposing
     ( FileOrDirectory, input, inputs
     , Monad, do, succeed, fail
-    , writeFile, run
+    , writeFile, run, runWith, listExisting, HashSet
     , map, map2, andThen, combine, combineBy, each, sequence
     , pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, compute, withFile
     , withPrefix, timed
@@ -609,6 +609,35 @@ run config buildPath m =
             )
 
 
+{-| Like `run`, but accepts a pre-computed `existing` set from `listExisting`.
+Use this when running multiple Cache operations in a loop to avoid redundant
+directory listings.
+-}
+runWith : { jobs : Maybe Int, existing : HashSet } -> Path -> Monad FileOrDirectory -> BackendTask FatalError { output : Path, dependencies : List Path }
+runWith config buildPath m =
+    let
+        input_ : Input
+        input_ =
+            { existing = config.existing
+            , prefix = []
+            , buildPath = buildPath
+            , jobs = config.jobs
+            }
+    in
+    runMonad m input_ hashSetEmpty
+        |> BackendTask.map
+            (\( output, deps ) ->
+                { output = Path.path (hashToPath buildPath output)
+                , dependencies =
+                    deps
+                        |> hashSetToList
+                        |> List.map (\raw -> raw |> hashToPath buildPath |> Path.path)
+                }
+            )
+
+
+{-| Read the existing cache directory entries. Call once, then pass to `runWith`.
+-}
 listExisting : Path -> BackendTask FatalError HashSet
 listExisting path =
     BackendTask.Custom.run "readdir"

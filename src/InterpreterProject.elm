@@ -36,6 +36,7 @@ import Types
 
 type alias ModuleGraph =
     { moduleToSource : Dict String String
+    , moduleToFile : Dict String File
     , imports : Dict String (Set String)
     }
 
@@ -194,9 +195,26 @@ loadWith config =
                                                                             )
                                                                             allSourceStrings
 
+                                                                    -- Pre-parse user source files for reuse across evaluations
+                                                                    userParsedFiles : Dict String File
+                                                                    userParsedFiles =
+                                                                        userFileContents
+                                                                            |> List.filterMap
+                                                                                (\( _, content ) ->
+                                                                                    case Elm.Parser.parseToFile content of
+                                                                                        Ok file ->
+                                                                                            DepGraph.parseModuleName content
+                                                                                                |> Maybe.map (\name -> ( name, file ))
+
+                                                                                        Err _ ->
+                                                                                            Nothing
+                                                                                )
+                                                                            |> Dict.fromList
+
                                                                     moduleGraph : ModuleGraph
                                                                     moduleGraph =
                                                                         { moduleToSource = Dict.fromList allModules
+                                                                        , moduleToFile = userParsedFiles
                                                                         , imports =
                                                                             allModules
                                                                                 |> List.map
@@ -619,6 +637,14 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                 True
                     )
 
+        -- Pre-parsed user module Files (from loadWith), in topo order
+        userFilteredFiles : List File
+        userFilteredFiles =
+            neededModules
+                |> Set.toList
+                |> List.filter (\name -> not (Set.member name project.packageModuleNames))
+                |> List.filterMap (\name -> Dict.get name project.moduleGraph.moduleToFile)
+
         -- Semantic hash: hash the wrapper expression's semantic dependencies
         -- + override hash keys. Only invalidates when actually-called functions change.
         fileOverrideHashKeys : List String
@@ -683,10 +709,11 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
         semanticHash
         (\() ->
             let
-                -- Parse string sources into Files, then combine with pre-parsed overrides
-                parsedUserSources : Result Types.Error (List File)
-                parsedUserSources =
-                    (userFilteredSources ++ sourceOverrides ++ [ wrapperSource ])
+                -- Only parse sourceOverrides and wrapper (small/new);
+                -- user sources are pre-parsed in moduleGraph.moduleToFile
+                parsedOverrides : Result Types.Error (List File)
+                parsedOverrides =
+                    (sourceOverrides ++ [ wrapperSource ])
                         |> List.map
                             (\src ->
                                 Elm.Parser.parseToFile src
@@ -694,7 +721,7 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                             )
                         |> combineFileResults
             in
-            case parsedUserSources of
+            case parsedOverrides of
                 Err err ->
                     case err of
                         Types.ParsingError _ ->
@@ -703,22 +730,24 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                         Types.EvalError evalErr ->
                             "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
 
-                Ok parsedFiles ->
+                Ok overrideFiles ->
                     let
-                        allButWrapper =
-                            List.take (List.length parsedFiles - 1) parsedFiles
+                        overridesButWrapper =
+                            List.take (List.length overrideFiles - 1) overrideFiles
 
                         wrapperFile =
-                            List.drop (List.length parsedFiles - 1) parsedFiles
+                            List.drop (List.length overrideFiles - 1) overrideFiles
 
                         allFiles =
-                            allButWrapper
+                            userFilteredFiles
+                                ++ overridesButWrapper
                                 ++ List.map .file fileOverrides
                                 ++ wrapperFile
 
                         result : Result Types.Error Types.Value
                         result =
-                            Eval.Module.evalWithEnvFromFiles
+                            Eval.Module.evalWithEnvFromFilesAndLimit
+                                (Just 5000000)
                                 project.packageEnv
                                 allFiles
                                 (FunctionOrValue [] "results")

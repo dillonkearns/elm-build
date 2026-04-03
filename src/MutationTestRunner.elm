@@ -298,11 +298,13 @@ task config =
         in
         Do.log ("  " ++ String.fromInt (List.length perTestCoverage) ++ " tests, " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
+        -- Pre-compute the cache directory listing once, instead of per-mutation
+        Do.do (Cache.listExisting config.buildDirectory) <| \existingCache ->
         Do.do BackendTask.Time.now <| \startTime ->
         -- Run mutations for each file and collect per-file results
         Do.do
             (filesToMutate
-                |> List.map
+                |> BackendTask.Extra.mapSequence
                     (\mutateFilePath ->
                         Do.allowFatal (File.rawFile mutateFilePath) <| \mutateSource ->
                         let
@@ -327,8 +329,9 @@ task config =
                         Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations (" ++ String.fromInt (List.length coveredMutations) ++ " covered, " ++ String.fromInt (List.length uncoveredMutations) ++ " no coverage)") <| \_ ->
                         Do.do
                             (coveredMutations
-                                |> List.indexedMap
-                                    (\mutIndex mutation ->
+                                |> List.indexedMap Tuple.pair
+                                |> BackendTask.Extra.mapSequence
+                                    (\( mutIndex, mutation ) ->
                                         let
                                             mutationProgress =
                                                 "    [" ++ String.fromInt (mutIndex + 1) ++ "/" ++ String.fromInt (List.length coveredMutations) ++ "] " ++ mutation.operator ++ " " ++ mutateFilePath ++ ":" ++ String.fromInt mutation.line
@@ -367,7 +370,7 @@ task config =
                                                     ""
                                         in
                                         Do.do
-                                            (Cache.run { jobs = Nothing } config.buildDirectory
+                                            (Cache.runWith { jobs = Nothing, existing = existingCache } config.buildDirectory
                                                 (InterpreterProject.evalWithFileOverrides project
                                                     { imports = evalConfig.imports
                                                     , expression = relevantSuiteExpr
@@ -403,7 +406,6 @@ task config =
                                         Do.log (mutationProgress ++ " " ++ statusStr) <| \_ ->
                                         BackendTask.succeed mutResult
                                     )
-                                |> BackendTask.Extra.sequence
                             )
                         <| \coveredResults ->
                         BackendTask.succeed
@@ -412,7 +414,6 @@ task config =
                             , results = coveredResults ++ uncoveredResults
                             }
                     )
-                |> BackendTask.Extra.sequence
             )
         <| \allFileResults ->
         Do.do BackendTask.Time.now <| \endTime ->

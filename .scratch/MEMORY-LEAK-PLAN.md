@@ -1,356 +1,293 @@
-# Memory Leak Investigation & Fix Plan
+# Memory Leak Fix Plan — TDD + Benchmarking
 
-## Symptom
+## Problem
 
-Running mutation testing on real codebases (53+ mutations) causes OOM crashes. Memory grows linearly at ~700MB-1.2GB/min. GC reports `mu = 0.001` (essentially 0% freed). With 16GB heap limit, crashes after ~49 minutes.
+Running mutation testing on real codebases (53+ mutations) causes OOM crashes. Memory grows
+at ~700MB-1.2GB/min. V8 GC reports mu=0.001 (0% freed). With 16GB heap, crashes after ~49min.
 
-## Architecture: How Mutations Are Evaluated
+## Root Cause Analysis (Confirmed via Code Review)
 
-```
-MutationTestRunner.task
-  → coveredMutations |> List.map (\mutation -> Cache.run ... ) |> BackendTask.Extra.sequence
-```
+Three compounding causes, ordered by impact:
 
-For each mutation:
-1. `Cache.run { jobs = Nothing } config.buildDirectory (InterpreterProject.evalWithFileOverrides ...)`
-2. Inside `Cache.run`: calls `listExisting buildPath` (reads dir listing), creates `Input`, runs `runMonad`
-3. Inside `evalWithFileOverrides`: computes semantic cache key, calls `Cache.compute`
-4. Inside `Cache.compute`: calls `derive` which either returns cached hash or runs the interpreter
-5. Result: `BackendTask FatalError { output : Path, dependencies : List Path }`
+### 1. BackendTask.andThen closure chain retains all intermediate state (CRITICAL)
 
-All 53 results are accumulated via `BackendTask.Extra.sequence` → `BackendTask.sequence` → chained `andThen` calls.
+`BackendTask.sequence` uses `List.foldl andThen`, creating N nested closures. Each closure
+captures the enclosing scope, so V8 cannot GC any intermediate result until the entire chain
+completes. For 53 mutations, this means 53 interpreter evaluations (each producing ASTs,
+Env bindings, cache state) all live simultaneously.
 
-## Root Causes (Multiple, Compounding)
+**Where**: elm-pages `BackendTask.elm:494-519` (andThen), `BackendTask.elm:392-405` (sequence)
+**Used by**: `MutationTestRunner.elm:406` via `BackendTask.Extra.sequence`
 
-### Cause 1: `Cache.run` calls `listExisting` on every mutation
+### 2. Cache.run calls listExisting (readdir) on every mutation (MEDIUM)
 
-**File**: `src/Cache.elm`, line 590
+`Cache.run` calls `listExisting buildPath` which does a full `readdir` of the cache directory.
+For 53 mutations, that's 53 readdir calls, each returning a growing list of cache entries.
+Each result is retained in the andThen closure chain.
 
-```elm
-run config buildPath m =
-    Do.do (listExisting buildPath) <| \existing ->
-    ...
-```
+**Where**: `Cache.elm:588-609`
 
-`listExisting` calls `BackendTask.Custom.run "readdir"` which reads the entire cache directory listing. For 53 mutations, this is called 53 times. As the cache grows (each mutation adds entries), the directory listing gets larger. Each listing is retained in the `andThen` closure chain.
+### 3. All Mutation ASTs generated upfront (MEDIUM)
 
-**Fix**: Call `listExisting` ONCE before the mutation loop, pass the result through. Or make `Cache.run` accept a pre-computed `existing` set.
+`Mutator.generateMutations` creates 53 full `File` AST copies immediately. All are held in
+memory for the entire mutation loop, even though they're processed one at a time.
 
-### Cause 2: `BackendTask.Extra.sequence` retains all closures
+**Where**: `MutationTestRunner.elm:309-310`, `Mutator.elm:23-31`
 
-**File**: `src/BackendTask/Extra.elm`, lines 161-196
+## Fix Strategy
 
-```elm
-sequence inputs =
-    ...
-    arr |> Array.slice ... |> BackendTask.sequence |> BackendTask.map Rope.fromList
-```
+Each fix follows strict red-green-refactor TDD and is validated by benchmarking.
 
-`BackendTask.sequence` (the built-in one from elm-pages) chains `andThen` calls. Each `andThen` creates a closure that captures the previous result AND the continuation. For 53 mutations, this creates a chain of 53 closures, none of which can be GC'd until the entire chain completes.
+---
 
-The closure for mutation N retains:
-- The `InterpreterProject` (full project with all parsed sources, package env, semantic index)
-- The `mutation.mutatedFile` (full AST)
-- The `Cache.Monad` state (`HashSet` of dependencies)
-- The result of the interpreter evaluation
-- All intermediate BackendTask state
+### Phase 0: Establish Baseline Benchmarks
 
-**Fix**: Use `BackendTask.sequence` with a streaming/folding pattern that discards intermediate state. Or process each mutation result immediately instead of accumulating all results.
+**Before touching any code**, capture reproducible baseline numbers.
 
-### Cause 3: Each `Cache.run` creates subprocess overhead
+Benchmarks to run:
+1. **elm-build MathLib** (51 mutations, fast): cold + warm wall time, peak RSS
+2. **elm-ical Format.elm** (53 mutations, the OOM case): time-to-OOM or completion, peak RSS
+3. **core-extra BasicsTests** (49 mutations): cold + warm
 
-Each `Cache.run` → `derive` → `execLog` chain spawns multiple subprocesses:
-- `b3sum` for input hashing (via `Cache.inputs` during `loadWith`)
-- `cp` for caching input files
-- `mkdir -p` for cache directories
-- `chmod -R` for setting permissions
-- `mv` for atomic cache entry creation
+Measurement method:
+```bash
+# Peak RSS via /usr/bin/time -l (macOS)
+/usr/bin/time -l bun dist/MutationTestRunner.mjs --mutate src/MathLib.elm --test src/MathLibTests.elm --break 0 2>&1
 
-For 53 mutations with warm cache (all hits), most of these are skipped. But for cold runs, each mutation creates ~5-10 subprocess calls, and their file descriptors / buffers may be retained.
-
-### Cause 4: `InterpreterProject` is captured in every closure
-
-The `project` value (type `InterpreterProject`) contains:
-- `patchedPackageSources : List String` — ALL package source code as strings
-- `userFileContents : Dict String String` — all user source files
-- `moduleGraph : ModuleGraph` — `Dict String String` of all module sources
-- `packageEnv : Eval.Module.ProjectEnv` — the full parsed package environment
-- `semanticIndex : SemanticHash.DeclarationIndex` — hash index
-
-This is a large data structure. It's referenced from every mutation's `andThen` closure because the mutation lambda captures `project` from the outer scope. Even though it's the SAME reference, JS engines may retain multiple references through the closure chain.
-
-### Cause 5: `mutation.mutatedFile` retains full AST per mutation
-
-Each mutation stores `mutatedFile : File` — a complete copy of the source file's AST with one expression replaced. For 53 mutations of a single file, that's 53 copies of the full AST. These are all constructed upfront by `Mutator.generateMutations` and retained in the `coveredMutations` list throughout the entire mutation loop.
-
-## Proposed Fixes (Priority Order)
-
-### Fix 1: Process mutations one-at-a-time (Highest Impact)
-
-Instead of:
-```elm
-coveredMutations
-    |> List.map (\mutation -> Cache.run ... )
-    |> BackendTask.Extra.sequence  -- accumulates ALL results
+# For OOM case: cap memory and measure
+node --max-old-space-size=2048 dist/MutationTestRunner.mjs --mutate src/Format.elm --test tests/FormatTests.elm --break 0
 ```
 
-Do:
-```elm
-coveredMutations
-    |> List.foldl
-        (\mutation accTask ->
-            accTask |> BackendTask.andThen (\accResults ->
-                Cache.run ... |> BackendTask.map (\result ->
-                    -- Process result immediately (log, write to report)
-                    -- Only keep the summary (Killed/Survived/etc), not the full data
-                    parseMutationResult ... :: accResults
-                )
-            )
-        )
-        (BackendTask.succeed [])
-```
+Record in `.scratch/benchmarks.md`.
 
-This processes each mutation and immediately discards the heavy data (mutated AST, cache state). Only the lightweight `MutationResult` is kept.
+---
 
-**But**: This still chains `andThen` calls. The deeper fix needs elm-pages support.
+### Phase 1: Cache.runWith — shared listExisting (Quick Win)
 
-### Fix 2: `Cache.run` with shared `existing` set
+**Why first**: Smallest change, most isolated, easy to TDD. Removes 52 redundant readdir calls.
 
-Add a variant that accepts a pre-computed `existing : HashSet`:
+#### RED: Write failing test
+
+Add a test in `src/CacheTests.elm` (or equivalent) that verifies `Cache.runWith` accepts
+a pre-computed `existing` set and produces the same result as `Cache.run`.
+
+More concretely: since Cache is tested via integration (BackendTask execution), the test is:
+- Run `Cache.listExisting` once
+- Run `Cache.runWith existing ...` with that result
+- Assert same output as `Cache.run ...`
+
+#### GREEN: Implement Cache.runWith
 
 ```elm
 runWith : { jobs : Maybe Int, existing : HashSet } -> Path -> Monad FileOrDirectory -> BackendTask FatalError { output : Path, dependencies : List Path }
+runWith config buildPath m =
+    let
+        input_ : Input
+        input_ =
+            { existing = config.existing
+            , prefix = []
+            , buildPath = buildPath
+            , jobs = config.jobs
+            }
+    in
+    runMonad m input_ hashSetEmpty
+        |> BackendTask.map (\( output, deps ) -> ...)
 ```
 
-Call `listExisting` ONCE in `MutationTestRunner.task`, pass the result to all mutation evals. This eliminates 52 redundant `readdir` calls and their retained data.
+Also expose `listExisting` from Cache module.
 
-### Fix 3: Lazy mutation generation
+#### REFACTOR: Wire into MutationTestRunner
 
-Instead of generating all 53 `mutatedFile` ASTs upfront (53 full AST copies), generate each mutation's AST lazily — only when that mutation is about to be evaluated:
+In `MutationTestRunner.task`, call `Cache.listExisting` once before the mutation loop,
+pass the result to `Cache.runWith` for each mutation.
+
+#### BENCHMARK: Verify improvement
+
+Re-run MathLib benchmark. Expect: warm time unchanged (readdir was fast), cold time slightly
+improved. Memory: small reduction from not retaining 52 readdir results in closure chain.
+
+---
+
+### Phase 2: BackendTask.foldSequence — break the closure chain (Critical Fix)
+
+**Why**: This is the root cause. Without this, fixes 1 and 3 only delay the OOM.
+
+#### RED: Write failing test in elm-pages
+
+Add test for new `BackendTask.foldSequence`:
+```elm
+test "foldSequence processes items without retaining intermediate state" <|
+    \_ ->
+        BackendTask.foldSequence
+            (\item acc -> BackendTask.succeed (item + acc))
+            0
+            (List.range 1 100 |> List.map BackendTask.succeed)
+        |> expectBackendTask (Expect.equal 5050)
+```
+
+Also test that it produces same results as `sequence |> map (List.foldl ...)`.
+
+#### GREEN: Implement BackendTask.foldSequence in elm-pages
+
+Two options explored:
+
+**Option A: Elm-level fold with forced evaluation** (simpler, may not fully fix GC)
+```elm
+foldSequence : (a -> b -> BackendTask error b) -> b -> List (BackendTask error a) -> BackendTask error b
+foldSequence step init items =
+    case items of
+        [] -> succeed init
+        first :: rest ->
+            first |> andThen (\a -> step a init |> andThen (\newAcc -> foldSequence step newAcc rest))
+```
+
+This still uses andThen but the key difference: each step's result is reduced into the
+accumulator immediately, so the heavy `a` value is not retained — only the lightweight `b`.
+
+**Option B: New ADT variant in BackendTask** (deeper, guaranteed fix)
+Add a `FoldStep` variant to `RawRequest` that the runtime processes iteratively without
+building nested closures. The runtime loop would:
+1. Evaluate item N
+2. Call step function with result + accumulator
+3. Drop item N's data
+4. Proceed to item N+1
+
+Option A is sufficient if the step function doesn't capture heavy data in its closure.
+For mutation testing, the step function would extract just the mutation result status
+(Killed/Survived/etc.) and discard the full interpreter output.
+
+#### REFACTOR: Use foldSequence in MutationTestRunner
+
+Replace:
+```elm
+coveredMutations
+    |> List.indexedMap (\i m -> evaluateMutation ...)
+    |> BackendTask.Extra.sequence
+```
+
+With:
+```elm
+coveredMutations
+    |> List.indexedMap Tuple.pair
+    |> BackendTask.foldSequence
+        (\(i, mutation) results ->
+            evaluateMutation mutation
+                |> BackendTask.map (\r -> r :: results)
+        )
+        []
+```
+
+Where `evaluateMutation` returns a lightweight `MutationResult` (just status + location),
+not the full interpreter output.
+
+#### BENCHMARK: Critical validation
+
+- **MathLib**: Should see minimal change (already fast)
+- **elm-ical Format.elm**: Should complete without OOM at 2GB heap limit
+- **Memory profile**: `node --max-old-space-size=2048` should stay under 2GB for 53 mutations
+
+---
+
+### Phase 3: Lazy Mutation Generation (Memory Reduction)
+
+**Why**: Avoids holding 53 full AST copies simultaneously.
+
+#### RED: Write failing test
+
+Test that `Mutator.generateLazyMutations` returns mutation descriptors without the full AST,
+and that calling `mutation.generateMutatedFile()` produces the same File as the eager version.
 
 ```elm
-type alias LazyMutation =
+test "lazy mutation produces same AST as eager" <|
+    \_ ->
+        let
+            source = "module Foo exposing (..)\n\nfoo = 1 + 2"
+            eager = Mutator.generateMutations source
+            lazy = Mutator.generateLazyMutations source
+        in
+        List.map2
+            (\e l ->
+                Expect.equal e.mutatedFile (l.generateMutatedFile ())
+            )
+            eager lazy
+            |> Expect.all
+```
+
+#### GREEN: Implement lazy mutations
+
+Change `Mutation` to store the original file + splice info instead of the mutated AST:
+```elm
+type alias Mutation =
     { line : Int
     , column : Int
     , operator : String
     , description : String
-    , generateMutatedFile : () -> File  -- lazy
     , spliceRange : Range
     , spliceText : String
+    , originalFile : File          -- shared reference (1 copy)
+    , applyMutation : () -> File   -- lazy, creates AST on demand
     }
 ```
 
-This avoids retaining 53 AST copies simultaneously.
+All 53 mutations share the same `originalFile` reference. Each `applyMutation` is a thunk
+that splices in the mutation when called.
 
-### Fix 4: Incremental report writing
+#### BENCHMARK: Measure reduction
 
-Write each mutation result to the `--report` JSON file as it's evaluated, not at the end. This way:
-- Progress is visible immediately
-- If OOM occurs, partial results are saved
-- Stdout can be flushed per mutation
-
-### Fix 5: elm-pages BackendTask streaming (Deepest Fix)
-
-The fundamental issue is that `BackendTask.andThen` creates closures that retain all previous state. A streaming/iterative execution model would allow the runtime to process one BackendTask at a time without retaining the chain.
-
-This could be a new primitive in elm-pages:
-```elm
-BackendTask.foldSequence : (a -> b -> BackendTask error b) -> b -> List (BackendTask error a) -> BackendTask error b
-```
-
-Where each step's BackendTask is resolved and its data is reduced into the accumulator `b`, allowing the runtime to drop the step's full data.
-
-## Files to Modify
-
-- `src/MutationTestRunner.elm` (lines 328-380): Mutation loop — restructure to process one at a time
-- `src/Cache.elm` (line 588-609): Add `runWith` variant accepting pre-computed `existing`
-- `src/Mutator.elm` (lines 23-31): Consider lazy `mutatedFile` generation
-- `src/MutationReport.elm`: Add incremental write support
-- elm-pages `BackendTask` module: Consider adding `foldSequence` primitive
-
-## Testing
-
-1. Run against elm-ical `src/Format.elm` (53 mutations) — should complete without OOM
-2. Monitor memory with `node --max-old-space-size=2048` — should stay under 2GB
-3. Verify mutation results are identical to small-batch runs
-4. Check that `--report` file is written incrementally
-
-## Quick Win vs Deep Fix
-
-**Quick win (Fix 1 + 2 + 4)**: Restructure mutation loop to process one mutation at a time with shared `existing` set and incremental reporting. This reduces peak memory from O(N × AST_size) to O(1 × AST_size). Estimated effort: ~1 hour.
-
-**Deep fix (Fix 5)**: Add `BackendTask.foldSequence` to elm-pages. This fixes the underlying issue for ALL elm-pages users who chain many BackendTasks. Estimated effort: ~4 hours (elm-pages core change).
-
-## Notes on Elm/JS Memory Model
-
-Elm compiles to JS. The `andThen` chain creates nested closures:
-```js
-// Simplified: what BackendTask.sequence produces
-andThen(result1 => 
-    andThen(result2 =>
-        andThen(result3 =>
-            // ... 53 levels deep
-            // result1, result2, result3 are all retained by their enclosing closures
-        )
-    )
-)
-```
-
-V8's GC cannot collect `result1` until the innermost callback completes, because each closure captures its enclosing scope. This is the classic "closure chain retention" problem in JS.
-
-The fix is to break the chain: process each result immediately, extract only the summary data, and let the heavy data (AST, cache state) be GC'd before starting the next mutation.
+For 53 mutations of a 136-line file, this changes from 53 AST copies (~53 * AST_size) to
+1 AST copy + 53 lightweight descriptors. Expect ~50x reduction in mutation-related memory.
 
 ---
 
-## Benchmarking Guide
+### Phase 4: Incremental Report Writing (UX + Crash Resilience)
 
-### How to build
+#### RED: Write failing test
 
-The mutation test runner and test runner are elm-pages scripts that get bundled into standalone .mjs files:
+Test that `MutationReport.writeIncremental` appends a single mutation result to the report
+file, and that reading the file after N incremental writes produces valid JSON matching
+the batch `toJson` output.
 
-```bash
-cd /Users/dillonkearns/src/github.com/dillonkearns/elm-build
+#### GREEN: Implement incremental writing
 
-# Build mutation test runner
-npx elm-pages bundle-script src/MutationTestRunner.elm --output dist/MutationTestRunner.mjs
+- After each mutation result, append to the report file
+- Use JSONL (one JSON object per line) for append-friendliness
+- Add a finalization step that writes the proper Stryker-format JSON from accumulated JSONL
 
-# Build test runner (elm-test replacement)
-npx elm-pages bundle-script src/TestRunner.elm --output dist/TestRunner.mjs
-```
+#### BENCHMARK: Verify no regression
 
-Both produce self-contained files (~1.8MB) that can be run with `bun` or `node` in any Elm project directory.
+Wall time should not increase meaningfully (file write per mutation is ~1ms).
 
-### Running the tools
+---
 
-```bash
-cd /path/to/target/elm/project
+### Phase 5: Additional Feedback Items (Post-Memory-Fix)
 
-# Mutation test runner
-bun /path/to/elm-build/dist/MutationTestRunner.mjs --break 0
-bun /path/to/elm-build/dist/MutationTestRunner.mjs --test tests/MyTests.elm --break 0
-bun /path/to/elm-build/dist/MutationTestRunner.mjs --mutate src/MyModule.elm --test tests/MyTests.elm --break 0
-bun /path/to/elm-build/dist/MutationTestRunner.mjs --test tests/MyTests.elm --break 0 --report reports/mutation.json
+These are from elm-mutant-feedback.md but not memory-related:
 
-# Test runner (elm-test replacement)
-bun /path/to/elm-build/dist/TestRunner.mjs
-bun /path/to/elm-build/dist/TestRunner.mjs --test tests/MyTests.elm
-```
+1. **Per-test granularity** ("1 tests" problem): Discover individual `test` calls within
+   `suite`, not just top-level exposed values. Requires deeper AST analysis in TestAnalysis.
+2. **Transitive import discovery**: `findTestFilesImporting` should walk the dep graph
+   transitively, not just check direct imports.
+3. **Multi-test-file support**: Remove "(using first)" behavior; run all discovered test files.
+4. **Cache cleanup**: Add `--clean` flag or don't use read-only permissions.
 
-### Benchmark targets
+These are important but orthogonal to the memory fix. Tackle after Phase 2 is validated.
 
-**Small/fast (use for quick iteration):**
-```bash
-# elm-build's own MathLib (51 mutations, 15 tests) — ~1s per run
-cd /Users/dillonkearns/src/github.com/dillonkearns/elm-build
-bun dist/MutationTestRunner.mjs --mutate src/MathLib.elm --test src/MathLibTests.elm --break 0
+---
 
-# core-extra BasicsTests (49 mutations, 15 tests) — ~1s per run
-cd /Users/dillonkearns/src/github.com/elmcraft/core-extra
-bun /Users/dillonkearns/src/github.com/dillonkearns/elm-build/dist/MutationTestRunner.mjs --test tests/BasicsTests.elm --break 0
-```
+## Files to Modify (by phase)
 
-**Medium (good signal without waiting forever):**
-```bash
-# core-extra MaybeTests (85 mutations, 30 tests, 36 NoCoverage) — ~2s warm
-bun dist/MutationTestRunner.mjs --test tests/MaybeTests.elm --break 0
+| Phase | Repo | Files |
+|-------|------|-------|
+| 1 | elm-build | `src/Cache.elm`, `src/MutationTestRunner.elm` |
+| 2 | elm-pages | `src/BackendTask.elm` or `src/BackendTask/Extra.elm` |
+| 2 | elm-build | `src/MutationTestRunner.elm`, `src/BackendTask/Extra.elm` |
+| 3 | elm-build | `src/Mutator.elm`, `src/MutationTestRunner.elm` |
+| 4 | elm-build | `src/MutationReport.elm`, `src/MutationTestRunner.elm` |
 
-# core-extra ResultTests (test runner only, 69 tests) — ~1s
-bun dist/TestRunner.mjs --test tests/ResultTests.elm
-```
+## Success Criteria
 
-**Large (use sparingly — hangs on String/Unicode tests):**
-```bash
-# core-extra auto-discover ALL tests — WILL HANG on String/Unicode modules
-# Don't run this without a timeout. Instead, run individual fast modules:
-for f in BasicsTests CharTests DictTests MaybeTests ResultTests SetTests TripleTests; do
-  bun dist/TestRunner.mjs --test "tests/$f.elm"
-done
-```
-
-**Real-world mutation test (the OOM case):**
-```bash
-# elm-ical Format.elm — 53 mutations, triggers OOM without the fix
-cd /Users/dillonkearns/src/github.com/dillonkearns/elm-ical
-bun /path/to/dist/MutationTestRunner.mjs --mutate src/Format.elm --test tests/FormatTests.elm --break 0
-```
-
-### Cold vs warm runs
-
-**Cold** = no `.elm-build` or `.elm-mutation-test` cache directory. Everything is computed from scratch.
-**Warm** = cache exists from previous run. Unchanged computations return cached results instantly.
-
-```bash
-# Cold run: clear cache first
-chmod -R u+w .elm-build 2>/dev/null; rm -rf .elm-build   # note: chmod needed because cache files are read-only
-chmod -R u+w .elm-mutation-test 2>/dev/null; rm -rf .elm-mutation-test
-
-# Then run the tool — this is a cold run
-
-# Run again without clearing — this is a warm run
-```
-
-**Key insight**: The cache uses read-only file permissions (content-addressable store pattern). You MUST `chmod -R u+w` before `rm -rf` or it will fail silently, leaving stale cache that confuses benchmarks.
-
-### What to measure
-
-1. **Wall clock time** — `/usr/bin/time -p bun ... 2>&1 | grep real`
-2. **Test Duration** — reported by the tool itself (eval time only, excludes startup)
-3. **Memory** — `node --max-old-space-size=2048 dist/TestRunner.mjs` to cap and detect leaks
-4. **Cache hit rate** — compare cold vs warm times. If warm ≈ cold, caching isn't working.
-5. **Mutations evaluated** — compare total vs NoCoverage (skipped) vs Equivalent
-
-### Current performance baselines (as of this session)
-
-| Benchmark | Cold | Warm |
-|-----------|------|------|
-| MathLib mutation (51 mut) | 2.3s, 45ms/mut | 0.13s, **2ms/mut** |
-| core-extra BasicsTests mutation (49 mut) | 1.4s, 29ms/mut | 0.13s, **2ms/mut** |
-| core-extra BasicsTests test runner | 1.3s wall | 0.85s wall (0.09s eval) |
-| elm-test full core-extra (622 tests) | 5.0s cold / 2.1s warm | — |
-| elm-build individual module test | 1.1s cold / 0.85s warm | per file, ~0.7s is bun startup |
-
-### Performance bottleneck breakdown
-
-For a single test file run (warm cache):
-- **~0.4s**: bun startup + loading 1.8MB bundled script
-- **~0.2s**: project loading (loadWith, b3sum of source files, package env)
-- **~0.09s**: cached test evaluation (semantic hash key computation + cache file read)
-- **~0.15s**: other overhead (dep fetching check, test discovery, output formatting)
-
-The **bun startup** is the single biggest cost and is outside our control. For multi-file runs, the project loads once so the amortized cost per test file is just the ~0.09s eval.
-
-### Known issues affecting benchmarks
-
-1. **String/Unicode tests hang** — `String.RemoveAccentsTest`, `String.RemoveDiacriticsTests`, `String.UnicodeTests` process huge character mapping tables that exceed the 5M step limit or take >5 minutes. Skip these for benchmarking.
-
-2. **Cache permissions** — `.elm-build` uses read-only files. Use `chmod -R u+w .elm-build && rm -rf .elm-build` to clear.
-
-3. **Stale cache format** — if you change the semantic hashing logic, old cache entries have incompatible hash keys. Clear the cache before benchmarking.
-
-4. **elm-pages compilation** — `npx elm-pages bundle-script` recompiles if source changed. The bundle step itself takes ~5-10s but is NOT part of the benchmark (it's a build step, not runtime).
-
-5. **Memory leak** — runs with 50+ mutations will eventually OOM. For benchmarking, use small targets (MathLib, BasicsTests) or add `--max-old-space-size=4096` for medium runs.
-
-### Comparing with elm-test
-
-elm-test compiles ALL test files to JS once (via `elm make`), then runs them in Node. elm-build interprets each test file individually via the Elm interpreter. The comparison:
-
-```bash
-# elm-test (baseline — all 622 tests)
-cd /Users/dillonkearns/src/github.com/elmcraft/core-extra
-/usr/bin/time -p npx elm-test 2>&1 | grep -E "(Duration|Passed|real)"
-
-# elm-build (individual modules)
-for f in BasicsTests CharTests DictTests MaybeTests ResultTests SetTests TripleTests; do
-  echo -n "$f: "
-  /usr/bin/time -p bun /path/to/dist/TestRunner.mjs --test "tests/$f.elm" 2>&1 | grep -E "(Passed|real)" | tr '\n' ' '
-  echo
-done
-```
-
-### Other feedback items from .scratch/elm-mutant-feedback.md (not yet fixed)
-
-- **"1 tests" problem**: Per-test coverage only discovers top-level exposed values (like `suite`), not individual `test` calls within them. This means per-test optimization doesn't work for single-suite modules.
-- **"using first"**: Auto-discover mode picks only the first test file when `--mutate` is not specified.
-- **Transitive imports**: `findTestFilesImporting` only checks direct imports, not transitive. Internal helper modules can't be mutated without `--test`.
-- **Read-only cache**: No `--clean` flag. Must manually `chmod -R u+w && rm -rf`.
+1. `elm-ical Format.elm` (53 mutations) completes without OOM at `--max-old-space-size=2048`
+2. Peak RSS stays under 2GB for 53-mutation runs
+3. MathLib warm benchmark stays at or below current 0.13s
+4. All existing tests pass
+5. Partial results survive OOM crashes (Phase 4)

@@ -4,6 +4,7 @@ import Expect
 import Json.Decode as Decode
 import Json.Encode as Encode
 import MutationReport
+import Set
 import Test exposing (Test, describe, test)
 
 

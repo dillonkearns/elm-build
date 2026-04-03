@@ -1,4 +1,4 @@
-module BackendTask.Extra exposing (combine, combineBy, combineBy_, finally, profiling, sequence, sequence_, timed)
+module BackendTask.Extra exposing (combine, combineBy, combineBy_, finally, mapSequence, profiling, sequence, sequence_, timed)
 
 import Array exposing (Array)
 import BackendTask exposing (BackendTask)
@@ -156,6 +156,30 @@ combine inputs =
     in
     go 0 (Array.length arr)
         |> BackendTask.map Rope.toList
+
+
+{-| Like `sequence`, but constructs each BackendTask lazily — the function `f`
+is called inside `andThen` so only one item's BackendTask is materialized at a
+time. This allows V8 to GC each item's intermediate state before starting the
+next one, preventing memory leaks when processing many items.
+-}
+mapSequence : (a -> BackendTask error b) -> List a -> BackendTask error (List b)
+mapSequence f items =
+    mapSequenceHelper f items []
+
+
+mapSequenceHelper : (a -> BackendTask error b) -> List a -> List b -> BackendTask error (List b)
+mapSequenceHelper f items acc =
+    case items of
+        [] ->
+            BackendTask.succeed (List.reverse acc)
+
+        item :: rest ->
+            f item
+                |> BackendTask.andThen
+                    (\result ->
+                        mapSequenceHelper f rest (result :: acc)
+                    )
 
 
 sequence : List (BackendTask error a) -> BackendTask error (List a)
