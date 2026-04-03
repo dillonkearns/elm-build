@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, extractDependencies, getSemanticHash, hashExpression, semanticHashForEntry)
+module SemanticHash exposing (DeclarationIndex, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, diffIndices, extractDependencies, getSemanticHash, hashExpression, semanticHashForEntry)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -590,3 +590,33 @@ resolveAll remaining resolved =
                 Dict.filter (\name _ -> not (Dict.member name ready)) remaining
         in
         resolveAll newRemaining newResolved
+
+
+{-| Compare two DeclarationIndices and identify which declarations have
+different semantic hashes. Thanks to the Merkle property, a declaration's
+hash changes if ANY of its transitive dependencies changed — so the returned
+`changed` set automatically includes reverse dependents.
+
+This is the Salsa-style invalidation primitive: given the original and mutated
+indices, the `changed` set tells you exactly which declarations need re-evaluation.
+Everything in `unchanged` is provably identical (Elm purity guarantee).
+
+-}
+diffIndices : DeclarationIndex -> DeclarationIndex -> { changed : Set String, unchanged : Set String }
+diffIndices original mutated =
+    Dict.foldl
+        (\name info acc ->
+            case Dict.get name original of
+                Just origInfo ->
+                    if origInfo.semanticHash == info.semanticHash then
+                        { acc | unchanged = Set.insert name acc.unchanged }
+
+                    else
+                        { acc | changed = Set.insert name acc.changed }
+
+                Nothing ->
+                    -- New declaration (not in original)
+                    { acc | changed = Set.insert name acc.changed }
+        )
+        { changed = Set.empty, unchanged = Set.empty }
+        mutated

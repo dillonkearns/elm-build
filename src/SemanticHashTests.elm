@@ -1,11 +1,13 @@
 module SemanticHashTests exposing (suite)
 
+import Dict
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Expect
 import SemanticHash
+import Set
 import Test exposing (Test, describe, test)
 
 
@@ -313,6 +315,87 @@ suite =
 
                         _ ->
                             Expect.fail "Expected both hashes to exist"
+            ]
+        , describe "diffIndices"
+            [ test "identical indices have no changes" <|
+                \_ ->
+                    let
+                        index =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "A", source = "module A exposing (..)\n\nfoo = 42\n" } ]
+
+                        diff =
+                            SemanticHash.diffIndices index index
+                    in
+                    diff.changed
+                        |> Expect.equal Set.empty
+            , test "changed function body shows up in changed set" <|
+                \_ ->
+                    let
+                        original =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "A", source = "module A exposing (..)\n\nfoo = 42\n" } ]
+
+                        mutated =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "A", source = "module A exposing (..)\n\nfoo = 43\n" } ]
+
+                        diff =
+                            SemanticHash.diffIndices original mutated
+                    in
+                    Set.member "A.foo" diff.changed
+                        |> Expect.equal True
+            , test "Merkle property: caller of changed function is also changed" <|
+                \_ ->
+                    let
+                        original =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "A"
+                                  , source = "module A exposing (..)\n\nhelper x = x + 1\n\nvalue = helper 10\n"
+                                  }
+                                ]
+
+                        mutated =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "A"
+                                  , source = "module A exposing (..)\n\nhelper x = x * 2\n\nvalue = helper 10\n"
+                                  }
+                                ]
+
+                        diff =
+                            SemanticHash.diffIndices original mutated
+                    in
+                    -- Both helper and value should be changed (value depends on helper)
+                    Expect.all
+                        [ \d -> Set.member "A.helper" d.changed |> Expect.equal True
+                        , \d -> Set.member "A.value" d.changed |> Expect.equal True
+                        ]
+                        diff
+            , test "unrelated function stays in unchanged set" <|
+                \_ ->
+                    let
+                        original =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "A"
+                                  , source = "module A exposing (..)\n\nfoo = 42\n\nbar = 99\n"
+                                  }
+                                ]
+
+                        mutated =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "A"
+                                  , source = "module A exposing (..)\n\nfoo = 43\n\nbar = 99\n"
+                                  }
+                                ]
+
+                        diff =
+                            SemanticHash.diffIndices original mutated
+                    in
+                    Expect.all
+                        [ \d -> Set.member "A.foo" d.changed |> Expect.equal True
+                        , \d -> Set.member "A.bar" d.unchanged |> Expect.equal True
+                        ]
+                        diff
             ]
         ]
 

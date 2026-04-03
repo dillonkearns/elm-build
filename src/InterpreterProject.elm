@@ -52,6 +52,7 @@ type InterpreterProject
         , moduleGraph : ModuleGraph
         , packageModuleNames : Set String
         , packageEnv : Eval.Module.ProjectEnv
+        , baseUserEnv : Maybe Eval.Module.ProjectEnv
         , semanticIndex : SemanticHash.DeclarationIndex
         }
 
@@ -250,6 +251,24 @@ loadWith config =
                                                                         BackendTask.fail (FatalError.fromString "Failed to build package environment")
 
                                                                     Ok pkgEnv ->
+                                                                        let
+                                                                            -- Build baseUserEnv: pkgEnv + all user modules in topo order.
+                                                                            -- This is reused for incremental env building in evalWithFileOverrides.
+                                                                            userModuleNamesSet : Set String
+                                                                            userModuleNamesSet =
+                                                                                userParsedFiles |> Dict.keys |> Set.fromList
+
+                                                                            userModulesInOrder : List File
+                                                                            userModulesInOrder =
+                                                                                topoSortModules moduleGraph userModuleNamesSet
+                                                                                    |> List.filterMap (\src -> DepGraph.parseModuleName src)
+                                                                                    |> List.filterMap (\name -> Dict.get name userParsedFiles)
+
+                                                                            baseUserEnvResult : Maybe Eval.Module.ProjectEnv
+                                                                            baseUserEnvResult =
+                                                                                Eval.Module.extendWithFiles pkgEnv userModulesInOrder
+                                                                                    |> Result.toMaybe
+                                                                        in
                                                                         Cache.inputs allUserPaths
                                                                             |> BackendTask.map
                                                                                 (\sourceInputs ->
@@ -275,6 +294,7 @@ loadWith config =
                                                                                         , moduleGraph = moduleGraph
                                                                                         , packageModuleNames = pkgModuleNames
                                                                                         , packageEnv = pkgEnv
+                                                                                        , baseUserEnv = baseUserEnvResult
                                                                                         , semanticIndex =
                                                                                             userFileContents
                                                                                                 |> List.map
@@ -738,19 +758,59 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                         wrapperFile =
                             List.drop (List.length overrideFiles - 1) overrideFiles
 
-                        allFiles =
-                            userFilteredFiles
-                                ++ overridesButWrapper
-                                ++ List.map .file fileOverrides
-                                ++ wrapperFile
-
+                        -- Incremental env: if baseUserEnv is available, replace only
+                        -- the mutated module(s) instead of rebuilding from all user files.
                         result : Result Types.Error Types.Value
                         result =
-                            Eval.Module.evalWithEnvFromFilesAndLimit
-                                (Just 5000000)
-                                project.packageEnv
-                                allFiles
-                                (FunctionOrValue [] "results")
+                            case project.baseUserEnv of
+                                Just baseEnv ->
+                                    let
+                                        -- Replace each file override in the base env
+                                        replacedEnvResult =
+                                            fileOverrides
+                                                |> List.foldl
+                                                    (\override envRes ->
+                                                        envRes
+                                                            |> Result.andThen
+                                                                (\env ->
+                                                                    Eval.Module.replaceModuleInEnv env
+                                                                        { file = override.file
+                                                                        , moduleName = Eval.Module.fileModuleName override.file
+                                                                        , interface = Eval.Module.buildInterfaceFromFile override.file
+                                                                        }
+                                                                )
+                                                    )
+                                                    (Ok baseEnv)
+
+                                        -- Only need sourceOverrides + wrapper as additional files
+                                        additionalFiles =
+                                            overridesButWrapper ++ wrapperFile
+                                    in
+                                    case replacedEnvResult of
+                                        Ok updatedEnv ->
+                                            Eval.Module.evalWithEnvFromFilesAndLimit
+                                                (Just 5000000)
+                                                updatedEnv
+                                                additionalFiles
+                                                (FunctionOrValue [] "results")
+
+                                        Err e ->
+                                            Err e
+
+                                Nothing ->
+                                    -- Fallback: original path (all user files)
+                                    let
+                                        allFiles =
+                                            userFilteredFiles
+                                                ++ overridesButWrapper
+                                                ++ List.map .file fileOverrides
+                                                ++ wrapperFile
+                                    in
+                                    Eval.Module.evalWithEnvFromFilesAndLimit
+                                        (Just 5000000)
+                                        project.packageEnv
+                                        allFiles
+                                        (FunctionOrValue [] "results")
                     in
                     case result of
                         Ok (Types.String s) ->

@@ -1,4 +1,4 @@
-module SimpleTestRunner exposing (runToString)
+module SimpleTestRunner exposing (countTests, runEach, runIndices, runNth, runToString)
 
 {-| Pure-Elm test runner that avoids Json.Encode.
 
@@ -103,3 +103,125 @@ runOneRunner runner =
         else
             String.join "; " failures
     }
+
+
+{-| Run each test runner individually, returning delimited per-test results.
+
+Decomposes the suite ONCE via Test.Runner.fromTest, then runs each runner
+separately. Results are separated by "---TEST_SEP---" so the caller can
+split and get per-test results without re-decomposing the suite.
+
+Each test's output is: "1,0,1\nPASS:label" or "0,1,1\nFAIL:label | msg"
+
+-}
+runEach : Test -> String
+runEach suite =
+    case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of
+        Test.Runner.Plain list ->
+            list |> List.map runOneAsString |> String.join "---TEST_SEP---"
+
+        Test.Runner.Only list ->
+            list |> List.map runOneAsString |> String.join "---TEST_SEP---"
+
+        Test.Runner.Skipping list ->
+            list |> List.map runOneAsString |> String.join "---TEST_SEP---"
+
+        Test.Runner.Invalid msg ->
+            "0,1,1\nFAIL:Invalid test suite: " ++ msg
+
+
+runOneAsString : Test.Runner.Runner -> String
+runOneAsString runner =
+    let
+        result =
+            runOneRunner runner
+    in
+    if result.passed then
+        "1,0,1\nPASS:" ++ result.label
+
+    else
+        "0,1,1\nFAIL:" ++ result.label ++ " | " ++ result.message
+
+
+{-| Run only the runners at the given indices (0-indexed).
+
+Decomposes the suite ONCE via Test.Runner.fromTest, then runs only the
+selected runners. This is the key optimization: a mutation that only
+affects 3 of 30 runners pays for 1 fromTest + 3 executions instead of 30.
+
+Results are separated by "---TEST_SEP---", same as runEach.
+
+-}
+runIndices : List Int -> Test -> String
+runIndices indices suite =
+    let
+        runners =
+            getRunners suite
+
+        selectedResults =
+            indices
+                |> List.filterMap
+                    (\i ->
+                        runners
+                            |> List.drop i
+                            |> List.head
+                            |> Maybe.map runOneAsString
+                    )
+    in
+    String.join "---TEST_SEP---" selectedResults
+
+
+{-| Count the number of flat test runners in a test suite.
+Returns the count as a string (for interpreter eval compatibility).
+-}
+countTests : Test -> String
+countTests suite =
+    case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of
+        Test.Runner.Plain list ->
+            String.fromInt (List.length list)
+
+        Test.Runner.Only list ->
+            String.fromInt (List.length list)
+
+        Test.Runner.Skipping list ->
+            String.fromInt (List.length list)
+
+        Test.Runner.Invalid _ ->
+            "0"
+
+
+{-| Run the Nth test runner (0-indexed) from a test suite.
+Returns the same CSV+lines format as runToString, but for a single runner.
+-}
+runNth : Int -> Test -> String
+runNth n suite =
+    case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of
+        Test.Runner.Plain list ->
+            runNthFromList n list
+
+        Test.Runner.Only list ->
+            runNthFromList n list
+
+        Test.Runner.Skipping list ->
+            runNthFromList n list
+
+        Test.Runner.Invalid msg ->
+            "0,1,1\nFAIL:Invalid test suite: " ++ msg
+
+
+runNthFromList : Int -> List Test.Runner.Runner -> String
+runNthFromList n runners =
+    case List.drop n runners |> List.head of
+        Just runner ->
+            let
+                result =
+                    runOneRunner runner
+            in
+            if result.passed then
+                "1,0,1\nPASS:" ++ result.label
+
+            else
+                "0,1,1\nFAIL:" ++ result.label ++ " | " ++ result.message
+
+        Nothing ->
+            "0,1,1\nFAIL:Test index " ++ String.fromInt n ++ " out of range"

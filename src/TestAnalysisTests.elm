@@ -145,4 +145,53 @@ suite =
                     TestAnalysis.discoverTestValues "not valid elm"
                         |> Expect.equal []
             ]
+        , describe "extractDescribeChildren"
+            [ test "extracts children from describe with list literal" <|
+                \_ ->
+                    let
+                        source =
+                            String.join "\n"
+                                [ "module T exposing (suite)"
+                                , "import Test exposing (Test, describe, test)"
+                                , "import Expect"
+                                , ""
+                                , "suite : Test"
+                                , "suite ="
+                                , "    describe \"tests\""
+                                , "        [ test \"a\" (\\_ -> Expect.equal 1 1)"
+                                , "        , test \"b\" (\\_ -> Expect.equal 2 2)"
+                                , "        ]"
+                                ]
+                    in
+                    case TestAnalysis.extractDescribeChildren "suite" source of
+                        Just children ->
+                            List.length children
+                                |> Expect.equal 2
+
+                        Nothing ->
+                            Expect.fail "Expected to extract 2 children"
+            , test "first child source starts with test" <|
+                \_ ->
+                    let
+                        source =
+                            String.join "\n"
+                                [ "module T exposing (suite)"
+                                , "import Test exposing (Test, describe, test)"
+                                , "import Expect"
+                                , ""
+                                , "suite ="
+                                , "    describe \"tests\""
+                                , "        [ test \"a\" (\\_ -> Expect.equal 1 1)"
+                                , "        , test \"b\" (\\_ -> Expect.equal 2 2)"
+                                , "        ]"
+                                ]
+                    in
+                    case TestAnalysis.extractDescribeChildren "suite" source of
+                        Just (first :: _) ->
+                            String.startsWith "test" first
+                                |> Expect.equal True
+
+                        _ ->
+                            Expect.fail "Expected at least 1 child"
+            ]
         ]

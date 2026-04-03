@@ -1,4 +1,4 @@
-module TestAnalysis exposing (discoverTestValues, discoverTestValuesViaInterpreter, getCandidateNames, probeCandidate, usesFuzz)
+module TestAnalysis exposing (discoverTestValues, discoverTestValuesViaInterpreter, extractDescribeChildren, getCandidateNames, probeCandidate, usesFuzz)
 
 {-| Static analysis for Elm test modules.
 
@@ -15,7 +15,8 @@ import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
 import Elm.Syntax.Expression exposing (Expression(..), LetDeclaration(..))
 import Elm.Syntax.File exposing (File)
 import Elm.Syntax.Import exposing (Import)
-import Elm.Syntax.Module
+import Elm.Syntax.Module exposing (Module(..))
+import Elm.Syntax.Module exposing (Module(..))
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Signature exposing (Signature)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
@@ -421,3 +422,146 @@ letDeclarationUsesFuzz fuzzRefs (Node _ letDecl) =
 
         LetDestructuring _ expr ->
             expressionUsesFuzz fuzzRefs expr
+
+
+{-| Extract individual test children from a `suite = describe "..." [child1, child2, ...]`
+declaration. Returns each child as a source string substring extracted from the original
+source using the AST node's Range.
+
+This is the key to Salsa-style per-test caching: each child becomes an independent
+cached computation whose semantic hash only includes ITS specific dependencies.
+A mutation on function F only invalidates children that reference F.
+
+Returns Nothing if the suite isn't a simple `describe` with a list literal.
+
+-}
+extractDescribeChildren : String -> String -> Maybe (List String)
+extractDescribeChildren valueName source =
+    case Elm.Parser.parseToFile source of
+        Err _ ->
+            Nothing
+
+        Ok file ->
+            let
+                modName =
+                    case Node.value file.moduleDefinition of
+                        NormalModule { moduleName } ->
+                            Node.value moduleName |> String.join "."
+
+                        PortModule { moduleName } ->
+                            Node.value moduleName |> String.join "."
+
+                        EffectModule { moduleName } ->
+                            Node.value moduleName |> String.join "."
+            in
+            file.declarations
+                |> List.filterMap
+                    (\(Node _ decl) ->
+                        case decl of
+                            FunctionDeclaration func ->
+                                let
+                                    (Node _ impl) =
+                                        func.declaration
+                                in
+                                if Node.value impl.name == valueName then
+                                    findDescribeListChildren impl.expression
+                                        |> Maybe.map
+                                            (List.map
+                                                (\child ->
+                                                    -- Qualify simple variable references with module name
+                                                    -- so the wrapper can access unexposed functions
+                                                    case Node.value child of
+                                                        FunctionOrValue [] name ->
+                                                            modName ++ "." ++ name
+
+                                                        _ ->
+                                                            extractSourceRange source child
+                                                )
+                                            )
+
+                                else
+                                    Nothing
+
+                            _ ->
+                                Nothing
+                    )
+                |> List.head
+
+
+{-| Find the list argument of a `describe "label" [children]` expression.
+Handles both `describe "label" [...]` and `Test.describe "label" [...]`.
+-}
+findDescribeListChildren : Node Expression -> Maybe (List (Node Expression))
+findDescribeListChildren (Node _ expr) =
+    case expr of
+        -- describe "label" [child1, child2, ...]
+        Application nodes ->
+            case nodes of
+                [ Node _ (FunctionOrValue _ "describe"), _, Node _ (ListExpr children) ] ->
+                    Just children
+
+                [ Node _ (FunctionOrValue _ "describe"), _, listNode ] ->
+                    -- The list might be wrapped in parens
+                    findListExpr listNode
+
+                _ ->
+                    Nothing
+
+        -- Could be wrapped in parens: (describe "label" [...])
+        ParenthesizedExpression inner ->
+            findDescribeListChildren inner
+
+        _ ->
+            Nothing
+
+
+findListExpr : Node Expression -> Maybe (List (Node Expression))
+findListExpr (Node _ expr) =
+    case expr of
+        ListExpr children ->
+            Just children
+
+        ParenthesizedExpression inner ->
+            findListExpr inner
+
+        _ ->
+            Nothing
+
+
+{-| Extract the source text for an AST node using its Range.
+Uses 1-based rows and 1-based columns (matching Elm syntax Range).
+-}
+extractSourceRange : String -> Node Expression -> String
+extractSourceRange source (Node range _) =
+    let
+        lines =
+            String.lines source
+
+        -- Extract lines within the range (1-based to 0-based)
+        relevantLines =
+            lines
+                |> List.drop (range.start.row - 1)
+                |> List.take (range.end.row - range.start.row + 1)
+    in
+    case relevantLines of
+        [] ->
+            ""
+
+        [ single ] ->
+            String.slice (range.start.column - 1) (range.end.column - 1) single
+
+        first :: rest ->
+            let
+                firstPart =
+                    String.dropLeft (range.start.column - 1) first
+
+                lastLine =
+                    List.reverse rest |> List.head |> Maybe.withDefault ""
+
+                lastPart =
+                    String.left (range.end.column - 1) lastLine
+
+                middleLines =
+                    rest |> List.reverse |> List.drop 1 |> List.reverse
+            in
+            String.join "\n" (firstPart :: middleLines ++ [ lastPart ])

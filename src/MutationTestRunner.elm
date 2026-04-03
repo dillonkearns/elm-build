@@ -24,6 +24,7 @@ import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import DepGraph
 import Elm.Syntax.Expression exposing (Expression(..))
+import Elm.Syntax.File exposing (File)
 import Eval.Module
 import FatalError exposing (FatalError)
 import Coverage
@@ -244,7 +245,7 @@ task config =
         -- Determine which files to mutate
         Do.do (resolveFilesToMutate config project sourceDirectories testFile) <| \filesToMutate ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Mutating " ++ String.fromInt (List.length filesToMutate) ++ " source file(s): " ++ String.join ", " filesToMutate)) <| \_ ->
-        -- Baseline: run the full suite unmutated to get the reference output
+        -- Baseline with tracing: full suite coverage + output
         Do.do
             (InterpreterProject.evalWithCoverage project
                 { imports = evalConfig.imports
@@ -253,50 +254,34 @@ task config =
                 }
             )
         <| \baselineCoverage ->
+        -- Per-runner baselines via runEach (single eval, no tracing needed)
+        Do.do
+            (InterpreterProject.evalWithCoverage project
+                { imports = evalConfig.imports
+                , expression = "SimpleTestRunner.runEach (" ++ suiteExpr ++ ")"
+                , sourceOverrides = [ simpleTestRunnerSource ]
+                }
+            )
+        <| \runEachBaseline ->
         let
             baselineOutput =
                 baselineCoverage.result
-        in
-        -- Per-test coverage: run each test individually with tracing
-        Do.do
-            (BackendTask.Extra.timed "Collecting per-test coverage" "Coverage collected"
-                (testValues
-                    |> List.map
-                        (\testValue ->
-                            let
-                                singleTestExpr =
-                                    "SimpleTestRunner.runToString (" ++ testModuleName ++ "." ++ testValue ++ ")"
-                            in
-                            InterpreterProject.evalWithCoverage project
-                                { imports = evalConfig.imports
-                                , expression = singleTestExpr
-                                , sourceOverrides = [ simpleTestRunnerSource ]
-                                }
-                                |> BackendTask.map
-                                    (\result ->
-                                        { testName = testModuleName ++ "." ++ testValue
-                                        , coveredRanges = result.coveredRanges
-                                        , baselineResult = result.result
-                                        }
-                                    )
-                        )
-                    |> BackendTask.Extra.combine
-                )
-            )
-        <| \perTestCoverage ->
-        let
-            -- Flatten all covered ranges (union across all tests)
+
+            perRunnerBaselines : List String
+            perRunnerBaselines =
+                String.split "---TEST_SEP---" runEachBaseline.result
+
+            runnerCount : Int
+            runnerCount =
+                List.length perRunnerBaselines
+
             allCoveredRanges =
-                perTestCoverage |> List.concatMap .coveredRanges
+                baselineCoverage.coveredRanges
 
             totalCoveredExpressions =
                 List.length allCoveredRanges
-
-            -- Note: per-test baselines are available in perTestCoverage but can't
-            -- be directly compared with mutation outputs (different suite composition).
-            -- Equivalent detection works when mutations run the full suite.
         in
-        Do.log ("  " ++ String.fromInt (List.length perTestCoverage) ++ " tests, " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
+        Do.log ("  " ++ String.fromInt runnerCount ++ " runners, " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
         -- Pre-compute the cache directory listing once, instead of per-mutation
         Do.do (Cache.listExisting config.buildDirectory) <| \existingCache ->
@@ -336,56 +321,24 @@ task config =
                                             mutationProgress =
                                                 "    [" ++ String.fromInt (mutIndex + 1) ++ "/" ++ String.fromInt (List.length coveredMutations) ++ "] " ++ mutation.operator ++ " " ++ mutateFilePath ++ ":" ++ String.fromInt mutation.line
 
-                                            -- Find tests whose coverage includes this mutation's range
-                                            relevantTests =
-                                                perTestCoverage
-                                                    |> List.filter (\tc -> Coverage.isCovered tc.coveredRanges mutation.spliceRange)
-                                                    |> List.map .testName
-
-                                            -- Build a suite expression with only the relevant tests
-                                            isFullSuite =
-                                                List.length relevantTests == List.length perTestCoverage
-
-                                            relevantSuiteExpr =
-                                                if isFullSuite then
-                                                    evalConfig.expression
-
-                                                else
-                                                    case relevantTests of
-                                                        [ single ] ->
-                                                            "SimpleTestRunner.runToString (" ++ single ++ ")"
-
-                                                        multiple ->
-                                                            "SimpleTestRunner.runToString (Test.describe \"relevant\" [" ++ String.join ", " multiple ++ "])"
-
-                                            -- For equivalent detection: compare mutation output
-                                            -- against the unmutated baseline
-                                            relevantBaseline =
-                                                if isFullSuite then
-                                                    baselineOutput
-
-                                                else
-                                                    -- Subset runs have different output format;
-                                                    -- can't compare directly. Skip equiv detection.
-                                                    ""
+                                            mutatedFile =
+                                                { file = mutation.getMutatedFile (), hashKey = Mutator.hashKey mutation }
                                         in
                                         Do.do
-                                            (Cache.runWith { jobs = Nothing, existing = existingCache } config.buildDirectory
-                                                (InterpreterProject.evalWithFileOverrides project
-                                                    { imports = evalConfig.imports
-                                                    , expression = relevantSuiteExpr
-                                                    , sourceOverrides = [ simpleTestRunnerSource ]
-                                                    , fileOverrides = [ { file = mutation.getMutatedFile (), hashKey = Mutator.hashKey mutation } ]
-                                                    }
-                                                    Cache.succeed
-                                                )
+                                            (evalMutationWithRunEach
+                                                { existingCache = existingCache
+                                                , buildDirectory = config.buildDirectory
+                                                , project = project
+                                                , imports = evalConfig.imports
+                                                , sourceOverrides = [ simpleTestRunnerSource ]
+                                                , mutatedFile = mutatedFile
+                                                , mutation = mutation
+                                                , suiteExpr = suiteExpr
+                                                , perRunnerBaselines = perRunnerBaselines
+                                                }
                                             )
-                                        <| \result ->
-                                        Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
+                                        <| \mutResult ->
                                         let
-                                            mutResult =
-                                                parseMutationResult relevantBaseline mutation output
-
                                             statusStr =
                                                 case mutResult of
                                                     Killed _ ->
@@ -496,6 +449,158 @@ filterMutations config mutations =
                 else
                     List.filter (\m -> not (List.member m.operator config.excludeOperators)) ms
            )
+
+
+{-| Evaluate a mutation by running ALL runners via runEach, then comparing
+each runner's output against its per-runner baseline. This decompose the test
+suite ONCE per mutation (via fromTest inside runEach) and compares at runner
+granularity for precise killed/equivalent detection.
+-}
+evalMutationWithRunEach :
+    { existingCache : Cache.HashSet
+    , buildDirectory : Path
+    , project : InterpreterProject
+    , imports : List String
+    , sourceOverrides : List String
+    , mutatedFile : { file : File, hashKey : String }
+    , mutation : Mutation
+    , suiteExpr : String
+    , perRunnerBaselines : List String
+    }
+    -> BackendTask FatalError MutationResult
+evalMutationWithRunEach ctx =
+    let
+        expression =
+            "SimpleTestRunner.runEach (" ++ ctx.suiteExpr ++ ")"
+    in
+    Cache.runWith { jobs = Nothing, existing = ctx.existingCache } ctx.buildDirectory
+        (InterpreterProject.evalWithFileOverrides ctx.project
+            { imports = ctx.imports
+            , expression = expression
+            , sourceOverrides = ctx.sourceOverrides
+            , fileOverrides = [ ctx.mutatedFile ]
+            }
+            Cache.succeed
+        )
+        |> BackendTask.andThen
+            (\result ->
+                File.rawFile (Path.toString result.output)
+                    |> BackendTask.allowFatal
+                    |> BackendTask.andThen
+                        (\output ->
+                            if String.startsWith "ERROR:" output then
+                                BackendTask.succeed
+                                    (ErrorResult { mutation = ctx.mutation, error = String.dropLeft 7 output })
+
+                            else
+                                classifyRunEachOutput ctx.mutation ctx.perRunnerBaselines output
+                        )
+            )
+
+
+classifyRunEachOutput : Mutation -> List String -> String -> BackendTask FatalError MutationResult
+classifyRunEachOutput mutation baselines output =
+    let
+        perTestOutputs =
+            String.split "---TEST_SEP---" output
+
+        classifyResults =
+            List.map2
+                (\baseline testOutput ->
+                    if testOutput == baseline then
+                        Unchanged
+
+                    else
+                        case parseFailCount testOutput of
+                            Just failCount ->
+                                if failCount > 0 then
+                                    TestKilled failCount
+
+                                else
+                                    TestChanged
+
+                            Nothing ->
+                                TestError "Could not parse test output"
+                )
+                baselines
+                perTestOutputs
+
+        firstKill =
+            classifyResults
+                |> List.filterMap
+                    (\r ->
+                        case r of
+                            TestKilled n ->
+                                Just n
+
+                            _ ->
+                                Nothing
+                    )
+                |> List.head
+
+        firstError =
+            classifyResults
+                |> List.filterMap
+                    (\r ->
+                        case r of
+                            TestError msg ->
+                                Just msg
+
+                            _ ->
+                                Nothing
+                    )
+                |> List.head
+
+        anyChanged =
+            List.any
+                (\r ->
+                    case r of
+                        TestChanged ->
+                            True
+
+                        TestKilled _ ->
+                            True
+
+                        _ ->
+                            False
+                )
+                classifyResults
+    in
+    case firstKill of
+        Just failCount ->
+            BackendTask.succeed (Killed { mutation = mutation, failCount = failCount })
+
+        Nothing ->
+            case firstError of
+                Just msg ->
+                    BackendTask.succeed (ErrorResult { mutation = mutation, error = msg })
+
+                Nothing ->
+                    if anyChanged then
+                        BackendTask.succeed (Survived { mutation = mutation })
+
+                    else
+                        BackendTask.succeed (EquivalentResult { mutation = mutation })
+
+
+type TestClassification
+    = Unchanged
+    | TestKilled Int
+    | TestChanged
+    | TestError String
+
+
+{-| Parse the fail count from a SimpleTestRunner output line like "15,2,0"
+(total, failures, todos).
+-}
+parseFailCount : String -> Maybe Int
+parseFailCount output =
+    case String.split "," (String.lines output |> List.head |> Maybe.withDefault "") of
+        [ _, failStr, _ ] ->
+            String.toInt failStr
+
+        _ ->
+            Nothing
 
 
 parseMutationResult : String -> Mutation -> String -> MutationResult
@@ -950,29 +1055,39 @@ of what project directory the tool runs from.
 simpleTestRunnerSource : String
 simpleTestRunnerSource =
     String.join "\n"
-        [ "module SimpleTestRunner exposing (runToString)"
+        [ "module SimpleTestRunner exposing (countTests, runEach, runIndices, runNth, runToString)"
         , "import Expect"
         , "import Random"
         , "import Test exposing (Test)"
         , "import Test.Runner"
+        , "getRunners suite ="
+        , "    case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of"
+        , "        Test.Runner.Plain list -> list"
+        , "        Test.Runner.Only list -> list"
+        , "        Test.Runner.Skipping list -> list"
+        , "        Test.Runner.Invalid msg -> []"
         , "runToString suite ="
         , "    let"
-        , "        runners = case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of"
-        , "            Test.Runner.Plain list -> Ok list"
-        , "            Test.Runner.Only list -> Ok list"
-        , "            Test.Runner.Skipping list -> Ok list"
-        , "            Test.Runner.Invalid msg -> Err msg"
+        , "        runnerList = getRunners suite"
+        , "        results = List.map runOneRunner runnerList"
+        , "        passCount = List.length (List.filter .passed results)"
+        , "        failCount = List.length results - passCount"
+        , "        formatResult r = if r.passed then \"PASS:\" ++ r.label else \"FAIL:\" ++ r.label ++ \" | \" ++ r.message"
         , "    in"
-        , "    case runners of"
-        , "        Err msg -> \"0,1,1\\nFAIL:Invalid test suite: \" ++ msg"
-        , "        Ok runnerList ->"
-        , "            let"
-        , "                results = List.map runOneRunner runnerList"
-        , "                passCount = List.length (List.filter .passed results)"
-        , "                failCount = List.length results - passCount"
-        , "                formatResult r = if r.passed then \"PASS:\" ++ r.label else \"FAIL:\" ++ r.label ++ \" | \" ++ r.message"
-        , "            in"
-        , "            String.fromInt passCount ++ \",\" ++ String.fromInt failCount ++ \",\" ++ String.fromInt (List.length results) ++ \"\\n\" ++ (List.map formatResult results |> String.join \"\\n\")"
+        , "    String.fromInt passCount ++ \",\" ++ String.fromInt failCount ++ \",\" ++ String.fromInt (List.length results) ++ \"\\n\" ++ (List.map formatResult results |> String.join \"\\n\")"
+        , "countTests suite = String.fromInt (List.length (getRunners suite))"
+        , "runIndices indices suite ="
+        , "    let runners = getRunners suite in"
+        , "    indices |> List.filterMap (\\i -> List.drop i runners |> List.head |> Maybe.map runOneAsString) |> String.join \"---TEST_SEP---\""
+        , "runNth n suite ="
+        , "    case List.drop n (getRunners suite) |> List.head of"
+        , "        Just runner -> runOneAsString runner"
+        , "        Nothing -> \"0,1,1\\nFAIL:Test index out of range\""
+        , "runEach suite ="
+        , "    getRunners suite |> List.map runOneAsString |> String.join \"---TEST_SEP---\""
+        , "runOneAsString runner ="
+        , "    let r = runOneRunner runner in"
+        , "    if r.passed then \"1,0,1\\nPASS:\" ++ r.label else \"0,1,1\\nFAIL:\" ++ r.label ++ \" | \" ++ r.message"
         , "runOneRunner runner ="
         , "    let"
         , "        labelPath = List.reverse runner.labels |> String.join \" > \""
