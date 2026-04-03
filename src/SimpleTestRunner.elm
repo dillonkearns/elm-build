@@ -156,7 +156,18 @@ runIndices : List Int -> Test -> String
 runIndices indices suite =
     let
         runners =
-            getRunners suite
+            case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of
+                Test.Runner.Plain list ->
+                    list
+
+                Test.Runner.Only list ->
+                    list
+
+                Test.Runner.Skipping list ->
+                    list
+
+                Test.Runner.Invalid _ ->
+                    []
 
         selectedResults =
             indices

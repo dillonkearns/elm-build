@@ -52,6 +52,7 @@ type alias Config =
     , excludeOperators : List String
     , onlyOperators : List String
     , reportFile : Maybe String
+    , clean : Bool
     }
 
 
@@ -106,6 +107,10 @@ programConfig =
                     (Option.optionalKeywordArg "report"
                         |> Option.withDescription "Write mutation testing report JSON to this path"
                     )
+                |> OptionsParser.with
+                    (Option.flag "clean"
+                        |> Option.withDescription "Remove the build cache directory before running"
+                    )
             )
 
 
@@ -117,6 +122,23 @@ run =
 task : Config -> BackendTask FatalError ()
 task config =
     BackendTask.Extra.profiling "mutation-test-runner" <|
+        Do.do
+            (if config.clean then
+                let
+                    buildDir =
+                        Path.toString config.buildDirectory
+                in
+                Do.log ("Cleaning " ++ buildDir ++ "...") <| \_ ->
+                Script.exec "chmod" [ "-R", "u+w", buildDir ]
+                    |> BackendTask.toResult
+                    |> BackendTask.andThen (\_ -> Script.exec "rm" [ "-rf", buildDir ])
+                    |> BackendTask.toResult
+                    |> BackendTask.map (\_ -> ())
+
+             else
+                BackendTask.succeed ()
+            )
+        <| \_ ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Loading project sources for mutation testing") <| \_ ->
         -- Ensure dependencies are fetched into ELM_HOME
         Do.do (ensureDependenciesFetched config) <| \_ ->
@@ -490,7 +512,9 @@ evalMutationWithRunEach ctx =
                         (\output ->
                             if String.startsWith "ERROR:" output then
                                 BackendTask.succeed
-                                    (ErrorResult { mutation = ctx.mutation, error = String.dropLeft 7 output })
+                                    (ErrorResult { mutation = ctx.mutation, error = String.dropLeft 7 output }
+                                        |> reclassifyResult
+                                    )
 
                             else
                                 classifyRunEachOutput ctx.mutation ctx.perRunnerBaselines output
@@ -573,7 +597,7 @@ classifyRunEachOutput mutation baselines output =
         Nothing ->
             case firstError of
                 Just msg ->
-                    BackendTask.succeed (ErrorResult { mutation = mutation, error = msg })
+                    BackendTask.succeed (ErrorResult { mutation = mutation, error = msg } |> reclassifyResult)
 
                 Nothing ->
                     if anyChanged then
@@ -638,6 +662,32 @@ type MutationResult
     | EquivalentResult { mutation : Mutation }
     | NoCoverageResult { mutation : Mutation }
     | ErrorResult { mutation : Mutation, error : String }
+
+
+{-| Reclassify errors that indicate the mutation broke the code as KILLED.
+Infinite recursion and Debug.todo crashes mean "the test caught the mutation"
+— functionally the same as a test failure.
+-}
+reclassifyResult : MutationResult -> MutationResult
+reclassifyResult result =
+    case result of
+        ErrorResult { mutation, error } ->
+            if isKillableError error then
+                Killed { mutation = mutation, failCount = 0 }
+
+            else
+                result
+
+        _ ->
+            result
+
+
+{-| Errors that indicate the mutation broke the code (not a tooling issue).
+-}
+isKillableError : String -> Bool
+isKillableError error =
+    String.contains "Infinite recursion" error
+        || String.contains "Debug.todo" error
 
 
 type alias FileResults =
@@ -765,6 +815,23 @@ displayMultiFileReport config allFileResults =
                 errors =
                     List.filter isError fileResult.results
 
+                noCoverage =
+                    List.filter isNoCoverage fileResult.results
+
+                noCoverageLines =
+                    noCoverage
+                        |> List.filterMap
+                            (\r ->
+                                case r of
+                                    NoCoverageResult { mutation } ->
+                                        Just mutation.line
+
+                                    _ ->
+                                        Nothing
+                            )
+                        |> Set.fromList
+                        |> Set.toList
+
                 total =
                     List.length fileResult.results
             in
@@ -830,6 +897,18 @@ displayMultiFileReport config allFileResults =
 
                         _ ->
                             Script.log ""
+                )
+            <| \_ ->
+            Do.each noCoverageLines
+                (\line ->
+                    Script.log
+                        (Ansi.Color.fontColor Ansi.Color.yellow
+                            ("  ! No coverage: "
+                                ++ fileResult.filePath
+                                ++ ":"
+                                ++ String.fromInt line
+                            )
+                        )
                 )
             <| \_ ->
             if multiFile then
@@ -1159,15 +1238,20 @@ resolveTestFile config project =
         Nothing ->
             case config.mutateFile of
                 Just mutateFile ->
-                    -- Single-file mode: find tests that import the mutated module
+                    -- Single-file mode: find tests that transitively import the mutated module
                     Do.allowFatal (File.rawFile mutateFile) <| \mutateSource ->
                     let
                         moduleName =
                             DepGraph.parseModuleName mutateSource
                                 |> Maybe.withDefault ""
+
+                        depGraph =
+                            InterpreterProject.getDepGraph project
+
+                        testFiles =
+                            findTestFilesImportingTransitive depGraph moduleName
                     in
                     Do.log ("Auto-discovering test files that import " ++ moduleName ++ "...") <| \_ ->
-                    Do.do (findTestFilesImporting moduleName) <| \testFiles ->
                     case testFiles of
                         [ single ] ->
                             Do.log ("Found test file: " ++ single) <| \_ ->
@@ -1206,36 +1290,19 @@ resolveTestFile config project =
                                 )
 
 
-findTestFilesImporting : String -> BackendTask FatalError (List String)
-findTestFilesImporting moduleName =
-    Glob.fromStringWithOptions
-        (let
-            o =
-                Glob.defaultOptions
-         in
-         { o | include = Glob.OnlyFiles }
-        )
-        "tests/**/*.elm"
-        |> BackendTask.andThen
-            (\files ->
-                files
-                    |> List.map
-                        (\filePath ->
-                            File.rawFile filePath
-                                |> BackendTask.allowFatal
-                                |> BackendTask.map (\content -> ( filePath, content ))
-                        )
-                    |> BackendTask.sequence
-                    |> BackendTask.map
-                        (\pairs ->
-                            pairs
-                                |> List.filter
-                                    (\( _, content ) ->
-                                        List.member moduleName (DepGraph.parseImports content)
-                                    )
-                                |> List.map Tuple.first
-                        )
-            )
+{-| Find test files that transitively import the given module.
+Uses the project's dependency graph for transitive resolution.
+-}
+findTestFilesImportingTransitive : DepGraph.Graph -> String -> List String
+findTestFilesImportingTransitive depGraph moduleName =
+    case DepGraph.moduleNameToFilePath depGraph moduleName of
+        Nothing ->
+            []
+
+        Just filePath ->
+            DepGraph.reverseDeps depGraph filePath
+                |> Set.filter (\f -> String.startsWith "tests/" f)
+                |> Set.toList
 
 
 {-| Find all test files by looking for .elm files in tests/ that import Test.
