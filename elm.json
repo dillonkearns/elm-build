@@ -12,7 +12,7 @@
         "direct": {
             "arowM/elm-multiline-string": "1.0.0",
             "dillonkearns/elm-cli-options-parser": "5.0.1",
-            "dillonkearns/elm-pages": "12.1.1",
+            "dillonkearns/elm-pages": "12.1.2",
             "elm/core": "1.0.5",
             "elm/json": "1.1.4",
             "elm/parser": "1.1.0",

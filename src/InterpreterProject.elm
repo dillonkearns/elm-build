@@ -472,6 +472,11 @@ evalWith (InterpreterProject project) { imports, expression } k =
                 Err (Types.EvalError evalErr) ->
                     "ERROR: Eval error: "
                         ++ evalErrorKindToString evalErr.error
+                        ++ " [module: "
+                        ++ String.join "." evalErr.currentModule
+                        ++ "] [stack: "
+                        ++ (evalErr.callStack |> List.take 10 |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name) |> String.join " <- ")
+                        ++ "]"
         )
         k
 
@@ -588,6 +593,11 @@ evalWithSourceOverrides (InterpreterProject project) { imports, expression, sour
                 Err (Types.EvalError evalErr) ->
                     "ERROR: Eval error: "
                         ++ evalErrorKindToString evalErr.error
+                        ++ " [module: "
+                        ++ String.join "." evalErr.currentModule
+                        ++ "] [stack: "
+                        ++ (evalErr.callStack |> List.take 10 |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name) |> String.join " <- ")
+                        ++ "]"
         )
         k
 
