@@ -442,20 +442,50 @@ task config =
                 |> List.map .byteCount
                 |> List.sum
     in
+    let
+        semanticCachePath =
+            Path.toString config.buildDirectory ++ "/review-" ++ semanticKey ++ ".result"
+    in
     Do.log ("Semantic key: " ++ semanticKey ++ " (" ++ String.fromInt (List.length modulesWithAst) ++ " files, source=" ++ String.fromInt totalSourceBytes ++ "B, json=" ++ String.fromInt totalJsonBytes ++ "B, wire=" ++ String.fromInt totalWireBytes ++ "B)") <| \_ ->
     Do.do BackendTask.Time.now <| \startTime ->
     Do.do
-        (Cache.run { jobs = Nothing } config.buildDirectory
-            (InterpreterProject.evalWithSourceOverrides reviewProject
-                { imports = [ "ReviewRunnerHelper" ]
-                , expression = expression
-                , sourceOverrides = [ reviewRunnerHelperSource ]
-                }
-                Cache.succeed
-            )
+        (File.rawFile semanticCachePath
+            |> BackendTask.toResult
+            |> BackendTask.andThen
+                (\cachedResult ->
+                    case cachedResult of
+                        Ok cached ->
+                            -- Semantic cache HIT — no interpreter eval needed
+                            BackendTask.succeed cached
+
+                        Err _ ->
+                            -- Semantic cache MISS — run interpreter
+                            Cache.run { jobs = Nothing } config.buildDirectory
+                                (InterpreterProject.evalWithSourceOverrides reviewProject
+                                    { imports = [ "ReviewRunnerHelper" ]
+                                    , expression = expression
+                                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                                    }
+                                    Cache.succeed
+                                )
+                                |> BackendTask.andThen
+                                    (\cacheResult ->
+                                        File.rawFile (Path.toString cacheResult.output)
+                                            |> BackendTask.allowFatal
+                                            |> BackendTask.andThen
+                                                (\output ->
+                                                    -- Write semantic cache entry
+                                                    Script.writeFile
+                                                        { path = semanticCachePath
+                                                        , body = output
+                                                        }
+                                                        |> BackendTask.allowFatal
+                                                        |> BackendTask.map (\_ -> output)
+                                                )
+                                    )
+                )
         )
-    <| \cacheResult ->
-    Do.allowFatal (File.rawFile (Path.toString cacheResult.output)) <| \output ->
+    <| \output ->
     Do.do BackendTask.Time.now <| \endTime ->
     let
         evalMs =
