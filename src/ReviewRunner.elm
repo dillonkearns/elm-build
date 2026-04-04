@@ -443,6 +443,7 @@ patchSource source =
             |> String.replace
                 "raise hidden =\n            let"
                 "raise hidden =\n            let\n                cache = hidden.cache"
+            -- no extra patches for now
 
     else
         source
