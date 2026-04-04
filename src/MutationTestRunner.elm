@@ -23,6 +23,7 @@ import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import DepGraph
+import Dict
 import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.File exposing (File)
 import Eval.Module
@@ -311,13 +312,32 @@ task config =
             perRunnerBaselines : List String
             perRunnerBaselines =
                 List.map .baseline perRunnerData
-
-            allCoveredRanges : List Range
-            allCoveredRanges =
-                List.concatMap .coveredRanges perRunnerData
-
+        in
+        -- Pre-compute file-scoped coverage for each mutation target file.
+        -- Each file only keeps ranges within its line count, dramatically
+        -- reducing memory vs holding the full 12M-range set.
+        Do.do
+            (filesToMutate
+                |> List.map
+                    (\fp ->
+                        File.rawFile fp
+                            |> BackendTask.allowFatal
+                            |> BackendTask.map
+                                (scopeRunnerDataToFile
+                                    (List.map (\rd -> { index = rd.index, coveredRanges = rd.coveredRanges }) perRunnerData)
+                                    fp
+                                )
+                    )
+                |> BackendTask.Extra.sequence
+                |> BackendTask.map Dict.fromList
+            )
+        <| \perFileData ->
+        let
             totalCoveredExpressions =
-                List.length allCoveredRanges
+                perFileData
+                    |> Dict.values
+                    |> List.concatMap .allCoveredRanges
+                    |> List.length
         in
         Do.log ("  " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
@@ -329,99 +349,96 @@ task config =
             (filesToMutate
                 |> BackendTask.Extra.mapSequence
                     (\mutateFilePath ->
-                        Do.allowFatal (File.rawFile mutateFilePath) <| \mutateSource ->
-                        let
-                            -- Scope per-runner coverage to this file's line count,
-                            -- filtering out ranges from other files that would cause
-                            -- false-positive matches (ranges lack file info).
-                            fileLineCount =
-                                List.length (String.lines mutateSource)
+                        case Dict.get mutateFilePath perFileData of
+                            Nothing ->
+                                BackendTask.succeed { filePath = mutateFilePath, sourceCode = "", results = [] }
 
-                            fileScopedRunnerData =
-                                perRunnerData
-                                    |> List.map
-                                        (\rd ->
-                                            { rd | coveredRanges = Coverage.filterRangesToFile fileLineCount rd.coveredRanges }
-                                        )
+                            Just fileData ->
+                                let
+                                    mutateSource =
+                                        fileData.source
 
-                            fileScopedAllCoveredRanges =
-                                List.concatMap .coveredRanges fileScopedRunnerData
+                                    fileScopedRunnerData =
+                                        fileData.runnerData
 
-                            allMutations =
-                                Mutator.generateMutations mutateSource
+                                    fileScopedAllCoveredRanges =
+                                        fileData.allCoveredRanges
 
-                            mutations =
-                                filterMutations config allMutations
+                                    allMutations =
+                                        Mutator.generateMutations mutateSource
 
-                            coveredMutations =
-                                mutations
-                                    |> List.filter (\m -> Coverage.isCovered fileScopedAllCoveredRanges m.spliceRange)
+                                    mutations =
+                                        filterMutations config allMutations
 
-                            uncoveredMutations =
-                                mutations
-                                    |> List.filter (\m -> not (Coverage.isCovered fileScopedAllCoveredRanges m.spliceRange))
+                                    coveredMutations =
+                                        mutations
+                                            |> List.filter (\m -> Coverage.isCovered fileScopedAllCoveredRanges m.spliceRange)
 
-                            uncoveredResults =
-                                uncoveredMutations
-                                    |> List.map (\m -> NoCoverageResult { mutation = m })
-                        in
-                        Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations (" ++ String.fromInt (List.length coveredMutations) ++ " covered, " ++ String.fromInt (List.length uncoveredMutations) ++ " no coverage)") <| \_ ->
-                        Do.do
-                            (coveredMutations
-                                |> List.indexedMap Tuple.pair
-                                |> BackendTask.Extra.mapSequence
-                                    (\( mutIndex, mutation ) ->
-                                        let
-                                            mutationProgress =
-                                                "    [" ++ String.fromInt (mutIndex + 1) ++ "/" ++ String.fromInt (List.length coveredMutations) ++ "] " ++ mutation.operator ++ " " ++ mutateFilePath ++ ":" ++ String.fromInt mutation.line
+                                    uncoveredMutations =
+                                        mutations
+                                            |> List.filter (\m -> not (Coverage.isCovered fileScopedAllCoveredRanges m.spliceRange))
 
-                                            mutatedFile =
-                                                { file = mutation.getMutatedFile (), hashKey = Mutator.hashKey mutation }
-                                        in
-                                        Do.do
-                                            (evalMutationWithRelevantRunners
-                                                { existingCache = existingCache
-                                                , buildDirectory = config.buildDirectory
-                                                , project = project
-                                                , imports = evalConfig.imports
-                                                , sourceOverrides = [ simpleTestRunnerSource ]
-                                                , mutatedFile = mutatedFile
-                                                , mutation = mutation
-                                                , suiteExpr = suiteExpr
-                                                , perRunnerBaselines = perRunnerBaselines
-                                                , perRunnerData = fileScopedRunnerData
-                                                , runnerCount = runnerCount
-                                                }
+                                    uncoveredResults =
+                                        uncoveredMutations
+                                            |> List.map (\m -> NoCoverageResult { mutation = m })
+                                in
+                                Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations (" ++ String.fromInt (List.length coveredMutations) ++ " covered, " ++ String.fromInt (List.length uncoveredMutations) ++ " no coverage)") <| \_ ->
+                                Do.do
+                                    (coveredMutations
+                                        |> List.indexedMap Tuple.pair
+                                        |> BackendTask.Extra.mapSequence
+                                            (\( mutIndex, mutation ) ->
+                                                let
+                                                    mutationProgress =
+                                                        "    [" ++ String.fromInt (mutIndex + 1) ++ "/" ++ String.fromInt (List.length coveredMutations) ++ "] " ++ mutation.operator ++ " " ++ mutateFilePath ++ ":" ++ String.fromInt mutation.line
+
+                                                    mutatedFile =
+                                                        { file = mutation.getMutatedFile (), hashKey = Mutator.hashKey mutation }
+                                                in
+                                                Do.do
+                                                    (evalMutationWithRelevantRunners
+                                                        { existingCache = existingCache
+                                                        , buildDirectory = config.buildDirectory
+                                                        , project = project
+                                                        , imports = evalConfig.imports
+                                                        , sourceOverrides = [ simpleTestRunnerSource ]
+                                                        , mutatedFile = mutatedFile
+                                                        , mutation = mutation
+                                                        , suiteExpr = suiteExpr
+                                                        , perRunnerBaselines = perRunnerBaselines
+                                                        , perRunnerData = fileScopedRunnerData
+                                                        , runnerCount = runnerCount
+                                                        }
+                                                    )
+                                                <| \mutResult ->
+                                                let
+                                                    statusStr =
+                                                        case mutResult of
+                                                            Killed _ ->
+                                                                Ansi.Color.fontColor Ansi.Color.green "KILLED"
+
+                                                            Survived _ ->
+                                                                Ansi.Color.fontColor Ansi.Color.red "SURVIVED"
+
+                                                            EquivalentResult _ ->
+                                                                Ansi.Color.fontColor Ansi.Color.yellow "EQUIVALENT"
+
+                                                            NoCoverageResult _ ->
+                                                                "NO COVERAGE"
+
+                                                            ErrorResult _ ->
+                                                                Ansi.Color.fontColor Ansi.Color.yellow "ERROR"
+                                                in
+                                                Do.log (mutationProgress ++ " " ++ statusStr) <| \_ ->
+                                                BackendTask.succeed mutResult
                                             )
-                                        <| \mutResult ->
-                                        let
-                                            statusStr =
-                                                case mutResult of
-                                                    Killed _ ->
-                                                        Ansi.Color.fontColor Ansi.Color.green "KILLED"
-
-                                                    Survived _ ->
-                                                        Ansi.Color.fontColor Ansi.Color.red "SURVIVED"
-
-                                                    EquivalentResult _ ->
-                                                        Ansi.Color.fontColor Ansi.Color.yellow "EQUIVALENT"
-
-                                                    NoCoverageResult _ ->
-                                                        "NO COVERAGE"
-
-                                                    ErrorResult _ ->
-                                                        Ansi.Color.fontColor Ansi.Color.yellow "ERROR"
-                                        in
-                                        Do.log (mutationProgress ++ " " ++ statusStr) <| \_ ->
-                                        BackendTask.succeed mutResult
                                     )
-                            )
-                        <| \coveredResults ->
-                        BackendTask.succeed
-                            { filePath = mutateFilePath
-                            , sourceCode = mutateSource
-                            , results = coveredResults ++ uncoveredResults
-                            }
+                                <| \coveredResults ->
+                                BackendTask.succeed
+                                    { filePath = mutateFilePath
+                                    , sourceCode = mutateSource
+                                    , results = coveredResults ++ uncoveredResults
+                                    }
                     )
             )
         <| \allFileResults ->
@@ -488,6 +505,37 @@ resolveFilesToMutate config project sourceDirectories testFile =
                 BackendTask.succeed sources
 
 
+{-| Pre-compute file-scoped coverage data from raw per-runner trace data.
+Filters coverage ranges to only those within the file's line count.
+-}
+scopeRunnerDataToFile :
+    List { index : Int, coveredRanges : List Range }
+    -> String
+    -> String
+    -> ( String, { source : String, runnerData : List { index : Int, coveredRanges : List Range }, allCoveredRanges : List Range } )
+scopeRunnerDataToFile runnerCoverage fp src =
+    let
+        lineCount =
+            List.length (String.lines src)
+
+        scopedRunnerData : List { index : Int, coveredRanges : List Range }
+        scopedRunnerData =
+            runnerCoverage
+                |> List.map
+                    (\rd ->
+                        { index = rd.index
+                        , coveredRanges = Coverage.filterRangesToFile lineCount rd.coveredRanges
+                        }
+                    )
+    in
+    ( fp
+    , { source = src
+      , runnerData = scopedRunnerData
+      , allCoveredRanges = List.concatMap .coveredRanges scopedRunnerData
+      }
+    )
+
+
 filterMutations : Config -> List Mutation -> List Mutation
 filterMutations config mutations =
     mutations
@@ -521,7 +569,7 @@ evalMutationWithRelevantRunners :
     , mutation : Mutation
     , suiteExpr : String
     , perRunnerBaselines : List String
-    , perRunnerData : List { index : Int, baseline : String, coveredRanges : List Range }
+    , perRunnerData : List { index : Int, coveredRanges : List Range }
     , runnerCount : Int
     }
     -> BackendTask FatalError MutationResult
