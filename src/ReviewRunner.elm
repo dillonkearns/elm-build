@@ -1,4 +1,4 @@
-module ReviewRunner exposing (ReviewError, buildExpression, buildModuleRecord, computeSemanticKey, escapeElmString, parseReviewOutput, run)
+module ReviewRunner exposing (ReviewError, buildExpression, buildModuleRecord, computeSemanticKey, encodeFileAsJson, escapeElmString, parseReviewOutput, run)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -19,8 +19,11 @@ import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import Dict
+import Elm.Parser
+import Elm.Syntax.File
 import FatalError exposing (FatalError)
 import FNV1a
+import Json.Encode
 import SemanticHash
 import InterpreterProject exposing (InterpreterProject)
 import Pages.Script as Script exposing (Script)
@@ -219,12 +222,65 @@ computeSemanticKey files =
         |> String.fromInt
 
 
+{-| Parse a source file on the HOST side and encode the AST as JSON.
+This avoids interpreter-side parsing entirely — the interpreter just
+decodes the pre-parsed AST.
+
+Returns Nothing if the file fails to parse.
+
+-}
+encodeFileAsJson : String -> Maybe String
+encodeFileAsJson source =
+    case Elm.Parser.parseToFile source of
+        Ok file ->
+            Elm.Syntax.File.encode file
+                |> Json.Encode.encode 0
+                |> Just
+
+        Err _ ->
+            Nothing
+
+
+{-| Build an expression that passes pre-parsed AST JSON to the interpreter.
+Each module is encoded as `{ path : String, ast : String }` where `ast`
+is the JSON-encoded elm-syntax File.
+-}
+buildExpressionWithAst : List { path : String, source : String, astJson : String } -> String
+buildExpressionWithAst modules =
+    let
+        moduleRecords =
+            modules
+                |> List.map
+                    (\{ path, source, astJson } ->
+                        "{ path = \""
+                            ++ escapeElmString path
+                            ++ "\", source = \""
+                            ++ escapeElmString source
+                            ++ "\", astJson = \""
+                            ++ escapeElmString astJson
+                            ++ "\" }"
+                    )
+                |> String.join ", "
+
+        moduleList =
+            case modules of
+                [] ->
+                    "[]"
+
+                _ ->
+                    "[ " ++ moduleRecords ++ " ]"
+    in
+    "ReviewRunnerHelper.runReview " ++ moduleList
+
+
 {-| The inline ReviewRunnerHelper module source, injected as a source override.
 -}
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
         [ "module ReviewRunnerHelper exposing (runReview)"
+        , "import Json.Decode"
+        , "import Elm.Syntax.File"
         , "import Review.Project as Project"
         , "import Review.Rule as Rule"
         , "import NoDebug.Log"
@@ -234,17 +290,15 @@ reviewRunnerHelperSource =
         , "import NoMissingTypeAnnotation"
         , "import NoMissingTypeAnnotationInLetIn"
         , "import NoDeprecated"
-        , "import Simplify"
-        , "import NoUnused.Variables"
-        , "import NoUnused.CustomTypeConstructors"
-        , "import NoUnused.CustomTypeConstructorArgs"
-        , "import NoUnused.Parameters"
-        , "import NoUnused.Patterns"
         , ""
         , "runReview modules ="
         , "    let"
+        , "        addParsed mod proj ="
+        , "            case Json.Decode.decodeString Elm.Syntax.File.decoder mod.astJson of"
+        , "                Ok ast -> Project.addParsedModule { path = mod.path, source = mod.source, ast = ast } proj"
+        , "                Err _ -> Project.addModule { path = mod.path, source = mod.source } proj"
         , "        project ="
-        , "            List.foldl (\\mod proj -> Project.addModule { path = mod.path, source = mod.source } proj) Project.new modules"
+        , "            List.foldl addParsed Project.new modules"
         , "        rules ="
         , "            [ NoDebug.Log.rule"
         , "            , NoDebug.TodoOrToString.rule"
@@ -300,10 +354,20 @@ task config =
         semanticKey =
             computeSemanticKey targetFileContents
 
+        -- Parse and encode ASTs on HOST side (fast, native compilation)
+        -- The interpreter receives pre-parsed JSON — no interpreter-side parsing needed
+        modulesWithAst =
+            targetFileContents
+                |> List.filterMap
+                    (\{ path, source } ->
+                        encodeFileAsJson source
+                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
+                    )
+
         expression =
-            buildExpression targetFileContents
+            buildExpressionWithAst modulesWithAst
     in
-    Do.log ("Semantic key: " ++ semanticKey) <| \_ ->
+    Do.log ("Semantic key: " ++ semanticKey ++ " (" ++ String.fromInt (List.length modulesWithAst) ++ " files parsed on HOST)") <| \_ ->
     Do.do BackendTask.Time.now <| \startTime ->
     Do.do
         (Cache.run { jobs = Nothing } config.buildDirectory
