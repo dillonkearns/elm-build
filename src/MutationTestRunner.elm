@@ -267,43 +267,59 @@ task config =
         -- Determine which files to mutate
         Do.do (resolveFilesToMutate config project sourceDirectories testFile) <| \filesToMutate ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Mutating " ++ String.fromInt (List.length filesToMutate) ++ " source file(s): " ++ String.join ", " filesToMutate)) <| \_ ->
-        -- Baseline with tracing: full suite coverage + output
+        -- Count runners (cheap eval, no tracing overhead)
         Do.do
             (InterpreterProject.evalWithCoverage project
                 { imports = evalConfig.imports
-                , expression = evalConfig.expression
+                , expression = "SimpleTestRunner.countTests (" ++ suiteExpr ++ ")"
                 , sourceOverrides = [ simpleTestRunnerSource ]
                 }
             )
-        <| \baselineCoverage ->
-        -- Per-runner baselines via runEach (single eval, no tracing needed)
-        Do.do
-            (InterpreterProject.evalWithCoverage project
-                { imports = evalConfig.imports
-                , expression = "SimpleTestRunner.runEach (" ++ suiteExpr ++ ")"
-                , sourceOverrides = [ simpleTestRunnerSource ]
-                }
-            )
-        <| \runEachBaseline ->
+        <| \countResult ->
         let
-            baselineOutput =
-                baselineCoverage.result
-
+            runnerCount =
+                String.toInt countResult.result |> Maybe.withDefault 0
+        in
+        Do.log ("  " ++ String.fromInt runnerCount ++ " runners, collecting per-runner coverage...") <| \_ ->
+        -- Per-runner coverage + baselines: trace each runner individually via mapSequence
+        -- (one trace in memory at a time, GC between runners — fixes OOM on large suites)
+        Do.do
+            (List.range 0 (runnerCount - 1)
+                |> BackendTask.Extra.mapSequence
+                    (\runnerIndex ->
+                        InterpreterProject.evalWithCoverage project
+                            { imports = evalConfig.imports
+                            , expression =
+                                "SimpleTestRunner.runNth "
+                                    ++ String.fromInt runnerIndex
+                                    ++ " ("
+                                    ++ suiteExpr
+                                    ++ ")"
+                            , sourceOverrides = [ simpleTestRunnerSource ]
+                            }
+                            |> BackendTask.map
+                                (\coverage ->
+                                    { index = runnerIndex
+                                    , baseline = coverage.result
+                                    , coveredRanges = coverage.coveredRanges
+                                    }
+                                )
+                    )
+            )
+        <| \perRunnerData ->
+        let
             perRunnerBaselines : List String
             perRunnerBaselines =
-                String.split "---TEST_SEP---" runEachBaseline.result
+                List.map .baseline perRunnerData
 
-            runnerCount : Int
-            runnerCount =
-                List.length perRunnerBaselines
-
+            allCoveredRanges : List Range
             allCoveredRanges =
-                baselineCoverage.coveredRanges
+                List.concatMap .coveredRanges perRunnerData
 
             totalCoveredExpressions =
                 List.length allCoveredRanges
         in
-        Do.log ("  " ++ String.fromInt runnerCount ++ " runners, " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
+        Do.log ("  " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
         -- Pre-compute the cache directory listing once, instead of per-mutation
         Do.do (Cache.listExisting config.buildDirectory) <| \existingCache ->
@@ -347,7 +363,7 @@ task config =
                                                 { file = mutation.getMutatedFile (), hashKey = Mutator.hashKey mutation }
                                         in
                                         Do.do
-                                            (evalMutationWithRunEach
+                                            (evalMutationWithRelevantRunners
                                                 { existingCache = existingCache
                                                 , buildDirectory = config.buildDirectory
                                                 , project = project
@@ -357,6 +373,8 @@ task config =
                                                 , mutation = mutation
                                                 , suiteExpr = suiteExpr
                                                 , perRunnerBaselines = perRunnerBaselines
+                                                , perRunnerData = perRunnerData
+                                                , runnerCount = runnerCount
                                                 }
                                             )
                                         <| \mutResult ->
@@ -471,6 +489,91 @@ filterMutations config mutations =
                 else
                     List.filter (\m -> not (List.member m.operator config.excludeOperators)) ms
            )
+
+
+{-| Evaluate a mutation by running only relevant runners (those whose coverage
+overlaps the mutation range). Falls back to running all runners if all are
+relevant. Uses per-runner coverage data collected during the baseline phase.
+-}
+evalMutationWithRelevantRunners :
+    { existingCache : Cache.HashSet
+    , buildDirectory : Path
+    , project : InterpreterProject
+    , imports : List String
+    , sourceOverrides : List String
+    , mutatedFile : { file : File, hashKey : String }
+    , mutation : Mutation
+    , suiteExpr : String
+    , perRunnerBaselines : List String
+    , perRunnerData : List { index : Int, baseline : String, coveredRanges : List Range }
+    , runnerCount : Int
+    }
+    -> BackendTask FatalError MutationResult
+evalMutationWithRelevantRunners ctx =
+    let
+        relevantIndices =
+            Coverage.relevantRunnerIndices ctx.perRunnerData ctx.mutation.spliceRange
+    in
+    if List.isEmpty relevantIndices then
+        BackendTask.succeed (NoCoverageResult { mutation = ctx.mutation })
+
+    else if List.length relevantIndices == ctx.runnerCount then
+        -- All runners relevant: use runEach (no overhead from index filtering)
+        evalMutationWithRunEach
+            { existingCache = ctx.existingCache
+            , buildDirectory = ctx.buildDirectory
+            , project = ctx.project
+            , imports = ctx.imports
+            , sourceOverrides = ctx.sourceOverrides
+            , mutatedFile = ctx.mutatedFile
+            , mutation = ctx.mutation
+            , suiteExpr = ctx.suiteExpr
+            , perRunnerBaselines = ctx.perRunnerBaselines
+            }
+
+    else
+        let
+            expression =
+                "SimpleTestRunner.runIndices ["
+                    ++ String.join "," (List.map String.fromInt relevantIndices)
+                    ++ "] ("
+                    ++ ctx.suiteExpr
+                    ++ ")"
+
+            relevantBaselines =
+                relevantIndices
+                    |> List.filterMap
+                        (\i ->
+                            ctx.perRunnerBaselines
+                                |> List.drop i
+                                |> List.head
+                        )
+        in
+        Cache.runWith { jobs = Nothing, existing = ctx.existingCache } ctx.buildDirectory
+            (InterpreterProject.evalWithFileOverrides ctx.project
+                { imports = ctx.imports
+                , expression = expression
+                , sourceOverrides = ctx.sourceOverrides
+                , fileOverrides = [ ctx.mutatedFile ]
+                }
+                Cache.succeed
+            )
+            |> BackendTask.andThen
+                (\result ->
+                    File.rawFile (Path.toString result.output)
+                        |> BackendTask.allowFatal
+                        |> BackendTask.andThen
+                            (\output ->
+                                if String.startsWith "ERROR:" output then
+                                    BackendTask.succeed
+                                        (ErrorResult { mutation = ctx.mutation, error = String.dropLeft 7 output }
+                                            |> reclassifyResult
+                                        )
+
+                                else
+                                    classifyRunEachOutput ctx.mutation relevantBaselines output
+                            )
+                )
 
 
 {-| Evaluate a mutation by running ALL runners via runEach, then comparing

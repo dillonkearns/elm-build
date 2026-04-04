@@ -9,7 +9,64 @@ import Test exposing (Test, describe, test)
 suite : Test
 suite =
     describe "Coverage"
-        [ describe "isCovered"
+        [ describe "relevantRunnerIndices"
+            [ test "selects only runners whose coverage overlaps the mutation" <|
+                \_ ->
+                    let
+                        perRunnerCoverage =
+                            [ { index = 0, coveredRanges = [ range 1 1 10 50 ] }
+                            , { index = 1, coveredRanges = [ range 20 1 30 50 ] }
+                            , { index = 2, coveredRanges = [ range 5 1 15 50 ] }
+                            ]
+                    in
+                    Coverage.relevantRunnerIndices perRunnerCoverage (range 8 1 8 10)
+                        |> Expect.equal [ 0, 2 ]
+            , test "returns empty when no runner covers the mutation" <|
+                \_ ->
+                    let
+                        perRunnerCoverage =
+                            [ { index = 0, coveredRanges = [ range 1 1 5 50 ] }
+                            , { index = 1, coveredRanges = [ range 10 1 15 50 ] }
+                            ]
+                    in
+                    Coverage.relevantRunnerIndices perRunnerCoverage (range 7 1 7 10)
+                        |> Expect.equal []
+            , test "returns all runners when all cover the mutation" <|
+                \_ ->
+                    let
+                        perRunnerCoverage =
+                            [ { index = 0, coveredRanges = [ range 1 1 50 50 ] }
+                            , { index = 1, coveredRanges = [ range 1 1 50 50 ] }
+                            , { index = 2, coveredRanges = [ range 1 1 50 50 ] }
+                            ]
+                    in
+                    Coverage.relevantRunnerIndices perRunnerCoverage (range 25 1 25 10)
+                        |> Expect.equal [ 0, 1, 2 ]
+            , test "handles single runner covering mutation" <|
+                \_ ->
+                    let
+                        perRunnerCoverage =
+                            [ { index = 0, coveredRanges = [ range 1 1 5 50 ] }
+                            , { index = 1, coveredRanges = [ range 10 1 20 50 ] }
+                            , { index = 2, coveredRanges = [ range 30 1 40 50 ] }
+                            ]
+                    in
+                    Coverage.relevantRunnerIndices perRunnerCoverage (range 15 1 15 10)
+                        |> Expect.equal [ 1 ]
+            , test "handles multi-line mutation spanning multiple runner coverages" <|
+                \_ ->
+                    let
+                        perRunnerCoverage =
+                            [ { index = 0, coveredRanges = [ range 1 1 10 50 ] }
+                            , { index = 1, coveredRanges = [ range 5 1 20 50 ] }
+                            , { index = 2, coveredRanges = [ range 15 1 25 50 ] }
+                            ]
+                    in
+                    -- Mutation at lines 5-7 is contained by runners 0 (1-10) and 1 (5-20)
+                    Coverage.relevantRunnerIndices perRunnerCoverage (range 5 1 7 50)
+                        |> Expect.equal [ 0, 1 ]
+            ]
+        , describe "isCovered"
             [ test "range fully inside a covered range is covered" <|
                 \_ ->
                     let
