@@ -180,37 +180,39 @@ reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
         [ "module ReviewRunnerHelper exposing (runReview)"
-        , "import Elm.Parser"
         , "import Review.Project as Project"
         , "import Review.Rule as Rule"
-        , "import Elm.Syntax.Expression exposing (Expression(..))"
-        , "import Elm.Syntax.Node as Node exposing (Node(..))"
+        , "import NoDebug.Log"
+        , "import NoDebug.TodoOrToString"
+        , "import NoExposingEverything"
+        , "import NoImportingEverything"
+        , "import NoMissingTypeAnnotation"
+        , "import NoMissingTypeAnnotationInLetIn"
+        , "import NoDeprecated"
+        , "import Simplify"
+        , "import NoUnused.Variables"
+        , "import NoUnused.CustomTypeConstructors"
+        , "import NoUnused.CustomTypeConstructorArgs"
+        , "import NoUnused.Parameters"
+        , "import NoUnused.Patterns"
         , ""
-        , "import Elm.Parser"
         , "runReview modules ="
         , "    let"
-        , "        addParsed mod proj ="
-        , "            case Elm.Parser.parseToFile mod.source of"
-        , "                Ok ast -> Project.addParsedModule { path = mod.path, source = mod.source, ast = ast } proj"
-        , "                Err _ -> proj"
         , "        project ="
-        , "            List.foldl addParsed Project.new modules"
+        , "            List.foldl (\\mod proj -> Project.addModule { path = mod.path, source = mod.source } proj) Project.new modules"
         , "        rules ="
-        , "            [ Rule.newModuleRuleSchema \"NoDebugLog\" ()"
-        , "                |> Rule.withSimpleExpressionVisitor expressionVisitor"
-        , "                |> Rule.fromModuleRuleSchema"
+        , "            [ NoDebug.Log.rule"
+        , "            , NoDebug.TodoOrToString.rule"
+        , "            , NoExposingEverything.rule"
+        , "            , NoImportingEverything.rule []"
+        , "            , NoMissingTypeAnnotation.rule"
+        , "            , NoMissingTypeAnnotationInLetIn.rule"
+        , "            , NoDeprecated.rule NoDeprecated.defaults"
         , "            ]"
         , "        ( errors, _ ) ="
         , "            Rule.review rules project"
         , "    in"
         , "    errors |> List.map formatError |> String.join \"\\n\""
-        , ""
-        , "expressionVisitor node ="
-        , "    case Node.value node of"
-        , "        Application ((Node r (FunctionOrValue [\"Debug\"] \"log\")) :: _) ->"
-        , "            [ Rule.error { message = \"Remove the use of Debug.log\", details = [\"Remove it.\"] } r ]"
-        , "        _ ->"
-        , "            []"
         , ""
         , "formatError err ="
         , "    let"
@@ -371,19 +373,24 @@ kernelPackages =
         ]
 
 
-{-| Packages to skip because they cause module name collisions (multiple
-packages expose a `Util` module) or are not needed for the POC.
+{-| Packages to skip because they cause module name collisions
+(multiple packages expose `Util`, `Char.Extra`, etc.) in the
+interpreter's flat namespace. Only skip packages not needed
+for the rules we actually use.
 -}
 conflictingPackages : Set.Set String
 conflictingPackages =
     Set.fromList
-        [ "truqu/elm-review-nobooleancase"
+        [ -- Util collisions
+          "truqu/elm-review-nobooleancase"
         , "SiriusStarr/elm-review-no-single-pattern-case"
         , "SiriusStarr/elm-review-no-unsorted"
         , "lue-bird/elm-review-equals-caseable"
         , "lue-bird/elm-review-no-catch-all-for-specific-remaining-patterns"
         , "lue-bird/elm-review-variables-between-case-of-access-in-cases"
         , "lue-bird/elm-no-record-type-alias-constructor-function"
+
+        -- Char.Extra / other collisions
         , "miniBill/elm-rope"
         , "gampleman/elm-review-derive"
         , "dillonkearns/elm-review-html-to-elm"
