@@ -8,12 +8,15 @@ Usage:
 -}
 
 import Ansi.Color
+import AstWireCodec
 import BackendTask exposing (BackendTask)
+import Lamdera.Wire3
 import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
 import BackendTask.Time
+import Bytes exposing (Bytes)
 import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
@@ -241,6 +244,36 @@ encodeFileAsJson source =
             Nothing
 
 
+{-| Parse a source file on the HOST side and encode the AST as binary
+using Lamdera Wire3 codecs. Much more compact than JSON (~3-4x smaller).
+
+Returns the encoded bytes as a comma-separated int list string for
+embedding in an Elm expression.
+
+-}
+encodeFileAsWire : String -> Maybe { intList : String, byteCount : Int }
+encodeFileAsWire source =
+    case Elm.Parser.parseToFile source of
+        Ok file ->
+            let
+                bytes =
+                    AstWireCodec.encodeToBytes file
+
+                ints =
+                    Lamdera.Wire3.intListFromBytes bytes
+            in
+            Just
+                { intList =
+                    ints
+                        |> List.map String.fromInt
+                        |> String.join ","
+                , byteCount = Bytes.width bytes
+                }
+
+        Err _ ->
+            Nothing
+
+
 {-| Build an expression that passes pre-parsed AST JSON to the interpreter.
 Each module is encoded as `{ path : String, ast : String }` where `ast`
 is the JSON-encoded elm-syntax File.
@@ -259,6 +292,35 @@ buildExpressionWithAst modules =
                             ++ "\", astJson = \""
                             ++ escapeElmString astJson
                             ++ "\" }"
+                    )
+                |> String.join ", "
+
+        moduleList =
+            case modules of
+                [] ->
+                    "[]"
+
+                _ ->
+                    "[ " ++ moduleRecords ++ " ]"
+    in
+    "ReviewRunnerHelper.runReview " ++ moduleList
+
+
+{-| Build an expression using Wire3 binary-encoded ASTs (most compact).
+Each module carries path, source, and a `List Int` (Wire3 bytes).
+-}
+buildExpressionWithWire : List { path : String, source : String, wireIntList : String } -> String
+buildExpressionWithWire modules =
+    let
+        moduleRecords =
+            modules
+                |> List.map
+                    (\{ path, source, wireIntList } ->
+                        "{ path = \""
+                            ++ escapeElmString path
+                            ++ "\", source = \""
+                            ++ escapeElmString source
+                            ++ "\", wireBytes = [" ++ wireIntList ++ "] }"
                     )
                 |> String.join ", "
 
@@ -367,7 +429,20 @@ task config =
         expression =
             buildExpressionWithAst modulesWithAst
     in
-    Do.log ("Semantic key: " ++ semanticKey ++ " (" ++ String.fromInt (List.length modulesWithAst) ++ " files parsed on HOST)") <| \_ ->
+    let
+        totalJsonBytes =
+            modulesWithAst |> List.map (\m -> String.length m.astJson) |> List.sum
+
+        totalSourceBytes =
+            targetFileContents |> List.map (\m -> String.length m.source) |> List.sum
+
+        totalWireBytes =
+            targetFileContents
+                |> List.filterMap (\m -> encodeFileAsWire m.source)
+                |> List.map .byteCount
+                |> List.sum
+    in
+    Do.log ("Semantic key: " ++ semanticKey ++ " (" ++ String.fromInt (List.length modulesWithAst) ++ " files, source=" ++ String.fromInt totalSourceBytes ++ "B, json=" ++ String.fromInt totalJsonBytes ++ "B, wire=" ++ String.fromInt totalWireBytes ++ "B)") <| \_ ->
     Do.do BackendTask.Time.now <| \startTime ->
     Do.do
         (Cache.run { jobs = Nothing } config.buildDirectory
