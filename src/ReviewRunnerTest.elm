@@ -22,6 +22,7 @@ suite : Test
 suite =
     describe "ReviewRunner integration"
         [ pureHelperTests
+        , semanticCacheKeyTests
         ]
 
 
@@ -126,6 +127,48 @@ pureHelperTests =
 
 
 -- Test fixtures
+
+
+{-| Test that semantic hashing gives stable cache keys.
+
+Note: computeSemanticKey calls Elm.Parser.parseToFile which can't run
+through the interpreter (Rope module collision). These tests run on the
+HOST side via elm-pages BackendTask, not through the interpreter.
+
+For now, we test the pure hash composition logic with pre-computed indices.
+The full parseToFile-based pipeline is tested via the actual script.
+
+-}
+semanticCacheKeyTests : Test
+semanticCacheKeyTests =
+    describe "semantic cache keys"
+        [ test "same input produces same key" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = "module Foo exposing (..)\n\nfoo = 1\n" } ]
+                in
+                ReviewRunner.computeSemanticKey files
+                    |> Expect.equal (ReviewRunner.computeSemanticKey files)
+        , test "different source produces different key" <|
+            \_ ->
+                ReviewRunner.computeSemanticKey
+                    [ { path = "src/Foo.elm", source = "module Foo exposing (..)\n\nfoo = 1\n" } ]
+                    |> Expect.notEqual
+                        (ReviewRunner.computeSemanticKey
+                            [ { path = "src/Foo.elm", source = "module Foo exposing (..)\n\nfoo = 2\n" } ]
+                        )
+        , test "adding a file produces different key" <|
+            \_ ->
+                ReviewRunner.computeSemanticKey
+                    [ { path = "src/Foo.elm", source = "module Foo exposing (..)\n\nfoo = 1\n" } ]
+                    |> Expect.notEqual
+                        (ReviewRunner.computeSemanticKey
+                            [ { path = "src/Foo.elm", source = "module Foo exposing (..)\n\nfoo = 1\n" }
+                            , { path = "src/Bar.elm", source = "module Bar exposing (..)\n\nbar = 2\n" }
+                            ]
+                        )
+        ]
 
 
 reviewElmJson : String

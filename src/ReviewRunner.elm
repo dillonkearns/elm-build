@@ -1,4 +1,4 @@
-module ReviewRunner exposing (ReviewError, buildExpression, buildModuleRecord, escapeElmString, parseReviewOutput, run)
+module ReviewRunner exposing (ReviewError, buildExpression, buildModuleRecord, computeSemanticKey, escapeElmString, parseReviewOutput, run)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -18,8 +18,10 @@ import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
-import DepGraph
+import Dict
 import FatalError exposing (FatalError)
+import FNV1a
+import SemanticHash
 import InterpreterProject exposing (InterpreterProject)
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
@@ -174,6 +176,49 @@ parseSingleError line =
             Nothing
 
 
+{-| Compute a semantic cache key for a set of source files.
+
+Uses SemanticHash to compute Merkle-style hashes for each declaration
+in each file. Whitespace and comment changes don't affect the hash —
+only meaningful AST changes do.
+
+This runs on the elm-build side (native compilation, fast) — NOT
+through the interpreter.
+
+-}
+computeSemanticKey : List { path : String, source : String } -> String
+computeSemanticKey files =
+    let
+        perFileHashes : List String
+        perFileHashes =
+            files
+                |> List.sortBy .path
+                |> List.map
+                    (\{ path, source } ->
+                        let
+                            index =
+                                SemanticHash.buildIndexFromSource source
+
+                            -- Combine all declaration hashes for this file
+                            declHashes =
+                                index
+                                    |> Dict.toList
+                                    |> List.sortBy Tuple.first
+                                    |> List.map
+                                        (\( name, info ) ->
+                                            name ++ ":" ++ info.semanticHash
+                                        )
+                                    |> String.join ","
+                        in
+                        path ++ "|" ++ declHashes
+                    )
+    in
+    perFileHashes
+        |> String.join "\n"
+        |> FNV1a.hash
+        |> String.fromInt
+
+
 {-| The inline ReviewRunnerHelper module source, injected as a source override.
 -}
 reviewRunnerHelperSource : String
@@ -251,11 +296,15 @@ task config =
     Do.do (resolveTargetFiles config) <| \targetFiles ->
     Do.log ("Found " ++ String.fromInt (List.length targetFiles) ++ " source file(s) to review") <| \_ ->
     Do.do (readTargetFiles targetFiles) <| \targetFileContents ->
-    Do.do BackendTask.Time.now <| \startTime ->
     let
+        semanticKey =
+            computeSemanticKey targetFileContents
+
         expression =
             buildExpression targetFileContents
     in
+    Do.log ("Semantic key: " ++ semanticKey) <| \_ ->
+    Do.do BackendTask.Time.now <| \startTime ->
     Do.do
         (Cache.run { jobs = Nothing } config.buildDirectory
             (InterpreterProject.evalWithSourceOverrides reviewProject
