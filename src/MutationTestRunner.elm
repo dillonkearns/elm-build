@@ -282,12 +282,26 @@ task config =
                 String.toInt countResult.result |> Maybe.withDefault 0
         in
         Do.log ("  " ++ String.fromInt runnerCount ++ " runners, collecting per-runner coverage...") <| \_ ->
-        -- Per-runner coverage + baselines: trace each runner individually via mapSequence
-        -- (one trace in memory at a time, GC between runners — fixes OOM on large suites)
+        -- Read all mutation target files upfront to get line counts for scoping
+        Do.do
+            (filesToMutate
+                |> List.map
+                    (\fp ->
+                        File.rawFile fp
+                            |> BackendTask.allowFatal
+                            |> BackendTask.map (\src -> ( fp, { source = src, lineCount = List.length (String.lines src) } ))
+                    )
+                |> BackendTask.Extra.sequence
+                |> BackendTask.map Dict.fromList
+            )
+        <| \fileInfo ->
+        -- Per-runner coverage: trace each runner individually, immediately scope
+        -- ranges to each file's line count, and accumulate only the scoped data.
+        -- Raw per-runner ranges are discarded after each step (GC-friendly).
         Do.do
             (List.range 0 (runnerCount - 1)
-                |> BackendTask.Extra.mapSequence
-                    (\runnerIndex ->
+                |> BackendTask.Extra.foldSequence
+                    (\runnerIndex acc ->
                         InterpreterProject.evalWithCoverage project
                             { imports = evalConfig.imports
                             , expression =
@@ -300,39 +314,49 @@ task config =
                             }
                             |> BackendTask.map
                                 (\coverage ->
-                                    { index = runnerIndex
-                                    , baseline = coverage.result
-                                    , coveredRanges = coverage.coveredRanges
+                                    let
+                                        -- Scope this runner's ranges to each file immediately
+                                        updatedPerFileData =
+                                            Dict.foldl
+                                                (\fp fi perFile ->
+                                                    let
+                                                        scopedRanges =
+                                                            Coverage.filterRangesToFile fi.lineCount coverage.coveredRanges
+
+                                                        entry =
+                                                            case Dict.get fp perFile of
+                                                                Just existing ->
+                                                                    { existing
+                                                                        | runnerData = existing.runnerData ++ [ { index = runnerIndex, coveredRanges = scopedRanges } ]
+                                                                        , allCoveredRanges = existing.allCoveredRanges ++ scopedRanges
+                                                                    }
+
+                                                                Nothing ->
+                                                                    { source = fi.source
+                                                                    , runnerData = [ { index = runnerIndex, coveredRanges = scopedRanges } ]
+                                                                    , allCoveredRanges = scopedRanges
+                                                                    }
+                                                    in
+                                                    Dict.insert fp entry perFile
+                                                )
+                                                acc.perFileData
+                                                fileInfo
+                                    in
+                                    { baselines = acc.baselines ++ [ coverage.result ]
+                                    , perFileData = updatedPerFileData
                                     }
                                 )
                     )
+                    { baselines = [], perFileData = Dict.empty }
             )
-        <| \perRunnerData ->
+        <| \collected ->
         let
-            perRunnerBaselines : List String
             perRunnerBaselines =
-                List.map .baseline perRunnerData
-        in
-        -- Pre-compute file-scoped coverage for each mutation target file.
-        -- Each file only keeps ranges within its line count, dramatically
-        -- reducing memory vs holding the full 12M-range set.
-        Do.do
-            (filesToMutate
-                |> List.map
-                    (\fp ->
-                        File.rawFile fp
-                            |> BackendTask.allowFatal
-                            |> BackendTask.map
-                                (scopeRunnerDataToFile
-                                    (List.map (\rd -> { index = rd.index, coveredRanges = rd.coveredRanges }) perRunnerData)
-                                    fp
-                                )
-                    )
-                |> BackendTask.Extra.sequence
-                |> BackendTask.map Dict.fromList
-            )
-        <| \perFileData ->
-        let
+                collected.baselines
+
+            perFileData =
+                collected.perFileData
+
             totalCoveredExpressions =
                 perFileData
                     |> Dict.values
