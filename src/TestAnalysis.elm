@@ -219,7 +219,8 @@ probeCandidate projectEnv testModuleName name extraSources =
                 ]
 
         result =
-            Eval.Module.evalWithEnv
+            Eval.Module.evalWithEnvAndLimit
+                (Just 5000000)
                 projectEnv
                 (extraSources ++ [ probeWrapper ])
                 (Elm.Syntax.Expression.FunctionOrValue [] "probe__")
@@ -252,6 +253,9 @@ evalErrorToString err =
 
         Types.Todo msg ->
             "hit Debug.todo: " ++ msg
+
+        Types.TailCall _ ->
+            "internal TCO signal"
 
 
 {-| Detect whether an Elm source file uses fuzz tests by checking for references

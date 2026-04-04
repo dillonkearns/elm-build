@@ -1,4 +1,4 @@
-module BackendTask.Extra exposing (combine, combineBy, combineBy_, finally, mapSequence, profiling, sequence, sequence_, timed)
+module BackendTask.Extra exposing (combine, combineBy, combineBy_, finally, foldSequence, mapSequence, profiling, sequence, sequence_, timed)
 
 import Array exposing (Array)
 import BackendTask exposing (BackendTask)
@@ -156,6 +156,25 @@ combine inputs =
     in
     go 0 (Array.length arr)
         |> BackendTask.map Rope.toList
+
+
+{-| Fold over a list sequentially, threading an accumulator through each step.
+Each step runs a BackendTask that receives the current accumulator and item,
+and returns the new accumulator. Only one step is materialized at a time,
+allowing V8 to GC intermediate state between steps.
+-}
+foldSequence : (a -> acc -> BackendTask error acc) -> acc -> List a -> BackendTask error acc
+foldSequence f acc items =
+    case items of
+        [] ->
+            BackendTask.succeed acc
+
+        item :: rest ->
+            f item acc
+                |> BackendTask.andThen
+                    (\newAcc ->
+                        foldSequence f newAcc rest
+                    )
 
 
 {-| Like `sequence`, but constructs each BackendTask lazily — the function `f`

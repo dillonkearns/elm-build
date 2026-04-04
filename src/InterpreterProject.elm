@@ -940,6 +940,9 @@ evalErrorKindToString kind =
         Types.Todo msg ->
             "hit Debug.todo: " ++ msg
 
+        Types.TailCall _ ->
+            "internal TCO signal (should not be user-visible)"
+
 
 {-| Get the pre-built package environment. Useful for direct eval calls
 that bypass the caching layer (e.g. benchmarking).

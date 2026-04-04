@@ -46,7 +46,7 @@ programConfig =
             (OptionsParser.build Config
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "test"
-                        |> Option.withDescription "Test file (auto-discovered if omitted)"
+                        |> Option.withDescription "Test file(s), comma-separated (auto-discovered if omitted)"
                     )
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "source-dirs"
@@ -167,44 +167,48 @@ runTestFile config project testFile =
         testModuleName =
             DepGraph.parseModuleName testSource |> Maybe.withDefault "Tests"
 
-        candidateNames =
-            TestAnalysis.getCandidateNames testSource
+        -- Fast path: use type annotations to discover Test values (no eval needed)
+        staticTestValues =
+            TestAnalysis.discoverTestValues testSource
 
-        packageEnv =
-            InterpreterProject.getPackageEnv project
-
-        probeSources =
+        -- Slow path: probe all zero-arg exposed values via interpreter
+        probeTestValues () =
             let
-                { userSources } =
-                    InterpreterProject.prepareEvalSources project
-                        { imports = [ "SimpleTestRunner", testModuleName ]
-                        , expression = "\"probe\""
-                        }
+                candidateNames =
+                    TestAnalysis.getCandidateNames testSource
+
+                packageEnv =
+                    InterpreterProject.getPackageEnv project
+
+                probeSources =
+                    let
+                        { userSources } =
+                            InterpreterProject.prepareEvalSources project
+                                { imports = [ "SimpleTestRunner", testModuleName ]
+                                , expression = "\"probe\""
+                                }
+                    in
+                    simpleTestRunnerSource :: userSources
+
+                probeResults =
+                    candidateNames
+                        |> List.map
+                            (\name ->
+                                ( name, TestAnalysis.probeCandidate packageEnv testModuleName name probeSources )
+                            )
             in
-            simpleTestRunnerSource :: userSources
+            { testValues =
+                probeResults
+                    |> List.filterMap
+                        (\( name, result ) ->
+                            case result of
+                                Ok _ ->
+                                    Just name
 
-        probeResults =
-            candidateNames
-                |> List.map
-                    (\name ->
-                        ( name, TestAnalysis.probeCandidate packageEnv testModuleName name probeSources )
-                    )
-
-        testValues =
-            probeResults
-                |> List.filterMap
-                    (\( name, result ) ->
-                        case result of
-                            Ok _ ->
-                                Just name
-
-                            Err _ ->
-                                Nothing
-                    )
-    in
-    if List.isEmpty testValues then
-        let
-            rejections =
+                                Err _ ->
+                                    Nothing
+                        )
+            , rejections =
                 probeResults
                     |> List.filterMap
                         (\( name, result ) ->
@@ -216,10 +220,24 @@ runTestFile config project testFile =
                                     Nothing
                         )
                     |> String.join "; "
-        in
+            , candidateCount = List.length candidateNames
+            }
+
+        { testValues, rejections, candidateCount } =
+            if List.isEmpty staticTestValues then
+                -- No type annotations found — fall back to probing
+                probeTestValues ()
+
+            else
+                { testValues = staticTestValues
+                , rejections = ""
+                , candidateCount = List.length staticTestValues
+                }
+    in
+    if List.isEmpty testValues then
         -- Can't run this test file (interpreter limitation)
         Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (skipped: " ++ rejections ++ ")")) <| \_ ->
-        BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = List.length candidateNames }
+        BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = candidateCount }
 
     else
         let
@@ -294,7 +312,7 @@ resolveTestFiles : Config -> BackendTask FatalError (List String)
 resolveTestFiles config =
     case config.testFile of
         Just explicit ->
-            BackendTask.succeed [ explicit ]
+            BackendTask.succeed (String.split "," explicit)
 
         Nothing ->
             Glob.fromStringWithOptions
@@ -327,58 +345,6 @@ resolveTestFiles config =
                                 )
                     )
 
-
-resolveTestFile : Config -> InterpreterProject -> BackendTask FatalError String
-resolveTestFile config project =
-    case config.testFile of
-        Just explicit ->
-            Do.log ("Using test file: " ++ explicit) <| \_ ->
-            BackendTask.succeed explicit
-
-        Nothing ->
-            Do.log "Auto-discovering test files..." <| \_ ->
-            Glob.fromStringWithOptions
-                (let
-                    o =
-                        Glob.defaultOptions
-                 in
-                 { o | include = Glob.OnlyFiles }
-                )
-                "tests/**/*.elm"
-                |> BackendTask.andThen
-                    (\files ->
-                        files
-                            |> List.map
-                                (\filePath ->
-                                    File.rawFile filePath
-                                        |> BackendTask.allowFatal
-                                        |> BackendTask.map (\content -> ( filePath, content ))
-                                )
-                            |> BackendTask.sequence
-                            |> BackendTask.map
-                                (\pairs ->
-                                    pairs
-                                        |> List.filter
-                                            (\( _, content ) ->
-                                                List.member "Test" (DepGraph.parseImports content)
-                                            )
-                                        |> List.map Tuple.first
-                                )
-                    )
-                |> BackendTask.andThen
-                    (\testFiles ->
-                        case testFiles of
-                            [ single ] ->
-                                Do.log ("Found test file: " ++ single) <| \_ ->
-                                BackendTask.succeed single
-
-                            first :: _ ->
-                                Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test files (using first: " ++ first ++ ")") <| \_ ->
-                                BackendTask.succeed first
-
-                            [] ->
-                                BackendTask.fail (FatalError.fromString "No test files found")
-                    )
 
 
 ensureDeps : BackendTask FatalError ()
@@ -484,6 +450,9 @@ evalErrorKindToString kind =
 
         Types.Todo msg ->
             "hit Debug.todo: " ++ msg
+
+        Types.TailCall _ ->
+            "internal TCO signal"
 
 
 patchSource : String -> String

@@ -1,4 +1,4 @@
-module Coverage exposing (extractRanges, isCovered)
+module Coverage exposing (extractRanges, filterRangesToFile, isCovered, relevantRunnerIndices)
 
 {-| Coverage analysis for mutation testing.
 
@@ -60,3 +60,39 @@ rangeContains outer inner =
 positionLte : { row : Int, column : Int } -> { row : Int, column : Int } -> Bool
 positionLte a b =
     a.row < b.row || (a.row == b.row && a.column <= b.column)
+
+
+{-| Filter coverage ranges to only those plausibly from a specific file.
+
+Ranges from other files evaluated during a trace have row/col positions
+from those other files. By filtering to ranges where end.row <= fileLineCount,
+we discard ranges from files shorter than the mutation target, dramatically
+reducing false-positive coverage matches across files.
+
+-}
+filterRangesToFile : Int -> List Range -> List Range
+filterRangesToFile fileLineCount ranges =
+    List.filter (\r -> r.start.row <= fileLineCount && r.end.row <= fileLineCount) ranges
+
+
+{-| Find which runner indices have coverage overlapping a mutation range.
+
+Given per-runner coverage data and a mutation's source range, returns the
+indices of runners whose coverage contains the mutation. Used for selective
+test execution: only run runners that could detect the mutation.
+
+-}
+relevantRunnerIndices :
+    List { a | index : Int, coveredRanges : List Range }
+    -> Range
+    -> List Int
+relevantRunnerIndices perRunnerCoverage mutationRange =
+    perRunnerCoverage
+        |> List.filterMap
+            (\rc ->
+                if isCovered rc.coveredRanges mutationRange then
+                    Just rc.index
+
+                else
+                    Nothing
+            )
