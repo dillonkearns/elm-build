@@ -451,6 +451,9 @@ evalErrorKindToString kind =
         Types.Todo msg ->
             "hit Debug.todo: " ++ msg
 
+        Types.TailCall _ ->
+            "internal TCO signal"
+
 
 patchSource : String -> String
 patchSource source =

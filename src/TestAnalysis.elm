@@ -254,6 +254,9 @@ evalErrorToString err =
         Types.Todo msg ->
             "hit Debug.todo: " ++ msg
 
+        Types.TailCall _ ->
+            "internal TCO signal"
+
 
 {-| Detect whether an Elm source file uses fuzz tests by checking for references
 to Test.fuzz, Test.fuzz2, or Test.fuzz3.

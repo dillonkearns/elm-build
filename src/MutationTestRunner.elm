@@ -331,6 +331,22 @@ task config =
                     (\mutateFilePath ->
                         Do.allowFatal (File.rawFile mutateFilePath) <| \mutateSource ->
                         let
+                            -- Scope per-runner coverage to this file's line count,
+                            -- filtering out ranges from other files that would cause
+                            -- false-positive matches (ranges lack file info).
+                            fileLineCount =
+                                List.length (String.lines mutateSource)
+
+                            fileScopedRunnerData =
+                                perRunnerData
+                                    |> List.map
+                                        (\rd ->
+                                            { rd | coveredRanges = Coverage.filterRangesToFile fileLineCount rd.coveredRanges }
+                                        )
+
+                            fileScopedAllCoveredRanges =
+                                List.concatMap .coveredRanges fileScopedRunnerData
+
                             allMutations =
                                 Mutator.generateMutations mutateSource
 
@@ -339,11 +355,11 @@ task config =
 
                             coveredMutations =
                                 mutations
-                                    |> List.filter (\m -> Coverage.isCovered allCoveredRanges m.spliceRange)
+                                    |> List.filter (\m -> Coverage.isCovered fileScopedAllCoveredRanges m.spliceRange)
 
                             uncoveredMutations =
                                 mutations
-                                    |> List.filter (\m -> not (Coverage.isCovered allCoveredRanges m.spliceRange))
+                                    |> List.filter (\m -> not (Coverage.isCovered fileScopedAllCoveredRanges m.spliceRange))
 
                             uncoveredResults =
                                 uncoveredMutations
@@ -373,7 +389,7 @@ task config =
                                                 , mutation = mutation
                                                 , suiteExpr = suiteExpr
                                                 , perRunnerBaselines = perRunnerBaselines
-                                                , perRunnerData = perRunnerData
+                                                , perRunnerData = fileScopedRunnerData
                                                 , runnerCount = runnerCount
                                                 }
                                             )

@@ -66,6 +66,28 @@ suite =
                     Coverage.relevantRunnerIndices perRunnerCoverage (range 5 1 7 50)
                         |> Expect.equal [ 0, 1 ]
             ]
+        , describe "filterRangesToFile"
+            [ test "keeps ranges within file line count" <|
+                \_ ->
+                    Coverage.filterRangesToFile 25 [ range 1 1 5 10, range 10 1 20 10, range 50 1 60 10 ]
+                        |> Expect.equal [ range 1 1 5 10, range 10 1 20 10 ]
+            , test "removes ranges that extend beyond file" <|
+                \_ ->
+                    Coverage.filterRangesToFile 25 [ range 1 1 5 10, range 20 1 30 10 ]
+                        |> Expect.equal [ range 1 1 5 10 ]
+            , test "keeps range exactly at file boundary" <|
+                \_ ->
+                    Coverage.filterRangesToFile 10 [ range 1 1 10 50 ]
+                        |> Expect.equal [ range 1 1 10 50 ]
+            , test "removes range starting beyond file" <|
+                \_ ->
+                    Coverage.filterRangesToFile 10 [ range 15 1 20 10 ]
+                        |> Expect.equal []
+            , test "empty ranges returns empty" <|
+                \_ ->
+                    Coverage.filterRangesToFile 100 []
+                        |> Expect.equal []
+            ]
         , describe "isCovered"
             [ test "range fully inside a covered range is covered" <|
                 \_ ->
