@@ -12,3 +12,4 @@ bun.lockb
 .elm-bench*
 .elm-mutation-test-debug*
 reports/
+dist/
