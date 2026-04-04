@@ -15,7 +15,6 @@ import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
-import BackendTask.Time
 import Bytes exposing (Bytes)
 import Cache
 import Cli.Option as Option
@@ -32,8 +31,6 @@ import InterpreterProject exposing (InterpreterProject)
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
-import Time
-import Types
 
 
 type alias ReviewError =
@@ -395,29 +392,23 @@ reviewRunnerHelperSource =
 
 task : Config -> BackendTask FatalError ()
 task config =
-    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Running elm-review via interpreter") <| \_ ->
-    Do.do ensureReviewDeps <| \_ ->
+    Do.do (ensureReviewDeps config.reviewDir) <| \_ ->
     Do.do
-        (BackendTask.Extra.timed "Loading review project" "Loaded review project"
-            (InterpreterProject.loadWith
-                { projectDir = Path.path "review"
-                , skipPackages = Set.union kernelPackages conflictingPackages
-                , patchSource = patchSource
-                , extraSourceFiles = []
-                , sourceDirectories = Just [ "review/src" ]
-                }
-            )
+        (InterpreterProject.loadWith
+            { projectDir = Path.path config.reviewDir
+            , skipPackages = Set.union kernelPackages conflictingPackages
+            , patchSource = patchSource
+            , extraSourceFiles = []
+            , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
+            }
         )
     <| \reviewProject ->
     Do.do (resolveTargetFiles config) <| \targetFiles ->
-    Do.log ("Found " ++ String.fromInt (List.length targetFiles) ++ " source file(s) to review") <| \_ ->
     Do.do (readTargetFiles targetFiles) <| \targetFileContents ->
     let
         semanticKey =
             computeSemanticKey targetFileContents
 
-        -- Parse and encode ASTs on HOST side (fast, native compilation)
-        -- The interpreter receives pre-parsed JSON — no interpreter-side parsing needed
         modulesWithAst =
             targetFileContents
                 |> List.filterMap
@@ -428,26 +419,10 @@ task config =
 
         expression =
             buildExpressionWithAst modulesWithAst
-    in
-    let
-        totalJsonBytes =
-            modulesWithAst |> List.map (\m -> String.length m.astJson) |> List.sum
 
-        totalSourceBytes =
-            targetFileContents |> List.map (\m -> String.length m.source) |> List.sum
-
-        totalWireBytes =
-            targetFileContents
-                |> List.filterMap (\m -> encodeFileAsWire m.source)
-                |> List.map .byteCount
-                |> List.sum
-    in
-    let
         semanticCachePath =
             Path.toString config.buildDirectory ++ "/review-" ++ semanticKey ++ ".result"
     in
-    Do.log ("Semantic key: " ++ semanticKey ++ " (" ++ String.fromInt (List.length modulesWithAst) ++ " files, source=" ++ String.fromInt totalSourceBytes ++ "B, json=" ++ String.fromInt totalJsonBytes ++ "B, wire=" ++ String.fromInt totalWireBytes ++ "B)") <| \_ ->
-    Do.do BackendTask.Time.now <| \startTime ->
     Do.do
         (File.rawFile semanticCachePath
             |> BackendTask.toResult
@@ -486,11 +461,7 @@ task config =
                 )
         )
     <| \output ->
-    Do.do BackendTask.Time.now <| \endTime ->
     let
-        evalMs =
-            Time.posixToMillis endTime - Time.posixToMillis startTime
-
         errors =
             if String.startsWith "ERROR:" output then
                 []
@@ -499,43 +470,85 @@ task config =
                 parseReviewOutput output
     in
     if String.startsWith "ERROR:" output then
-        Do.log (Ansi.Color.fontColor Ansi.Color.red ("Interpreter error: " ++ String.left 200 output)) <| \_ ->
-        BackendTask.fail (FatalError.fromString output)
+        BackendTask.fail
+            (FatalError.build
+                { title = "ELM-REVIEW ERROR"
+                , body = String.dropLeft 7 output |> String.left 500
+                }
+            )
 
     else if List.isEmpty errors then
-        Do.log
-            (Ansi.Color.fontColor Ansi.Color.brightGreen
-                ("\nNo errors found! (" ++ String.fromInt evalMs ++ "ms)")
-            )
-        <| \_ ->
-        Do.noop
+        Script.log (Ansi.Color.fontColor Ansi.Color.brightGreen "No errors found!")
 
     else
         Do.do (displayErrors errors) <| \_ ->
         Do.log
             (Ansi.Color.fontColor Ansi.Color.brightRed
-                ("\n" ++ String.fromInt (List.length errors) ++ " error(s) found (" ++ String.fromInt evalMs ++ "ms)")
+                ("\nI found " ++ String.fromInt (List.length errors) ++ " error(s) in " ++ String.fromInt (countFiles errors) ++ " file(s).")
             )
         <| \_ ->
         BackendTask.fail
             (FatalError.build
-                { title = "Review Errors"
-                , body = String.fromInt (List.length errors) ++ " errors found"
+                { title = ""
+                , body = ""
                 }
             )
 
 
+countFiles : List ReviewError -> Int
+countFiles errors =
+    errors
+        |> List.map .filePath
+        |> Set.fromList
+        |> Set.size
+
+
 displayErrors : List ReviewError -> BackendTask FatalError ()
 displayErrors errors =
-    errors
-        |> List.map
-            (\err ->
-                Script.log
-                    (Ansi.Color.fontColor Ansi.Color.red
-                        ("  " ++ err.ruleName ++ " - " ++ err.filePath ++ ":" ++ String.fromInt err.line ++ ":" ++ String.fromInt err.column)
-                        ++ "\n    "
-                        ++ err.message
+    let
+        -- Group errors by file
+        byFile =
+            errors
+                |> List.foldl
+                    (\err acc ->
+                        Dict.update err.filePath
+                            (\existing ->
+                                case existing of
+                                    Just list ->
+                                        Just (list ++ [ err ])
+
+                                    Nothing ->
+                                        Just [ err ]
+                            )
+                            acc
                     )
+                    Dict.empty
+    in
+    byFile
+        |> Dict.toList
+        |> List.concatMap
+            (\( filePath, fileErrors ) ->
+                fileErrors
+                    |> List.map
+                        (\err ->
+                            Script.log
+                                ("\n"
+                                    ++ Ansi.Color.fontColor Ansi.Color.cyan
+                                        ("-- " ++ String.toUpper err.ruleName ++ " ")
+                                    ++ Ansi.Color.fontColor Ansi.Color.cyan
+                                        (String.repeat (60 - String.length err.ruleName) "-"
+                                            ++ " "
+                                            ++ filePath
+                                            ++ ":"
+                                            ++ String.fromInt err.line
+                                            ++ ":"
+                                            ++ String.fromInt err.column
+                                        )
+                                    ++ "\n\n"
+                                    ++ "    "
+                                    ++ err.message
+                                )
+                        )
             )
         |> BackendTask.Extra.sequence_
 
@@ -571,10 +584,10 @@ readTargetFiles files =
         |> BackendTask.Extra.combine
 
 
-ensureReviewDeps : BackendTask FatalError ()
-ensureReviewDeps =
+ensureReviewDeps : String -> BackendTask FatalError ()
+ensureReviewDeps reviewDir =
     Script.exec "elm" [ "make", "src/ReviewConfig.elm", "--output", "/dev/null" ]
-        |> BackendTask.inDir "review"
+        |> BackendTask.inDir reviewDir
         |> BackendTask.toResult
         |> BackendTask.map (\_ -> ())
 
