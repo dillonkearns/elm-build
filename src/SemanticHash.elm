@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, diffIndices, extractDependencies, getSemanticHash, hashExpression, semanticHashForEntry)
+module SemanticHash exposing (DeclarationIndex, FileAspectHashes, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, computeAspectHashesFromSource, diffIndices, extractDependencies, getSemanticHash, hashExpression, semanticHashForEntry)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -11,11 +11,237 @@ propagate only through actual dependency chains.
 import Dict exposing (Dict)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
+import Elm.Syntax.Exposing exposing (Exposing(..), TopLevelExpose(..))
 import Elm.Syntax.Expression exposing (Expression(..), LetDeclaration(..))
 import Elm.Syntax.File exposing (File)
+import Elm.Syntax.Import exposing (Import)
+import Elm.Syntax.Module exposing (Module(..))
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..))
+import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
+import FNV1a
 import Set exposing (Set)
+
+
+{-| Sub-AST hashes for fine-grained cache invalidation.
+Each field hashes a different aspect of a file's AST.
+-}
+type alias FileAspectHashes =
+    { expressionsHash : String
+    , declNamesHash : String
+    , importsHash : String
+    , exposingHash : String
+    , customTypesHash : String
+    , fullHash : String
+    }
+
+
+{-| Compute aspect hashes from source code.
+-}
+computeAspectHashesFromSource : String -> FileAspectHashes
+computeAspectHashesFromSource source =
+    case Elm.Parser.parseToFile source of
+        Ok file ->
+            computeAspectHashes file
+
+        Err _ ->
+            { expressionsHash = ""
+            , declNamesHash = ""
+            , importsHash = ""
+            , exposingHash = ""
+            , customTypesHash = ""
+            , fullHash = ""
+            }
+
+
+computeAspectHashes : File -> FileAspectHashes
+computeAspectHashes file =
+    let
+        expressionsHash =
+            file.declarations
+                |> List.filterMap
+                    (\(Node _ decl) ->
+                        case decl of
+                            FunctionDeclaration func ->
+                                Just (hashExpression (Node.value func.declaration |> .expression))
+
+                            _ ->
+                                Nothing
+                    )
+                |> String.join "|"
+                |> FNV1a.hash
+                |> String.fromInt
+
+        declNamesHash =
+            file.declarations
+                |> List.map
+                    (\(Node _ decl) ->
+                        case decl of
+                            FunctionDeclaration func ->
+                                let
+                                    name =
+                                        Node.value (Node.value func.declaration).name
+
+                                    hasSignature =
+                                        case func.signature of
+                                            Just _ ->
+                                                "T"
+
+                                            Nothing ->
+                                                "F"
+                                in
+                                name ++ ":" ++ hasSignature
+
+                            AliasDeclaration alias_ ->
+                                "alias:" ++ Node.value alias_.name
+
+                            CustomTypeDeclaration type_ ->
+                                "type:" ++ Node.value type_.name
+
+                            PortDeclaration port_ ->
+                                "port:" ++ Node.value port_.name
+
+                            InfixDeclaration _ ->
+                                "infix"
+
+                            Destructuring _ _ ->
+                                "destructuring"
+                    )
+                |> String.join ","
+                |> FNV1a.hash
+                |> String.fromInt
+
+        importsHash =
+            file.imports
+                |> List.map
+                    (\(Node _ imp) ->
+                        let
+                            modName =
+                                Node.value imp.moduleName |> String.join "."
+
+                            alias =
+                                imp.moduleAlias
+                                    |> Maybe.map (Node.value >> String.join ".")
+                                    |> Maybe.withDefault ""
+
+                            exposing_ =
+                                case imp.exposingList of
+                                    Just (Node _ (All _)) ->
+                                        "(..)"
+
+                                    Just (Node _ (Explicit exposes)) ->
+                                        "("
+                                            ++ (exposes
+                                                    |> List.map
+                                                        (\(Node _ e) ->
+                                                            case e of
+                                                                InfixExpose s ->
+                                                                    s
+
+                                                                FunctionExpose s ->
+                                                                    s
+
+                                                                TypeOrAliasExpose s ->
+                                                                    s
+
+                                                                TypeExpose { name } ->
+                                                                    name
+                                                        )
+                                                    |> String.join ","
+                                               )
+                                            ++ ")"
+
+                                    Nothing ->
+                                        ""
+                        in
+                        modName ++ "|" ++ alias ++ "|" ++ exposing_
+                    )
+                |> String.join "\n"
+                |> FNV1a.hash
+                |> String.fromInt
+
+        exposingHash =
+            case Node.value file.moduleDefinition of
+                NormalModule { exposingList } ->
+                    hashExposingList exposingList
+
+                PortModule { exposingList } ->
+                    hashExposingList exposingList
+
+                EffectModule { exposingList } ->
+                    hashExposingList exposingList
+
+        customTypesHash =
+            file.declarations
+                |> List.filterMap
+                    (\(Node _ decl) ->
+                        case decl of
+                            CustomTypeDeclaration type_ ->
+                                Just
+                                    (Node.value type_.name
+                                        ++ "="
+                                        ++ (type_.constructors
+                                                |> List.map
+                                                    (\(Node _ ctor) ->
+                                                        Node.value ctor.name
+                                                            ++ "("
+                                                            ++ String.fromInt (List.length ctor.arguments)
+                                                            ++ ")"
+                                                    )
+                                                |> String.join "|"
+                                           )
+                                    )
+
+                            _ ->
+                                Nothing
+                    )
+                |> String.join ","
+                |> FNV1a.hash
+                |> String.fromInt
+
+        fullHash =
+            [ expressionsHash, declNamesHash, importsHash, exposingHash, customTypesHash ]
+                |> String.join "|"
+                |> FNV1a.hash
+                |> String.fromInt
+    in
+    { expressionsHash = expressionsHash
+    , declNamesHash = declNamesHash
+    , importsHash = importsHash
+    , exposingHash = exposingHash
+    , customTypesHash = customTypesHash
+    , fullHash = fullHash
+    }
+
+
+hashExposingList : Node Exposing -> String
+hashExposingList (Node _ exposing_) =
+    (case exposing_ of
+        All _ ->
+            "(..)"
+
+        Explicit exposes ->
+            exposes
+                |> List.map
+                    (\(Node _ e) ->
+                        case e of
+                            InfixExpose s ->
+                                s
+
+                            FunctionExpose s ->
+                                s
+
+                            TypeOrAliasExpose s ->
+                                s
+
+                            TypeExpose { name } ->
+                                name
+                    )
+                |> List.sort
+                |> String.join ","
+    )
+        |> FNV1a.hash
+        |> String.fromInt
 
 
 type alias DeclarationIndex =

@@ -14,7 +14,8 @@ import Test exposing (Test, describe, test)
 suite : Test
 suite =
     describe "SemanticHash"
-        [ describe "hashExpression"
+        [ fileAspectHashTests
+        , describe "hashExpression"
             [ test "same expression produces same hash" <|
                 \_ ->
                     let
@@ -432,3 +433,94 @@ parseDeps source =
 
         Nothing ->
             []
+
+
+fileAspectHashTests : Test
+fileAspectHashTests =
+    describe "FileAspectHashes"
+        [ test "changing function body changes expressionsHash only" <|
+            \_ ->
+                let
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nimport Bar\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nimport Bar\n\nfoo = 999\n"
+                in
+                Expect.all
+                    [ \_ -> Expect.notEqual before.expressionsHash after.expressionsHash
+                    , \_ -> Expect.equal before.importsHash after.importsHash
+                    , \_ -> Expect.equal before.exposingHash after.exposingHash
+                    , \_ -> Expect.equal before.declNamesHash after.declNamesHash
+                    ]
+                    ()
+        , test "changing import changes importsHash only" <|
+            \_ ->
+                let
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nimport Bar\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nimport Baz\n\nfoo = 1\n"
+                in
+                Expect.all
+                    [ \_ -> Expect.equal before.expressionsHash after.expressionsHash
+                    , \_ -> Expect.notEqual before.importsHash after.importsHash
+                    , \_ -> Expect.equal before.exposingHash after.exposingHash
+                    , \_ -> Expect.equal before.declNamesHash after.declNamesHash
+                    ]
+                    ()
+        , test "changing exposing list changes exposingHash only" <|
+            \_ ->
+                let
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = 1\n"
+                in
+                Expect.all
+                    [ \_ -> Expect.equal before.expressionsHash after.expressionsHash
+                    , \_ -> Expect.notEqual before.exposingHash after.exposingHash
+                    , \_ -> Expect.equal before.declNamesHash after.declNamesHash
+                    ]
+                    ()
+        , test "adding type annotation changes declNamesHash but not expressionsHash" <|
+            \_ ->
+                let
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nfoo : Int\nfoo = 1\n"
+                in
+                Expect.all
+                    [ \_ -> Expect.equal before.expressionsHash after.expressionsHash
+                    , \_ -> Expect.notEqual before.declNamesHash after.declNamesHash
+                    ]
+                    ()
+        , test "adding custom type changes customTypesHash but not expressionsHash" <|
+            \_ ->
+                let
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\ntype Color = Red | Blue\n\nfoo = 1\n"
+                in
+                Expect.all
+                    [ \_ -> Expect.equal before.expressionsHash after.expressionsHash
+                    , \_ -> Expect.notEqual before.customTypesHash after.customTypesHash
+                    ]
+                    ()
+        ]
