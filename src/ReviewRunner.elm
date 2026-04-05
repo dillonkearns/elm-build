@@ -880,7 +880,7 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (buildProject, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
+        [ "module ReviewRunnerHelper exposing (buildProject, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
@@ -895,6 +895,17 @@ reviewRunnerHelperSource =
         , "                Err _ -> Project.addModule { path = mod.path, source = mod.source } proj"
         , "    in"
         , "    List.foldl addParsed Project.new modules"
+        , ""
+        , "runReviewCachingWithProject indices modules ="
+        , "    let"
+        , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
+        , "        project = projectCacheMarker (buildProject modules)"
+        , "        ( errors, updatedRules ) = Rule.review selectedRules project"
+        , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
+        , "    in"
+        , "    ( errorStr, updatedRules )"
+        , ""
+        , "projectCacheMarker project = project"
         , ""
         , "runReview modules ="
         , "    let"
@@ -1575,12 +1586,13 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                             intercepts =
                                 buildReviewIntercepts preloadedCaches
 
-                            -- Use runReviewCaching to get (errors, updatedRules) tuple
                             moduleList =
                                 buildModuleListWithAst allModulesWithAst
 
+                            -- Use runReviewCachingWithProject to get (errors, updatedRules, project)
+                            -- The project Value is yielded for disk caching.
                             cachingExpr =
-                                "ReviewRunnerHelper.runReviewCachingByIndices "
+                                "ReviewRunnerHelper.runReviewCachingWithProject "
                                     ++ "[ " ++ (fpIndices |> List.map String.fromInt |> String.join ", ") ++ " ] "
                                     ++ moduleList
 
@@ -1667,6 +1679,17 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                             _ ->
                                                 BackendTask.succeed Types.Unit
 
+                                    "project-cache" ->
+                                        let
+                                            serializedProject =
+                                                ValueCodec.encodeValue payload
+
+                                            projectPath =
+                                                Path.toString config.buildDirectory ++ "/project-cache.json"
+                                        in
+                                        Do.do (Script.writeFile { path = projectPath, body = serializedProject } |> BackendTask.allowFatal) <| \_ ->
+                                        BackendTask.succeed Types.Unit
+
                                     _ ->
                                         BackendTask.succeed Types.Unit
                         in
@@ -1699,7 +1722,34 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                         |> String.join "\n"
                                     )
 
-                            Ok _ ->
+                            Ok otherValue ->
+                                -- Debug: write the result type to a file
+                                let
+                                    typeStr =
+                                        case otherValue of
+                                            Types.Triple _ _ _ ->
+                                                "Triple (non-string first)"
+
+                                            Types.Tuple _ _ ->
+                                                "Tuple (non-string first)"
+
+                                            Types.Record _ ->
+                                                "Record"
+
+                                            Types.Custom ref _ ->
+                                                "Custom " ++ ref.name
+
+                                            _ ->
+                                                "Other"
+                                in
+                                Do.do
+                                    (Script.writeFile
+                                        { path = Path.toString config.buildDirectory ++ "/result-type-debug.txt"
+                                        , body = typeStr
+                                        }
+                                        |> BackendTask.allowFatal
+                                    )
+                                <| \_ ->
                                 File.rawFile fpKeyPath
                                     |> BackendTask.toResult
                                     |> BackendTask.andThen
@@ -2186,9 +2236,19 @@ buildReviewIntercepts preloadedCaches =
                             Types.EvOk Types.Unit
                 )
           )
-        -- Note: removed match intercept — it was for debugging.
-        -- The match function runs natively now (no yield overhead).
-        -- Context matching works (verified: context=True with sort fix).
+        , ( "ReviewRunnerHelper.projectCacheMarker"
+          , Types.Intercept
+                (\args _ _ ->
+                    case args of
+                        [ project ] ->
+                            Types.EvYield "project-cache"
+                                project
+                                (\_ -> Types.EvOk project)
+
+                        _ ->
+                            Types.EvOk (args |> List.head |> Maybe.withDefault Types.Unit)
+                )
+          )
         , ( "Review.Cache.ContextHash.sort"
           , Types.Intercept
                 (\args _ _ ->
