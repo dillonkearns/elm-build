@@ -7,12 +7,8 @@ the interpreter, parse results, verify caching behavior.
 
 -}
 
-import BackendTask exposing (BackendTask)
-import BackendTask.File as File
-import BackendTask.Glob as Glob
+import Dict
 import Expect
-import FatalError exposing (FatalError)
-import Pages.Script as Script
 import ReviewRunner
 import Test exposing (Test, describe, test)
 import Test.BackendTask as BackendTaskTest
@@ -23,6 +19,7 @@ suite =
     describe "ReviewRunner integration"
         [ pureHelperTests
         , semanticCacheKeyTests
+        , perDeclarationTests
         ]
 
 
@@ -168,6 +165,112 @@ semanticCacheKeyTests =
                             , { path = "src/Bar.elm", source = "module Bar exposing (..)\n\nbar = 2\n" }
                             ]
                         )
+        ]
+
+
+perDeclarationTests : Test
+perDeclarationTests =
+    describe "per-declaration semantic hashing"
+        [ test "getDeclarationHashes returns one entry per function" <|
+            \_ ->
+                ReviewRunner.getDeclarationHashes "module Foo exposing (..)\n\nfoo = 1\n\nbar = 2\n"
+                    |> List.map .name
+                    |> List.sort
+                    |> Expect.equal [ "bar", "foo" ]
+        , test "each declaration has a unique semantic hash" <|
+            \_ ->
+                let
+                    hashes =
+                        ReviewRunner.getDeclarationHashes "module Foo exposing (..)\n\nfoo = 1\n\nbar = 2\n"
+                            |> List.map .semanticHash
+                in
+                Expect.notEqual (List.head hashes) (List.head (List.drop 1 hashes))
+        , test "changing one declaration only changes that hash" <|
+            \_ ->
+                let
+                    before =
+                        ReviewRunner.getDeclarationHashes "module Foo exposing (..)\n\nfoo = 1\n\nbar = 2\n"
+                            |> List.sortBy .name
+
+                    after =
+                        ReviewRunner.getDeclarationHashes "module Foo exposing (..)\n\nfoo = 999\n\nbar = 2\n"
+                            |> List.sortBy .name
+
+                    barBefore =
+                        before |> List.filter (\d -> d.name == "bar") |> List.head |> Maybe.map .semanticHash
+
+                    barAfter =
+                        after |> List.filter (\d -> d.name == "bar") |> List.head |> Maybe.map .semanticHash
+
+                    fooBefore =
+                        before |> List.filter (\d -> d.name == "foo") |> List.head |> Maybe.map .semanticHash
+
+                    fooAfter =
+                        after |> List.filter (\d -> d.name == "foo") |> List.head |> Maybe.map .semanticHash
+                in
+                Expect.all
+                    [ \_ -> Expect.equal barBefore barAfter -- bar unchanged
+                    , \_ -> Expect.notEqual fooBefore fooAfter -- foo changed
+                    ]
+                    ()
+        , test "Merkle property: changing callee changes caller hash" <|
+            \_ ->
+                let
+                    before =
+                        ReviewRunner.getDeclarationHashes "module Foo exposing (..)\n\nfoo = 1\n\nbaz = foo\n"
+
+                    after =
+                        ReviewRunner.getDeclarationHashes "module Foo exposing (..)\n\nfoo = 999\n\nbaz = foo\n"
+
+                    bazBefore =
+                        before |> List.filter (\d -> d.name == "baz") |> List.head |> Maybe.map .semanticHash
+
+                    bazAfter =
+                        after |> List.filter (\d -> d.name == "baz") |> List.head |> Maybe.map .semanticHash
+                in
+                Expect.notEqual bazBefore bazAfter
+        , test "mapErrorsToDeclarations assigns errors to correct declarations" <|
+            \_ ->
+                let
+                    declarations =
+                        [ { name = "foo", semanticHash = "abc", startLine = 3, endLine = 4 }
+                        , { name = "bar", semanticHash = "def", startLine = 6, endLine = 7 }
+                        ]
+
+                    errors =
+                        [ { ruleName = "R1", filePath = "f", line = 3, column = 1, message = "in foo" }
+                        , { ruleName = "R2", filePath = "f", line = 6, column = 1, message = "in bar" }
+                        ]
+
+                    result =
+                        ReviewRunner.mapErrorsToDeclarations declarations errors
+                in
+                Expect.all
+                    [ \_ ->
+                        Dict.get "foo" result
+                            |> Maybe.map (.errors >> List.length)
+                            |> Expect.equal (Just 1)
+                    , \_ ->
+                        Dict.get "bar" result
+                            |> Maybe.map (.errors >> List.length)
+                            |> Expect.equal (Just 1)
+                    ]
+                    ()
+        , test "module-level errors go to __module__ bucket" <|
+            \_ ->
+                let
+                    declarations =
+                        [ { name = "foo", semanticHash = "abc", startLine = 5, endLine = 6 } ]
+
+                    errors =
+                        [ { ruleName = "NoExposing", filePath = "f", line = 1, column = 1, message = "module level" } ]
+
+                    result =
+                        ReviewRunner.mapErrorsToDeclarations declarations errors
+                in
+                Dict.get "__module__" result
+                    |> Maybe.map (.errors >> List.length)
+                    |> Expect.equal (Just 1)
         ]
 
 

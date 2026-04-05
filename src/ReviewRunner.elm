@@ -1,4 +1,4 @@
-module ReviewRunner exposing (ReviewError, buildExpression, buildModuleRecord, computeSemanticKey, encodeFileAsJson, escapeElmString, parseReviewOutput, run)
+module ReviewRunner exposing (DeclarationCache, ReviewError, buildExpression, buildModuleRecord, computeSemanticKey, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, run)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -22,7 +22,10 @@ import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import Dict
 import Elm.Parser
+import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.File
+import Elm.Syntax.Node as Node exposing (Node(..))
+import Elm.Syntax.Range exposing (Range)
 import FatalError exposing (FatalError)
 import FNV1a
 import Json.Encode
@@ -220,6 +223,103 @@ computeSemanticKey files =
         |> String.join "\n"
         |> FNV1a.hash
         |> String.fromInt
+
+
+{-| Per-declaration cache entry: maps each top-level declaration
+to its semantic hash and any review errors within its range.
+-}
+type alias DeclarationCache =
+    Dict String { semanticHash : String, errors : List ReviewError }
+
+
+{-| Get per-declaration semantic hashes and line ranges for a source file.
+Returns (declarationName, semanticHash, startLine, endLine) for each
+top-level function declaration.
+-}
+getDeclarationHashes : String -> List { name : String, semanticHash : String, startLine : Int, endLine : Int }
+getDeclarationHashes source =
+    case Elm.Parser.parseToFile source of
+        Ok file ->
+            let
+                index =
+                    SemanticHash.buildIndexFromFile file
+
+                rangeMap : Dict String Range
+                rangeMap =
+                    file.declarations
+                        |> List.filterMap
+                            (\(Node range decl) ->
+                                case decl of
+                                    FunctionDeclaration func ->
+                                        Just ( Node.value (Node.value func.declaration).name, range )
+
+                                    _ ->
+                                        Nothing
+                            )
+                        |> Dict.fromList
+            in
+            index
+                |> Dict.toList
+                |> List.filterMap
+                    (\( name, info ) ->
+                        Dict.get name rangeMap
+                            |> Maybe.map
+                                (\range ->
+                                    { name = name
+                                    , semanticHash = info.semanticHash
+                                    , startLine = range.start.row
+                                    , endLine = range.end.row
+                                    }
+                                )
+                    )
+
+        Err _ ->
+            []
+
+
+{-| Map review errors to their enclosing top-level declarations by line range.
+Errors outside any declaration go into the "__module__" bucket.
+-}
+mapErrorsToDeclarations :
+    List { name : String, semanticHash : String, startLine : Int, endLine : Int }
+    -> List ReviewError
+    -> Dict String { semanticHash : String, errors : List ReviewError }
+mapErrorsToDeclarations declarations errors =
+    let
+        emptyCache : Dict String { semanticHash : String, errors : List ReviewError }
+        emptyCache =
+            declarations
+                |> List.map (\d -> ( d.name, { semanticHash = d.semanticHash, errors = [] } ))
+                |> Dict.fromList
+
+        findDeclaration : Int -> Maybe String
+        findDeclaration line =
+            declarations
+                |> List.filter (\d -> line >= d.startLine && line <= d.endLine)
+                |> List.head
+                |> Maybe.map .name
+    in
+    errors
+        |> List.foldl
+            (\err acc ->
+                let
+                    declName =
+                        findDeclaration err.line
+                            |> Maybe.withDefault "__module__"
+                in
+                Dict.update declName
+                    (\existing ->
+                        case existing of
+                            Just entry ->
+                                Just { entry | errors = entry.errors ++ [ err ] }
+
+                            Nothing ->
+                                -- Module-level error (outside any declaration)
+                                Just { semanticHash = "__module__", errors = [ err ] }
+                    )
+                    acc
+            )
+            emptyCache
 
 
 {-| Parse a source file on the HOST side and encode the AST as JSON.
