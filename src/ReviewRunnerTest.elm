@@ -21,6 +21,8 @@ suite =
         , semanticCacheKeyTests
         , perDeclarationTests
         , cacheDecisionTests
+        , cacheSerializationTests
+        , cachePipelineTests
         ]
 
 
@@ -420,6 +422,207 @@ cacheDecisionTests =
                 case ReviewRunner.checkCache cache files of
                     ReviewRunner.FullCacheHit errors ->
                         Expect.equal originalErrors errors
+
+                    other ->
+                        Expect.fail ("Expected FullCacheHit, got " ++ cacheDecisionToString other)
+        ]
+
+
+
+cacheSerializationTests : Test
+cacheSerializationTests =
+    describe "cache serialization (JSON round-trip)"
+        [ test "empty cache round-trips" <|
+            \_ ->
+                Dict.empty
+                    |> ReviewRunner.encodeCacheState
+                    |> ReviewRunner.decodeCacheState
+                    |> Expect.equal (Just Dict.empty)
+        , test "single file cache round-trips" <|
+            \_ ->
+                let
+                    cache =
+                        ReviewRunner.updateCache Dict.empty
+                            [ { path = "src/Foo.elm", source = fooSource } ]
+                            [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "Remove Debug.log" } ]
+                in
+                cache
+                    |> ReviewRunner.encodeCacheState
+                    |> ReviewRunner.decodeCacheState
+                    |> Maybe.andThen (\decoded -> Just (ReviewRunner.checkCache decoded [ { path = "src/Foo.elm", source = fooSource } ]))
+                    |> Maybe.map (expectFullCacheHit 1)
+                    |> Maybe.withDefault (Expect.fail "decode failed")
+        , test "multi-file cache round-trips preserving all errors" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource }
+                        , { path = "src/Bar.elm", source = barSource }
+                        ]
+
+                    errors =
+                        [ { ruleName = "R1", filePath = "src/Foo.elm", line = 5, column = 5, message = "err1" }
+                        , { ruleName = "R2", filePath = "src/Bar.elm", line = 3, column = 1, message = "err2" }
+                        ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+                in
+                cache
+                    |> ReviewRunner.encodeCacheState
+                    |> ReviewRunner.decodeCacheState
+                    |> Maybe.map (\decoded -> ReviewRunner.checkCache decoded files)
+                    |> Maybe.map (expectFullCacheHit 2)
+                    |> Maybe.withDefault (Expect.fail "decode failed")
+        ]
+
+
+{-| Tests that simulate the full pipeline: cold → warm → change → warm.
+These test the sequence of operations that would happen across multiple
+CLI invocations, using the pure cache functions.
+-}
+cachePipelineTests : Test
+cachePipelineTests =
+    describe "cache pipeline (simulated multi-run)"
+        [ test "cold → warm: first run caches, second run hits" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource } ]
+
+                    -- Simulate first run: cold miss → evaluate → cache results
+                    decision1 =
+                        ReviewRunner.checkCache Dict.empty files
+
+                    errors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "Remove Debug.log" } ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+
+                    -- Simulate second run: same files → should be full hit
+                    decision2 =
+                        ReviewRunner.checkCache cache files
+                in
+                Expect.all
+                    [ \_ -> expectColdMiss decision1
+                    , \_ -> expectFullCacheHit 1 decision2
+                    ]
+                    ()
+        , test "cold → change one file → partial miss with correct stale/cached split" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource }
+                        , { path = "src/Bar.elm", source = barSource }
+                        ]
+
+                    errors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "in foo" }
+                        , { ruleName = "NoMissing", filePath = "src/Bar.elm", line = 3, column = 1, message = "in bar" }
+                        ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+
+                    -- Second run: change Foo only
+                    changedFiles =
+                        [ { path = "src/Foo.elm", source = fooSourceChanged }
+                        , { path = "src/Bar.elm", source = barSource }
+                        ]
+
+                    decision =
+                        ReviewRunner.checkCache cache changedFiles
+                in
+                case decision of
+                    ReviewRunner.PartialMiss { cachedErrors, staleFiles } ->
+                        Expect.all
+                            [ \_ -> Expect.equal [ "src/Foo.elm" ] staleFiles
+                            , \_ -> Expect.equal 1 (List.length cachedErrors)
+                            , \_ ->
+                                cachedErrors
+                                    |> List.head
+                                    |> Maybe.map .message
+                                    |> Expect.equal (Just "in bar")
+                            ]
+                            ()
+
+                    other ->
+                        Expect.fail ("Expected PartialMiss, got " ++ cacheDecisionToString other)
+        , test "cold → reformat → full cache hit (semantic hash unchanged)" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource } ]
+
+                    errors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "Remove Debug.log" } ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+
+                    -- Reformat: add blank lines (no semantic change)
+                    reformattedFiles =
+                        [ { path = "src/Foo.elm", source = fooSourceReformatted } ]
+
+                    decision =
+                        ReviewRunner.checkCache cache reformattedFiles
+                in
+                expectFullCacheHit 1 decision
+        , test "cold → change → update → warm: full cycle with stale re-eval" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource }
+                        , { path = "src/Bar.elm", source = barSource }
+                        ]
+
+                    initialErrors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "in foo" }
+                        , { ruleName = "NoMissing", filePath = "src/Bar.elm", line = 3, column = 1, message = "in bar" }
+                        ]
+
+                    cache1 =
+                        ReviewRunner.updateCache Dict.empty files initialErrors
+
+                    -- Change Foo
+                    changedFiles =
+                        [ { path = "src/Foo.elm", source = fooSourceChanged }
+                        , { path = "src/Bar.elm", source = barSource }
+                        ]
+
+                    -- Re-evaluate stale files only → new errors for Foo
+                    newFooErrors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "new foo error" } ]
+
+                    -- Update cache with new results for changed files only
+                    cache2 =
+                        ReviewRunner.updateCache cache1
+                            [ { path = "src/Foo.elm", source = fooSourceChanged } ]
+                            newFooErrors
+
+                    -- Third run: nothing changed → full hit
+                    decision =
+                        ReviewRunner.checkCache cache2 changedFiles
+                in
+                case decision of
+                    ReviewRunner.FullCacheHit errors ->
+                        Expect.all
+                            [ \_ -> Expect.equal 2 (List.length errors) -- both files cached
+                            , \_ ->
+                                errors
+                                    |> List.filter (\e -> e.filePath == "src/Foo.elm")
+                                    |> List.head
+                                    |> Maybe.map .message
+                                    |> Expect.equal (Just "new foo error") -- updated error
+                            , \_ ->
+                                errors
+                                    |> List.filter (\e -> e.filePath == "src/Bar.elm")
+                                    |> List.head
+                                    |> Maybe.map .message
+                                    |> Expect.equal (Just "in bar") -- preserved from cache1
+                            ]
+                            ()
 
                     other ->
                         Expect.fail ("Expected FullCacheHit, got " ++ cacheDecisionToString other)

@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, DeclarationCache, ReviewError, buildExpression, buildModuleRecord, checkCache, computeSemanticKey, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, DeclarationCache, ReviewError, buildExpression, buildModuleRecord, checkCache, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -27,6 +27,7 @@ import Elm.Syntax.File
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
 import FatalError exposing (FatalError)
+import Json.Decode
 import FNV1a
 import Json.Encode
 import SemanticHash
@@ -460,6 +461,82 @@ updateCache previousCache files errors =
                 Dict.insert path fileCache acc
             )
             previousCache
+
+
+{-| Encode CacheState to a JSON string for persistence to disk.
+-}
+encodeCacheState : CacheState -> String
+encodeCacheState cache =
+    cache
+        |> Dict.toList
+        |> Json.Encode.list
+            (\( filePath, declCache ) ->
+                Json.Encode.object
+                    [ ( "file", Json.Encode.string filePath )
+                    , ( "declarations"
+                      , declCache
+                            |> Dict.toList
+                            |> Json.Encode.list
+                                (\( declName, entry ) ->
+                                    Json.Encode.object
+                                        [ ( "name", Json.Encode.string declName )
+                                        , ( "hash", Json.Encode.string entry.semanticHash )
+                                        , ( "errors"
+                                          , entry.errors
+                                                |> Json.Encode.list
+                                                    (\err ->
+                                                        Json.Encode.object
+                                                            [ ( "rule", Json.Encode.string err.ruleName )
+                                                            , ( "file", Json.Encode.string err.filePath )
+                                                            , ( "line", Json.Encode.int err.line )
+                                                            , ( "col", Json.Encode.int err.column )
+                                                            , ( "msg", Json.Encode.string err.message )
+                                                            ]
+                                                    )
+                                          )
+                                        ]
+                                )
+                      )
+                    ]
+            )
+        |> Json.Encode.encode 0
+
+
+{-| Decode CacheState from a JSON string (read from disk).
+-}
+decodeCacheState : String -> Maybe CacheState
+decodeCacheState json =
+    let
+        errorDecoder =
+            Json.Decode.map5
+                (\rule file line col msg -> { ruleName = rule, filePath = file, line = line, column = col, message = msg })
+                (Json.Decode.field "rule" Json.Decode.string)
+                (Json.Decode.field "file" Json.Decode.string)
+                (Json.Decode.field "line" Json.Decode.int)
+                (Json.Decode.field "col" Json.Decode.int)
+                (Json.Decode.field "msg" Json.Decode.string)
+
+        entryDecoder =
+            Json.Decode.map2 Tuple.pair
+                (Json.Decode.field "name" Json.Decode.string)
+                (Json.Decode.map2 (\hash errors -> { semanticHash = hash, errors = errors })
+                    (Json.Decode.field "hash" Json.Decode.string)
+                    (Json.Decode.field "errors" (Json.Decode.list errorDecoder))
+                )
+
+        fileDecoder =
+            Json.Decode.map2 Tuple.pair
+                (Json.Decode.field "file" Json.Decode.string)
+                (Json.Decode.field "declarations" (Json.Decode.list entryDecoder)
+                    |> Json.Decode.map Dict.fromList
+                )
+
+        decoder =
+            Json.Decode.list fileDecoder
+                |> Json.Decode.map Dict.fromList
+    in
+    Json.Decode.decodeString decoder json
+        |> Result.toMaybe
 
 
 {-| Parse a source file on the HOST side and encode the AST as JSON.
