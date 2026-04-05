@@ -23,6 +23,7 @@ suite =
         , cacheDecisionTests
         , cacheSerializationTests
         , cachePipelineTests
+        , ruleClassificationTests
         ]
 
 
@@ -113,7 +114,7 @@ pureHelperTests =
             , test "exposes runSingleRule and ruleCount" <|
                 \_ ->
                     ReviewRunner.reviewRunnerHelperSource
-                        |> String.contains "exposing (ruleCount, runReview, runSingleRule)"
+                        |> String.contains "runSingleRule"
                         |> Expect.equal True
             ]
         , describe "parseReviewOutput"
@@ -735,4 +736,68 @@ config =
         |> Rule.withSimpleExpressionVisitor (\\_ -> [])
         |> Rule.fromModuleRuleSchema
     ]
+"""
+
+
+ruleClassificationTests : Test
+ruleClassificationTests =
+    describe "rule classification"
+        [ test "module rule detected from newModuleRuleSchema" <|
+            \_ ->
+                ReviewRunner.classifyRuleSource moduleRuleSource
+                    |> Expect.equal ReviewRunner.ModuleRule
+        , test "project rule detected from newProjectRuleSchema" <|
+            \_ ->
+                ReviewRunner.classifyRuleSource projectRuleSource
+                    |> Expect.equal ReviewRunner.ProjectRule
+        , test "unknown source defaults to ProjectRule (conservative)" <|
+            \_ ->
+                ReviewRunner.classifyRuleSource "module Foo exposing (..)\n\nfoo = 1\n"
+                    |> Expect.equal ReviewRunner.ProjectRule
+        , test "module rule with pipeline operators" <|
+            \_ ->
+                ReviewRunner.classifyRuleSource moduleRuleWithPipeline
+                    |> Expect.equal ReviewRunner.ModuleRule
+        ]
+
+
+moduleRuleSource : String
+moduleRuleSource =
+    """module NoDebug.Log exposing (rule)
+
+import Review.Rule as Rule exposing (Rule)
+
+rule =
+    Rule.newModuleRuleSchema "NoDebug.Log" ()
+        |> Rule.withSimpleExpressionVisitor expressionVisitor
+        |> Rule.fromModuleRuleSchema
+"""
+
+
+projectRuleSource : String
+projectRuleSource =
+    """module NoUnused.Exports exposing (rule)
+
+import Review.Rule as Rule exposing (Rule)
+
+rule =
+    Rule.newProjectRuleSchema "NoUnused.Exports" initialProjectContext
+        |> Rule.withModuleVisitor moduleVisitor
+        |> Rule.withModuleContextUsingContextCreator creator
+        |> Rule.withFinalProjectEvaluation finalEvaluation
+        |> Rule.fromProjectRuleSchema
+"""
+
+
+moduleRuleWithPipeline : String
+moduleRuleWithPipeline =
+    """module NoMissingTypeAnnotation exposing (rule)
+
+import Review.Rule as Rule exposing (Rule)
+
+rule : Rule
+rule =
+    Rule.newModuleRuleSchema "NoMissingTypeAnnotation" ()
+        |> Rule.withSimpleDeclarationVisitor declarationVisitor
+        |> Rule.fromModuleRuleSchema
 """

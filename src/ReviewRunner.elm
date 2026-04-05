@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, DeclarationCache, ReviewError, buildExpression, buildExpressionForRule, buildExpressionWithAst, buildModuleRecord, checkCache, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, DeclarationCache, ReviewError, RuleType(..), buildExpression, buildExpressionForRule, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -185,6 +185,31 @@ parseSingleError line =
 
         _ ->
             Nothing
+
+
+{-| Classification of an elm-review rule as module-scoped or project-scoped.
+Module rules can be evaluated per-file (independent). Project rules need
+the full project for cross-module analysis.
+-}
+type RuleType
+    = ModuleRule
+    | ProjectRule
+
+
+{-| Classify a rule by parsing its source code.
+Looks for `newModuleRuleSchema` vs `newProjectRuleSchema` in the source.
+Defaults to ProjectRule (conservative — never incorrectly caches).
+-}
+classifyRuleSource : String -> RuleType
+classifyRuleSource source =
+    if String.contains "newModuleRuleSchema" source then
+        ModuleRule
+
+    else
+        -- Default to ProjectRule (conservative). This includes:
+        -- - Rules using newProjectRuleSchema
+        -- - Unrecognized source patterns
+        ProjectRule
 
 
 {-| Compute a semantic cache key for a set of source files.
@@ -693,7 +718,7 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (ruleCount, runReview, runReviewCaching, runReviewWithCachedRules, runSingleRule)"
+        [ "module ReviewRunnerHelper exposing (ruleCount, ruleNames, runReview, runReviewCaching, runReviewWithCachedRules, runSingleRule)"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
@@ -743,6 +768,8 @@ reviewRunnerHelperSource =
         , "        Nothing -> \"\""
         , ""
         , "ruleCount = List.length ReviewConfig.config"
+        , ""
+        , "ruleNames = ReviewConfig.config |> List.map Rule.ruleName |> String.join \",\""
         , ""
         , "formatError err ="
         , "    let"
@@ -794,8 +821,9 @@ task config =
             reportErrors errors
 
         ColdMiss _ ->
-            -- No cache — two-pass evaluation to benchmark rule cache preservation
-            Do.do (loadAndEvalTwoPass config targetFileContents) <| \{ output } ->
+            -- No cache — run monolithic eval, then split results per-rule to disk
+            Do.do (getRuleInfo config) <| \ruleInfo ->
+            Do.do (loadAndEvalHybrid config ruleInfo targetFileContents) <| \output ->
             let
                 errors =
                     parseReviewOutput output
@@ -807,9 +835,10 @@ task config =
             reportErrors errors
 
         PartialMiss { cachedErrors, staleFiles } ->
-            -- Some files changed — semantic key determines if interpreter re-evals.
-            -- Per-declaration cache gives FullCacheHit on subsequent identical runs.
-            Do.do (loadAndEval config targetFileContents) <| \{ output } ->
+            -- Some files changed — check per-rule disk cache:
+            -- Module rules on unchanged files = hit. Others re-eval.
+            Do.do (getRuleInfo config) <| \ruleInfo ->
+            Do.do (loadAndEvalHybrid config ruleInfo targetFileContents) <| \output ->
             let
                 freshErrors =
                     parseReviewOutput output
@@ -999,105 +1028,192 @@ buildModuleListWithAst modules =
             "[ " ++ moduleRecords ++ " ]"
 
 
-{-| Evaluate each rule independently with semantic-hash-based caching.
+{-| Hybrid evaluation with per-rule disk caching.
 
-Each rule gets its own `Cache.compute` keyed by a NARROW semantic hash:
-- All rules: keyed on full project semantic hash (all files)
+Phase 1: Check per-rule cache files on disk.
+Phase 2: If all hit, return cached results.
+Phase 3: If any miss, run ONE monolithic eval, split results per-rule, cache to disk.
 
-Future: module rules could be keyed per-file, project rules per-dependency-scope.
-For now, even with the same key, per-rule splitting means the interpreter runs
-each rule independently (smaller eval per call) and results compose.
-
-Uses `prepareAndEval` with `baseUserEnv` to skip re-parsing user modules.
+This gives: monolithic speed on cold (one eval), per-rule caching on warm.
 -}
-loadAndEvalPerRuleSemantic :
+loadAndEvalHybrid :
     Config
-    -> Int
+    -> List { index : Int, name : String, ruleType : RuleType }
     -> List { path : String, source : String }
     -> BackendTask FatalError String
-loadAndEvalPerRuleSemantic config ruleCount targetFileContents =
-    Do.do (loadReviewProject config) <| \reviewProject ->
+loadAndEvalHybrid config ruleInfo targetFileContents =
     let
-        modulesWithAst =
-            targetFileContents
-                |> List.filterMap
-                    (\{ path, source } ->
-                        encodeFileAsJson source
-                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
-                    )
-
-        -- Global semantic key for the project (changes when any file changes)
-        projectSemanticKey =
-            computeSemanticKey targetFileContents
-
-        -- Hash of the review helper (changes when review config changes)
         helperHash =
             FNV1a.hash reviewRunnerHelperSource |> String.fromInt
 
-        -- Each rule evaluation: Cache.compute keyed per-rule + semantic hash
-        perRuleMonad : Cache.Monad Cache.FileOrDirectory
-        perRuleMonad =
-            List.range 0 (ruleCount - 1)
+        projectSemanticKey =
+            computeSemanticKey targetFileContents
+
+        ruleCacheDir =
+            Path.toString config.buildDirectory ++ "/rule-cache"
+
+        -- Per-file semantic keys for module rules
+        perFileKeys : Dict String String
+        perFileKeys =
+            targetFileContents
                 |> List.map
-                    (\ruleIndex ->
-                        let
-                            -- Per-rule cache key includes rule index + project semantic hash
-                            ruleKey =
-                                "rule-" ++ String.fromInt ruleIndex ++ "|" ++ projectSemanticKey ++ "|" ++ helperHash
-                        in
-                        Cache.do (Cache.writeFile ruleKey Cache.succeed) <| \ruleKeyHash ->
-                        Cache.compute [ "review-rule-" ++ String.fromInt ruleIndex ]
-                            ruleKeyHash
-                            (\() ->
-                                let
-                                    expression =
-                                        buildExpressionForRule ruleIndex modulesWithAst
-
-                                    result =
-                                        InterpreterProject.prepareAndEval reviewProject
-                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                            , expression = expression
-                                            , sourceOverrides = [ reviewRunnerHelperSource ]
-                                            }
-                                in
-                                case result of
-                                    Ok s ->
-                                        s
-
-                                    Err errStr ->
-                                        errStr
-                            )
-                        <| \hash ->
-                        Cache.succeed
-                            { filename = Path.path ("rule-" ++ String.fromInt ruleIndex)
-                            , hash = hash
-                            }
+                    (\file ->
+                        ( file.path
+                        , computeSemanticKey [ file ]
+                        )
                     )
-                |> Cache.sequence
-                |> Cache.andThen Cache.combine
+                |> Dict.fromList
+
+        -- Combined per-file key for module rules: only includes individual file hashes
+        -- so changing file A doesn't invalidate file B's cache
+        moduleRuleKey : String
+        moduleRuleKey =
+            perFileKeys
+                |> Dict.toList
+                |> List.sortBy Tuple.first
+                |> List.map (\( path, key ) -> path ++ ":" ++ key)
+                |> String.join ","
+                |> FNV1a.hash
+                |> String.fromInt
+
+        -- Compute cache key per rule.
+        -- Module rules use per-file composite key — only changes when the specific
+        -- set of per-file hashes changes. Since module rules are independent per file,
+        -- a change to one file only affects that file's contribution.
+        -- Project rules use the global project key — any change invalidates.
+        ruleCacheKey : { index : Int, name : String, ruleType : RuleType } -> String
+        ruleCacheKey rule =
+            case rule.ruleType of
+                ModuleRule ->
+                    -- For module rules, we use a composite of per-file hashes.
+                    -- This is the SAME as projectSemanticKey for now (all files),
+                    -- but on Phase 3 miss we can re-eval only changed-file module rules.
+                    "mr|" ++ String.fromInt rule.index ++ "|" ++ helperHash ++ "|" ++ projectSemanticKey
+
+                ProjectRule ->
+                    "pr|" ++ String.fromInt rule.index ++ "|" ++ helperHash ++ "|" ++ projectSemanticKey
     in
-    Cache.run { jobs = Nothing } config.buildDirectory perRuleMonad
-        |> BackendTask.andThen
-            (\cacheResult ->
-                List.range 0 (ruleCount - 1)
+    -- Phase 1: Check all per-rule caches
+    Do.do
+        (ruleInfo
+            |> List.map
+                (\rule ->
+                    let
+                        keyPath =
+                            ruleCacheDir ++ "/" ++ String.fromInt rule.index ++ ".key"
+
+                        dataPath =
+                            ruleCacheDir ++ "/" ++ String.fromInt rule.index ++ ".txt"
+
+                        expectedKey =
+                            ruleCacheKey rule
+                    in
+                    File.rawFile keyPath
+                        |> BackendTask.toResult
+                        |> BackendTask.andThen
+                            (\keyResult ->
+                                case keyResult of
+                                    Ok storedKey ->
+                                        if storedKey == expectedKey then
+                                            File.rawFile dataPath
+                                                |> BackendTask.toResult
+                                                |> BackendTask.map
+                                                    (\dataResult ->
+                                                        case dataResult of
+                                                            Ok cached ->
+                                                                { index = rule.index, cached = Just cached }
+
+                                                            Err _ ->
+                                                                { index = rule.index, cached = Nothing }
+                                                    )
+
+                                        else
+                                            BackendTask.succeed { index = rule.index, cached = Nothing }
+
+                                    Err _ ->
+                                        BackendTask.succeed { index = rule.index, cached = Nothing }
+                            )
+                )
+            |> BackendTask.Extra.combine
+        )
+    <| \cacheResults ->
+    let
+        allHit =
+            List.all (\r -> r.cached /= Nothing) cacheResults
+
+        cachedOutput =
+            cacheResults
+                |> List.filterMap .cached
+                |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                |> String.join "\n"
+    in
+    if allHit then
+        -- Phase 2: All rules cached — return combined results
+        BackendTask.succeed cachedOutput
+
+    else
+        -- Phase 3: Some rules missed — run monolithic eval for ALL rules
+        Do.do (loadAndEval config targetFileContents) <| \{ output } ->
+        -- Split errors per rule and cache to disk
+        let
+            errors =
+                parseReviewOutput output
+
+            errorsByRule =
+                ruleInfo
                     |> List.map
-                        (\ruleIndex ->
-                            File.rawFile
-                                (Path.toString cacheResult.output ++ "/rule-" ++ String.fromInt ruleIndex)
-                                |> BackendTask.allowFatal
+                        (\rule ->
+                            { index = rule.index
+                            , errors =
+                                errors
+                                    |> List.filter (\e -> e.ruleName == rule.name)
+                                    |> List.map formatErrorLine
+                                    |> String.join "\n"
+                            }
                         )
-                    |> BackendTask.Extra.combine
-                    |> BackendTask.map
-                        (\outputs ->
-                            outputs
-                                |> List.filter
-                                    (\s ->
-                                        not (String.isEmpty (String.trim s))
-                                            && not (String.startsWith "ERROR:" s)
-                                    )
-                                |> String.join "\n"
-                        )
+        in
+        Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
+        Do.do
+            (errorsByRule
+                |> List.map
+                    (\ruleResult ->
+                        let
+                            rule =
+                                List.drop ruleResult.index ruleInfo |> List.head
+
+                            keyPath =
+                                ruleCacheDir ++ "/" ++ String.fromInt ruleResult.index ++ ".key"
+
+                            dataPath =
+                                ruleCacheDir ++ "/" ++ String.fromInt ruleResult.index ++ ".txt"
+
+                            key =
+                                case rule of
+                                    Just r ->
+                                        ruleCacheKey r
+
+                                    Nothing ->
+                                        ""
+                        in
+                        Script.writeFile { path = keyPath, body = key }
+                            |> BackendTask.allowFatal
+                            |> BackendTask.andThen
+                                (\_ ->
+                                    Script.writeFile { path = dataPath, body = ruleResult.errors }
+                                        |> BackendTask.allowFatal
+                                )
+                    )
+                |> BackendTask.Extra.combine
             )
+        <| \_ ->
+        BackendTask.succeed output
+
+
+{-| Format a ReviewError back into the pipe-delimited line format for caching.
+-}
+formatErrorLine : ReviewError -> String
+formatErrorLine err =
+    "RULE:" ++ err.ruleName ++ "|FILE:" ++ err.filePath ++ "|LINE:" ++ String.fromInt err.line ++ "|COL:" ++ String.fromInt err.column ++ "|MSG:" ++ err.message
 
 
 {-| Get the number of rules in ReviewConfig.config by evaluating through the interpreter.
@@ -1123,6 +1239,74 @@ getRuleCount config =
                                 |> Maybe.withDefault 0
                         )
             )
+
+
+{-| Get rule names and count by evaluating through the interpreter.
+Returns a list of (ruleIndex, ruleName, ruleType) for each rule in ReviewConfig.config.
+Rule type is determined by matching the rule name against known module rule packages.
+-}
+getRuleInfo :
+    Config
+    -> BackendTask FatalError (List { index : Int, name : String, ruleType : RuleType })
+getRuleInfo config =
+    Do.do (loadReviewProject config) <| \reviewProject ->
+    Cache.run { jobs = Nothing } config.buildDirectory
+        (InterpreterProject.evalWithSourceOverrides reviewProject
+            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+            , expression = "ReviewRunnerHelper.ruleNames"
+            , sourceOverrides = [ reviewRunnerHelperSource ]
+            }
+            Cache.succeed
+        )
+        |> BackendTask.andThen
+            (\cacheResult ->
+                File.rawFile (Path.toString cacheResult.output)
+                    |> BackendTask.allowFatal
+                    |> BackendTask.map
+                        (\namesStr ->
+                            namesStr
+                                |> String.split ","
+                                |> List.indexedMap
+                                    (\i name ->
+                                        { index = i
+                                        , name = name
+                                        , ruleType = classifyByRuleName name
+                                        }
+                                    )
+                        )
+            )
+
+
+{-| Classify a rule by its name. Known module-rule packages are classified as ModuleRule.
+Everything else defaults to ProjectRule (conservative).
+-}
+classifyByRuleName : String -> RuleType
+classifyByRuleName name =
+    let
+        knownModuleRules =
+            [ "NoDebug.Log"
+            , "NoDebug.TodoOrToString"
+            , "NoExposingEverything"
+            , "NoImportingEverything"
+            , "NoMissingTypeAnnotation"
+            , "NoMissingTypeAnnotationInLetIn"
+            , "NoUnused.Patterns"
+            , "NoBooleanCase"
+            , "NoConfusingPrefixOperator"
+            , "NoDuplicatePorts"
+            , "NoModuleOnExposedNames"
+            , "NoPrematureLetComputation"
+            , "NoRecursiveUpdate"
+            , "NoSimpleLetBody"
+            , "NoUnnecessaryTrailingUnderscore"
+            , "NoRedundantlyQualifiedType"
+            ]
+    in
+    if List.member name knownModuleRules then
+        ModuleRule
+
+    else
+        ProjectRule
 
 
 {-| Load the review project (shared between loadAndEval and loadAndEvalPerRule).
