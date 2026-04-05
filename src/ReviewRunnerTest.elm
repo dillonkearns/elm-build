@@ -1239,6 +1239,65 @@ cacheBehaviorScenarioTests =
                 -- Changing C (non-importer of A) should NOT change A's key
                 ReviewRunner.narrowCacheKey profile "src/A.elm" fileAHashes allBefore graph
                     |> Expect.equal (ReviewRunner.narrowCacheKey profile "src/A.elm" fileAHashes allAfter graph)
+        , test "aspect hashes: adding new declaration changes declNamesHash but not importsHash" <|
+            \_ ->
+                let
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module A exposing (..)\n\nimport B\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module A exposing (..)\n\nimport B\n\nfoo = 1\n\nbar = 2\n"
+                in
+                Expect.all
+                    [ \_ -> Expect.notEqual before.declNamesHash after.declNamesHash
+                    , \_ -> Expect.notEqual before.expressionsHash after.expressionsHash
+                    , \_ -> Expect.equal before.importsHash after.importsHash
+                    , \_ -> Expect.equal before.exposingHash after.exposingHash
+                    ]
+                    ()
+        , test "narrow key: all 12 bench rules have explicit profiles (not all FullProject)" <|
+            \_ ->
+                let
+                    benchRuleNames =
+                        [ "NoDebug.Log"
+                        , "NoDebug.TodoOrToString"
+                        , "NoExposingEverything"
+                        , "NoMissingTypeAnnotation"
+                        , "NoMissingTypeAnnotationInLetIn"
+                        , "NoUnused.Patterns"
+                        , "NoUnused.Exports"
+                        , "NoUnused.CustomTypeConstructors"
+                        , "NoUnused.CustomTypeConstructorArgs"
+                        ]
+
+                    profiles =
+                        benchRuleNames |> List.map ReviewRunner.profileForRule
+
+                    -- At least some rules should NOT have expressionDep (NoExposingEverything, NoMissingTypeAnnotation)
+                    nonExpressionDepCount =
+                        profiles |> List.filter (\p -> not p.expressionDep) |> List.length
+
+                    -- At least some should be ImportersOf
+                    importersOfCount =
+                        profiles
+                            |> List.filter
+                                (\p ->
+                                    case p.crossModuleDep of
+                                        ReviewRunner.ImportersOf ->
+                                            True
+
+                                        _ ->
+                                            False
+                                )
+                            |> List.length
+                in
+                Expect.all
+                    [ \_ -> Expect.atLeast 2 nonExpressionDepCount
+                    , \_ -> Expect.atLeast 3 importersOfCount
+                    ]
+                    ()
         , test "full cold → change → warm pipeline preserves cached errors" <|
             \_ ->
                 let
