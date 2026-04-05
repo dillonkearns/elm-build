@@ -1173,10 +1173,10 @@ This is the BackendTask driver loop: eval → yield → handle → resume → re
 -}
 prepareAndEvalWithYield :
     InterpreterProject
-    -> { imports : List String, expression : String, sourceOverrides : List String, intercepts : FastDict.Dict String Types.Intercept }
+    -> { imports : List String, expression : String, sourceOverrides : List String, intercepts : FastDict.Dict String Types.Intercept, injectedValues : FastDict.Dict String Types.Value }
     -> (String -> Types.Value -> BackendTask FatalError Types.Value)
     -> BackendTask FatalError (Result String Types.Value)
-prepareAndEvalWithYield (InterpreterProject project) { imports, expression, sourceOverrides, intercepts } yieldHandler =
+prepareAndEvalWithYield (InterpreterProject project) { imports, expression, sourceOverrides, intercepts, injectedValues } yieldHandler =
     let
         wrapperSource =
             generateWrapper imports expression
@@ -1214,7 +1214,29 @@ prepareAndEvalWithYield (InterpreterProject project) { imports, expression, sour
                     project.packageEnv
 
         rawResult =
-            Eval.Module.evalWithInterceptsRaw env evalSources intercepts (FunctionOrValue [] "results")
+            if FastDict.isEmpty injectedValues then
+                Eval.Module.evalWithInterceptsRaw env evalSources intercepts (FunctionOrValue [] "results")
+
+            else
+                -- Need to inject values AND use intercepts.
+                -- Parse sources, build env, inject values, then eval with intercepts.
+                -- This is a combination of evalWithEnvFromFilesAndValues + evalWithInterceptsRaw.
+                let
+                    parseResult =
+                        evalSources
+                            |> List.map
+                                (\src ->
+                                    Elm.Parser.parseToFile src
+                                        |> Result.mapError Types.ParsingError
+                                )
+                            |> combineFileResults
+                in
+                case parseResult of
+                    Err _ ->
+                        Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Parse error in prepareAndEvalWithYield" }
+
+                    Ok parsedModules ->
+                        Eval.Module.evalWithEnvFromFilesAndValuesAndInterceptsRaw env parsedModules injectedValues intercepts (FunctionOrValue [] "results")
     in
     driveYields yieldHandler rawResult
 

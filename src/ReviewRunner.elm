@@ -880,7 +880,7 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (buildProject, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
+        [ "module ReviewRunnerHelper exposing (buildProject, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedProject, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
@@ -900,6 +900,23 @@ reviewRunnerHelperSource =
         , "    let"
         , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
         , "        project = projectCacheMarker (buildProject modules)"
+        , "        ( errors, updatedRules ) = Rule.review selectedRules project"
+        , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
+        , "    in"
+        , "    ( errorStr, updatedRules )"
+        , ""
+        , "runReviewWithCachedProject indices cachedProj modules ="
+        , "    let"
+        , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
+        , "        -- Use cached project, but add the changed module on top"
+        , "        project = List.foldl"
+        , "            (\\mod proj ->"
+        , "                case Json.Decode.decodeString Elm.Syntax.File.decoder mod.astJson of"
+        , "                    Ok ast -> Project.addParsedModule { path = mod.path, source = mod.source, ast = ast } proj"
+        , "                    Err _ -> Project.addModule { path = mod.path, source = mod.source } proj"
+        , "            )"
+        , "            cachedProj"
+        , "            modules"
         , "        ( errors, updatedRules ) = Rule.review selectedRules project"
         , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
         , "    in"
@@ -1580,8 +1597,22 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                             )
 
                     else
-                        -- Load any previously cached rule Values from disk
+                        -- Load cached rule Values AND cached Project from disk
                         Do.do (loadRuleCaches (Path.toString config.buildDirectory)) <| \preloadedCaches ->
+                        Do.do
+                            (File.rawFile (Path.toString config.buildDirectory ++ "/project-cache.json")
+                                |> BackendTask.toResult
+                                |> BackendTask.map
+                                    (\r ->
+                                        case r of
+                                            Ok json ->
+                                                ValueCodec.decodeValue json
+
+                                            Err _ ->
+                                                Nothing
+                                    )
+                            )
+                        <| \maybeCachedProject ->
                         let
                             intercepts =
                                 buildReviewIntercepts preloadedCaches
@@ -1589,12 +1620,15 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                             moduleList =
                                 buildModuleListWithAst allModulesWithAst
 
-                            -- Use runReviewCachingWithProject to get (errors, updatedRules, project)
-                            -- The project Value is yielded for disk caching.
+                            indexList =
+                                "[ " ++ (fpIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+
                             cachingExpr =
                                 "ReviewRunnerHelper.runReviewCachingWithProject "
-                                    ++ "[ " ++ (fpIndices |> List.map String.fromInt |> String.join ", ") ++ " ] "
-                                    ++ moduleList
+                                    ++ indexList ++ " " ++ moduleList
+
+                            injectedValues =
+                                FastDict.empty
 
                             ruleCacheDir =
                                 Path.toString config.buildDirectory ++ "/rule-value-cache"
@@ -1699,6 +1733,7 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                 , expression = cachingExpr
                                 , sourceOverrides = [ reviewRunnerHelperSource ]
                                 , intercepts = intercepts
+                                , injectedValues = injectedValues
                                 }
                                 yieldHandler
                             )
