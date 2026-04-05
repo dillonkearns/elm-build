@@ -27,6 +27,7 @@ suite =
         , cachePipelineTests
         , ruleClassificationTests
         , narrowCacheKeyTests
+        , cacheBehaviorScenarioTests
         ]
 
 
@@ -1024,3 +1025,285 @@ rule =
         |> Rule.withSimpleDeclarationVisitor declarationVisitor
         |> Rule.fromModuleRuleSchema
 """
+
+
+{-| Integration tests for cache behavior scenarios.
+Simulates sequences of file changes and verifies cache hits/misses.
+-}
+cacheBehaviorScenarioTests : Test
+cacheBehaviorScenarioTests =
+    describe "cache behavior scenarios"
+        [ test "cold → warm: identical files produce FullCacheHit" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\na = 1\n" }
+                        , { path = "src/B.elm", source = "module B exposing (..)\n\nb = 2\n" }
+                        ]
+
+                    errors =
+                        [ { ruleName = "R", filePath = "src/A.elm", line = 3, column = 1, message = "unused" } ]
+
+                    -- Simulate cold run: update cache
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+
+                    -- Simulate warm run: check same files
+                    decision =
+                        ReviewRunner.checkCache cache files
+                in
+                case decision of
+                    ReviewRunner.FullCacheHit cachedErrors ->
+                        Expect.equal errors cachedErrors
+
+                    other ->
+                        Expect.fail ("Expected FullCacheHit, got " ++ cacheDecisionToString other)
+        , test "body change triggers PartialMiss for changed file only" <|
+            \_ ->
+                let
+                    original =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\na = 1\n" }
+                        , { path = "src/B.elm", source = "module B exposing (..)\n\nb = 2\n" }
+                        ]
+
+                    errors =
+                        [ { ruleName = "R", filePath = "src/A.elm", line = 3, column = 1, message = "in A" }
+                        , { ruleName = "R", filePath = "src/B.elm", line = 3, column = 1, message = "in B" }
+                        ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty original errors
+
+                    -- Change A's body
+                    changed =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\na = 999\n" }
+                        , { path = "src/B.elm", source = "module B exposing (..)\n\nb = 2\n" }
+                        ]
+
+                    decision =
+                        ReviewRunner.checkCache cache changed
+                in
+                case decision of
+                    ReviewRunner.PartialMiss { staleFiles, cachedErrors } ->
+                        Expect.all
+                            [ \_ -> Expect.equal [ "src/A.elm" ] staleFiles
+                            , \_ -> Expect.equal 1 (List.length cachedErrors)
+                            , \_ ->
+                                cachedErrors
+                                    |> List.head
+                                    |> Maybe.map .message
+                                    |> Expect.equal (Just "in B")
+                            ]
+                            ()
+
+                    other ->
+                        Expect.fail ("Expected PartialMiss, got " ++ cacheDecisionToString other)
+        , test "import change triggers PartialMiss (detected by __fileAspects__)" <|
+            \_ ->
+                let
+                    original =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\nimport B\n\na = 1\n" } ]
+
+                    errors =
+                        [ { ruleName = "R", filePath = "src/A.elm", line = 5, column = 1, message = "unused" } ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty original errors
+
+                    -- Change only the import
+                    changed =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\nimport C\n\na = 1\n" } ]
+
+                    decision =
+                        ReviewRunner.checkCache cache changed
+                in
+                case decision of
+                    ReviewRunner.PartialMiss { staleFiles } ->
+                        Expect.equal [ "src/A.elm" ] staleFiles
+
+                    ReviewRunner.FullCacheHit _ ->
+                        Expect.fail "FullCacheHit — import change should be detected"
+
+                    other ->
+                        Expect.fail ("Expected PartialMiss, got " ++ cacheDecisionToString other)
+        , test "whitespace-only change produces FullCacheHit (semantic hash unchanged)" <|
+            \_ ->
+                let
+                    original =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\na = 1\n" } ]
+
+                    errors =
+                        [ { ruleName = "R", filePath = "src/A.elm", line = 3, column = 1, message = "unused" } ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty original errors
+
+                    -- Add whitespace only
+                    reformatted =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\n\na =\n    1\n" } ]
+
+                    decision =
+                        ReviewRunner.checkCache cache reformatted
+                in
+                case decision of
+                    ReviewRunner.FullCacheHit _ ->
+                        Expect.pass
+
+                    other ->
+                        Expect.fail ("Expected FullCacheHit for whitespace change, got " ++ cacheDecisionToString other)
+        , test "narrow key: NoExposingEverything stable across body changes" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoExposingEverything"
+
+                    beforeHashes =
+                        SemanticHash.computeAspectHashesFromSource "module A exposing (foo)\n\nfoo = 1\n"
+
+                    afterHashes =
+                        SemanticHash.computeAspectHashesFromSource "module A exposing (foo)\n\nfoo = completely_different_implementation 42\n"
+
+                    graph =
+                        DepGraph.buildGraph { sourceDirectories = [], files = [] }
+
+                    keyBefore =
+                        ReviewRunner.narrowCacheKey profile "src/A.elm" beforeHashes Dict.empty graph
+
+                    keyAfter =
+                        ReviewRunner.narrowCacheKey profile "src/A.elm" afterHashes Dict.empty graph
+                in
+                Expect.equal keyBefore keyAfter
+        , test "narrow key: NoDebug.Log changes when body changes" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoDebug.Log"
+
+                    beforeHashes =
+                        SemanticHash.computeAspectHashesFromSource "module A exposing (..)\n\na = 1\n"
+
+                    afterHashes =
+                        SemanticHash.computeAspectHashesFromSource "module A exposing (..)\n\na = Debug.log \"x\" 1\n"
+
+                    graph =
+                        DepGraph.buildGraph { sourceDirectories = [], files = [] }
+
+                    keyBefore =
+                        ReviewRunner.narrowCacheKey profile "src/A.elm" beforeHashes Dict.empty graph
+
+                    keyAfter =
+                        ReviewRunner.narrowCacheKey profile "src/A.elm" afterHashes Dict.empty graph
+                in
+                Expect.notEqual keyBefore keyAfter
+        , test "narrow key: ImportersOf stable when non-importer changes" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoUnused.Exports"
+
+                    fileAHashes =
+                        SemanticHash.computeAspectHashesFromSource "module A exposing (foo)\n\nfoo = 1\n"
+
+                    fileBHashes =
+                        SemanticHash.computeAspectHashesFromSource "module B exposing (..)\n\nimport A\n\nbar = A.foo\n"
+
+                    fileCBefore =
+                        SemanticHash.computeAspectHashesFromSource "module C exposing (..)\n\nc = 1\n"
+
+                    fileCAfter =
+                        SemanticHash.computeAspectHashesFromSource "module C exposing (..)\n\nc = 999\n"
+
+                    files =
+                        [ { filePath = "src/A.elm", content = "module A exposing (foo)\n\nimport B\n\nfoo = 1\n" }
+                        , { filePath = "src/B.elm", content = "module B exposing (..)\n\nimport A\n\nbar = A.foo\n" }
+                        , { filePath = "src/C.elm", content = "module C exposing (..)\n\nc = 1\n" }
+                        ]
+
+                    graph =
+                        DepGraph.buildGraph { sourceDirectories = [ "src" ], files = files }
+
+                    allBefore =
+                        Dict.fromList
+                            [ ( "src/A.elm", fileAHashes )
+                            , ( "src/B.elm", fileBHashes )
+                            , ( "src/C.elm", fileCBefore )
+                            ]
+
+                    allAfter =
+                        Dict.fromList
+                            [ ( "src/A.elm", fileAHashes )
+                            , ( "src/B.elm", fileBHashes )
+                            , ( "src/C.elm", fileCAfter )
+                            ]
+                in
+                -- Changing C (non-importer of A) should NOT change A's key
+                ReviewRunner.narrowCacheKey profile "src/A.elm" fileAHashes allBefore graph
+                    |> Expect.equal (ReviewRunner.narrowCacheKey profile "src/A.elm" fileAHashes allAfter graph)
+        , test "full cold → change → warm pipeline preserves cached errors" <|
+            \_ ->
+                let
+                    -- Simulate: cold run with 3 files
+                    files =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\nimport B\n\na = B.b\n" }
+                        , { path = "src/B.elm", source = "module B exposing (b)\n\nb = 42\n" }
+                        , { path = "src/C.elm", source = "module C exposing (..)\n\nc = 1\n" }
+                        ]
+
+                    coldErrors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/A.elm", line = 5, column = 1, message = "debug in A" }
+                        , { ruleName = "NoExposing", filePath = "src/C.elm", line = 1, column = 1, message = "exposing everything in C" }
+                        ]
+
+                    -- Cold run builds cache
+                    cache1 =
+                        ReviewRunner.updateCache Dict.empty files coldErrors
+
+                    -- Change C only
+                    changedFiles =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\nimport B\n\na = B.b\n" }
+                        , { path = "src/B.elm", source = "module B exposing (b)\n\nb = 42\n" }
+                        , { path = "src/C.elm", source = "module C exposing (c)\n\nc = 999\n" }
+                        ]
+
+                    -- Check cache
+                    decision =
+                        ReviewRunner.checkCache cache1 changedFiles
+                in
+                case decision of
+                    ReviewRunner.PartialMiss { staleFiles, cachedErrors } ->
+                        Expect.all
+                            [ \_ -> Expect.equal [ "src/C.elm" ] staleFiles
+                            , \_ ->
+                                -- A's error should be cached (A didn't change)
+                                cachedErrors
+                                    |> List.filter (\e -> e.filePath == "src/A.elm")
+                                    |> List.length
+                                    |> Expect.equal 1
+                            , \_ ->
+                                -- After re-eval of C, update cache with new results
+                                let
+                                    newCErrors =
+                                        [ { ruleName = "NoDebug.Log", filePath = "src/C.elm", line = 2, column = 1, message = "new error in C" } ]
+
+                                    cache2 =
+                                        ReviewRunner.updateCache cache1
+                                            [ { path = "src/C.elm", source = "module C exposing (c)\n\nc = 999\n" } ]
+                                            newCErrors
+
+                                    -- Verify: running same changed files again → FullCacheHit
+                                    decision2 =
+                                        ReviewRunner.checkCache cache2 changedFiles
+                                in
+                                case decision2 of
+                                    ReviewRunner.FullCacheHit errors2 ->
+                                        -- Should have A's cached error + C's new error
+                                        Expect.equal 2 (List.length errors2)
+
+                                    other2 ->
+                                        Expect.fail ("Expected FullCacheHit on re-check, got " ++ cacheDecisionToString other2)
+                            ]
+                            ()
+
+                    other ->
+                        Expect.fail ("Expected PartialMiss, got " ++ cacheDecisionToString other)
+        ]
