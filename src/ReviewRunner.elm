@@ -621,9 +621,20 @@ encodeFileAsWire source =
             Nothing
 
 
-{-| Build expression to evaluate a single rule by index.
-Uses pre-parsed AST JSON modules.
+{-| Build expression to evaluate multiple rules by their indices in one call.
 -}
+buildExpressionForRules : List Int -> List { path : String, source : String, astJson : String } -> String
+buildExpressionForRules ruleIndices modules =
+    let
+        moduleList =
+            buildModuleListWithAst modules
+
+        indexList =
+            "[ " ++ (ruleIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+    in
+    "ReviewRunnerHelper.runRulesByIndices " ++ indexList ++ " " ++ moduleList
+
+
 buildExpressionForRule : Int -> List { path : String, source : String, astJson : String } -> String
 buildExpressionForRule ruleIndex modules =
     let
@@ -718,7 +729,7 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (ruleCount, ruleNames, runReview, runReviewCaching, runReviewWithCachedRules, runSingleRule)"
+        [ "module ReviewRunnerHelper exposing (ruleCount, ruleNames, runReview, runReviewCaching, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
@@ -756,6 +767,14 @@ reviewRunnerHelperSource =
         , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
         , "    in"
         , "    ( errorStr, updatedRules )"
+        , ""
+        , "runRulesByIndices indices modules ="
+        , "    let"
+        , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
+        , "        project = buildProject modules"
+        , "        ( errors, _ ) = Rule.review selectedRules project"
+        , "    in"
+        , "    errors |> List.map formatError |> String.join \"\\n\""
         , ""
         , "runSingleRule ruleIndex modules ="
         , "    case List.head (List.drop ruleIndex ReviewConfig.config) of"
@@ -1034,7 +1053,10 @@ Phase 1: Check per-rule cache files on disk.
 Phase 2: If all hit, return cached results.
 Phase 3: If any miss, run ONE monolithic eval, split results per-rule, cache to disk.
 
-This gives: monolithic speed on cold (one eval), per-rule caching on warm.
+Module rules: cached per (ruleIndex, file) with per-file semantic keys.
+Project rules: cached per (ruleIndex, allFiles) with global project key.
+On miss: module rules eval per-file (only changed files), project rules eval individually.
+All via Cache.compute for disk persistence.
 -}
 loadAndEvalHybrid :
     Config
@@ -1042,6 +1064,7 @@ loadAndEvalHybrid :
     -> List { path : String, source : String }
     -> BackendTask FatalError String
 loadAndEvalHybrid config ruleInfo targetFileContents =
+    Do.do (loadReviewProject config) <| \reviewProject ->
     let
         helperHash =
             FNV1a.hash reviewRunnerHelperSource |> String.fromInt
@@ -1049,11 +1072,140 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
         projectSemanticKey =
             computeSemanticKey targetFileContents
 
-        ruleCacheDir =
-            Path.toString config.buildDirectory ++ "/rule-cache"
+        modulesWithAst =
+            targetFileContents
+                |> List.filterMap
+                    (\{ path, source } ->
+                        encodeFileAsJson source
+                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
+                    )
 
-        -- Per-file semantic keys for module rules
-        perFileKeys : Dict String String
+        moduleRules =
+            ruleInfo |> List.filter (\r -> r.ruleType == ModuleRule)
+
+        projectRules =
+            ruleInfo |> List.filter (\r -> r.ruleType == ProjectRule)
+
+        -- Module rules: one Cache.compute per (rule, file) with per-file key
+        moduleRuleMonads =
+            moduleRules
+                |> List.concatMap
+                    (\rule ->
+                        modulesWithAst
+                            |> List.indexedMap
+                                (\fileIdx file ->
+                                    let
+                                        fileKey =
+                                            computeSemanticKey [ { path = file.path, source = file.source } ]
+
+                                        cacheKey =
+                                            "mr|" ++ String.fromInt rule.index ++ "|" ++ helperHash ++ "|" ++ file.path ++ "|" ++ fileKey
+                                    in
+                                    Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
+                                    Cache.compute [ "mr", String.fromInt rule.index, file.path ]
+                                        keyHash
+                                        (\() ->
+                                            case
+                                                InterpreterProject.prepareAndEval reviewProject
+                                                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                                    , expression = buildExpressionForRule rule.index [ file ]
+                                                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                                                    }
+                                            of
+                                                Ok s -> s
+                                                Err e -> e
+                                        )
+                                    <| \hash ->
+                                    Cache.succeed
+                                        { filename = Path.path ("mr-" ++ String.fromInt rule.index ++ "-" ++ String.fromInt fileIdx)
+                                        , hash = hash
+                                        }
+                                )
+                    )
+
+        -- Project rules: ONE Cache.compute for ALL project rules together
+        -- (one interpreter call instead of N separate calls)
+        projectRuleMonads =
+            if List.isEmpty projectRules then
+                []
+
+            else
+                let
+                    prIndices =
+                        projectRules |> List.map .index
+
+                    prCacheKey =
+                        "pr-all|" ++ helperHash ++ "|" ++ (prIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ projectSemanticKey
+                in
+                [ Cache.do (Cache.writeFile prCacheKey Cache.succeed) <| \keyHash ->
+                  Cache.compute [ "pr-all" ]
+                    keyHash
+                    (\() ->
+                        case
+                            InterpreterProject.prepareAndEval reviewProject
+                                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                , expression = buildExpressionForRules prIndices modulesWithAst
+                                , sourceOverrides = [ reviewRunnerHelperSource ]
+                                }
+                        of
+                            Ok s -> s
+                            Err e -> e
+                    )
+                  <| \hash ->
+                  Cache.succeed
+                    { filename = Path.path "pr-all"
+                    , hash = hash
+                    }
+                ]
+
+        allMonads =
+            (moduleRuleMonads ++ projectRuleMonads)
+                |> Cache.sequence
+                |> Cache.andThen Cache.combine
+    in
+    Cache.run { jobs = Nothing } config.buildDirectory allMonads
+        |> BackendTask.andThen
+            (\cacheResult ->
+                let
+                    mrFiles =
+                        moduleRules
+                            |> List.concatMap
+                                (\rule ->
+                                    List.indexedMap
+                                        (\fileIdx _ ->
+                                            File.rawFile
+                                                (Path.toString cacheResult.output ++ "/mr-" ++ String.fromInt rule.index ++ "-" ++ String.fromInt fileIdx)
+                                                |> BackendTask.allowFatal
+                                        )
+                                        modulesWithAst
+                                )
+
+                    prFiles =
+                        if List.isEmpty projectRules then
+                            []
+
+                        else
+                            [ File.rawFile
+                                (Path.toString cacheResult.output ++ "/pr-all")
+                                |> BackendTask.allowFatal
+                            ]
+                in
+                (mrFiles ++ prFiles)
+                    |> BackendTask.Extra.combine
+                    |> BackendTask.map
+                        (\outputs ->
+                            outputs
+                                |> List.filter
+                                    (\s ->
+                                        not (String.isEmpty (String.trim s))
+                                            && not (String.startsWith "ERROR:" s)
+                                    )
+                                |> String.join "\n"
+                        )
+            )
+
+
+{--  OLD BODY
         perFileKeys =
             targetFileContents
                 |> List.map
@@ -1206,7 +1358,7 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
                 |> BackendTask.Extra.combine
             )
         <| \_ ->
-        BackendTask.succeed output
+OLD BODY END --}
 
 
 {-| Format a ReviewError back into the pipe-delimited line format for caching.
