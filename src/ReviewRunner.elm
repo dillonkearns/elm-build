@@ -996,10 +996,14 @@ task config =
             reportErrors errors
 
         PartialMiss { cachedErrors, staleFiles } ->
-            -- Some files changed — check per-rule disk cache:
-            -- Module rules on unchanged files = hit. Others re-eval.
+            -- Some files changed. Module rules on unchanged files use cachedErrors.
+            -- Only stale files need module rule re-eval. Project rules always re-eval.
             Do.do (getRuleInfo config) <| \ruleInfo ->
-            Do.do (loadAndEvalHybrid config ruleInfo targetFileContents) <| \output ->
+            let
+                staleFileContents =
+                    targetFileContents |> List.filter (\f -> List.member f.path staleFiles)
+            in
+            Do.do (loadAndEvalHybridPartial config ruleInfo targetFileContents staleFileContents cachedErrors) <| \output ->
             let
                 freshErrors =
                     parseReviewOutput output
@@ -1189,16 +1193,204 @@ buildModuleListWithAst modules =
             "[ " ++ moduleRecords ++ " ]"
 
 
-{-| Hybrid evaluation with per-rule disk caching.
+{-| Partial hybrid evaluation for PartialMiss:
+Module rules on STALE files only (unchanged files use cachedErrors).
+Project rules re-eval on full project.
+-}
+loadAndEvalHybridPartial :
+    Config
+    -> List { index : Int, name : String, ruleType : RuleType }
+    -> List { path : String, source : String }
+    -> List { path : String, source : String }
+    -> List ReviewError
+    -> BackendTask FatalError String
+loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cachedErrors =
+    Do.do (loadReviewProject config) <| \reviewProject ->
+    let
+        helperHash =
+            FNV1a.hash reviewRunnerHelperSource |> String.fromInt
 
-Phase 1: Check per-rule cache files on disk.
-Phase 2: If all hit, return cached results.
-Phase 3: If any miss, run ONE monolithic eval, split results per-rule, cache to disk.
+        projectSemanticKey =
+            computeSemanticKey allFileContents
 
-Module rules: cached per (ruleIndex, file) with per-file semantic keys.
-Project rules: cached per (ruleIndex, allFiles) with global project key.
-On miss: module rules eval per-file (only changed files), project rules eval individually.
-All via Cache.compute for disk persistence.
+        staleModulesWithAst =
+            staleFileContents
+                |> List.filterMap
+                    (\{ path, source } ->
+                        encodeFileAsJson source
+                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
+                    )
+
+        allModulesWithAst =
+            allFileContents
+                |> List.filterMap
+                    (\{ path, source } ->
+                        encodeFileAsJson source
+                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
+                    )
+
+        moduleRules =
+            ruleInfo |> List.filter (\r -> r.ruleType == ModuleRule)
+
+        projectRules =
+            ruleInfo |> List.filter (\r -> r.ruleType == ProjectRule)
+
+        stalePaths =
+            staleFileContents |> List.map .path |> Set.fromList
+
+        -- Cached module rule errors for UNCHANGED files
+        cachedModuleRuleErrors =
+            cachedErrors
+                |> List.filter
+                    (\err ->
+                        not (Set.member err.filePath stalePaths)
+                            && List.any (\r -> r.name == err.ruleName) moduleRules
+                    )
+                |> List.map formatErrorLine
+                |> String.join "\n"
+
+        -- Module rules: only eval STALE files (others are cached)
+        moduleRuleMonads =
+            moduleRules
+                |> List.concatMap
+                    (\rule ->
+                        let
+                            profile =
+                                profileForRule rule.name
+                        in
+                        staleModulesWithAst
+                            |> List.indexedMap
+                                (\fileIdx file ->
+                                    let
+                                        fileHashes =
+                                            SemanticHash.computeAspectHashesFromSource file.source
+
+                                        fileNarrowKey =
+                                            narrowCacheKey profile file.path fileHashes Dict.empty (DepGraph.buildGraph { sourceDirectories = [], files = [] })
+
+                                        cacheKey =
+                                            "mr|" ++ String.fromInt rule.index ++ "|" ++ helperHash ++ "|" ++ file.path ++ "|" ++ fileNarrowKey
+                                    in
+                                    Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
+                                    Cache.compute [ "mr", String.fromInt rule.index, file.path ]
+                                        keyHash
+                                        (\() ->
+                                            case
+                                                InterpreterProject.prepareAndEval reviewProject
+                                                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                                    , expression = buildExpressionForRule rule.index [ file ]
+                                                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                                                    }
+                                            of
+                                                Ok s -> s
+                                                Err e -> e
+                                        )
+                                    <| \hash ->
+                                    Cache.succeed
+                                        { filename = Path.path ("smr-" ++ String.fromInt rule.index ++ "-" ++ String.fromInt fileIdx)
+                                        , hash = hash
+                                        }
+                                )
+                    )
+
+        allMonads =
+            moduleRuleMonads
+                |> Cache.sequence
+                |> Cache.andThen Cache.combine
+    in
+    -- Step 1: Run module rules on STALE files only
+    Cache.run { jobs = Nothing } config.buildDirectory allMonads
+        |> BackendTask.andThen
+            (\cacheResult ->
+                -- Read stale module rule results
+                let
+                    staleCount =
+                        List.length staleModulesWithAst
+
+                    mrFiles =
+                        moduleRules
+                            |> List.concatMap
+                                (\rule ->
+                                    List.range 0 (staleCount - 1)
+                                        |> List.map
+                                            (\fileIdx ->
+                                                File.rawFile
+                                                    (Path.toString cacheResult.output ++ "/smr-" ++ String.fromInt rule.index ++ "-" ++ String.fromInt fileIdx)
+                                                    |> BackendTask.allowFatal
+                                            )
+                                )
+                in
+                mrFiles
+                    |> BackendTask.Extra.combine
+                    |> BackendTask.map
+                        (\staleOutputs ->
+                            let
+                                freshModuleErrors =
+                                    staleOutputs
+                                        |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                        |> String.join "\n"
+                            in
+                            -- Combine: cached unchanged + fresh stale
+                            [ cachedModuleRuleErrors, freshModuleErrors ]
+                                |> List.filter (not << String.isEmpty)
+                                |> String.join "\n"
+                        )
+            )
+        |> BackendTask.andThen
+            (\moduleRuleOutput ->
+                -- Step 2: Project rules on full project
+                if List.isEmpty projectRules then
+                    BackendTask.succeed moduleRuleOutput
+
+                else
+                    let
+                        prIndices =
+                            projectRules |> List.map .index
+
+                        prCacheKey =
+                            "pr-all|" ++ helperHash ++ "|" ++ (prIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ projectSemanticKey
+
+                        prCacheKeyPath =
+                            Path.toString config.buildDirectory ++ "/pr-cache.key"
+
+                        prCacheDataPath =
+                            Path.toString config.buildDirectory ++ "/pr-cache.txt"
+                    in
+                    File.rawFile prCacheKeyPath
+                        |> BackendTask.toResult
+                        |> BackendTask.andThen
+                            (\keyResult ->
+                                case keyResult of
+                                    Ok storedKey ->
+                                        if storedKey == prCacheKey then
+                                            File.rawFile prCacheDataPath
+                                                |> BackendTask.toResult
+                                                |> BackendTask.andThen
+                                                    (\dataResult ->
+                                                        case dataResult of
+                                                            Ok cached ->
+                                                                BackendTask.succeed cached
+
+                                                            Err _ ->
+                                                                evalProjectRulesSingle reviewProject prIndices allModulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                                    )
+
+                                        else
+                                            evalProjectRulesSingle reviewProject prIndices allModulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+
+                                    Err _ ->
+                                        evalProjectRulesSingle reviewProject prIndices allModulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                            )
+                        |> BackendTask.map
+                            (\prOutput ->
+                                [ moduleRuleOutput, prOutput ]
+                                    |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                    |> String.join "\n"
+                            )
+            )
+
+
+{-| Full hybrid evaluation (ColdMiss path). Uses Cache.compute for all rules.
 -}
 loadAndEvalHybrid :
     Config
@@ -1222,26 +1414,53 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
                             |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
                     )
 
+        -- Compute per-file aspect hashes for narrow cache keys
+        allFileAspectHashes : Dict String SemanticHash.FileAspectHashes
+        allFileAspectHashes =
+            targetFileContents
+                |> List.map
+                    (\{ path, source } ->
+                        ( path, SemanticHash.computeAspectHashesFromSource source )
+                    )
+                |> Dict.fromList
+
+        depGraph : DepGraph.Graph
+        depGraph =
+            DepGraph.buildGraph
+                { sourceDirectories = []
+                , files =
+                    targetFileContents
+                        |> List.map (\{ path, source } -> { filePath = path, content = source })
+                }
+
         moduleRules =
             ruleInfo |> List.filter (\r -> r.ruleType == ModuleRule)
 
         projectRules =
             ruleInfo |> List.filter (\r -> r.ruleType == ProjectRule)
 
-        -- Module rules: one Cache.compute per (rule, file) with per-file key
+        -- Module rules: one Cache.compute per (rule, file) with NARROW key
         moduleRuleMonads =
             moduleRules
                 |> List.concatMap
                     (\rule ->
+                        let
+                            profile =
+                                profileForRule rule.name
+                        in
                         modulesWithAst
                             |> List.indexedMap
                                 (\fileIdx file ->
                                     let
-                                        fileKey =
-                                            computeSemanticKey [ { path = file.path, source = file.source } ]
+                                        fileHashes =
+                                            Dict.get file.path allFileAspectHashes
+                                                |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
+
+                                        fileNarrowKey =
+                                            narrowCacheKey profile file.path fileHashes allFileAspectHashes depGraph
 
                                         cacheKey =
-                                            "mr|" ++ String.fromInt rule.index ++ "|" ++ helperHash ++ "|" ++ file.path ++ "|" ++ fileKey
+                                            "mr|" ++ String.fromInt rule.index ++ "|" ++ helperHash ++ "|" ++ file.path ++ "|" ++ fileNarrowKey
                                     in
                                     Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
                                     Cache.compute [ "mr", String.fromInt rule.index, file.path ]
@@ -1312,8 +1531,32 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
                         prIndices =
                             projectRules |> List.map .index
 
+                        -- Use FullProject profile for combined project rules (conservative)
+                        -- Individual rules could be narrower, but they run together
+                        prNarrowKey =
+                            let
+                                combinedProfile =
+                                    { expressionDep = True
+                                    , declarationNameDep = True
+                                    , importDep = True
+                                    , exposingDep = True
+                                    , customTypeDep = True
+                                    , crossModuleDep = FullProject
+                                    }
+
+                                dummyHashes =
+                                    { expressionsHash = projectSemanticKey
+                                    , declNamesHash = projectSemanticKey
+                                    , importsHash = projectSemanticKey
+                                    , exposingHash = projectSemanticKey
+                                    , customTypesHash = projectSemanticKey
+                                    , fullHash = projectSemanticKey
+                                    }
+                            in
+                            narrowCacheKey combinedProfile "" dummyHashes allFileAspectHashes depGraph
+
                         prCacheKey =
-                            "pr-all|" ++ helperHash ++ "|" ++ (prIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ projectSemanticKey
+                            "pr-all|" ++ helperHash ++ "|" ++ (prIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ prNarrowKey
 
                         prCacheKeyPath =
                             Path.toString config.buildDirectory ++ "/pr-cache.key"
