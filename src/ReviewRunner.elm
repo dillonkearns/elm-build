@@ -880,7 +880,7 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (buildProject, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedProject, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
+        [ "module ReviewRunnerHelper exposing (buildProject, extractRuleCaches, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedProject, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
@@ -904,6 +904,14 @@ reviewRunnerHelperSource =
         , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
         , "    in"
         , "    ( errorStr, updatedRules )"
+        , ""
+        , "extractRuleCaches updatedRules ="
+        , "    let"
+        , "        -- Run Rule.review on empty project to trigger initialCacheMarker"
+        , "        -- for each rule with its warm cache. The intercept yields them."
+        , "        ( _, _ ) = Rule.review updatedRules Project.new"
+        , "    in"
+        , "    \"done\""
         , ""
         , "runReviewWithCachedProject indices cachedProj modules ="
         , "    let"
@@ -2225,12 +2233,25 @@ buildReviewIntercepts preloadedCaches =
                 (\args _ _ ->
                     case args of
                         [ Types.String ruleName, _, defaultCache ] ->
-                            case Dict.get ruleName preloadedCaches of
-                                Just cached ->
-                                    Types.EvOk cached
+                            let
+                                cacheToUse =
+                                    case Dict.get ruleName preloadedCaches of
+                                        Just cached ->
+                                            cached
 
-                                Nothing ->
-                                    Types.EvOk defaultCache
+                                        Nothing ->
+                                            defaultCache
+                            in
+                            -- Yield for disk persistence, then return the cache
+                            Types.EvYield "review-cache-write"
+                                (Types.Record
+                                    (FastDict.fromList
+                                        [ ( "ruleName", Types.String ruleName )
+                                        , ( "cache", cacheToUse )
+                                        ]
+                                    )
+                                )
+                                (\_ -> Types.EvOk cacheToUse)
 
                         _ ->
                             Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
@@ -2239,21 +2260,10 @@ buildReviewIntercepts preloadedCaches =
         , ( "Review.Rule.finalCacheMarker"
           , Types.Intercept
                 (\args _ _ ->
+                    -- Identity — caches are extracted via expression-level helper
                     case args of
-                        [ Types.String ruleName, _, cache ] ->
-                            -- YIELD the cache to the framework for disk persistence.
-                            Types.EvYield "review-cache-write"
-                                (Types.Record
-                                    (FastDict.fromList
-                                        [ ( "ruleName", Types.String ruleName )
-                                        , ( "cache", cache )
-                                        ]
-                                    )
-                                )
-                                (\_ ->
-                                    -- After framework stores it, return the cache unchanged
-                                    Types.EvOk cache
-                                )
+                        [ _, _, cache ] ->
+                            Types.EvOk cache
 
                         _ ->
                             Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
