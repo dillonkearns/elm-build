@@ -7,9 +7,11 @@ the interpreter, parse results, verify caching behavior.
 
 -}
 
+import DepGraph
 import Dict
 import Expect
 import ReviewRunner
+import SemanticHash
 import Test exposing (Test, describe, test)
 import Test.BackendTask as BackendTaskTest
 
@@ -24,6 +26,7 @@ suite =
         , cacheSerializationTests
         , cachePipelineTests
         , ruleClassificationTests
+        , narrowCacheKeyTests
         ]
 
 
@@ -737,6 +740,122 @@ config =
         |> Rule.fromModuleRuleSchema
     ]
 """
+
+
+narrowCacheKeyTests : Test
+narrowCacheKeyTests =
+    describe "narrow cache keys"
+        [ test "NoExposingEverything: body change does NOT change key" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoExposingEverything"
+
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nfoo = 999\n"
+
+                    emptyHashes =
+                        Dict.empty
+
+                    emptyGraph =
+                        DepGraph.buildGraph { sourceDirectories = [], files = [] }
+                in
+                ReviewRunner.narrowCacheKey profile "src/Foo.elm" before emptyHashes emptyGraph
+                    |> Expect.equal (ReviewRunner.narrowCacheKey profile "src/Foo.elm" after emptyHashes emptyGraph)
+        , test "NoExposingEverything: exposing change DOES change key" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoExposingEverything"
+
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (foo)\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = 1\n"
+
+                    emptyHashes =
+                        Dict.empty
+
+                    emptyGraph =
+                        DepGraph.buildGraph { sourceDirectories = [], files = [] }
+                in
+                ReviewRunner.narrowCacheKey profile "src/Foo.elm" before emptyHashes emptyGraph
+                    |> Expect.notEqual (ReviewRunner.narrowCacheKey profile "src/Foo.elm" after emptyHashes emptyGraph)
+        , test "NoDebug.Log: body change DOES change key (expression dep)" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoDebug.Log"
+
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = Debug.log \"x\" 1\n"
+
+                    emptyHashes =
+                        Dict.empty
+
+                    emptyGraph =
+                        DepGraph.buildGraph { sourceDirectories = [], files = [] }
+                in
+                ReviewRunner.narrowCacheKey profile "src/Foo.elm" before emptyHashes emptyGraph
+                    |> Expect.notEqual (ReviewRunner.narrowCacheKey profile "src/Foo.elm" after emptyHashes emptyGraph)
+        , test "NoMissingTypeAnnotation: body change does NOT change key" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoMissingTypeAnnotation"
+
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = 999\n"
+
+                    emptyHashes =
+                        Dict.empty
+
+                    emptyGraph =
+                        DepGraph.buildGraph { sourceDirectories = [], files = [] }
+                in
+                ReviewRunner.narrowCacheKey profile "src/Foo.elm" before emptyHashes emptyGraph
+                    |> Expect.equal (ReviewRunner.narrowCacheKey profile "src/Foo.elm" after emptyHashes emptyGraph)
+        , test "unknown rule: conservative, body change DOES change key" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "SomeUnknownRule"
+
+                    before =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = 1\n"
+
+                    after =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module Foo exposing (..)\n\nfoo = 999\n"
+
+                    emptyHashes =
+                        Dict.empty
+
+                    emptyGraph =
+                        DepGraph.buildGraph { sourceDirectories = [], files = [] }
+                in
+                ReviewRunner.narrowCacheKey profile "src/Foo.elm" before emptyHashes emptyGraph
+                    |> Expect.notEqual (ReviewRunner.narrowCacheKey profile "src/Foo.elm" after emptyHashes emptyGraph)
+        ]
 
 
 ruleClassificationTests : Test

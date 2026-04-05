@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, DeclarationCache, ReviewError, RuleType(..), buildExpression, buildExpressionForRule, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), buildExpression, buildExpressionForRule, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, profileForRule, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -17,6 +17,7 @@ import BackendTask.File as File
 import BackendTask.Glob as Glob
 import Bytes exposing (Bytes)
 import Cache
+import DepGraph
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
@@ -210,6 +211,138 @@ classifyRuleSource source =
         -- - Rules using newProjectRuleSchema
         -- - Unrecognized source patterns
         ProjectRule
+
+
+{-| What cross-module information a rule depends on.
+-}
+type CrossModuleDep
+    = NoCrossModule
+    | ImportersOf
+    | FullProject
+
+
+{-| Which sub-AST aspects a rule depends on.
+-}
+type alias RuleDependencyProfile =
+    { expressionDep : Bool
+    , declarationNameDep : Bool
+    , importDep : Bool
+    , exposingDep : Bool
+    , customTypeDep : Bool
+    , crossModuleDep : CrossModuleDep
+    }
+
+
+{-| Get the dependency profile for a known rule name.
+Unknown rules get a conservative profile (all True, FullProject).
+-}
+profileForRule : String -> RuleDependencyProfile
+profileForRule ruleName =
+    case ruleName of
+        "NoDebug.Log" ->
+            { expressionDep = True, declarationNameDep = False, importDep = True, exposingDep = False, customTypeDep = False, crossModuleDep = NoCrossModule }
+
+        "NoDebug.TodoOrToString" ->
+            { expressionDep = True, declarationNameDep = False, importDep = True, exposingDep = False, customTypeDep = False, crossModuleDep = NoCrossModule }
+
+        "NoExposingEverything" ->
+            { expressionDep = False, declarationNameDep = True, importDep = False, exposingDep = True, customTypeDep = False, crossModuleDep = NoCrossModule }
+
+        "NoMissingTypeAnnotation" ->
+            { expressionDep = False, declarationNameDep = True, importDep = False, exposingDep = False, customTypeDep = False, crossModuleDep = NoCrossModule }
+
+        "NoMissingTypeAnnotationInLetIn" ->
+            { expressionDep = True, declarationNameDep = False, importDep = False, exposingDep = False, customTypeDep = False, crossModuleDep = NoCrossModule }
+
+        "NoUnused.Patterns" ->
+            { expressionDep = True, declarationNameDep = True, importDep = False, exposingDep = False, customTypeDep = False, crossModuleDep = NoCrossModule }
+
+        "NoUnused.Exports" ->
+            { expressionDep = True, declarationNameDep = True, importDep = True, exposingDep = True, customTypeDep = False, crossModuleDep = ImportersOf }
+
+        "NoUnused.CustomTypeConstructors" ->
+            { expressionDep = True, declarationNameDep = True, importDep = True, exposingDep = True, customTypeDep = True, crossModuleDep = ImportersOf }
+
+        "NoUnused.CustomTypeConstructorArgs" ->
+            { expressionDep = True, declarationNameDep = True, importDep = True, exposingDep = True, customTypeDep = True, crossModuleDep = ImportersOf }
+
+        _ ->
+            -- Conservative: depend on everything
+            { expressionDep = True, declarationNameDep = True, importDep = True, exposingDep = True, customTypeDep = True, crossModuleDep = FullProject }
+
+
+{-| Compute a narrow cache key for a (rule, file) pair.
+
+Only includes the AST aspects the rule actually inspects.
+For cross-module rules, includes relevant context from other files.
+-}
+narrowCacheKey :
+    RuleDependencyProfile
+    -> String
+    -> SemanticHash.FileAspectHashes
+    -> Dict String SemanticHash.FileAspectHashes
+    -> DepGraph.Graph
+    -> String
+narrowCacheKey profile filePath fileHashes allFileHashes depGraph =
+    let
+        localParts =
+            [ if profile.expressionDep then
+                fileHashes.expressionsHash
+
+              else
+                ""
+            , if profile.declarationNameDep then
+                fileHashes.declNamesHash
+
+              else
+                ""
+            , if profile.importDep then
+                fileHashes.importsHash
+
+              else
+                ""
+            , if profile.exposingDep then
+                fileHashes.exposingHash
+
+              else
+                ""
+            , if profile.customTypeDep then
+                fileHashes.customTypesHash
+
+              else
+                ""
+            ]
+                |> List.filter (not << String.isEmpty)
+                |> String.join "|"
+
+        localKey =
+            FNV1a.hash localParts |> String.fromInt
+
+        crossModuleKey =
+            case profile.crossModuleDep of
+                NoCrossModule ->
+                    ""
+
+                ImportersOf ->
+                    DepGraph.reverseDeps depGraph filePath
+                        |> Set.toList
+                        |> List.sort
+                        |> List.filterMap (\p -> Dict.get p allFileHashes)
+                        |> List.map (\h -> h.importsHash ++ h.expressionsHash)
+                        |> String.join "|"
+                        |> FNV1a.hash
+                        |> String.fromInt
+
+                FullProject ->
+                    allFileHashes
+                        |> Dict.toList
+                        |> List.sortBy Tuple.first
+                        |> List.map (\( _, h ) -> h.fullHash)
+                        |> String.join "|"
+                        |> FNV1a.hash
+                        |> String.fromInt
+    in
+    localKey ++ "|" ++ crossModuleKey
 
 
 {-| Compute a semantic cache key for a set of source files.
