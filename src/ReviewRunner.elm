@@ -2186,43 +2186,9 @@ buildReviewIntercepts preloadedCaches =
                             Types.EvOk Types.Unit
                 )
           )
-        , ( "Review.Cache.Module.match"
-          , Types.Intercept
-                (\args _ _ ->
-                    case args of
-                        [ contentHash, inputContexts, Types.Custom _ [ Types.Record entryFields ], _ ] ->
-                            let
-                                entryContentHash =
-                                    FastDict.get "contentHash" entryFields
-                                        |> Maybe.withDefault Types.Unit
-
-                                entryInputContexts =
-                                    FastDict.get "inputContextHashes" entryFields
-                                        |> Maybe.withDefault Types.Unit
-
-                                contentMatch =
-                                    contentHash == entryContentHash
-
-                                contextMatch =
-                                    inputContexts == entryInputContexts
-                            in
-                            if contentMatch && contextMatch then
-                                Types.EvYield "log"
-                                    (Types.String "match: HIT")
-                                    (\_ -> Types.EvOk (Types.Bool True))
-
-                            else
-                                Types.EvYield "log"
-                                    (Types.String
-                                        ("match: MISS (content=" ++ boolStr contentMatch ++ ", context=" ++ boolStr contextMatch ++ ")")
-                                    )
-                                    (\_ -> Types.EvOk (Types.Bool False))
-
-                        _ ->
-                            -- Can't parse args — delegate to original
-                            Types.EvOk (Types.Bool False)
-                )
-          )
+        -- Note: removed match intercept — it was for debugging.
+        -- The match function runs natively now (no yield overhead).
+        -- Context matching works (verified: context=True with sort fix).
         , ( "Review.Cache.ContextHash.sort"
           , Types.Intercept
                 (\args _ _ ->
