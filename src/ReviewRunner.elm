@@ -1630,6 +1630,28 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                                     filePath =
                                                         ruleCacheDir ++ "/" ++ ruleName ++ "-" ++ String.fromInt ruleId ++ ".json"
                                                 in
+                                                Do.do
+                                                    (File.rawFile (Path.toString config.buildDirectory ++ "/yield-log.txt")
+                                                        |> BackendTask.toResult
+                                                        |> BackendTask.andThen
+                                                            (\existing ->
+                                                                let
+                                                                    prev =
+                                                                        case existing of
+                                                                            Ok s ->
+                                                                                s
+
+                                                                            Err _ ->
+                                                                                ""
+                                                                in
+                                                                Script.writeFile
+                                                                    { path = Path.toString config.buildDirectory ++ "/yield-log.txt"
+                                                                    , body = prev ++ ruleName ++ "-" ++ String.fromInt ruleId ++ ": " ++ String.fromInt (String.length serialized) ++ " bytes\n"
+                                                                    }
+                                                                    |> BackendTask.allowFatal
+                                                            )
+                                                    )
+                                                <| \_ ->
                                                 Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
                                                 Do.do (Script.writeFile { path = filePath, body = serialized } |> BackendTask.allowFatal) <| \_ ->
                                                 BackendTask.succeed Types.Unit
