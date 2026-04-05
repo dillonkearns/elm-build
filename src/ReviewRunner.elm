@@ -1584,19 +1584,74 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                     ++ "[ " ++ (fpIndices |> List.map String.fromInt |> String.join ", ") ++ " ] "
                                     ++ moduleList
 
-                            result =
-                                InterpreterProject.prepareAndEvalWithIntercepts reviewProject
-                                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                    , expression = cachingExpr
-                                    , sourceOverrides = [ reviewRunnerHelperSource ]
-                                    , intercepts = intercepts
-                                    }
+                            ruleCacheDir =
+                                Path.toString config.buildDirectory ++ "/rule-value-cache"
+
+                            -- Yield handler: when finalCacheMarker yields, serialize cache to disk
+                            yieldHandler tag payload =
+                                case tag of
+                                    "review-cache-write" ->
+                                        case payload of
+                                            Types.Record fields ->
+                                                let
+                                                    ruleName =
+                                                        FastDict.get "ruleName" fields
+                                                            |> Maybe.andThen
+                                                                (\v ->
+                                                                    case v of
+                                                                        Types.String s ->
+                                                                            Just s
+
+                                                                        _ ->
+                                                                            Nothing
+                                                                )
+                                                            |> Maybe.withDefault "unknown"
+
+                                                    ruleId =
+                                                        FastDict.get "ruleId" fields
+                                                            |> Maybe.andThen
+                                                                (\v ->
+                                                                    case v of
+                                                                        Types.Int i ->
+                                                                            Just i
+
+                                                                        _ ->
+                                                                            Nothing
+                                                                )
+                                                            |> Maybe.withDefault 0
+
+                                                    cache =
+                                                        FastDict.get "cache" fields
+                                                            |> Maybe.withDefault Types.Unit
+
+                                                    serialized =
+                                                        ValueCodec.encodeValue cache
+
+                                                    filePath =
+                                                        ruleCacheDir ++ "/" ++ ruleName ++ "-" ++ String.fromInt ruleId ++ ".json"
+                                                in
+                                                Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
+                                                Do.do (Script.writeFile { path = filePath, body = serialized } |> BackendTask.allowFatal) <| \_ ->
+                                                BackendTask.succeed Types.Unit
+
+                                            _ ->
+                                                BackendTask.succeed Types.Unit
+
+                                    _ ->
+                                        BackendTask.succeed Types.Unit
                         in
+                        Do.do
+                            (InterpreterProject.prepareAndEvalWithYield reviewProject
+                                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                , expression = cachingExpr
+                                , sourceOverrides = [ reviewRunnerHelperSource ]
+                                , intercepts = intercepts
+                                }
+                                yieldHandler
+                            )
+                        <| \result ->
                         case result of
-                            Ok (Types.Tuple (Types.String errorStr) updatedRules) ->
-                                -- Save the rule caches to disk for next run
-                                Do.do (saveRuleCaches (Path.toString config.buildDirectory) updatedRules) <| \_ ->
-                                -- Also save the string cache for fast path
+                            Ok (Types.Tuple (Types.String errorStr) _) ->
                                 Do.do (Script.writeFile { path = fpKeyPath, body = fpCacheKey } |> BackendTask.allowFatal) <| \_ ->
                                 Do.do (Script.writeFile { path = fpDataPath, body = errorStr } |> BackendTask.allowFatal) <| \_ ->
                                 BackendTask.succeed
@@ -1606,7 +1661,6 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                     )
 
                             Ok (Types.String errorStr) ->
-                                -- Got string directly (fallback)
                                 Do.do (Script.writeFile { path = fpKeyPath, body = fpCacheKey } |> BackendTask.allowFatal) <| \_ ->
                                 Do.do (Script.writeFile { path = fpDataPath, body = errorStr } |> BackendTask.allowFatal) <| \_ ->
                                 BackendTask.succeed
@@ -1616,7 +1670,6 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                     )
 
                             Ok _ ->
-                                -- Still check the string-only cache path as fallback
                                 File.rawFile fpKeyPath
                                     |> BackendTask.toResult
                                     |> BackendTask.andThen
@@ -2067,10 +2120,23 @@ buildReviewIntercepts preloadedCaches =
         , ( "Review.Rule.finalCacheMarker"
           , Types.Intercept
                 (\args _ _ ->
-                    -- Identity — we extract caches from the returned updatedRules after eval
                     case args of
-                        [ _, _, cache ] ->
-                            Types.EvOk cache
+                        [ Types.String ruleName, Types.Int ruleId, cache ] ->
+                            -- YIELD the cache to the framework for disk persistence.
+                            -- The framework serializes it and resumes with the same cache.
+                            Types.EvYield "review-cache-write"
+                                (Types.Record
+                                    (FastDict.fromList
+                                        [ ( "ruleName", Types.String ruleName )
+                                        , ( "ruleId", Types.Int ruleId )
+                                        , ( "cache", cache )
+                                        ]
+                                    )
+                                )
+                                (\_ ->
+                                    -- After framework stores it, return the cache unchanged
+                                    Types.EvOk cache
+                                )
 
                         _ ->
                             Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)

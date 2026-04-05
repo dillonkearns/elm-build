@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithValues, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithValues, prepareAndEvalWithYield, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -1163,7 +1163,92 @@ prepareAndEvalWithValues (InterpreterProject project) { imports, expression, sou
                         |> Result.mapError formatError
 
 
-{-| Like prepareAndEval but with function intercepts.
+{-| Evaluate with intercepts that can yield to the framework.
+
+When an intercept yields (EvYield tag payload resume), the yieldHandler
+BackendTask runs with (tag, payload), producing a Value. The eval then
+resumes with that Value via the continuation.
+
+This is the BackendTask driver loop: eval → yield → handle → resume → repeat.
+-}
+prepareAndEvalWithYield :
+    InterpreterProject
+    -> { imports : List String, expression : String, sourceOverrides : List String, intercepts : FastDict.Dict String Types.Intercept }
+    -> (String -> Types.Value -> BackendTask FatalError Types.Value)
+    -> BackendTask FatalError (Result String Types.Value)
+prepareAndEvalWithYield (InterpreterProject project) { imports, expression, sourceOverrides, intercepts } yieldHandler =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        allSources =
+            let
+                { userSources } =
+                    prepareEvalSources (InterpreterProject project) { imports = imports, expression = expression }
+
+                len =
+                    List.length userSources
+
+                beforeWrapper =
+                    List.take (len - 1) userSources
+
+                wrapper =
+                    List.drop (len - 1) userSources
+            in
+            beforeWrapper ++ sourceOverrides ++ wrapper
+
+        evalSources =
+            case project.baseUserEnv of
+                Just _ ->
+                    sourceOverrides ++ [ wrapperSource ]
+
+                Nothing ->
+                    allSources
+
+        env =
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    baseEnv
+
+                Nothing ->
+                    project.packageEnv
+
+        rawResult =
+            Eval.Module.evalWithInterceptsRaw env evalSources intercepts (FunctionOrValue [] "results")
+    in
+    driveYields yieldHandler rawResult
+
+
+{-| Drive the yield loop: handle EvYield via BackendTask, resume, repeat.
+-}
+driveYields :
+    (String -> Types.Value -> BackendTask FatalError Types.Value)
+    -> Types.EvalResult Types.Value
+    -> BackendTask FatalError (Result String Types.Value)
+driveYields yieldHandler evalResult =
+    case evalResult of
+        Types.EvOk value ->
+            BackendTask.succeed (Ok value)
+
+        Types.EvErr evalErr ->
+            BackendTask.succeed (Err (formatError (Types.EvalError evalErr)))
+
+        Types.EvOkTrace value _ _ ->
+            BackendTask.succeed (Ok value)
+
+        Types.EvErrTrace evalErr _ _ ->
+            BackendTask.succeed (Err (formatError (Types.EvalError evalErr)))
+
+        Types.EvYield tag payload resume ->
+            -- Handle the yield via BackendTask, then resume eval
+            yieldHandler tag payload
+                |> BackendTask.andThen
+                    (\resumeValue ->
+                        driveYields yieldHandler (resume resumeValue)
+                    )
+
+
+{-| Like prepareAndEval but with function intercepts (synchronous, no yield support).
 
 Intercepts are checked before normal function evaluation. Used for
 elm-review cache markers, memoization, and framework callbacks.
