@@ -1,4 +1,4 @@
-module ReviewRunner exposing (DeclarationCache, ReviewError, buildExpression, buildModuleRecord, computeSemanticKey, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, run)
+module ReviewRunner exposing (CacheDecision(..), CacheState, DeclarationCache, ReviewError, buildExpression, buildModuleRecord, checkCache, computeSemanticKey, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -320,6 +320,146 @@ mapErrorsToDeclarations declarations errors =
                     acc
             )
             emptyCache
+
+
+{-| The full cache state: per-file, per-declaration.
+    filePath → (declarationName → { semanticHash, errors })
+-}
+type alias CacheState =
+    Dict String DeclarationCache
+
+
+{-| Result of checking the cache against current source files.
+-}
+type CacheDecision
+    = FullCacheHit (List ReviewError)
+    | PartialMiss
+        { cachedErrors : List ReviewError
+        , staleFiles : List String
+        }
+    | ColdMiss (List String)
+
+
+{-| Check the per-declaration cache against current source files.
+
+For each file, computes current declaration hashes and compares to cached.
+If ALL declarations in ALL files match → FullCacheHit.
+If some files have mismatched declarations → PartialMiss (with cached errors
+for unchanged files and a list of files needing re-evaluation).
+If no cache exists → ColdMiss.
+
+-}
+checkCache :
+    CacheState
+    -> List { path : String, source : String }
+    -> CacheDecision
+checkCache cache files =
+    let
+        fileResults =
+            files
+                |> List.map
+                    (\{ path, source } ->
+                        let
+                            currentHashes =
+                                getDeclarationHashes source
+                                    |> List.map (\d -> ( d.name, d.semanticHash ))
+                                    |> Dict.fromList
+
+                            cachedFile =
+                                Dict.get path cache
+                        in
+                        case cachedFile of
+                            Nothing ->
+                                -- No cache for this file at all
+                                { path = path, status = FileMiss, cachedErrors = [] }
+
+                            Just fileCache ->
+                                let
+                                    allMatch =
+                                        Dict.foldl
+                                            (\name hash acc ->
+                                                acc
+                                                    && (Dict.get name fileCache
+                                                            |> Maybe.map (\entry -> entry.semanticHash == hash)
+                                                            |> Maybe.withDefault False
+                                                       )
+                                            )
+                                            (Dict.size currentHashes == Dict.size fileCache)
+                                            currentHashes
+                                in
+                                if allMatch then
+                                    { path = path
+                                    , status = FileHit
+                                    , cachedErrors =
+                                        fileCache
+                                            |> Dict.values
+                                            |> List.concatMap .errors
+                                    }
+
+                                else
+                                    { path = path, status = FileMiss, cachedErrors = [] }
+                    )
+
+        allHit =
+            List.all (\r -> r.status == FileHit) fileResults
+
+        staleFiles =
+            fileResults |> List.filter (\r -> r.status == FileMiss) |> List.map .path
+
+        cachedErrors =
+            fileResults |> List.filter (\r -> r.status == FileHit) |> List.concatMap .cachedErrors
+    in
+    if List.isEmpty (Dict.keys cache) then
+        ColdMiss (List.map .path files)
+
+    else if allHit then
+        FullCacheHit cachedErrors
+
+    else
+        PartialMiss { cachedErrors = cachedErrors, staleFiles = staleFiles }
+
+
+type FileStatus
+    = FileHit
+    | FileMiss
+
+
+{-| Update the cache with fresh results from a review run.
+Merges new results for re-evaluated files, keeps cached entries for others.
+-}
+updateCache :
+    CacheState
+    -> List { path : String, source : String }
+    -> List ReviewError
+    -> CacheState
+updateCache previousCache files errors =
+    let
+        errorsByFile =
+            errors
+                |> List.foldl
+                    (\err acc ->
+                        Dict.update err.filePath
+                            (\existing -> Just (err :: Maybe.withDefault [] existing))
+                            acc
+                    )
+                    Dict.empty
+    in
+    files
+        |> List.foldl
+            (\{ path, source } acc ->
+                let
+                    declarations =
+                        getDeclarationHashes source
+
+                    fileErrors =
+                        Dict.get path errorsByFile |> Maybe.withDefault []
+
+                    fileCache =
+                        mapErrorsToDeclarations declarations fileErrors
+                in
+                Dict.insert path fileCache acc
+            )
+            previousCache
 
 
 {-| Parse a source file on the HOST side and encode the AST as JSON.

@@ -20,6 +20,7 @@ suite =
         [ pureHelperTests
         , semanticCacheKeyTests
         , perDeclarationTests
+        , cacheDecisionTests
         ]
 
 
@@ -272,6 +273,218 @@ perDeclarationTests =
                     |> Maybe.map (.errors >> List.length)
                     |> Expect.equal (Just 1)
         ]
+
+
+cacheDecisionTests : Test
+cacheDecisionTests =
+    describe "cache decisions"
+        [ test "ColdMiss when cache is empty" <|
+            \_ ->
+                ReviewRunner.checkCache Dict.empty
+                    [ { path = "src/Foo.elm", source = fooSource } ]
+                    |> expectColdMiss
+        , test "FullCacheHit when no source changes" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource } ]
+
+                    errors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "Remove Debug.log" } ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+                in
+                ReviewRunner.checkCache cache files
+                    |> expectFullCacheHit 1
+        , test "FullCacheHit after whitespace-only change" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource } ]
+
+                    errors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "Remove Debug.log" } ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+
+                    -- Same code with extra blank lines
+                    reformattedFiles =
+                        [ { path = "src/Foo.elm", source = fooSourceReformatted } ]
+                in
+                ReviewRunner.checkCache cache reformattedFiles
+                    |> expectFullCacheHit 1
+        , test "PartialMiss when one file changes" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource }
+                        , { path = "src/Bar.elm", source = barSource }
+                        ]
+
+                    errors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "Remove Debug.log" }
+                        , { ruleName = "NoMissing", filePath = "src/Bar.elm", line = 3, column = 1, message = "Missing annotation" }
+                        ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+
+                    -- Change Foo, keep Bar
+                    changedFiles =
+                        [ { path = "src/Foo.elm", source = fooSourceChanged }
+                        , { path = "src/Bar.elm", source = barSource }
+                        ]
+                in
+                case ReviewRunner.checkCache cache changedFiles of
+                    ReviewRunner.PartialMiss { cachedErrors, staleFiles } ->
+                        Expect.all
+                            [ \_ -> Expect.equal [ "src/Foo.elm" ] staleFiles
+                            , \_ -> Expect.equal 1 (List.length cachedErrors) -- Bar's error cached
+                            , \_ ->
+                                cachedErrors
+                                    |> List.head
+                                    |> Maybe.map .filePath
+                                    |> Expect.equal (Just "src/Bar.elm")
+                            ]
+                            ()
+
+                    other ->
+                        Expect.fail ("Expected PartialMiss, got " ++ cacheDecisionToString other)
+        , test "PartialMiss: changing one declaration keeps others cached within same file" <|
+            \_ ->
+                let
+                    source =
+                        "module M exposing (..)\n\nfoo = 1\n\nbar = 2\n"
+
+                    files =
+                        [ { path = "src/M.elm", source = source } ]
+
+                    errors =
+                        [ { ruleName = "R1", filePath = "src/M.elm", line = 3, column = 1, message = "err in foo" }
+                        , { ruleName = "R2", filePath = "src/M.elm", line = 5, column = 1, message = "err in bar" }
+                        ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+
+                    -- Change only foo, bar stays the same
+                    changedSource =
+                        "module M exposing (..)\n\nfoo = 999\n\nbar = 2\n"
+
+                    changedFiles =
+                        [ { path = "src/M.elm", source = changedSource } ]
+                in
+                -- File has changed declarations, so it's a miss for the file
+                -- But the cache preserved per-declaration info
+                case ReviewRunner.checkCache cache changedFiles of
+                    ReviewRunner.PartialMiss { staleFiles } ->
+                        Expect.equal [ "src/M.elm" ] staleFiles
+
+                    ReviewRunner.ColdMiss _ ->
+                        Expect.fail "Should not be ColdMiss — cache exists"
+
+                    ReviewRunner.FullCacheHit _ ->
+                        Expect.fail "Should not be FullCacheHit — foo changed"
+        , test "updateCache then checkCache round-trips correctly" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/A.elm", source = "module A exposing (..)\n\na = 1\n" }
+                        , { path = "src/B.elm", source = "module B exposing (..)\n\nb = 2\n" }
+                        ]
+
+                    errors =
+                        [ { ruleName = "R", filePath = "src/A.elm", line = 3, column = 1, message = "e1" }
+                        , { ruleName = "R", filePath = "src/B.elm", line = 3, column = 1, message = "e2" }
+                        ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files errors
+                in
+                ReviewRunner.checkCache cache files
+                    |> expectFullCacheHit 2
+        , test "FullCacheHit preserves exact error content" <|
+            \_ ->
+                let
+                    files =
+                        [ { path = "src/Foo.elm", source = fooSource } ]
+
+                    originalErrors =
+                        [ { ruleName = "NoDebug.Log", filePath = "src/Foo.elm", line = 5, column = 5, message = "Remove Debug.log" } ]
+
+                    cache =
+                        ReviewRunner.updateCache Dict.empty files originalErrors
+                in
+                case ReviewRunner.checkCache cache files of
+                    ReviewRunner.FullCacheHit errors ->
+                        Expect.equal originalErrors errors
+
+                    other ->
+                        Expect.fail ("Expected FullCacheHit, got " ++ cacheDecisionToString other)
+        ]
+
+
+
+-- Cache test helpers
+
+
+expectColdMiss : ReviewRunner.CacheDecision -> Expect.Expectation
+expectColdMiss decision =
+    case decision of
+        ReviewRunner.ColdMiss _ ->
+            Expect.pass
+
+        other ->
+            Expect.fail ("Expected ColdMiss, got " ++ cacheDecisionToString other)
+
+
+expectFullCacheHit : Int -> ReviewRunner.CacheDecision -> Expect.Expectation
+expectFullCacheHit expectedErrorCount decision =
+    case decision of
+        ReviewRunner.FullCacheHit errors ->
+            Expect.equal expectedErrorCount (List.length errors)
+
+        other ->
+            Expect.fail ("Expected FullCacheHit with " ++ String.fromInt expectedErrorCount ++ " errors, got " ++ cacheDecisionToString other)
+
+
+cacheDecisionToString : ReviewRunner.CacheDecision -> String
+cacheDecisionToString d =
+    case d of
+        ReviewRunner.FullCacheHit errors ->
+            "FullCacheHit(" ++ String.fromInt (List.length errors) ++ " errors)"
+
+        ReviewRunner.PartialMiss { cachedErrors, staleFiles } ->
+            "PartialMiss(cached=" ++ String.fromInt (List.length cachedErrors) ++ ", stale=" ++ String.join "," staleFiles ++ ")"
+
+        ReviewRunner.ColdMiss files ->
+            "ColdMiss(" ++ String.join "," files ++ ")"
+
+
+
+-- Test fixtures
+
+
+fooSource : String
+fooSource =
+    "module Foo exposing (..)\n\nimport Debug\n\nfoo x =\n    Debug.log \"test\" x\n\nbar = 42\n"
+
+
+fooSourceReformatted : String
+fooSourceReformatted =
+    "module Foo exposing (..)\n\n\nimport Debug\n\n\nfoo x =\n    Debug.log \"test\" x\n\n\nbar =\n    42\n"
+
+
+fooSourceChanged : String
+fooSourceChanged =
+    "module Foo exposing (..)\n\nimport Debug\n\nfoo x =\n    Debug.log \"test\" (x + 1)\n\nbar = 42\n"
+
+
+barSource : String
+barSource =
+    "module Bar exposing (..)\n\nbar x y =\n    x + y\n"
 
 
 reviewElmJson : String
