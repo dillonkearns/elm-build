@@ -2121,6 +2121,15 @@ intercepts for the 3 marker functions:
 - finalCacheMarker: identity (cache extracted from result after eval)
 - createContextHashMarker: deep hash of context Value
 -}
+boolStr : Bool -> String
+boolStr b =
+    if b then
+        "True"
+
+    else
+        "False"
+
+
 buildReviewIntercepts :
     Dict String Types.Value
     -> FastDict.Dict String Types.Intercept
@@ -2175,6 +2184,67 @@ buildReviewIntercepts preloadedCaches =
 
                         _ ->
                             Types.EvOk Types.Unit
+                )
+          )
+        , ( "Review.Cache.Module.match"
+          , Types.Intercept
+                (\args _ _ ->
+                    case args of
+                        [ contentHash, inputContexts, Types.Custom _ [ Types.Record entryFields ], _ ] ->
+                            let
+                                entryContentHash =
+                                    FastDict.get "contentHash" entryFields
+                                        |> Maybe.withDefault Types.Unit
+
+                                entryInputContexts =
+                                    FastDict.get "inputContextHashes" entryFields
+                                        |> Maybe.withDefault Types.Unit
+
+                                contentMatch =
+                                    contentHash == entryContentHash
+
+                                contextMatch =
+                                    inputContexts == entryInputContexts
+                            in
+                            if contentMatch && contextMatch then
+                                Types.EvYield "log"
+                                    (Types.String "match: HIT")
+                                    (\_ -> Types.EvOk (Types.Bool True))
+
+                            else
+                                Types.EvYield "log"
+                                    (Types.String
+                                        ("match: MISS (content=" ++ boolStr contentMatch ++ ", context=" ++ boolStr contextMatch ++ ")")
+                                    )
+                                    (\_ -> Types.EvOk (Types.Bool False))
+
+                        _ ->
+                            -- Can't parse args — delegate to original
+                            Types.EvOk (Types.Bool False)
+                )
+          )
+        , ( "Review.Cache.ContextHash.sort"
+          , Types.Intercept
+                (\args _ _ ->
+                    case args of
+                        [ Types.List items ] ->
+                            -- Sort ContextHash values by their Int hash.
+                            -- This makes ComparableContextHash deterministic
+                            -- regardless of Dict.foldl order.
+                            let
+                                sortKey item =
+                                    case item of
+                                        Types.Custom _ [ Types.Int h ] ->
+                                            h
+
+                                        _ ->
+                                            0
+                            in
+                            Types.EvOk (Types.List (List.sortBy sortKey items))
+
+                        _ ->
+                            -- Identity fallback
+                            Types.EvOk (args |> List.head |> Maybe.withDefault Types.Unit)
                 )
           )
         ]
