@@ -342,13 +342,7 @@ reviewRunnerHelperSource =
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
         , "import Review.Rule as Rule"
-        , "import NoDebug.Log"
-        , "import NoDebug.TodoOrToString"
-        , "import NoExposingEverything"
-        , "import NoImportingEverything"
-        , "import NoMissingTypeAnnotation"
-        , "import NoMissingTypeAnnotationInLetIn"
-        , "import NoDeprecated"
+        , "import ReviewConfig"
         , ""
         , "runReview modules ="
         , "    let"
@@ -358,17 +352,8 @@ reviewRunnerHelperSource =
         , "                Err _ -> Project.addModule { path = mod.path, source = mod.source } proj"
         , "        project ="
         , "            List.foldl addParsed Project.new modules"
-        , "        rules ="
-        , "            [ NoDebug.Log.rule"
-        , "            , NoDebug.TodoOrToString.rule"
-        , "            , NoExposingEverything.rule"
-        , "            , NoImportingEverything.rule []"
-        , "            , NoMissingTypeAnnotation.rule"
-        , "            , NoMissingTypeAnnotationInLetIn.rule"
-        , "            , NoDeprecated.rule NoDeprecated.defaults"
-        , "            ]"
         , "        ( errors, _ ) ="
-        , "            Rule.review rules project"
+        , "            Rule.review ReviewConfig.config project"
         , "    in"
         , "    errors |> List.map formatError |> String.join \"\\n\""
         , ""
@@ -437,7 +422,7 @@ task config =
                             -- Semantic cache MISS — run interpreter
                             Cache.run { jobs = Nothing } config.buildDirectory
                                 (InterpreterProject.evalWithSourceOverrides reviewProject
-                                    { imports = [ "ReviewRunnerHelper" ]
+                                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
                                     , expression = expression
                                     , sourceOverrides = [ reviewRunnerHelperSource ]
                                     }
@@ -604,38 +589,15 @@ kernelPackages =
         ]
 
 
-{-| Packages to skip because they cause module name collisions
-(multiple packages expose `Util`, `Char.Extra`, etc.) in the
-interpreter's flat namespace. Only skip packages not needed
-for the rules we actually use.
+{-| Packages to skip because they have unsupported kernel code.
+Module name collisions (multiple packages exposing `Util` etc.)
+are a known limitation of the interpreter's flat namespace —
+projects with conflicting packages may need to exclude some rules.
 -}
 conflictingPackages : Set.Set String
 conflictingPackages =
     Set.fromList
-        [ -- Util collisions
-          "truqu/elm-review-nobooleancase"
-        , "SiriusStarr/elm-review-no-single-pattern-case"
-        , "SiriusStarr/elm-review-no-unsorted"
-        , "lue-bird/elm-review-equals-caseable"
-        , "lue-bird/elm-review-no-catch-all-for-specific-remaining-patterns"
-        , "lue-bird/elm-review-variables-between-case-of-access-in-cases"
-        , "lue-bird/elm-no-record-type-alias-constructor-function"
-
-        -- Char.Extra / other collisions
-        , "miniBill/elm-rope"
-        , "gampleman/elm-review-derive"
-        , "dillonkearns/elm-review-html-to-elm"
-        , "matzko/elm-review-limit-aliased-record-size"
-        , "sparksp/elm-review-camelcase"
-        , "sparksp/elm-review-imports"
-        , "sparksp/elm-review-ports"
-        , "miniBill/elm-review-no-broken-elm-parser-functions"
-        , "miniBill/elm-review-no-internal-imports"
-        , "miniBill/elm-review-validate-regexes"
-        , "folq/review-rgb-ranges"
-        , "SiriusStarr/elm-review-pipeline-styles"
-        , "vkfisher/elm-review-no-unsafe-division"
-        , "lue-bird/elm-review-documentation-code-snippet"
+        [
         ]
 
 
