@@ -1587,9 +1587,30 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                             ruleCacheDir =
                                 Path.toString config.buildDirectory ++ "/rule-value-cache"
 
-                            -- Yield handler: when finalCacheMarker yields, serialize cache to disk
+                            -- Yield handler
                             yieldHandler tag payload =
                                 case tag of
+                                    "log" ->
+                                        case payload of
+                                            Types.String msg ->
+                                                Do.do
+                                                    (File.rawFile (Path.toString config.buildDirectory ++ "/yield-log.txt")
+                                                        |> BackendTask.toResult
+                                                        |> BackendTask.andThen
+                                                            (\existing ->
+                                                                Script.writeFile
+                                                                    { path = Path.toString config.buildDirectory ++ "/yield-log.txt"
+                                                                    , body = (Result.withDefault "" existing) ++ msg ++ "\n"
+                                                                    }
+                                                                    |> BackendTask.allowFatal
+                                                            )
+                                                    )
+                                                <| \_ ->
+                                                BackendTask.succeed Types.Unit
+
+                                            _ ->
+                                                BackendTask.succeed Types.Unit
+
                                     "review-cache-write" ->
                                         case payload of
                                             Types.Record fields ->
@@ -1607,19 +1628,6 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                                                 )
                                                             |> Maybe.withDefault "unknown"
 
-                                                    ruleId =
-                                                        FastDict.get "ruleId" fields
-                                                            |> Maybe.andThen
-                                                                (\v ->
-                                                                    case v of
-                                                                        Types.Int i ->
-                                                                            Just i
-
-                                                                        _ ->
-                                                                            Nothing
-                                                                )
-                                                            |> Maybe.withDefault 0
-
                                                     cache =
                                                         FastDict.get "cache" fields
                                                             |> Maybe.withDefault Types.Unit
@@ -1628,7 +1636,7 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                                         ValueCodec.encodeValue cache
 
                                                     filePath =
-                                                        ruleCacheDir ++ "/" ++ ruleName ++ "-" ++ String.fromInt ruleId ++ ".json"
+                                                        ruleCacheDir ++ "/" ++ ruleName ++ ".json"
                                                 in
                                                 Do.do
                                                     (File.rawFile (Path.toString config.buildDirectory ++ "/yield-log.txt")
@@ -1646,7 +1654,7 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                                                 in
                                                                 Script.writeFile
                                                                     { path = Path.toString config.buildDirectory ++ "/yield-log.txt"
-                                                                    , body = prev ++ ruleName ++ "-" ++ String.fromInt ruleId ++ ": " ++ String.fromInt (String.length serialized) ++ " bytes\n"
+                                                                    , body = prev ++ ruleName ++ ": " ++ String.fromInt (String.length serialized) ++ " bytes\n"
                                                                     }
                                                                     |> BackendTask.allowFatal
                                                             )
@@ -2122,12 +2130,8 @@ buildReviewIntercepts preloadedCaches =
           , Types.Intercept
                 (\args _ _ ->
                     case args of
-                        [ Types.String ruleName, Types.Int ruleId, defaultCache ] ->
-                            let
-                                key =
-                                    ruleName ++ "-" ++ String.fromInt ruleId
-                            in
-                            case Dict.get key preloadedCaches of
+                        [ Types.String ruleName, _, defaultCache ] ->
+                            case Dict.get ruleName preloadedCaches of
                                 Just cached ->
                                     Types.EvOk cached
 
@@ -2135,7 +2139,6 @@ buildReviewIntercepts preloadedCaches =
                                     Types.EvOk defaultCache
 
                         _ ->
-                            -- Fallback: return last arg (identity behavior)
                             Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
                 )
           )
@@ -2143,14 +2146,12 @@ buildReviewIntercepts preloadedCaches =
           , Types.Intercept
                 (\args _ _ ->
                     case args of
-                        [ Types.String ruleName, Types.Int ruleId, cache ] ->
+                        [ Types.String ruleName, _, cache ] ->
                             -- YIELD the cache to the framework for disk persistence.
-                            -- The framework serializes it and resumes with the same cache.
                             Types.EvYield "review-cache-write"
                                 (Types.Record
                                     (FastDict.fromList
                                         [ ( "ruleName", Types.String ruleName )
-                                        , ( "ruleId", Types.Int ruleId )
                                         , ( "cache", cache )
                                         ]
                                     )
