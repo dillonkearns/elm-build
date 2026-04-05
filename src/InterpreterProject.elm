@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithValues, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithValues, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -1160,6 +1160,65 @@ prepareAndEvalWithValues (InterpreterProject project) { imports, expression, sou
                 Nothing ->
                     -- Fallback without values (can't inject without baseUserEnv)
                     Eval.Module.evalWithEnvFromFiles project.packageEnv newFiles (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+
+{-| Like prepareAndEval but with function intercepts.
+
+Intercepts are checked before normal function evaluation. Used for
+elm-review cache markers, memoization, and framework callbacks.
+-}
+prepareAndEvalWithIntercepts :
+    InterpreterProject
+    -> { imports : List String, expression : String, sourceOverrides : List String, intercepts : FastDict.Dict String Types.Intercept }
+    -> Result String Types.Value
+prepareAndEvalWithIntercepts (InterpreterProject project) { imports, expression, sourceOverrides, intercepts } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        parsedNewModules =
+            (sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parsedNewModules of
+        Err err ->
+            Err (formatError err)
+
+        Ok newFiles ->
+            let
+                -- Build sources list for evalWithIntercepts
+                { userSources } =
+                    prepareEvalSources (InterpreterProject project) { imports = imports, expression = expression }
+
+                allSources =
+                    let
+                        len =
+                            List.length userSources
+
+                        beforeWrapper =
+                            List.take (len - 1) userSources
+
+                        wrapper =
+                            List.drop (len - 1) userSources
+                    in
+                    beforeWrapper ++ sourceOverrides ++ wrapper
+            in
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    -- Fast path: baseUserEnv has all user modules pre-loaded.
+                    -- Only parse sourceOverrides + wrapper (small/new).
+                    Eval.Module.evalWithIntercepts baseEnv (sourceOverrides ++ [ wrapperSource ]) intercepts (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+                Nothing ->
+                    -- Fallback: parse everything from scratch
+                    Eval.Module.evalWithIntercepts project.packageEnv allSources intercepts (FunctionOrValue [] "results")
                         |> Result.mapError formatError
 
 

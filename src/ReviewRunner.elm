@@ -39,7 +39,9 @@ import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
 import Time
+import Eval.Expression
 import Types
+import ValueCodec
 
 
 type alias ReviewError =
@@ -1567,37 +1569,95 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                             )
 
                     else
-                        File.rawFile fpKeyPath
-                            |> BackendTask.toResult
-                            |> BackendTask.andThen
-                                (\keyResult ->
-                                    case keyResult of
-                                        Ok storedKey ->
-                                            if storedKey == fpCacheKey then
-                                                File.rawFile fpDataPath
-                                                    |> BackendTask.toResult
-                                                    |> BackendTask.andThen
-                                                        (\dataResult ->
-                                                            case dataResult of
-                                                                Ok cached ->
-                                                                    BackendTask.succeed cached
+                        -- Load any previously cached rule Values from disk
+                        Do.do (loadRuleCaches (Path.toString config.buildDirectory)) <| \preloadedCaches ->
+                        let
+                            intercepts =
+                                buildReviewIntercepts preloadedCaches
 
-                                                                Err _ ->
-                                                                    evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
-                                                        )
+                            -- Use runReviewCaching to get (errors, updatedRules) tuple
+                            moduleList =
+                                buildModuleListWithAst allModulesWithAst
 
-                                            else
-                                                evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
+                            cachingExpr =
+                                "ReviewRunnerHelper.runReviewCachingByIndices "
+                                    ++ "[ " ++ (fpIndices |> List.map String.fromInt |> String.join ", ") ++ " ] "
+                                    ++ moduleList
 
-                                        Err _ ->
-                                            evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
-                                )
-                            |> BackendTask.map
-                                (\fpOutput ->
-                                    [ moduleRuleOutput, importersResult.outputs, fpOutput ]
+                            result =
+                                InterpreterProject.prepareAndEvalWithIntercepts reviewProject
+                                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                    , expression = cachingExpr
+                                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                                    , intercepts = intercepts
+                                    }
+                        in
+                        case result of
+                            Ok (Types.Tuple (Types.String errorStr) updatedRules) ->
+                                -- Save the rule caches to disk for next run
+                                Do.do (saveRuleCaches (Path.toString config.buildDirectory) updatedRules) <| \_ ->
+                                -- Also save the string cache for fast path
+                                Do.do (Script.writeFile { path = fpKeyPath, body = fpCacheKey } |> BackendTask.allowFatal) <| \_ ->
+                                Do.do (Script.writeFile { path = fpDataPath, body = errorStr } |> BackendTask.allowFatal) <| \_ ->
+                                BackendTask.succeed
+                                    ([ moduleRuleOutput, importersResult.outputs, errorStr ]
                                         |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
                                         |> String.join "\n"
-                                )
+                                    )
+
+                            Ok (Types.String errorStr) ->
+                                -- Got string directly (fallback)
+                                Do.do (Script.writeFile { path = fpKeyPath, body = fpCacheKey } |> BackendTask.allowFatal) <| \_ ->
+                                Do.do (Script.writeFile { path = fpDataPath, body = errorStr } |> BackendTask.allowFatal) <| \_ ->
+                                BackendTask.succeed
+                                    ([ moduleRuleOutput, importersResult.outputs, errorStr ]
+                                        |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                        |> String.join "\n"
+                                    )
+
+                            Ok _ ->
+                                -- Still check the string-only cache path as fallback
+                                File.rawFile fpKeyPath
+                                    |> BackendTask.toResult
+                                    |> BackendTask.andThen
+                                        (\keyResult ->
+                                            case keyResult of
+                                                Ok storedKey ->
+                                                    if storedKey == fpCacheKey then
+                                                        File.rawFile fpDataPath
+                                                            |> BackendTask.toResult
+                                                            |> BackendTask.andThen
+                                                                (\dataResult ->
+                                                                    case dataResult of
+                                                                        Ok cached ->
+                                                                            BackendTask.succeed cached
+
+                                                                        Err _ ->
+                                                                            evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
+                                                                )
+
+                                                    else
+                                                        evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
+
+                                                Err _ ->
+                                                    evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
+                                        )
+                                    |> BackendTask.map
+                                        (\fpOutput ->
+                                            [ moduleRuleOutput, importersResult.outputs, fpOutput ]
+                                                |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                                |> String.join "\n"
+                                        )
+
+                            Err errStr ->
+                                -- Eval error — fall back to non-intercepted eval
+                                evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
+                                    |> BackendTask.map
+                                        (\fpOutput ->
+                                            [ moduleRuleOutput, importersResult.outputs, fpOutput ]
+                                                |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                                |> String.join "\n"
+                                        )
             )
 
 
@@ -1970,8 +2030,156 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
 OLD BODY END --}
 
 
-{-| Single-eval project rules: run all project rules in one interpreter call.
+{-| Build elm-review cache marker intercepts.
+
+Pre-loads any previously cached rule Values from disk, then builds
+intercepts for the 3 marker functions:
+- initialCacheMarker: returns loaded cache if available, else default
+- finalCacheMarker: identity (cache extracted from result after eval)
+- createContextHashMarker: deep hash of context Value
 -}
+buildReviewIntercepts :
+    Dict String Types.Value
+    -> FastDict.Dict String Types.Intercept
+buildReviewIntercepts preloadedCaches =
+    FastDict.fromList
+        [ ( "Review.Rule.initialCacheMarker"
+          , Types.Intercept
+                (\args _ _ ->
+                    case args of
+                        [ Types.String ruleName, Types.Int ruleId, defaultCache ] ->
+                            let
+                                key =
+                                    ruleName ++ "-" ++ String.fromInt ruleId
+                            in
+                            case Dict.get key preloadedCaches of
+                                Just cached ->
+                                    Types.EvOk cached
+
+                                Nothing ->
+                                    Types.EvOk defaultCache
+
+                        _ ->
+                            -- Fallback: return last arg (identity behavior)
+                            Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
+                )
+          )
+        , ( "Review.Rule.finalCacheMarker"
+          , Types.Intercept
+                (\args _ _ ->
+                    -- Identity — we extract caches from the returned updatedRules after eval
+                    case args of
+                        [ _, _, cache ] ->
+                            Types.EvOk cache
+
+                        _ ->
+                            Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
+                )
+          )
+        , ( "Review.Cache.ContextHash.createContextHashMarker"
+          , Types.Intercept
+                (\args _ _ ->
+                    case args of
+                        [ context ] ->
+                            -- Deep hash the context for cache key comparison
+                            Types.EvOk (Types.Int (Eval.Expression.deepHashValue context))
+
+                        _ ->
+                            Types.EvOk Types.Unit
+                )
+          )
+        ]
+
+
+{-| Load previously serialized rule cache Values from disk.
+Returns a Dict keyed by "ruleName-ruleId".
+-}
+loadRuleCaches : String -> BackendTask FatalError (Dict String Types.Value)
+loadRuleCaches buildDir =
+    let
+        cacheDir =
+            buildDir ++ "/rule-value-cache"
+    in
+    Glob.fromStringWithOptions
+        (let
+            o =
+                Glob.defaultOptions
+         in
+         { o | include = Glob.OnlyFiles }
+        )
+        (cacheDir ++ "/*.json")
+        |> BackendTask.toResult
+        |> BackendTask.map
+            (\result ->
+                case result of
+                    Ok files ->
+                        files
+
+                    Err _ ->
+                        []
+            )
+        |> BackendTask.andThen
+            (\files ->
+                files
+                    |> List.map
+                        (\filePath ->
+                            File.rawFile filePath
+                                |> BackendTask.toResult
+                                |> BackendTask.map
+                                    (\content ->
+                                        case content of
+                                            Ok json ->
+                                                ValueCodec.decodeValue json
+                                                    |> Maybe.map
+                                                        (\value ->
+                                                            let
+                                                                -- Extract key from filename: "RuleName-0.json" -> "RuleName-0"
+                                                                key =
+                                                                    filePath
+                                                                        |> String.split "/"
+                                                                        |> List.reverse
+                                                                        |> List.head
+                                                                        |> Maybe.withDefault ""
+                                                                        |> String.replace ".json" ""
+                                                            in
+                                                            Just ( key, value )
+                                                        )
+                                                    |> Maybe.withDefault Nothing
+
+                                            Err _ ->
+                                                Nothing
+                                    )
+                        )
+                    |> BackendTask.Extra.combine
+                    |> BackendTask.map
+                        (\results ->
+                            results
+                                |> List.filterMap identity
+                                |> Dict.fromList
+                        )
+            )
+
+
+{-| Save rule cache Values to disk after eval.
+Extracts cache data from the returned updatedRules Value.
+-}
+saveRuleCaches : String -> Types.Value -> BackendTask FatalError ()
+saveRuleCaches buildDir updatedRulesValue =
+    let
+        cacheDir =
+            buildDir ++ "/rule-value-cache"
+
+        -- The updatedRules is a List of Rule values. Each Rule contains
+        -- a ProjectRuleCache. We serialize the ENTIRE updatedRules value
+        -- as a single cache entry keyed by "all-rules".
+        serialized =
+            ValueCodec.encodeValue updatedRulesValue
+    in
+    Do.do (Script.exec "mkdir" [ "-p", cacheDir ]) <| \_ ->
+    Script.writeFile { path = cacheDir ++ "/all-rules.json", body = serialized }
+        |> BackendTask.allowFatal
+
+
 evalProjectRulesSingle :
     InterpreterProject
     -> List Int
