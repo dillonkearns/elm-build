@@ -88,6 +88,34 @@ pureHelperTests =
                     ReviewRunner.buildExpression []
                         |> Expect.equal "ReviewRunnerHelper.runReview []"
             ]
+        , describe "buildExpressionForRule"
+            [ test "rule 0 with one module" <|
+                \_ ->
+                    ReviewRunner.buildExpressionForRule 0
+                        [ { path = "src/A.elm", source = "a", astJson = "{}" } ]
+                        |> Expect.equal "ReviewRunnerHelper.runSingleRule 0 [ { path = \"src/A.elm\", source = \"a\", astJson = \"{}\" } ]"
+            , test "rule 2 with empty modules" <|
+                \_ ->
+                    ReviewRunner.buildExpressionForRule 2 []
+                        |> Expect.equal "ReviewRunnerHelper.runSingleRule 2 []"
+            ]
+        , describe "reviewRunnerHelperSource"
+            [ test "contains runSingleRule" <|
+                \_ ->
+                    ReviewRunner.reviewRunnerHelperSource
+                        |> String.contains "runSingleRule ruleIndex modules ="
+                        |> Expect.equal True
+            , test "contains ruleCount" <|
+                \_ ->
+                    ReviewRunner.reviewRunnerHelperSource
+                        |> String.contains "ruleCount = List.length ReviewConfig.config"
+                        |> Expect.equal True
+            , test "exposes runSingleRule and ruleCount" <|
+                \_ ->
+                    ReviewRunner.reviewRunnerHelperSource
+                        |> String.contains "exposing (ruleCount, runReview, runSingleRule)"
+                        |> Expect.equal True
+            ]
         , describe "parseReviewOutput"
             [ test "single error" <|
                 \_ ->

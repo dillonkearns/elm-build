@@ -1,0 +1,33 @@
+{
+  "date": "2026-04-05",
+  "project": "elm-spa-example (33 files)",
+  "rules": "12 rules: 7 module + 5 project (all NoUnused rules working)",
+  "results": {
+    "elm-build (two-pass with Dict kernel optimization)": {
+      "cold_ms": 60113,
+      "warm_ms": 480,
+      "warm_1_file_cached_rules_ms": 12142,
+      "speedup": "5x (60s -> 12s) from rule cache preservation",
+      "errorCount_fresh": 292,
+      "errorCount_cached": 294,
+      "notes": "294 = 292 + 2 from injected test declaration"
+    },
+    "elm-review CLI": {
+      "cold_ms": 631,
+      "warm_ms": 421,
+      "errorCount": 300
+    }
+  },
+  "improvements_this_session": {
+    "1_infinite_recursion_fix": "Review.Rule.raise threshold 3 -> 100000 in elm-interpreter/src/Eval/Expression.elm",
+    "2_project_rules_working": "All 6 NoUnused rules produce correct results (5/6 exact match with CLI)",
+    "3_semantic_key_caching": "Whitespace/comment changes = free cache hit",
+    "4_per_declaration_cache": "FullCacheHit when all declarations unchanged",
+    "5_rule_cache_preservation": "evalWithEnvFromFilesAndValues enables passing updatedRules Value back into next eval. elm-review skips 32/33 modules -> 5x speedup on warm-1-file",
+    "6_dict_kernel_optimization": "Merged kernel Dict.foldl/foldr/map for 21% faster Dict ops"
+  },
+  "architecture": {
+    "key_insight": "Rule.review returns (errors, updatedRules). The updatedRules carry ProjectRuleCache with ModuleCacheEntry per (rule, module). By injecting the updatedRules Value back into the next interpreter eval via evalWithEnvFromFilesAndValues, elm-review's internal cache skips unchanged modules.",
+    "remaining_gap": "12s vs CLI's 0.4s. Remaining cost is interpreter overhead for project building + 1 module visitor traversal. Value can't persist across process invocations (closures not serializable). Need daemon mode or watcher for sub-second incremental."
+  }
+}

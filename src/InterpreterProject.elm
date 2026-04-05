@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithValues, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -16,6 +16,7 @@ import BackendTask.Time
 import Cache exposing (FileOrDirectory)
 import DepGraph
 import Dict exposing (Dict)
+import FastDict
 import Coverage
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
@@ -998,6 +999,197 @@ prepareEvalSources (InterpreterProject project) { imports, expression } =
     { allSources = filteredSources ++ [ wrapperSource ]
     , userSources = userFilteredSources ++ [ wrapperSource ]
     }
+
+
+{-| Prepare and evaluate an expression, pure function without Cache.Monad.
+
+Uses baseUserEnv when available (skips re-parsing all user modules).
+Only parses sourceOverrides + the generated wrapper module.
+
+Useful when the caller manages caching externally (e.g. using semantic hash
+keys instead of content-based hashing).
+
+-}
+prepareAndEval :
+    InterpreterProject
+    -> { imports : List String, expression : String, sourceOverrides : List String }
+    -> Result String String
+prepareAndEval (InterpreterProject project) { imports, expression, sourceOverrides } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        -- Parse only sourceOverrides + wrapper (small, new each time).
+        -- User modules are already in baseUserEnv.
+        parsedNewModules =
+            (sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+
+        result =
+            case parsedNewModules of
+                Err err ->
+                    Err err
+
+                Ok newFiles ->
+                    case project.baseUserEnv of
+                        Just baseEnv ->
+                            -- Fast path: baseUserEnv already has all user modules.
+                            -- Only need to add sourceOverrides + wrapper.
+                            Eval.Module.evalWithEnvFromFiles baseEnv newFiles (FunctionOrValue [] "results")
+
+                        Nothing ->
+                            -- Fallback: parse everything from scratch
+                            let
+                                { userSources } =
+                                    prepareEvalSources (InterpreterProject project) { imports = imports, expression = expression }
+
+                                allSources =
+                                    let
+                                        len =
+                                            List.length userSources
+
+                                        beforeWrapper =
+                                            List.take (len - 1) userSources
+
+                                        wrapper =
+                                            List.drop (len - 1) userSources
+                                    in
+                                    beforeWrapper ++ sourceOverrides ++ wrapper
+                            in
+                            Eval.Module.evalWithEnv project.packageEnv allSources (FunctionOrValue [] "results")
+    in
+    formatEvalResult result
+
+
+{-| Like prepareAndEval but returns the raw interpreter Value.
+
+Useful when the expression returns structured data (e.g. a Tuple)
+that the caller needs to decompose.
+
+-}
+prepareAndEvalRaw :
+    InterpreterProject
+    -> { imports : List String, expression : String, sourceOverrides : List String }
+    -> Result String Types.Value
+prepareAndEvalRaw (InterpreterProject project) { imports, expression, sourceOverrides } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        parsedNewModules =
+            (sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parsedNewModules of
+        Err err ->
+            Err (formatError err)
+
+        Ok newFiles ->
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    Eval.Module.evalWithEnvFromFiles baseEnv newFiles (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+                Nothing ->
+                    let
+                        { userSources } =
+                            prepareEvalSources (InterpreterProject project) { imports = imports, expression = expression }
+
+                        allSources =
+                            let
+                                len =
+                                    List.length userSources
+
+                                beforeWrapper =
+                                    List.take (len - 1) userSources
+
+                                wrapper =
+                                    List.drop (len - 1) userSources
+                            in
+                            beforeWrapper ++ sourceOverrides ++ wrapper
+                    in
+                    Eval.Module.evalWithEnv project.packageEnv allSources (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+
+{-| Like prepareAndEval but with injected Values available in the expression.
+
+The injected values are available as local variables. Used to pass
+preserved interpreter state (like elm-review's updatedRules) into
+subsequent evaluations.
+
+-}
+prepareAndEvalWithValues :
+    InterpreterProject
+    -> { imports : List String, expression : String, sourceOverrides : List String, injectedValues : FastDict.Dict String Types.Value }
+    -> Result String Types.Value
+prepareAndEvalWithValues (InterpreterProject project) { imports, expression, sourceOverrides, injectedValues } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        parsedNewModules =
+            (sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parsedNewModules of
+        Err err ->
+            Err (formatError err)
+
+        Ok newFiles ->
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    Eval.Module.evalWithEnvFromFilesAndValues baseEnv newFiles injectedValues (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+                Nothing ->
+                    -- Fallback without values (can't inject without baseUserEnv)
+                    Eval.Module.evalWithEnvFromFiles project.packageEnv newFiles (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+
+formatEvalResult : Result Types.Error Types.Value -> Result String String
+formatEvalResult result =
+    case result of
+        Ok (Types.String s) ->
+            Ok s
+
+        Ok _ ->
+            Err "ERROR: Expected String result"
+
+        Err err ->
+            Err (formatError err)
+
+
+formatError : Types.Error -> String
+formatError err =
+    case err of
+        Types.ParsingError _ ->
+            "ERROR: Parsing error"
+
+        Types.EvalError evalErr ->
+            "ERROR: Eval error: "
+                ++ evalErrorKindToString evalErr.error
+                ++ " [module: "
+                ++ String.join "." evalErr.currentModule
+                ++ "] [stack: "
+                ++ (evalErr.callStack |> List.take 10 |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name) |> String.join " <- ")
+                ++ "]"
 
 
 

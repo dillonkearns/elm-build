@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, DeclarationCache, ReviewError, buildExpression, buildModuleRecord, checkCache, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, DeclarationCache, ReviewError, buildExpression, buildExpressionForRule, buildExpressionWithAst, buildModuleRecord, checkCache, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, parseReviewOutput, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -26,15 +26,19 @@ import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.File
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
+import FastDict
 import FatalError exposing (FatalError)
 import Json.Decode
 import FNV1a
 import Json.Encode
 import SemanticHash
+import BackendTask.Time
 import InterpreterProject exposing (InterpreterProject)
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
+import Time
+import Types
 
 
 type alias ReviewError =
@@ -592,6 +596,37 @@ encodeFileAsWire source =
             Nothing
 
 
+{-| Build expression to evaluate a single rule by index.
+Uses pre-parsed AST JSON modules.
+-}
+buildExpressionForRule : Int -> List { path : String, source : String, astJson : String } -> String
+buildExpressionForRule ruleIndex modules =
+    let
+        moduleRecords =
+            modules
+                |> List.map
+                    (\{ path, source, astJson } ->
+                        "{ path = \""
+                            ++ escapeElmString path
+                            ++ "\", source = \""
+                            ++ escapeElmString source
+                            ++ "\", astJson = \""
+                            ++ escapeElmString astJson
+                            ++ "\" }"
+                    )
+                |> String.join ", "
+
+        moduleList =
+            case modules of
+                [] ->
+                    "[]"
+
+                _ ->
+                    "[ " ++ moduleRecords ++ " ]"
+    in
+    "ReviewRunnerHelper.runSingleRule " ++ String.fromInt ruleIndex ++ " " ++ moduleList
+
+
 {-| Build an expression that passes pre-parsed AST JSON to the interpreter.
 Each module is encoded as `{ path : String, ast : String }` where `ast`
 is the JSON-encoded elm-syntax File.
@@ -658,25 +693,56 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (runReview)"
+        [ "module ReviewRunnerHelper exposing (ruleCount, runReview, runReviewCaching, runReviewWithCachedRules, runSingleRule)"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
         , "import Review.Rule as Rule"
         , "import ReviewConfig"
         , ""
-        , "runReview modules ="
+        , "buildProject modules ="
         , "    let"
         , "        addParsed mod proj ="
         , "            case Json.Decode.decodeString Elm.Syntax.File.decoder mod.astJson of"
         , "                Ok ast -> Project.addParsedModule { path = mod.path, source = mod.source, ast = ast } proj"
         , "                Err _ -> Project.addModule { path = mod.path, source = mod.source } proj"
-        , "        project ="
-        , "            List.foldl addParsed Project.new modules"
-        , "        ( errors, _ ) ="
-        , "            Rule.review ReviewConfig.config project"
+        , "    in"
+        , "    List.foldl addParsed Project.new modules"
+        , ""
+        , "runReview modules ="
+        , "    let"
+        , "        project = buildProject modules"
+        , "        ( errors, _ ) = Rule.review ReviewConfig.config project"
         , "    in"
         , "    errors |> List.map formatError |> String.join \"\\n\""
+        , ""
+        , "runReviewCaching modules ="
+        , "    let"
+        , "        project = buildProject modules"
+        , "        ( errors, updatedRules ) = Rule.review ReviewConfig.config project"
+        , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
+        , "    in"
+        , "    ( errorStr, updatedRules )"
+        , ""
+        , "runReviewWithCachedRules cachedRules modules ="
+        , "    let"
+        , "        project = buildProject modules"
+        , "        ( errors, updatedRules ) = Rule.review cachedRules project"
+        , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
+        , "    in"
+        , "    ( errorStr, updatedRules )"
+        , ""
+        , "runSingleRule ruleIndex modules ="
+        , "    case List.head (List.drop ruleIndex ReviewConfig.config) of"
+        , "        Just rule ->"
+        , "            let"
+        , "                project = buildProject modules"
+        , "                ( errors, _ ) = Rule.review [ rule ] project"
+        , "            in"
+        , "            errors |> List.map formatError |> String.join \"\\n\""
+        , "        Nothing -> \"\""
+        , ""
+        , "ruleCount = List.length ReviewConfig.config"
         , ""
         , "formatError err ="
         , "    let"
@@ -728,8 +794,8 @@ task config =
             reportErrors errors
 
         ColdMiss _ ->
-            -- No cache — evaluate everything
-            Do.do (loadAndEval config targetFileContents) <| \{ output, reviewProject } ->
+            -- No cache — two-pass evaluation to benchmark rule cache preservation
+            Do.do (loadAndEvalTwoPass config targetFileContents) <| \{ output } ->
             let
                 errors =
                     parseReviewOutput output
@@ -741,12 +807,9 @@ task config =
             reportErrors errors
 
         PartialMiss { cachedErrors, staleFiles } ->
-            -- Some files changed — re-evaluate only stale files
-            -- (For now, re-eval all files when any change — per-file eval
-            -- requires passing only stale files to Rule.review, which
-            -- would lose ModuleNameLookupTable for the others.
-            -- The cache still helps: unchanged files between runs are free.)
-            Do.do (loadAndEval config targetFileContents) <| \{ output, reviewProject } ->
+            -- Some files changed — semantic key determines if interpreter re-evals.
+            -- Per-declaration cache gives FullCacheHit on subsequent identical runs.
+            Do.do (loadAndEval config targetFileContents) <| \{ output } ->
             let
                 freshErrors =
                     parseReviewOutput output
@@ -759,22 +822,17 @@ task config =
 
 
 {-| Load the review project and evaluate Rule.review via the interpreter.
+
+Uses `prepareAndEvalRaw` with `runReviewCaching` to get both errors AND
+the updated rules Value (with elm-review's internal per-module cache).
+Returns the rules Value so the caller can pass it back on subsequent runs.
 -}
 loadAndEval :
     Config
     -> List { path : String, source : String }
     -> BackendTask FatalError { output : String, reviewProject : InterpreterProject }
 loadAndEval config targetFileContents =
-    Do.do
-        (InterpreterProject.loadWith
-            { projectDir = Path.path config.reviewDir
-            , skipPackages = Set.union kernelPackages conflictingPackages
-            , patchSource = patchSource
-            , extraSourceFiles = []
-            , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
-            }
-        )
-    <| \reviewProject ->
+    Do.do (loadReviewProject config) <| \reviewProject ->
     let
         modulesWithAst =
             targetFileContents
@@ -801,6 +859,283 @@ loadAndEval config targetFileContents =
                     |> BackendTask.allowFatal
                     |> BackendTask.map (\output -> { output = output, reviewProject = reviewProject })
             )
+
+
+{-| Two-pass evaluation: first pass warms elm-review's internal rule cache,
+second pass uses cached rules with a simulated file change.
+
+This is the proof-of-concept for Salsa-style rule cache preservation.
+Measures the time difference between fresh eval and cached-rule eval.
+-}
+loadAndEvalTwoPass :
+    Config
+    -> List { path : String, source : String }
+    -> BackendTask FatalError { output : String, reviewProject : InterpreterProject }
+loadAndEvalTwoPass config targetFileContents =
+    Do.do (loadReviewProject config) <| \reviewProject ->
+    let
+        modulesWithAst =
+            targetFileContents
+                |> List.filterMap
+                    (\{ path, source } ->
+                        encodeFileAsJson source
+                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
+                    )
+
+        moduleList =
+            buildModuleListWithAst modulesWithAst
+
+        -- Expression that returns (errorString, updatedRules) tuple
+        cachingExpression =
+            "ReviewRunnerHelper.runReviewCaching " ++ moduleList
+    in
+    -- PASS 1: Fresh evaluation, get (errors, rules) tuple
+    Do.do BackendTask.Time.now <| \t1 ->
+    let
+        pass1Result =
+            InterpreterProject.prepareAndEvalRaw reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = cachingExpression
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                }
+    in
+    case pass1Result of
+        Err errStr ->
+            Do.do (Script.log ("Pass 1 error: " ++ String.left 200 errStr)) <| \_ ->
+            BackendTask.succeed { output = errStr, reviewProject = reviewProject }
+
+        Ok (Types.Tuple (Types.String errorStr) rulesValue) ->
+            Do.do BackendTask.Time.now <| \t2 ->
+            Do.do (Script.log ("Pass 1 (fresh): " ++ String.fromInt (Time.posixToMillis t2 - Time.posixToMillis t1) ++ "ms, " ++ String.fromInt (List.length (parseReviewOutput errorStr)) ++ " errors")) <| \_ ->
+            -- PASS 2: Simulated file change — modify one file, use cached rules
+            let
+                -- Simulate a change to the first file by appending a declaration
+                changedModulesWithAst =
+                    case modulesWithAst of
+                        first :: rest ->
+                            let
+                                changedSource =
+                                    first.source ++ "\n\ntestBenchmarkInjected__ = 42\n"
+
+                                changedAstJson =
+                                    encodeFileAsJson changedSource
+                                        |> Maybe.withDefault first.astJson
+                            in
+                            { first | source = changedSource, astJson = changedAstJson } :: rest
+
+                        [] ->
+                            []
+
+                changedModuleList =
+                    buildModuleListWithAst changedModulesWithAst
+
+                -- Expression using cached rules
+                cachedExpression =
+                    "ReviewRunnerHelper.runReviewWithCachedRules cachedRules__ " ++ changedModuleList
+
+                injectedValues =
+                    FastDict.singleton "cachedRules__" rulesValue
+            in
+            Do.do BackendTask.Time.now <| \t3 ->
+            let
+                pass2Result =
+                    InterpreterProject.prepareAndEvalWithValues reviewProject
+                        { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                        , expression = cachedExpression
+                        , sourceOverrides = [ reviewRunnerHelperSource ]
+                        , injectedValues = injectedValues
+                        }
+            in
+            case pass2Result of
+                Ok (Types.Tuple (Types.String errorStr2) _) ->
+                    Do.do BackendTask.Time.now <| \t4 ->
+                    Do.do (Script.log ("Pass 2 (cached rules, 1 file changed): " ++ String.fromInt (Time.posixToMillis t4 - Time.posixToMillis t3) ++ "ms, " ++ String.fromInt (List.length (parseReviewOutput errorStr2)) ++ " errors")) <| \_ ->
+                    BackendTask.succeed { output = errorStr, reviewProject = reviewProject }
+
+                Ok (Types.String s) ->
+                    -- runReviewWithCachedRules returned string directly (error?)
+                    Do.do BackendTask.Time.now <| \t4 ->
+                    Do.do (Script.log ("Pass 2 returned String: " ++ String.left 100 s ++ " (" ++ String.fromInt (Time.posixToMillis t4 - Time.posixToMillis t3) ++ "ms)")) <| \_ ->
+                    BackendTask.succeed { output = errorStr, reviewProject = reviewProject }
+
+                Ok other ->
+                    Do.do (Script.log ("Pass 2 unexpected value type")) <| \_ ->
+                    BackendTask.succeed { output = errorStr, reviewProject = reviewProject }
+
+                Err errStr2 ->
+                    Do.do (Script.log ("Pass 2 error: " ++ String.left 200 errStr2)) <| \_ ->
+                    BackendTask.succeed { output = errorStr, reviewProject = reviewProject }
+
+        Ok _ ->
+            Do.do (Script.log "Pass 1: unexpected return type (expected Tuple)") <| \_ ->
+            -- Fallback: run normal eval
+            loadAndEval config targetFileContents
+
+
+{-| Build the module list literal for expressions with AST JSON.
+-}
+buildModuleListWithAst : List { path : String, source : String, astJson : String } -> String
+buildModuleListWithAst modules =
+    let
+        moduleRecords =
+            modules
+                |> List.map
+                    (\{ path, source, astJson } ->
+                        "{ path = \""
+                            ++ escapeElmString path
+                            ++ "\", source = \""
+                            ++ escapeElmString source
+                            ++ "\", astJson = \""
+                            ++ escapeElmString astJson
+                            ++ "\" }"
+                    )
+                |> String.join ", "
+    in
+    case modules of
+        [] ->
+            "[]"
+
+        _ ->
+            "[ " ++ moduleRecords ++ " ]"
+
+
+{-| Evaluate each rule independently with semantic-hash-based caching.
+
+Each rule gets its own `Cache.compute` keyed by a NARROW semantic hash:
+- All rules: keyed on full project semantic hash (all files)
+
+Future: module rules could be keyed per-file, project rules per-dependency-scope.
+For now, even with the same key, per-rule splitting means the interpreter runs
+each rule independently (smaller eval per call) and results compose.
+
+Uses `prepareAndEval` with `baseUserEnv` to skip re-parsing user modules.
+-}
+loadAndEvalPerRuleSemantic :
+    Config
+    -> Int
+    -> List { path : String, source : String }
+    -> BackendTask FatalError String
+loadAndEvalPerRuleSemantic config ruleCount targetFileContents =
+    Do.do (loadReviewProject config) <| \reviewProject ->
+    let
+        modulesWithAst =
+            targetFileContents
+                |> List.filterMap
+                    (\{ path, source } ->
+                        encodeFileAsJson source
+                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
+                    )
+
+        -- Global semantic key for the project (changes when any file changes)
+        projectSemanticKey =
+            computeSemanticKey targetFileContents
+
+        -- Hash of the review helper (changes when review config changes)
+        helperHash =
+            FNV1a.hash reviewRunnerHelperSource |> String.fromInt
+
+        -- Each rule evaluation: Cache.compute keyed per-rule + semantic hash
+        perRuleMonad : Cache.Monad Cache.FileOrDirectory
+        perRuleMonad =
+            List.range 0 (ruleCount - 1)
+                |> List.map
+                    (\ruleIndex ->
+                        let
+                            -- Per-rule cache key includes rule index + project semantic hash
+                            ruleKey =
+                                "rule-" ++ String.fromInt ruleIndex ++ "|" ++ projectSemanticKey ++ "|" ++ helperHash
+                        in
+                        Cache.do (Cache.writeFile ruleKey Cache.succeed) <| \ruleKeyHash ->
+                        Cache.compute [ "review-rule-" ++ String.fromInt ruleIndex ]
+                            ruleKeyHash
+                            (\() ->
+                                let
+                                    expression =
+                                        buildExpressionForRule ruleIndex modulesWithAst
+
+                                    result =
+                                        InterpreterProject.prepareAndEval reviewProject
+                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                            , expression = expression
+                                            , sourceOverrides = [ reviewRunnerHelperSource ]
+                                            }
+                                in
+                                case result of
+                                    Ok s ->
+                                        s
+
+                                    Err errStr ->
+                                        errStr
+                            )
+                        <| \hash ->
+                        Cache.succeed
+                            { filename = Path.path ("rule-" ++ String.fromInt ruleIndex)
+                            , hash = hash
+                            }
+                    )
+                |> Cache.sequence
+                |> Cache.andThen Cache.combine
+    in
+    Cache.run { jobs = Nothing } config.buildDirectory perRuleMonad
+        |> BackendTask.andThen
+            (\cacheResult ->
+                List.range 0 (ruleCount - 1)
+                    |> List.map
+                        (\ruleIndex ->
+                            File.rawFile
+                                (Path.toString cacheResult.output ++ "/rule-" ++ String.fromInt ruleIndex)
+                                |> BackendTask.allowFatal
+                        )
+                    |> BackendTask.Extra.combine
+                    |> BackendTask.map
+                        (\outputs ->
+                            outputs
+                                |> List.filter
+                                    (\s ->
+                                        not (String.isEmpty (String.trim s))
+                                            && not (String.startsWith "ERROR:" s)
+                                    )
+                                |> String.join "\n"
+                        )
+            )
+
+
+{-| Get the number of rules in ReviewConfig.config by evaluating through the interpreter.
+-}
+getRuleCount : Config -> BackendTask FatalError Int
+getRuleCount config =
+    Do.do (loadReviewProject config) <| \reviewProject ->
+    Cache.run { jobs = Nothing } config.buildDirectory
+        (InterpreterProject.evalWithSourceOverrides reviewProject
+            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+            , expression = "String.fromInt ReviewRunnerHelper.ruleCount"
+            , sourceOverrides = [ reviewRunnerHelperSource ]
+            }
+            Cache.succeed
+        )
+        |> BackendTask.andThen
+            (\cacheResult ->
+                File.rawFile (Path.toString cacheResult.output)
+                    |> BackendTask.allowFatal
+                    |> BackendTask.map
+                        (\s ->
+                            String.toInt (String.trim s)
+                                |> Maybe.withDefault 0
+                        )
+            )
+
+
+{-| Load the review project (shared between loadAndEval and loadAndEvalPerRule).
+-}
+loadReviewProject : Config -> BackendTask FatalError InterpreterProject
+loadReviewProject config =
+    InterpreterProject.loadWith
+        { projectDir = Path.path config.reviewDir
+        , skipPackages = Set.union kernelPackages conflictingPackages
+        , patchSource = patchSource
+        , extraSourceFiles = []
+        , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
+        }
 
 
 {-| Write the per-declaration cache to disk.
@@ -953,7 +1288,30 @@ projects with conflicting packages may need to exclude some rules.
 conflictingPackages : Set.Set String
 conflictingPackages =
     Set.fromList
-        [
+        [ -- Util collisions
+          "truqu/elm-review-nobooleancase"
+        , "SiriusStarr/elm-review-no-single-pattern-case"
+        , "SiriusStarr/elm-review-no-unsorted"
+        , "lue-bird/elm-review-equals-caseable"
+        , "lue-bird/elm-review-no-catch-all-for-specific-remaining-patterns"
+        , "lue-bird/elm-review-variables-between-case-of-access-in-cases"
+        , "lue-bird/elm-no-record-type-alias-constructor-function"
+
+        -- Char.Extra / other collisions
+        , "miniBill/elm-rope"
+        , "gampleman/elm-review-derive"
+        , "dillonkearns/elm-review-html-to-elm"
+        , "matzko/elm-review-limit-aliased-record-size"
+        , "sparksp/elm-review-camelcase"
+        , "sparksp/elm-review-imports"
+        , "sparksp/elm-review-ports"
+        , "miniBill/elm-review-no-broken-elm-parser-functions"
+        , "miniBill/elm-review-no-internal-imports"
+        , "miniBill/elm-review-validate-regexes"
+        , "folq/review-rgb-ranges"
+        , "SiriusStarr/elm-review-pipeline-styles"
+        , "vkfisher/elm-review-no-unsafe-division"
+        , "lue-bird/elm-review-documentation-code-snippet"
         ]
 
 
