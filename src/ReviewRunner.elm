@@ -1245,6 +1245,25 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                             |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
                     )
 
+        -- Per-file aspect hashes for narrow project rule keys
+        allFileAspectHashes : Dict String SemanticHash.FileAspectHashes
+        allFileAspectHashes =
+            allFileContents
+                |> List.map
+                    (\{ path, source } ->
+                        ( path, SemanticHash.computeAspectHashesFromSource source )
+                    )
+                |> Dict.fromList
+
+        depGraph : DepGraph.Graph
+        depGraph =
+            DepGraph.buildGraph
+                { sourceDirectories = []
+                , files =
+                    allFileContents
+                        |> List.map (\{ path, source } -> { filePath = path, content = source })
+                }
+
         moduleRules =
             ruleInfo |> List.filter (\r -> r.ruleType == ModuleRule)
 
@@ -1354,7 +1373,7 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
             )
         |> BackendTask.andThen
             (\moduleRuleOutput ->
-                -- Step 2: Project rules on full project
+                -- Step 2: Project rules — grouped into one eval, disk-cached
                 if List.isEmpty projectRules then
                     BackendTask.succeed moduleRuleOutput
 
