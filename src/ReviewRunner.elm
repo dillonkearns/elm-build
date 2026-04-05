@@ -365,21 +365,13 @@ computeSemanticKey files =
                 |> List.map
                     (\{ path, source } ->
                         let
-                            index =
-                                SemanticHash.buildIndexFromSource source
-
-                            -- Combine all declaration hashes for this file
-                            declHashes =
-                                index
-                                    |> Dict.toList
-                                    |> List.sortBy Tuple.first
-                                    |> List.map
-                                        (\( name, info ) ->
-                                            name ++ ":" ++ info.semanticHash
-                                        )
-                                    |> String.join ","
+                            -- Use FileAspectHashes.fullHash which covers ALL AST aspects:
+                            -- expressions, declarations, imports, exports, custom types.
+                            -- This ensures import-only and export-only changes are detected.
+                            aspects =
+                                SemanticHash.computeAspectHashesFromSource source
                         in
-                        path ++ "|" ++ declHashes
+                        path ++ "|" ++ aspects.fullHash
                     )
     in
     perFileHashes
@@ -538,11 +530,14 @@ checkCache cache files =
 
                             Just fileCache ->
                                 let
-                                    -- Exclude __module__ from comparison (it has no semantic hash)
+                                    -- Exclude __module__ and __fileAspects__ from declaration comparison
                                     fileCacheDecls =
-                                        Dict.remove "__module__" fileCache
+                                        fileCache
+                                            |> Dict.remove "__module__"
+                                            |> Dict.remove "__fileAspects__"
 
-                                    allMatch =
+                                    -- Check declaration hashes match
+                                    declsMatch =
                                         Dict.foldl
                                             (\name hash acc ->
                                                 acc
@@ -553,6 +548,18 @@ checkCache cache files =
                                             )
                                             (Dict.size currentHashes == Dict.size fileCacheDecls)
                                             currentHashes
+
+                                    -- Also check file-level aspects (imports, exports, custom types)
+                                    currentFullHash =
+                                        (SemanticHash.computeAspectHashesFromSource source).fullHash
+
+                                    cachedFullHash =
+                                        Dict.get "__fileAspects__" fileCache
+                                            |> Maybe.map .semanticHash
+                                            |> Maybe.withDefault ""
+
+                                    allMatch =
+                                        declsMatch && (currentFullHash == cachedFullHash)
                                 in
                                 if allMatch then
                                     { path = path
@@ -623,8 +630,17 @@ updateCache previousCache files errors =
 
                     fileCache =
                         mapErrorsToDeclarations declarations fileErrors
+
+                    -- Store full file aspect hash for detecting non-declaration changes
+                    fullHash =
+                        (SemanticHash.computeAspectHashesFromSource source).fullHash
+
+                    fileCacheWithAspects =
+                        Dict.insert "__fileAspects__"
+                            { semanticHash = fullHash, errors = [] }
+                            fileCache
                 in
-                Dict.insert path fileCache acc
+                Dict.insert path fileCacheWithAspects acc
             )
             previousCache
 
