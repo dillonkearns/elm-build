@@ -20,7 +20,7 @@ import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
-import Dict
+import Dict exposing (Dict)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.File
@@ -243,7 +243,7 @@ getDeclarationHashes source =
         Ok file ->
             let
                 index =
-                    SemanticHash.buildIndexFromFile file
+                    SemanticHash.buildIndexFromSource source
 
                 rangeMap : Dict String Range
                 rangeMap =
@@ -376,16 +376,20 @@ checkCache cache files =
 
                             Just fileCache ->
                                 let
+                                    -- Exclude __module__ from comparison (it has no semantic hash)
+                                    fileCacheDecls =
+                                        Dict.remove "__module__" fileCache
+
                                     allMatch =
                                         Dict.foldl
                                             (\name hash acc ->
                                                 acc
-                                                    && (Dict.get name fileCache
+                                                    && (Dict.get name fileCacheDecls
                                                             |> Maybe.map (\entry -> entry.semanticHash == hash)
                                                             |> Maybe.withDefault False
                                                        )
                                             )
-                                            (Dict.size currentHashes == Dict.size fileCache)
+                                            (Dict.size currentHashes == Dict.size fileCacheDecls)
                                             currentHashes
                                 in
                                 if allMatch then
@@ -694,7 +698,73 @@ reviewRunnerHelperSource =
 
 task : Config -> BackendTask FatalError ()
 task config =
+    let
+        declCachePath =
+            Path.toString config.buildDirectory ++ "/review-decl-cache.json"
+    in
     Do.do (ensureReviewDeps config.reviewDir) <| \_ ->
+    -- Load previous per-declaration cache from disk
+    Do.do
+        (File.rawFile declCachePath
+            |> BackendTask.toResult
+            |> BackendTask.map
+                (\result ->
+                    result
+                        |> Result.toMaybe
+                        |> Maybe.andThen decodeCacheState
+                        |> Maybe.withDefault Dict.empty
+                )
+        )
+    <| \previousCache ->
+    Do.do (resolveTargetFiles config) <| \targetFiles ->
+    Do.do (readTargetFiles targetFiles) <| \targetFileContents ->
+    let
+        decision =
+            checkCache previousCache targetFileContents
+    in
+    case decision of
+        FullCacheHit errors ->
+            -- All declarations cached — skip interpreter entirely
+            reportErrors errors
+
+        ColdMiss _ ->
+            -- No cache — evaluate everything
+            Do.do (loadAndEval config targetFileContents) <| \{ output, reviewProject } ->
+            let
+                errors =
+                    parseReviewOutput output
+
+                newCache =
+                    updateCache Dict.empty targetFileContents errors
+            in
+            Do.do (persistCache declCachePath newCache) <| \_ ->
+            reportErrors errors
+
+        PartialMiss { cachedErrors, staleFiles } ->
+            -- Some files changed — re-evaluate only stale files
+            -- (For now, re-eval all files when any change — per-file eval
+            -- requires passing only stale files to Rule.review, which
+            -- would lose ModuleNameLookupTable for the others.
+            -- The cache still helps: unchanged files between runs are free.)
+            Do.do (loadAndEval config targetFileContents) <| \{ output, reviewProject } ->
+            let
+                freshErrors =
+                    parseReviewOutput output
+
+                newCache =
+                    updateCache previousCache targetFileContents freshErrors
+            in
+            Do.do (persistCache declCachePath newCache) <| \_ ->
+            reportErrors freshErrors
+
+
+{-| Load the review project and evaluate Rule.review via the interpreter.
+-}
+loadAndEval :
+    Config
+    -> List { path : String, source : String }
+    -> BackendTask FatalError { output : String, reviewProject : InterpreterProject }
+loadAndEval config targetFileContents =
     Do.do
         (InterpreterProject.loadWith
             { projectDir = Path.path config.reviewDir
@@ -705,12 +775,7 @@ task config =
             }
         )
     <| \reviewProject ->
-    Do.do (resolveTargetFiles config) <| \targetFiles ->
-    Do.do (readTargetFiles targetFiles) <| \targetFileContents ->
     let
-        semanticKey =
-            computeSemanticKey targetFileContents
-
         modulesWithAst =
             targetFileContents
                 |> List.filterMap
@@ -721,65 +786,39 @@ task config =
 
         expression =
             buildExpressionWithAst modulesWithAst
-
-        semanticCachePath =
-            Path.toString config.buildDirectory ++ "/review-" ++ semanticKey ++ ".result"
     in
-    Do.do
-        (File.rawFile semanticCachePath
-            |> BackendTask.toResult
-            |> BackendTask.andThen
-                (\cachedResult ->
-                    case cachedResult of
-                        Ok cached ->
-                            -- Semantic cache HIT — no interpreter eval needed
-                            BackendTask.succeed cached
-
-                        Err _ ->
-                            -- Semantic cache MISS — run interpreter
-                            Cache.run { jobs = Nothing } config.buildDirectory
-                                (InterpreterProject.evalWithSourceOverrides reviewProject
-                                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                    , expression = expression
-                                    , sourceOverrides = [ reviewRunnerHelperSource ]
-                                    }
-                                    Cache.succeed
-                                )
-                                |> BackendTask.andThen
-                                    (\cacheResult ->
-                                        File.rawFile (Path.toString cacheResult.output)
-                                            |> BackendTask.allowFatal
-                                            |> BackendTask.andThen
-                                                (\output ->
-                                                    -- Write semantic cache entry
-                                                    Script.writeFile
-                                                        { path = semanticCachePath
-                                                        , body = output
-                                                        }
-                                                        |> BackendTask.allowFatal
-                                                        |> BackendTask.map (\_ -> output)
-                                                )
-                                    )
-                )
+    Cache.run { jobs = Nothing } config.buildDirectory
+        (InterpreterProject.evalWithSourceOverrides reviewProject
+            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+            , expression = expression
+            , sourceOverrides = [ reviewRunnerHelperSource ]
+            }
+            Cache.succeed
         )
-    <| \output ->
-    let
-        errors =
-            if String.startsWith "ERROR:" output then
-                []
-
-            else
-                parseReviewOutput output
-    in
-    if String.startsWith "ERROR:" output then
-        BackendTask.fail
-            (FatalError.build
-                { title = "ELM-REVIEW ERROR"
-                , body = String.dropLeft 7 output |> String.left 500
-                }
+        |> BackendTask.andThen
+            (\cacheResult ->
+                File.rawFile (Path.toString cacheResult.output)
+                    |> BackendTask.allowFatal
+                    |> BackendTask.map (\output -> { output = output, reviewProject = reviewProject })
             )
 
-    else if List.isEmpty errors then
+
+{-| Write the per-declaration cache to disk.
+-}
+persistCache : String -> CacheState -> BackendTask FatalError ()
+persistCache path cache =
+    Script.writeFile
+        { path = path
+        , body = encodeCacheState cache
+        }
+        |> BackendTask.allowFatal
+
+
+{-| Report errors and exit with appropriate code.
+-}
+reportErrors : List ReviewError -> BackendTask FatalError ()
+reportErrors errors =
+    if List.isEmpty errors then
         Script.log (Ansi.Color.fontColor Ansi.Color.brightGreen "No errors found!")
 
     else
