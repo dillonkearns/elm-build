@@ -729,7 +729,7 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (ruleCount, ruleNames, runReview, runReviewCaching, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
+        [ "module ReviewRunnerHelper exposing (buildProject, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
@@ -764,6 +764,15 @@ reviewRunnerHelperSource =
         , "    let"
         , "        project = buildProject modules"
         , "        ( errors, updatedRules ) = Rule.review cachedRules project"
+        , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
+        , "    in"
+        , "    ( errorStr, updatedRules )"
+        , ""
+        , "runReviewCachingByIndices indices modules ="
+        , "    let"
+        , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
+        , "        project = buildProject modules"
+        , "        ( errors, updatedRules ) = Rule.review selectedRules project"
         , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
         , "    in"
         , "    ( errorStr, updatedRules )"
@@ -1123,46 +1132,12 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
                                 )
                     )
 
-        -- Project rules: ONE Cache.compute for ALL project rules together
-        -- (one interpreter call instead of N separate calls)
-        projectRuleMonads =
-            if List.isEmpty projectRules then
-                []
-
-            else
-                let
-                    prIndices =
-                        projectRules |> List.map .index
-
-                    prCacheKey =
-                        "pr-all|" ++ helperHash ++ "|" ++ (prIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ projectSemanticKey
-                in
-                [ Cache.do (Cache.writeFile prCacheKey Cache.succeed) <| \keyHash ->
-                  Cache.compute [ "pr-all" ]
-                    keyHash
-                    (\() ->
-                        case
-                            InterpreterProject.prepareAndEval reviewProject
-                                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                , expression = buildExpressionForRules prIndices modulesWithAst
-                                , sourceOverrides = [ reviewRunnerHelperSource ]
-                                }
-                        of
-                            Ok s -> s
-                            Err e -> e
-                    )
-                  <| \hash ->
-                  Cache.succeed
-                    { filename = Path.path "pr-all"
-                    , hash = hash
-                    }
-                ]
-
         allMonads =
-            (moduleRuleMonads ++ projectRuleMonads)
+            moduleRuleMonads
                 |> Cache.sequence
                 |> Cache.andThen Cache.combine
     in
+    -- Step 1: Run module rules via Cache.compute (per-file, disk-cached)
     Cache.run { jobs = Nothing } config.buildDirectory allMonads
         |> BackendTask.andThen
             (\cacheResult ->
@@ -1179,18 +1154,8 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
                                         )
                                         modulesWithAst
                                 )
-
-                    prFiles =
-                        if List.isEmpty projectRules then
-                            []
-
-                        else
-                            [ File.rawFile
-                                (Path.toString cacheResult.output ++ "/pr-all")
-                                |> BackendTask.allowFatal
-                            ]
                 in
-                (mrFiles ++ prFiles)
+                mrFiles
                     |> BackendTask.Extra.combine
                     |> BackendTask.map
                         (\outputs ->
@@ -1202,6 +1167,63 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
                                     )
                                 |> String.join "\n"
                         )
+            )
+        |> BackendTask.andThen
+            (\moduleRuleOutput ->
+                -- Step 2: Project rules — two-pass with Value injection
+                if List.isEmpty projectRules then
+                    BackendTask.succeed moduleRuleOutput
+
+                else
+                    let
+                        prIndices =
+                            projectRules |> List.map .index
+
+                        prCacheKey =
+                            "pr-all|" ++ helperHash ++ "|" ++ (prIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ projectSemanticKey
+
+                        prCacheKeyPath =
+                            Path.toString config.buildDirectory ++ "/pr-cache.key"
+
+                        prCacheDataPath =
+                            Path.toString config.buildDirectory ++ "/pr-cache.txt"
+                    in
+                    -- Check project rule disk cache
+                    File.rawFile prCacheKeyPath
+                        |> BackendTask.toResult
+                        |> BackendTask.andThen
+                            (\keyResult ->
+                                case keyResult of
+                                    Ok storedKey ->
+                                        if storedKey == prCacheKey then
+                                            File.rawFile prCacheDataPath
+                                                |> BackendTask.toResult
+                                                |> BackendTask.andThen
+                                                    (\dataResult ->
+                                                        case dataResult of
+                                                            Ok cachedPrErrors ->
+                                                                BackendTask.succeed cachedPrErrors
+
+                                                            Err _ ->
+                                                                evalProjectRulesSingle reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                                    )
+
+                                        else
+                                            evalProjectRulesSingle reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+
+                                    Err _ ->
+                                        evalProjectRulesSingle reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                            )
+                        |> BackendTask.map
+                            (\prOutput ->
+                                let
+                                    combined =
+                                        [ moduleRuleOutput, prOutput ]
+                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                            |> String.join "\n"
+                                in
+                                combined
+                            )
             )
 
 
@@ -1361,8 +1383,144 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
 OLD BODY END --}
 
 
-{-| Format a ReviewError back into the pipe-delimited line format for caching.
+{-| Single-eval project rules: run all project rules in one interpreter call.
 -}
+evalProjectRulesSingle :
+    InterpreterProject
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> String
+    -> String
+    -> String
+    -> BackendTask FatalError String
+evalProjectRulesSingle reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
+    let
+        result =
+            InterpreterProject.prepareAndEval reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = buildExpressionForRules prIndices modulesWithAst
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                }
+
+        output =
+            case result of
+                Ok s ->
+                    s
+
+                Err e ->
+                    e
+    in
+    Do.do
+        (Script.writeFile { path = cacheKeyPath, body = cacheKey } |> BackendTask.allowFatal)
+    <| \_ ->
+    Do.do
+        (Script.writeFile { path = cacheDataPath, body = output } |> BackendTask.allowFatal)
+    <| \_ ->
+    BackendTask.succeed output
+
+
+{-| Two-pass project rule evaluation with Value injection (kept for reference).
+
+Pass 1: Run all project rules with runReviewCaching to get (errors, updatedRules).
+Pass 2: Re-run with cached rules on the same modules. elm-review's internal
+ModuleCacheEntry skips unchanged modules (32/33 on warm-1-file).
+
+The pass 2 result is the one we use (it has the warm cache benefit).
+Both passes store errors to disk cache.
+-}
+evalProjectRulesTwoPass :
+    Config
+    -> InterpreterProject
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> String
+    -> String
+    -> String
+    -> BackendTask FatalError String
+evalProjectRulesTwoPass config reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
+    let
+        moduleList =
+            buildModuleListWithAst modulesWithAst
+
+        -- Use ReviewRunnerHelper.runReviewCaching which returns (errorStr, updatedRules)
+        -- but only for the selected project rule indices
+        indexList =
+            "[ " ++ (prIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+
+        -- Expression: select rules by index, build project, review, return (errors, rules) tuple
+        cachingExpr =
+            "ReviewRunnerHelper.runReviewCachingByIndices " ++ indexList ++ " " ++ moduleList
+    in
+    Do.do BackendTask.Time.now <| \t1 ->
+    let
+        pass1Result =
+            InterpreterProject.prepareAndEvalRaw reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = cachingExpr
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                }
+    in
+    case pass1Result of
+        Ok (Types.Tuple (Types.String errorStr) rulesValue) ->
+            Do.do BackendTask.Time.now <| \t2 ->
+            Do.do (Script.log ("  project rules pass 1: " ++ String.fromInt (Time.posixToMillis t2 - Time.posixToMillis t1) ++ "ms")) <| \_ ->
+            -- Pass 2: re-eval with cached rules (elm-review skips unchanged modules)
+            let
+                cachedExpr =
+                    "ReviewRunnerHelper.runReviewWithCachedRules cachedRules__ " ++ moduleList
+
+                pass2Result =
+                    InterpreterProject.prepareAndEvalWithValues reviewProject
+                        { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                        , expression = cachedExpr
+                        , sourceOverrides = [ reviewRunnerHelperSource ]
+                        , injectedValues = FastDict.singleton "cachedRules__" rulesValue
+                        }
+            in
+            case pass2Result of
+                Ok (Types.Tuple (Types.String errorStr2) _) ->
+                    Do.do BackendTask.Time.now <| \t3 ->
+                    Do.do (Script.log ("  project rules pass 2 (cached): " ++ String.fromInt (Time.posixToMillis t3 - Time.posixToMillis t2) ++ "ms")) <| \_ ->
+                    -- Cache the pass 2 result (warm)
+                    Do.do
+                        (Script.writeFile { path = cacheKeyPath, body = cacheKey }
+                            |> BackendTask.allowFatal
+                        )
+                    <| \_ ->
+                    Do.do
+                        (Script.writeFile { path = cacheDataPath, body = errorStr2 }
+                            |> BackendTask.allowFatal
+                        )
+                    <| \_ ->
+                    BackendTask.succeed errorStr2
+
+                _ ->
+                    -- Pass 2 failed, use pass 1 result
+                    Do.do
+                        (Script.writeFile { path = cacheKeyPath, body = cacheKey } |> BackendTask.allowFatal)
+                    <| \_ ->
+                    Do.do
+                        (Script.writeFile { path = cacheDataPath, body = errorStr } |> BackendTask.allowFatal)
+                    <| \_ ->
+                    BackendTask.succeed errorStr
+
+        Ok (Types.String errorStr) ->
+            -- Got string directly (no tuple), store as-is
+            Do.do
+                (Script.writeFile { path = cacheKeyPath, body = cacheKey } |> BackendTask.allowFatal)
+            <| \_ ->
+            Do.do
+                (Script.writeFile { path = cacheDataPath, body = errorStr } |> BackendTask.allowFatal)
+            <| \_ ->
+            BackendTask.succeed errorStr
+
+        Ok _ ->
+            BackendTask.succeed ""
+
+        Err errStr ->
+            BackendTask.succeed errStr
+
+
 formatErrorLine : ReviewError -> String
 formatErrorLine err =
     "RULE:" ++ err.ruleName ++ "|FILE:" ++ err.filePath ++ "|LINE:" ++ String.fromInt err.line ++ "|COL:" ++ String.fromInt err.column ++ "|MSG:" ++ err.message
