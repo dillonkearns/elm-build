@@ -833,6 +833,110 @@ narrowCacheKeyTests =
                 in
                 ReviewRunner.narrowCacheKey profile "src/Foo.elm" before emptyHashes emptyGraph
                     |> Expect.equal (ReviewRunner.narrowCacheKey profile "src/Foo.elm" after emptyHashes emptyGraph)
+        , test "NoUnused.Exports (ImportersOf): change in non-importer does NOT change key" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoUnused.Exports"
+
+                    -- File A is the one we're computing the key for
+                    fileAHashes =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module A exposing (foo)\n\nimport B\n\nfoo = 1\n"
+
+                    -- File B imports A
+                    fileBHashes =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module B exposing (..)\n\nimport A\n\nbar = A.foo\n"
+
+                    -- File C does NOT import A
+                    fileCBefore =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module C exposing (..)\n\nbaz = 1\n"
+
+                    fileCAfter =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module C exposing (..)\n\nbaz = 999\n"
+
+                    files =
+                        [ { filePath = "src/A.elm", content = "module A exposing (foo)\n\nimport B\n\nfoo = 1\n" }
+                        , { filePath = "src/B.elm", content = "module B exposing (..)\n\nimport A\n\nbar = A.foo\n" }
+                        , { filePath = "src/C.elm", content = "module C exposing (..)\n\nbaz = 1\n" }
+                        ]
+
+                    graph =
+                        DepGraph.buildGraph { sourceDirectories = [ "src" ], files = files }
+
+                    allHashesBefore =
+                        Dict.fromList
+                            [ ( "src/A.elm", fileAHashes )
+                            , ( "src/B.elm", fileBHashes )
+                            , ( "src/C.elm", fileCBefore )
+                            ]
+
+                    allHashesAfter =
+                        Dict.fromList
+                            [ ( "src/A.elm", fileAHashes )
+                            , ( "src/B.elm", fileBHashes )
+                            , ( "src/C.elm", fileCAfter )
+                            ]
+
+                    keyBefore =
+                        ReviewRunner.narrowCacheKey profile "src/A.elm" fileAHashes allHashesBefore graph
+
+                    keyAfter =
+                        ReviewRunner.narrowCacheKey profile "src/A.elm" fileAHashes allHashesAfter graph
+                in
+                -- Changing C (which doesn't import A) should NOT change A's key
+                keyBefore
+                    |> Expect.equal keyAfter
+        , test "NoUnused.Exports (ImportersOf): change in importer DOES change key" <|
+            \_ ->
+                let
+                    profile =
+                        ReviewRunner.profileForRule "NoUnused.Exports"
+
+                    fileAHashes =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module A exposing (foo)\n\nimport B\n\nfoo = 1\n"
+
+                    fileBBefore =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module B exposing (..)\n\nimport A\n\nbar = A.foo\n"
+
+                    fileBAfter =
+                        SemanticHash.computeAspectHashesFromSource
+                            "module B exposing (..)\n\nimport A\n\nbar = A.foo + 1\n"
+
+                    files =
+                        [ { filePath = "src/A.elm", content = "module A exposing (foo)\n\nimport B\n\nfoo = 1\n" }
+                        , { filePath = "src/B.elm", content = "module B exposing (..)\n\nimport A\n\nbar = A.foo\n" }
+                        ]
+
+                    graph =
+                        DepGraph.buildGraph { sourceDirectories = [ "src" ], files = files }
+
+                    allHashesBefore =
+                        Dict.fromList
+                            [ ( "src/A.elm", fileAHashes )
+                            , ( "src/B.elm", fileBBefore )
+                            ]
+
+                    allHashesAfter =
+                        Dict.fromList
+                            [ ( "src/A.elm", fileAHashes )
+                            , ( "src/B.elm", fileBAfter )
+                            ]
+
+                    keyBefore =
+                        ReviewRunner.narrowCacheKey profile "src/A.elm" fileAHashes allHashesBefore graph
+
+                    keyAfter =
+                        ReviewRunner.narrowCacheKey profile "src/A.elm" fileAHashes allHashesAfter graph
+                in
+                -- Changing B (which imports A) SHOULD change A's key
+                keyBefore
+                    |> Expect.notEqual keyAfter
         , test "unknown rule: conservative, body change DOES change key" <|
             \_ ->
                 let

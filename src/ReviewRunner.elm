@@ -998,9 +998,9 @@ task config =
             reportErrors errors
 
         ColdMiss _ ->
-            -- No cache — run monolithic eval, then split results per-rule to disk
+            -- No cache — treat all files as stale (same code path as PartialMiss)
             Do.do (getRuleInfo config) <| \ruleInfo ->
-            Do.do (loadAndEvalHybrid config ruleInfo targetFileContents) <| \output ->
+            Do.do (loadAndEvalHybridPartial config ruleInfo targetFileContents targetFileContents []) <| \output ->
             let
                 errors =
                     parseReviewOutput output
@@ -1258,7 +1258,7 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
         depGraph : DepGraph.Graph
         depGraph =
             DepGraph.buildGraph
-                { sourceDirectories = []
+                { sourceDirectories = config.sourceDirs
                 , files =
                     allFileContents
                         |> List.map (\{ path, source } -> { filePath = path, content = source })
@@ -1373,55 +1373,231 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
             )
         |> BackendTask.andThen
             (\moduleRuleOutput ->
-                -- Step 2: Project rules — grouped into one eval, disk-cached
+                -- Step 2: Project rules — split by profile into two groups:
+                -- Group A (ImportersOf): per-file narrow keys, skip if all hit
+                -- Group B (FullProject): global key, always re-eval on any change
                 if List.isEmpty projectRules then
                     BackendTask.succeed moduleRuleOutput
 
                 else
                     let
-                        prIndices =
-                            projectRules |> List.map .index
+                        importersOfRules =
+                            projectRules
+                                |> List.filter
+                                    (\rule ->
+                                        case (profileForRule rule.name).crossModuleDep of
+                                            ImportersOf ->
+                                                True
 
-                        prCacheKey =
-                            "pr-all|" ++ helperHash ++ "|" ++ (prIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ projectSemanticKey
+                                            _ ->
+                                                False
+                                    )
 
-                        prCacheKeyPath =
-                            Path.toString config.buildDirectory ++ "/pr-cache.key"
+                        fullProjectRules =
+                            projectRules
+                                |> List.filter
+                                    (\rule ->
+                                        case (profileForRule rule.name).crossModuleDep of
+                                            ImportersOf ->
+                                                False
 
-                        prCacheDataPath =
-                            Path.toString config.buildDirectory ++ "/pr-cache.txt"
+                                            _ ->
+                                                True
+                                    )
+
+                        prCacheDir =
+                            Path.toString config.buildDirectory ++ "/pr-per-file"
+
+                        -- Combined profile for ImportersOf rules only
+                        importersProfile =
+                            importersOfRules
+                                |> List.foldl
+                                    (\rule acc ->
+                                        let
+                                            p =
+                                                profileForRule rule.name
+                                        in
+                                        { acc
+                                            | expressionDep = acc.expressionDep || p.expressionDep
+                                            , declarationNameDep = acc.declarationNameDep || p.declarationNameDep
+                                            , importDep = acc.importDep || p.importDep
+                                            , exposingDep = acc.exposingDep || p.exposingDep
+                                            , customTypeDep = acc.customTypeDep || p.customTypeDep
+                                        }
+                                    )
+                                    { expressionDep = False, declarationNameDep = False, importDep = False, exposingDep = False, customTypeDep = False, crossModuleDep = ImportersOf }
+
+                        -- Per-file narrow keys for ImportersOf rules
+                        importersPerFileKeys =
+                            allFileContents
+                                |> List.map
+                                    (\file ->
+                                        let
+                                            fileHashes =
+                                                Dict.get file.path allFileAspectHashes
+                                                    |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
+                                        in
+                                        { path = file.path
+                                        , narrowKey =
+                                            "prf-io|" ++ helperHash ++ "|"
+                                                ++ (importersOfRules |> List.map (.index >> String.fromInt) |> String.join ",")
+                                                ++ "|" ++ narrowCacheKey importersProfile file.path fileHashes allFileAspectHashes depGraph
+                                        }
+                                    )
                     in
-                    File.rawFile prCacheKeyPath
-                        |> BackendTask.toResult
-                        |> BackendTask.andThen
-                            (\keyResult ->
-                                case keyResult of
-                                    Ok storedKey ->
-                                        if storedKey == prCacheKey then
-                                            File.rawFile prCacheDataPath
+                    -- Check ImportersOf per-file caches
+                    Do.do (Script.exec "mkdir" [ "-p", prCacheDir ]) <| \_ ->
+                    Do.do
+                        (if List.isEmpty importersOfRules then
+                            BackendTask.succeed { allHit = True, outputs = "" }
+
+                         else
+                            Do.do
+                                (importersPerFileKeys
+                                    |> List.map
+                                        (\{ path, narrowKey } ->
+                                            let
+                                                safePath =
+                                                    path |> String.replace "/" "_"
+                                            in
+                                            File.rawFile (prCacheDir ++ "/" ++ safePath ++ ".key")
                                                 |> BackendTask.toResult
-                                                |> BackendTask.andThen
-                                                    (\dataResult ->
-                                                        case dataResult of
-                                                            Ok cached ->
-                                                                BackendTask.succeed cached
+                                                |> BackendTask.map
+                                                    (\result ->
+                                                        case result of
+                                                            Ok storedKey ->
+                                                                { path = path, hit = storedKey == narrowKey }
 
                                                             Err _ ->
-                                                                evalProjectRulesSingle reviewProject prIndices allModulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                                                { path = path, hit = False }
                                                     )
+                                        )
+                                    |> BackendTask.Extra.combine
+                                )
+                            <| \checks ->
+                            if List.all .hit checks then
+                                -- All ImportersOf per-file caches valid
+                                Do.do
+                                    (importersPerFileKeys
+                                        |> List.map
+                                            (\{ path } ->
+                                                File.rawFile (prCacheDir ++ "/" ++ (path |> String.replace "/" "_") ++ ".txt")
+                                                    |> BackendTask.allowFatal
+                                            )
+                                        |> BackendTask.Extra.combine
+                                    )
+                                <| \cached ->
+                                BackendTask.succeed
+                                    { allHit = True
+                                    , outputs =
+                                        cached
+                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                                            |> String.join "\n"
+                                    }
 
-                                        else
-                                            evalProjectRulesSingle reviewProject prIndices allModulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                            else
+                                -- Some ImportersOf files missed — eval ImportersOf rules
+                                let
+                                    ioIndices =
+                                        importersOfRules |> List.map .index
 
-                                    Err _ ->
-                                        evalProjectRulesSingle reviewProject prIndices allModulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                    result =
+                                        InterpreterProject.prepareAndEval reviewProject
+                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                            , expression = buildExpressionForRules ioIndices allModulesWithAst
+                                            , sourceOverrides = [ reviewRunnerHelperSource ]
+                                            }
+
+                                    ioOutput =
+                                        case result of
+                                            Ok s -> s
+                                            Err e -> e
+
+                                    ioErrors =
+                                        parseReviewOutput ioOutput
+                                in
+                                -- Write per-file caches for ImportersOf rules
+                                Do.do
+                                    (importersPerFileKeys
+                                        |> List.map
+                                            (\{ path, narrowKey } ->
+                                                let
+                                                    safePath =
+                                                        path |> String.replace "/" "_"
+
+                                                    fileErrors =
+                                                        ioErrors
+                                                            |> List.filter (\err -> err.filePath == path)
+                                                            |> List.map formatErrorLine
+                                                            |> String.join "\n"
+                                                in
+                                                Script.writeFile { path = prCacheDir ++ "/" ++ safePath ++ ".key", body = narrowKey }
+                                                    |> BackendTask.allowFatal
+                                                    |> BackendTask.andThen
+                                                        (\_ ->
+                                                            Script.writeFile { path = prCacheDir ++ "/" ++ safePath ++ ".txt", body = fileErrors }
+                                                                |> BackendTask.allowFatal
+                                                        )
+                                            )
+                                        |> BackendTask.Extra.combine
+                                    )
+                                <| \_ ->
+                                BackendTask.succeed { allHit = False, outputs = ioOutput }
+                        )
+                    <| \importersResult ->
+                    -- Now handle FullProject rules (always re-eval on any change)
+                    let
+                        fpIndices =
+                            fullProjectRules |> List.map .index
+
+                        fpCacheKey =
+                            "pr-fp|" ++ helperHash ++ "|" ++ (fpIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ projectSemanticKey
+
+                        fpKeyPath =
+                            Path.toString config.buildDirectory ++ "/pr-fp-cache.key"
+
+                        fpDataPath =
+                            Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
+                    in
+                    if List.isEmpty fullProjectRules then
+                        BackendTask.succeed
+                            ([ moduleRuleOutput, importersResult.outputs ]
+                                |> List.filter (not << String.isEmpty)
+                                |> String.join "\n"
                             )
-                        |> BackendTask.map
-                            (\prOutput ->
-                                [ moduleRuleOutput, prOutput ]
-                                    |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
-                                    |> String.join "\n"
-                            )
+
+                    else
+                        File.rawFile fpKeyPath
+                            |> BackendTask.toResult
+                            |> BackendTask.andThen
+                                (\keyResult ->
+                                    case keyResult of
+                                        Ok storedKey ->
+                                            if storedKey == fpCacheKey then
+                                                File.rawFile fpDataPath
+                                                    |> BackendTask.toResult
+                                                    |> BackendTask.andThen
+                                                        (\dataResult ->
+                                                            case dataResult of
+                                                                Ok cached ->
+                                                                    BackendTask.succeed cached
+
+                                                                Err _ ->
+                                                                    evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
+                                                        )
+
+                                            else
+                                                evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
+
+                                        Err _ ->
+                                            evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
+                                )
+                            |> BackendTask.map
+                                (\fpOutput ->
+                                    [ moduleRuleOutput, importersResult.outputs, fpOutput ]
+                                        |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                        |> String.join "\n"
+                                )
             )
 
 
