@@ -86,6 +86,20 @@ type alias AnalyzedTargetFile =
     }
 
 
+type alias ProjectCacheMetadata =
+    { schemaVersion : String
+    , helperHash : String
+    , fileHashes : Dict String String
+    }
+
+
+type alias ProjectEvalOutputCache =
+    { keyPath : String
+    , dataPath : String
+    , key : String
+    }
+
+
 cacheSchemaVersion : String
 cacheSchemaVersion =
     "review-runner-v4"
@@ -1095,6 +1109,119 @@ decodeFileAnalysisCache json =
         |> Result.toMaybe
 
 
+encodeProjectCacheMetadata : ProjectCacheMetadata -> String
+encodeProjectCacheMetadata metadata =
+    Json.Encode.object
+        [ ( "schemaVersion", Json.Encode.string metadata.schemaVersion )
+        , ( "helperHash", Json.Encode.string metadata.helperHash )
+        , ( "fileHashes"
+          , metadata.fileHashes
+                |> Dict.toList
+                |> Json.Encode.list
+                    (\( filePath, sourceHash ) ->
+                        Json.Encode.object
+                            [ ( "file", Json.Encode.string filePath )
+                            , ( "sourceHash", Json.Encode.string sourceHash )
+                            ]
+                    )
+          )
+        ]
+        |> Json.Encode.encode 0
+
+
+decodeProjectCacheMetadata : String -> Maybe ProjectCacheMetadata
+decodeProjectCacheMetadata json =
+    let
+        fileHashDecoder =
+            Json.Decode.map2 Tuple.pair
+                (Json.Decode.field "file" Json.Decode.string)
+                (Json.Decode.field "sourceHash" Json.Decode.string)
+    in
+    Json.Decode.decodeString
+        (Json.Decode.map3
+            (\schemaVersion helperHash fileHashes ->
+                { schemaVersion = schemaVersion
+                , helperHash = helperHash
+                , fileHashes = fileHashes
+                }
+            )
+            (Json.Decode.field "schemaVersion" Json.Decode.string)
+            (Json.Decode.field "helperHash" Json.Decode.string)
+            (Json.Decode.field "fileHashes" (Json.Decode.list fileHashDecoder) |> Json.Decode.map Dict.fromList)
+        )
+        json
+        |> Result.toMaybe
+
+
+projectCacheMetadataFor : String -> List AnalyzedTargetFile -> ProjectCacheMetadata
+projectCacheMetadataFor helperHash files =
+    { schemaVersion = cacheSchemaVersion
+    , helperHash = helperHash
+    , fileHashes =
+        files
+            |> List.map (\file -> ( file.path, file.analysis.sourceHash ))
+            |> Dict.fromList
+    }
+
+
+projectCacheShapeMatches : ProjectCacheMetadata -> ProjectCacheMetadata -> Bool
+projectCacheShapeMatches expected actual =
+    expected.schemaVersion == actual.schemaVersion
+        && expected.helperHash == actual.helperHash
+        && (expected.fileHashes |> Dict.keys |> Set.fromList)
+        == (actual.fileHashes |> Dict.keys |> Set.fromList)
+
+
+persistProjectCacheMetadata : String -> ProjectCacheMetadata -> BackendTask FatalError ()
+persistProjectCacheMetadata buildDir metadata =
+    Script.writeFile
+        { path = buildDir ++ "/project-cache-meta.json"
+        , body = encodeProjectCacheMetadata metadata
+        }
+        |> BackendTask.allowFatal
+
+
+loadProjectCache : String -> ProjectCacheMetadata -> BackendTask FatalError (Maybe Types.Value)
+loadProjectCache buildDir expectedMetadata =
+    let
+        metadataPath =
+            buildDir ++ "/project-cache-meta.json"
+
+        projectPath =
+            buildDir ++ "/project-cache.json"
+    in
+    File.rawFile metadataPath
+        |> BackendTask.toResult
+        |> BackendTask.andThen
+            (\metadataResult ->
+                case metadataResult of
+                    Ok metadataJson ->
+                        case decodeProjectCacheMetadata metadataJson of
+                            Just actualMetadata ->
+                                if projectCacheShapeMatches expectedMetadata actualMetadata then
+                                    File.rawFile projectPath
+                                        |> BackendTask.toResult
+                                        |> BackendTask.map
+                                            (\projectResult ->
+                                                case projectResult of
+                                                    Ok projectJson ->
+                                                        ValueCodec.decodeValue projectJson
+
+                                                    Err _ ->
+                                                        Nothing
+                                            )
+
+                                else
+                                    BackendTask.succeed Nothing
+
+                            Nothing ->
+                                BackendTask.succeed Nothing
+
+                    Err _ ->
+                        BackendTask.succeed Nothing
+            )
+
+
 analyzeSourceFile : String -> Maybe FileAnalysis
 analyzeSourceFile source =
     case Elm.Parser.parseToFile source of
@@ -1309,6 +1436,11 @@ buildExpressionForRule ruleIndex modules =
     "ReviewRunnerHelper.runSingleRule " ++ String.fromInt ruleIndex ++ " " ++ moduleList
 
 
+ruleCacheValueKey : String -> Int -> String
+ruleCacheValueKey ruleName ruleId =
+    ruleName ++ "-" ++ String.fromInt ruleId
+
+
 {-| Build an expression that passes pre-parsed AST JSON to the interpreter.
 Each module is encoded as `{ path : String, ast : String }` where `ast`
 is the JSON-encoded elm-syntax File.
@@ -1394,7 +1526,7 @@ reviewRunnerHelperSource =
         , "runReviewCachingWithProject indices modules ="
         , "    let"
         , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
-        , "        project = buildProject modules"
+        , "        project = buildProject modules |> projectCacheMarker"
         , "        ( errors, updatedRules ) = Rule.review selectedRules project"
         , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
         , "    in"
@@ -1420,6 +1552,7 @@ reviewRunnerHelperSource =
         , "            )"
         , "            cachedProj"
         , "            modules"
+        , "            |> projectCacheMarker"
         , "        ( errors, updatedRules ) = Rule.review selectedRules project"
         , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
         , "    in"
@@ -2203,8 +2336,11 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
                                     ioOutput =
                                         case result of
-                                            Ok s -> s
-                                            Err e -> e
+                                            Ok s ->
+                                                s
+
+                                            Err e ->
+                                                e
 
                                     ioErrors =
                                         parseReviewOutput ioOutput
@@ -2360,8 +2496,11 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
                                     doOutput =
                                         case doResult of
-                                            Ok s -> s
-                                            Err e -> e
+                                            Ok s ->
+                                                s
+
+                                            Err e ->
+                                                e
 
                                     doErrors =
                                         parseReviewOutput doOutput
@@ -2466,238 +2605,25 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             )
 
                     else
-                        -- Load cached rule Values AND cached Project from disk
-                        Do.do (loadRuleCaches (Path.toString config.buildDirectory)) <| \preloadedCaches ->
-                        let
-                            intercepts =
-                                buildReviewIntercepts preloadedCaches
-
-                            moduleList =
-                                buildModuleListWithAst allModulesWithAst
-
-                            indexList =
-                                "[ " ++ (fpIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
-
-                            cachingExpr =
-                                "ReviewRunnerHelper.runReviewCachingWithProject "
-                                    ++ indexList ++ " " ++ moduleList
-
-                            injectedValues =
-                                FastDict.empty
-
-                            ruleCacheDir =
-                                Path.toString config.buildDirectory ++ "/rule-value-cache"
-
-                            -- Yield handler
-                            yieldHandler tag payload =
-                                case tag of
-                                    "log" ->
-                                        case payload of
-                                            Types.String msg ->
-                                                Do.do
-                                                    (File.rawFile (Path.toString config.buildDirectory ++ "/yield-log.txt")
-                                                        |> BackendTask.toResult
-                                                        |> BackendTask.andThen
-                                                            (\existing ->
-                                                                Script.writeFile
-                                                                    { path = Path.toString config.buildDirectory ++ "/yield-log.txt"
-                                                                    , body = (Result.withDefault "" existing) ++ msg ++ "\n"
-                                                                    }
-                                                                    |> BackendTask.allowFatal
-                                                            )
-                                                    )
-                                                <| \_ ->
-                                                BackendTask.succeed Types.Unit
-
-                                            _ ->
-                                                BackendTask.succeed Types.Unit
-
-                                    "review-cache-write" ->
-                                        case payload of
-                                            Types.Record fields ->
-                                                let
-                                                    ruleName =
-                                                        FastDict.get "ruleName" fields
-                                                            |> Maybe.andThen
-                                                                (\v ->
-                                                                    case v of
-                                                                        Types.String s ->
-                                                                            Just s
-
-                                                                        _ ->
-                                                                            Nothing
-                                                                )
-                                                            |> Maybe.withDefault "unknown"
-
-                                                    cache =
-                                                        FastDict.get "cache" fields
-                                                            |> Maybe.withDefault Types.Unit
-
-                                                    serialized =
-                                                        ValueCodec.encodeValue cache
-
-                                                    filePath =
-                                                        ruleCacheDir ++ "/" ++ ruleName ++ ".json"
-                                                in
-                                                Do.do
-                                                    (File.rawFile (Path.toString config.buildDirectory ++ "/yield-log.txt")
-                                                        |> BackendTask.toResult
-                                                        |> BackendTask.andThen
-                                                            (\existing ->
-                                                                let
-                                                                    prev =
-                                                                        case existing of
-                                                                            Ok s ->
-                                                                                s
-
-                                                                            Err _ ->
-                                                                                ""
-                                                                in
-                                                                Script.writeFile
-                                                                    { path = Path.toString config.buildDirectory ++ "/yield-log.txt"
-                                                                    , body = prev ++ ruleName ++ ": " ++ String.fromInt (String.length serialized) ++ " bytes\n"
-                                                                    }
-                                                                    |> BackendTask.allowFatal
-                                                            )
-                                                    )
-                                                <| \_ ->
-                                                Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
-                                                Do.do (Script.writeFile { path = filePath, body = serialized } |> BackendTask.allowFatal) <| \_ ->
-                                                BackendTask.succeed Types.Unit
-
-                                            _ ->
-                                                BackendTask.succeed Types.Unit
-
-                                    "project-cache" ->
-                                        let
-                                            serializedProject =
-                                                ValueCodec.encodeValue payload
-
-                                            projectPath =
-                                                Path.toString config.buildDirectory ++ "/project-cache.json"
-                                        in
-                                        Do.do (Script.writeFile { path = projectPath, body = serializedProject } |> BackendTask.allowFatal) <| \_ ->
-                                        BackendTask.succeed Types.Unit
-
-                                    other ->
-                                        Do.do
-                                            (File.rawFile (Path.toString config.buildDirectory ++ "/yield-log.txt")
-                                                |> BackendTask.toResult
-                                                |> BackendTask.andThen
-                                                    (\existing ->
-                                                        Script.writeFile
-                                                            { path = Path.toString config.buildDirectory ++ "/yield-log.txt"
-                                                            , body = (Result.withDefault "" existing) ++ "UNKNOWN yield: " ++ other ++ "\n"
-                                                            }
-                                                            |> BackendTask.allowFatal
-                                                    )
-                                            )
-                                        <| \_ ->
-                                        BackendTask.succeed Types.Unit
-                        in
-                        Do.do
-                            (InterpreterProject.prepareAndEvalWithYield reviewProject
-                                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                , expression = cachingExpr
-                                , sourceOverrides = [ reviewRunnerHelperSource ]
-                                , intercepts = intercepts
-                                , injectedValues = injectedValues
+                        evalProjectRulesWithWarmState
+                            config
+                            reviewProject
+                            helperHash
+                            fpIndices
+                            allFileContents
+                            staleFileContents
+                            (Just
+                                { keyPath = fpKeyPath
+                                , dataPath = fpDataPath
+                                , key = fpCacheKey
                                 }
-                                yieldHandler
                             )
-                        <| \result ->
-                        let
-                            handleSuccess errorStr =
-                                Do.do (Script.writeFile { path = fpKeyPath, body = fpCacheKey } |> BackendTask.allowFatal) <| \_ ->
-                                Do.do (Script.writeFile { path = fpDataPath, body = errorStr } |> BackendTask.allowFatal) <| \_ ->
-                                BackendTask.succeed
-                                    ([ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, errorStr ]
+                            |> BackendTask.map
+                                (\fpOutput ->
+                                    [ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, fpOutput ]
                                         |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
                                         |> String.join "\n"
-                                    )
-                        in
-                        case result of
-                            Ok (Types.Tuple (Types.String errorStr) _) ->
-                                handleSuccess errorStr
-
-                            Ok (Types.String errorStr) ->
-                                Do.do (Script.writeFile { path = fpKeyPath, body = fpCacheKey } |> BackendTask.allowFatal) <| \_ ->
-                                Do.do (Script.writeFile { path = fpDataPath, body = errorStr } |> BackendTask.allowFatal) <| \_ ->
-                                BackendTask.succeed
-                                    ([ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, errorStr ]
-                                        |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
-                                        |> String.join "\n"
-                                    )
-
-                            Ok otherValue ->
-                                -- Debug: write the result type to a file
-                                let
-                                    typeStr =
-                                        case otherValue of
-                                            Types.Triple _ _ _ ->
-                                                "Triple (non-string first)"
-
-                                            Types.Tuple _ _ ->
-                                                "Tuple (non-string first)"
-
-                                            Types.Record _ ->
-                                                "Record"
-
-                                            Types.Custom ref _ ->
-                                                "Custom " ++ ref.name
-
-                                            _ ->
-                                                "Other"
-                                in
-                                Do.do
-                                    (Script.writeFile
-                                        { path = Path.toString config.buildDirectory ++ "/result-type-debug.txt"
-                                        , body = typeStr
-                                        }
-                                        |> BackendTask.allowFatal
-                                    )
-                                <| \_ ->
-                                File.rawFile fpKeyPath
-                                    |> BackendTask.toResult
-                                    |> BackendTask.andThen
-                                        (\keyResult ->
-                                            case keyResult of
-                                                Ok storedKey ->
-                                                    if storedKey == fpCacheKey then
-                                                        File.rawFile fpDataPath
-                                                            |> BackendTask.toResult
-                                                            |> BackendTask.andThen
-                                                                (\dataResult ->
-                                                                    case dataResult of
-                                                                        Ok cached ->
-                                                                            BackendTask.succeed cached
-
-                                                                        Err _ ->
-                                                                            evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
-                                                                )
-
-                                                    else
-                                                        evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
-
-                                                Err _ ->
-                                                    evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
-                                        )
-                                    |> BackendTask.map
-                                        (\fpOutput ->
-                                            [ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, fpOutput ]
-                                                |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
-                                                |> String.join "\n"
-                                        )
-
-                            Err errStr ->
-                                -- Eval error — fall back to non-intercepted eval
-                                evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
-                                    |> BackendTask.map
-                                        (\fpOutput ->
-                                            [ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, fpOutput ]
-                                                |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
-                                                |> String.join "\n"
-                                        )
+                                )
             )
 
 
@@ -3117,8 +3043,8 @@ buildReviewIntercepts preloadedCaches =
           , Types.Intercept
                 (\args _ _ ->
                     case args of
-                        [ Types.String ruleName, _, defaultCache ] ->
-                            case Dict.get ruleName preloadedCaches of
+                        [ Types.String ruleName, Types.Int ruleId, defaultCache ] ->
+                            case Dict.get (ruleCacheValueKey ruleName ruleId) preloadedCaches of
                                 Just cached ->
                                     Types.EvOk cached
 
@@ -3133,12 +3059,13 @@ buildReviewIntercepts preloadedCaches =
           , Types.Intercept
                 (\args _ _ ->
                     case args of
-                        [ Types.String ruleName, _, cache ] ->
+                        [ Types.String ruleName, Types.Int ruleId, cache ] ->
                             -- Yield to save cache to disk
                             Types.EvYield "review-cache-write"
                                 (Types.Record
                                     (FastDict.fromList
                                         [ ( "ruleName", Types.String ruleName )
+                                        , ( "ruleId", Types.Int ruleId )
                                         , ( "cache", cache )
                                         ]
                                     )
@@ -3290,6 +3217,275 @@ saveRuleCaches buildDir updatedRulesValue =
         |> BackendTask.allowFatal
 
 
+persistProjectEvalOutput : Maybe ProjectEvalOutputCache -> String -> BackendTask FatalError String
+persistProjectEvalOutput maybeOutputCache output =
+    case maybeOutputCache of
+        Just outputCache ->
+            Do.do
+                (Script.writeFile { path = outputCache.keyPath, body = outputCache.key } |> BackendTask.allowFatal)
+            <| \_ ->
+            Do.do
+                (Script.writeFile { path = outputCache.dataPath, body = output } |> BackendTask.allowFatal)
+            <| \_ ->
+            BackendTask.succeed output
+
+        Nothing ->
+            BackendTask.succeed output
+
+
+runProjectRulesFresh :
+    InterpreterProject
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> String
+runProjectRulesFresh reviewProject prIndices modulesWithAst =
+    case
+        InterpreterProject.prepareAndEval reviewProject
+            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+            , expression = buildExpressionForRules prIndices modulesWithAst
+            , sourceOverrides = [ reviewRunnerHelperSource ]
+            }
+    of
+        Ok output ->
+            output
+
+        Err err ->
+            err
+
+
+projectRuleYieldHandler : String -> String -> Types.Value -> BackendTask FatalError Types.Value
+projectRuleYieldHandler buildDir tag payload =
+    let
+        yieldLogPath =
+            buildDir ++ "/yield-log.txt"
+
+        ruleCacheDir =
+            buildDir ++ "/rule-value-cache"
+    in
+    case tag of
+        "log" ->
+            case payload of
+                Types.String msg ->
+                    Do.do
+                        (File.rawFile yieldLogPath
+                            |> BackendTask.toResult
+                            |> BackendTask.andThen
+                                (\existing ->
+                                    Script.writeFile
+                                        { path = yieldLogPath
+                                        , body = (Result.withDefault "" existing) ++ msg ++ "\n"
+                                        }
+                                        |> BackendTask.allowFatal
+                                )
+                        )
+                    <| \_ ->
+                    BackendTask.succeed Types.Unit
+
+                _ ->
+                    BackendTask.succeed Types.Unit
+
+        "review-cache-write" ->
+            case payload of
+                Types.Record fields ->
+                    let
+                        ruleName =
+                            FastDict.get "ruleName" fields
+                                |> Maybe.andThen
+                                    (\value ->
+                                        case value of
+                                            Types.String name ->
+                                                Just name
+
+                                            _ ->
+                                                Nothing
+                                    )
+                                |> Maybe.withDefault "unknown"
+
+                        ruleId =
+                            FastDict.get "ruleId" fields
+                                |> Maybe.andThen
+                                    (\value ->
+                                        case value of
+                                            Types.Int id_ ->
+                                                Just id_
+
+                                            _ ->
+                                                Nothing
+                                    )
+                                |> Maybe.withDefault 0
+
+                        cache =
+                            FastDict.get "cache" fields
+                                |> Maybe.withDefault Types.Unit
+
+                        serialized =
+                            ValueCodec.encodeValue cache
+
+                        filePath =
+                            ruleCacheDir ++ "/" ++ ruleCacheValueKey ruleName ruleId ++ ".json"
+                    in
+                    Do.do
+                        (File.rawFile yieldLogPath
+                            |> BackendTask.toResult
+                            |> BackendTask.andThen
+                                (\existing ->
+                                    let
+                                        prev =
+                                            case existing of
+                                                Ok s ->
+                                                    s
+
+                                                Err _ ->
+                                                    ""
+                                    in
+                                    Script.writeFile
+                                        { path = yieldLogPath
+                                        , body =
+                                            prev
+                                                ++ ruleCacheValueKey ruleName ruleId
+                                                ++ ": "
+                                                ++ String.fromInt (String.length serialized)
+                                                ++ " bytes\n"
+                                        }
+                                        |> BackendTask.allowFatal
+                                )
+                        )
+                    <| \_ ->
+                    Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
+                    Do.do (Script.writeFile { path = filePath, body = serialized } |> BackendTask.allowFatal) <| \_ ->
+                    BackendTask.succeed Types.Unit
+
+                _ ->
+                    BackendTask.succeed Types.Unit
+
+        "project-cache" ->
+            Do.do
+                (Script.writeFile
+                    { path = buildDir ++ "/project-cache.json"
+                    , body = ValueCodec.encodeValue payload
+                    }
+                    |> BackendTask.allowFatal
+                )
+            <| \_ ->
+            BackendTask.succeed Types.Unit
+
+        other ->
+            Do.do
+                (File.rawFile yieldLogPath
+                    |> BackendTask.toResult
+                    |> BackendTask.andThen
+                        (\existing ->
+                            Script.writeFile
+                                { path = yieldLogPath
+                                , body = (Result.withDefault "" existing) ++ "UNKNOWN yield: " ++ other ++ "\n"
+                                }
+                                |> BackendTask.allowFatal
+                        )
+                )
+            <| \_ ->
+            BackendTask.succeed Types.Unit
+
+
+evalProjectRulesWithWarmState :
+    Config
+    -> InterpreterProject
+    -> String
+    -> List Int
+    -> List AnalyzedTargetFile
+    -> List AnalyzedTargetFile
+    -> Maybe ProjectEvalOutputCache
+    -> BackendTask FatalError String
+evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileContents staleFileContents maybeOutputCache =
+    let
+        buildDir =
+            Path.toString config.buildDirectory
+
+        projectMetadata =
+            projectCacheMetadataFor helperHash allFileContents
+
+        allModulesWithAst =
+            allFileContents
+                |> List.map
+                    (\file ->
+                        { path = file.path
+                        , source = file.source
+                        , astJson = file.analysis.astJson
+                        }
+                    )
+
+        staleModulesWithAst =
+            staleFileContents
+                |> List.map
+                    (\file ->
+                        { path = file.path
+                        , source = file.source
+                        , astJson = file.analysis.astJson
+                        }
+                    )
+
+        indexList =
+            "[ " ++ (prIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+    in
+    Do.do (loadRuleCaches buildDir) <| \preloadedCaches ->
+    Do.do (loadProjectCache buildDir projectMetadata) <| \maybeCachedProject ->
+    let
+        intercepts =
+            buildReviewIntercepts preloadedCaches
+
+        expression =
+            case maybeCachedProject of
+                Just _ ->
+                    "ReviewRunnerHelper.runReviewWithCachedProject "
+                        ++ indexList
+                        ++ " cachedProj__ "
+                        ++ buildModuleListWithAst staleModulesWithAst
+
+                Nothing ->
+                    "ReviewRunnerHelper.runReviewCachingWithProject "
+                        ++ indexList
+                        ++ " "
+                        ++ buildModuleListWithAst allModulesWithAst
+
+        injectedValues =
+            case maybeCachedProject of
+                Just cachedProject ->
+                    FastDict.singleton "cachedProj__" cachedProject
+
+                Nothing ->
+                    FastDict.empty
+
+        persistWarmOutput output =
+            Do.do (persistProjectCacheMetadata buildDir projectMetadata) <| \_ ->
+            persistProjectEvalOutput maybeOutputCache output
+
+        fallbackOutput =
+            runProjectRulesFresh reviewProject prIndices allModulesWithAst
+    in
+    Do.do
+        (InterpreterProject.prepareAndEvalWithYield reviewProject
+            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+            , expression = expression
+            , sourceOverrides = [ reviewRunnerHelperSource ]
+            , intercepts = intercepts
+            , injectedValues = injectedValues
+            }
+            (projectRuleYieldHandler buildDir)
+        )
+    <| \result ->
+    case result of
+        Ok (Types.Tuple (Types.String output) _) ->
+            persistWarmOutput output
+
+        Ok (Types.String output) ->
+            persistWarmOutput output
+
+        Ok _ ->
+            persistProjectEvalOutput maybeOutputCache fallbackOutput
+
+        Err _ ->
+            persistProjectEvalOutput maybeOutputCache fallbackOutput
+
+
 evalProjectRulesSingle :
     InterpreterProject
     -> List Int
@@ -3299,29 +3495,14 @@ evalProjectRulesSingle :
     -> String
     -> BackendTask FatalError String
 evalProjectRulesSingle reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
-    let
-        result =
-            InterpreterProject.prepareAndEval reviewProject
-                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                , expression = buildExpressionForRules prIndices modulesWithAst
-                , sourceOverrides = [ reviewRunnerHelperSource ]
+    runProjectRulesFresh reviewProject prIndices modulesWithAst
+        |> persistProjectEvalOutput
+            (Just
+                { keyPath = cacheKeyPath
+                , dataPath = cacheDataPath
+                , key = cacheKey
                 }
-
-        output =
-            case result of
-                Ok s ->
-                    s
-
-                Err e ->
-                    e
-    in
-    Do.do
-        (Script.writeFile { path = cacheKeyPath, body = cacheKey } |> BackendTask.allowFatal)
-    <| \_ ->
-    Do.do
-        (Script.writeFile { path = cacheDataPath, body = output } |> BackendTask.allowFatal)
-    <| \_ ->
-    BackendTask.succeed output
+            )
 
 
 {-| Two-pass project rule evaluation with Value injection (kept for reference).

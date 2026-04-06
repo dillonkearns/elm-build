@@ -13,6 +13,9 @@
 - Reprofiled `NoUnused.Parameters` from `FullProject` to `ImportersOf`.
 - Added a persisted per-file host analysis cache keyed by file-content hash.
 - Reused cached AST JSON, aspect hashes, declaration hashes, module names, and imports for unchanged files on subsequent runs.
+- Fixed the rule-value cache bridge to key by `ruleName-ruleId` instead of only `ruleName`.
+- Added a manifest-validated serialized project cache path for warm `FullProject` rule evaluation.
+- Tested broader cached-project reuse for `ImportersOf`/`DependenciesOf`, then reverted it after it erased the subgraph-narrowing win.
 
 ### Benchmarks
 
@@ -54,9 +57,22 @@ After the per-file host analysis cache round:
 - `warm`: `398.0ms` (down from `548.0ms`)
 - `warm_1_file_changed`: `3488.0ms` (down from `3617.0ms`)
 
+After the project-cache experiment:
+
+- Broad cached-project reuse for `ImportersOf` + `DependenciesOf` was a regression on the same fixture:
+  - `cold`: `118820.0ms`
+  - `warm`: `409.0ms`
+  - `warm_1_file_changed`: `61910.0ms`
+- Selective cached-project reuse only for `FullProject` rules restored the prior mixed-run shape:
+  - `cold`: `74440.0ms`
+  - `warm`: `400.0ms`
+  - `warm_1_file_changed`: `3510.0ms`
+
 ### Takeaways
 
 - The unfair-advantage warm path is now much closer to the target shape: `37.2s -> 3.74s` on the 12-file fixture for a real 1-file semantic change.
 - Warm no-change stays sub-second and is slightly better after removing the unconditional review-app prepare step from the hot path.
 - The new host analysis cache mostly attacks parse/AST overhead, so its biggest win showed up on cold and full-hit warm paths. The 1-file warm path improved modestly because it is now dominated more by interpreter/rule execution than host parsing.
+- Cached-project reuse is not the next big win for narrowed `ImportersOf` / `DependenciesOf` project rules. The existing affected-subgraph strategy is much better there.
+- The real next performance step for 1-file warm runs is still rule-specific contribution caching, where a file change updates folded project-rule state instead of rerunning whole rule logic over any slice.
 - The next big opportunities are project-rule contribution caches, smaller AST transport than JSON, and eventually daemonized in-memory state.
