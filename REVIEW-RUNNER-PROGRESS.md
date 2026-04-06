@@ -11,6 +11,8 @@
 - Fixed the zero-module-rule path so project-only configs do not try to read missing `smr-*` cache outputs.
 - Reworked `ImportersOf` and `DependenciesOf` project-rule misses to re-evaluate only the affected subgraph instead of the full project.
 - Reprofiled `NoUnused.Parameters` from `FullProject` to `ImportersOf`.
+- Added a persisted per-file host analysis cache keyed by file-content hash.
+- Reused cached AST JSON, aspect hashes, declaration hashes, module names, and imports for unchanged files on subsequent runs.
 
 ### Benchmarks
 
@@ -45,8 +47,16 @@ Project-only on the same fixture after the second round:
 - `warm`: `556.9ms`
 - `warm_1_file_changed`: `3295.4ms`
 
+After the per-file host analysis cache round:
+
+- Fixture: 12 copied non-test modules from `src`, `bench/review` rules, one semantic change by appending `benchmarkTouchedHostCache__ = 42` to `MathLib.elm`.
+- `cold`: `74663.0ms` (down from `98098.0ms` on the same fixture before this round)
+- `warm`: `398.0ms` (down from `548.0ms`)
+- `warm_1_file_changed`: `3488.0ms` (down from `3617.0ms`)
+
 ### Takeaways
 
 - The unfair-advantage warm path is now much closer to the target shape: `37.2s -> 3.74s` on the 12-file fixture for a real 1-file semantic change.
 - Warm no-change stays sub-second and is slightly better after removing the unconditional review-app prepare step from the hot path.
-- Cold performance is still poor and regressed on this fixture. The next big opportunities are cold-path batching/caching, AST transport/caching, and possibly daemonized in-memory state.
+- The new host analysis cache mostly attacks parse/AST overhead, so its biggest win showed up on cold and full-hit warm paths. The 1-file warm path improved modestly because it is now dominated more by interpreter/rule execution than host parsing.
+- The next big opportunities are project-rule contribution caches, smaller AST transport than JSON, and eventually daemonized in-memory state.

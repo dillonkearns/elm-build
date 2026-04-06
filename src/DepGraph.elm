@@ -4,6 +4,7 @@ module DepGraph exposing
     , parseModuleName
     , filePathToModuleName
     , buildGraph
+    , buildGraphFromModuleData
     , transitiveDeps
     , reverseDeps
     , moduleNameToFilePath
@@ -177,6 +178,36 @@ buildGraph { sourceDirectories, files } =
                                     |> Set.fromList
                         in
                         ( filePath, depFilePaths )
+                    )
+                |> Dict.fromList
+    in
+    Graph { deps = deps, moduleToFile = moduleToFile }
+
+
+{-| Build a dependency graph from precomputed module names and imports.
+
+This lets callers reuse host-side analysis caches instead of reparsing
+source text just to rebuild the graph.
+-}
+buildGraphFromModuleData : List { filePath : String, moduleName : String, imports : List String } -> Graph
+buildGraphFromModuleData files =
+    let
+        moduleToFile : Dict String String
+        moduleToFile =
+            files
+                |> List.map (\file -> ( file.moduleName, file.filePath ))
+                |> Dict.fromList
+
+        deps : Dict String (Set String)
+        deps =
+            files
+                |> List.map
+                    (\file ->
+                        ( file.filePath
+                        , file.imports
+                            |> List.filterMap (\moduleName -> Dict.get moduleName moduleToFile)
+                            |> Set.fromList
+                        )
                     )
                 |> Dict.fromList
     in

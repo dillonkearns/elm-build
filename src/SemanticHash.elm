@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, FileAspectHashes, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, computeAspectHashesFromSource, diffIndices, extractDependencies, getSemanticHash, hashExpression, semanticHashForEntry)
+module SemanticHash exposing (DeclarationIndex, FileAspectHashes, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, computeAspectHashesFromFile, computeAspectHashesFromSource, diffIndices, extractDependencies, getSemanticHash, hashExpression, semanticHashForEntry)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -42,7 +42,7 @@ computeAspectHashesFromSource : String -> FileAspectHashes
 computeAspectHashesFromSource source =
     case Elm.Parser.parseToFile source of
         Ok file ->
-            computeAspectHashes file
+            computeAspectHashesFromFile file
 
         Err _ ->
             { expressionsHash = ""
@@ -54,8 +54,8 @@ computeAspectHashesFromSource source =
             }
 
 
-computeAspectHashes : File -> FileAspectHashes
-computeAspectHashes file =
+computeAspectHashesFromFile : File -> FileAspectHashes
+computeAspectHashesFromFile file =
     let
         expressionsHash =
             file.declarations

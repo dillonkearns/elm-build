@@ -25,6 +25,7 @@ import Dict exposing (Dict)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.File
+import Elm.Syntax.Module
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
 import FastDict
@@ -60,9 +61,34 @@ type alias Config =
     }
 
 
+type alias DeclarationHashInfo =
+    { name : String
+    , semanticHash : String
+    , startLine : Int
+    , endLine : Int
+    }
+
+
+type alias FileAnalysis =
+    { sourceHash : String
+    , astJson : String
+    , aspectHashes : SemanticHash.FileAspectHashes
+    , declarations : List DeclarationHashInfo
+    , moduleName : String
+    , imports : List String
+    }
+
+
+type alias AnalyzedTargetFile =
+    { path : String
+    , source : String
+    , analysis : FileAnalysis
+    }
+
+
 cacheSchemaVersion : String
 cacheSchemaVersion =
-    "review-runner-v3"
+    "review-runner-v4"
 
 
 programConfig : Program.Config Config
@@ -460,6 +486,16 @@ computeSemanticKey files =
         |> String.fromInt
 
 
+computeSemanticKeyFromAnalyses : List AnalyzedTargetFile -> String
+computeSemanticKeyFromAnalyses files =
+    files
+        |> List.sortBy .path
+        |> List.map (\file -> file.path ++ "|" ++ file.analysis.aspectHashes.fullHash)
+        |> String.join "\n"
+        |> FNV1a.hash
+        |> String.fromInt
+
+
 {-| Per-declaration cache entry: maps each top-level declaration
 to its semantic hash and any review errors within its range.
 -}
@@ -467,46 +503,78 @@ type alias DeclarationCache =
     Dict String { semanticHash : String, errors : List ReviewError }
 
 
+hashSourceContents : String -> String
+hashSourceContents source =
+    FNV1a.hash source |> String.fromInt
+
+
+moduleNameFromFile : Elm.Syntax.File.File -> String
+moduleNameFromFile file =
+    case Node.value file.moduleDefinition of
+        Elm.Syntax.Module.NormalModule { moduleName } ->
+            Node.value moduleName |> String.join "."
+
+        Elm.Syntax.Module.PortModule { moduleName } ->
+            Node.value moduleName |> String.join "."
+
+        Elm.Syntax.Module.EffectModule { moduleName } ->
+            Node.value moduleName |> String.join "."
+
+
+importsFromFile : Elm.Syntax.File.File -> List String
+importsFromFile file =
+    file.imports
+        |> List.map
+            (\(Node _ imp) ->
+                Node.value imp.moduleName |> String.join "."
+            )
+
+
+getDeclarationHashesFromFile : Elm.Syntax.File.File -> List DeclarationHashInfo
+getDeclarationHashesFromFile file =
+    let
+        index =
+            SemanticHash.buildIndexFromFile file
+
+        rangeMap : Dict String Range
+        rangeMap =
+            file.declarations
+                |> List.filterMap
+                    (\(Node range decl) ->
+                        case decl of
+                            FunctionDeclaration func ->
+                                Just ( Node.value (Node.value func.declaration).name, range )
+
+                            _ ->
+                                Nothing
+                    )
+                |> Dict.fromList
+    in
+    index
+        |> Dict.toList
+        |> List.filterMap
+            (\( name, info ) ->
+                Dict.get name rangeMap
+                    |> Maybe.map
+                        (\range ->
+                            { name = name
+                            , semanticHash = info.semanticHash
+                            , startLine = range.start.row
+                            , endLine = range.end.row
+                            }
+                        )
+            )
+
+
 {-| Get per-declaration semantic hashes and line ranges for a source file.
 Returns (declarationName, semanticHash, startLine, endLine) for each
 top-level function declaration.
 -}
-getDeclarationHashes : String -> List { name : String, semanticHash : String, startLine : Int, endLine : Int }
+getDeclarationHashes : String -> List DeclarationHashInfo
 getDeclarationHashes source =
     case Elm.Parser.parseToFile source of
         Ok file ->
-            let
-                index =
-                    SemanticHash.buildIndexFromSource source
-
-                rangeMap : Dict String Range
-                rangeMap =
-                    file.declarations
-                        |> List.filterMap
-                            (\(Node range decl) ->
-                                case decl of
-                                    FunctionDeclaration func ->
-                                        Just ( Node.value (Node.value func.declaration).name, range )
-
-                                    _ ->
-                                        Nothing
-                            )
-                        |> Dict.fromList
-            in
-            index
-                |> Dict.toList
-                |> List.filterMap
-                    (\( name, info ) ->
-                        Dict.get name rangeMap
-                            |> Maybe.map
-                                (\range ->
-                                    { name = name
-                                    , semanticHash = info.semanticHash
-                                    , startLine = range.start.row
-                                    , endLine = range.end.row
-                                    }
-                                )
-                    )
+            getDeclarationHashesFromFile file
 
         Err _ ->
             []
@@ -725,6 +793,128 @@ updateCache previousCache files errors =
             previousCache
 
 
+checkCacheWithAnalyses :
+    CacheState
+    -> List AnalyzedTargetFile
+    -> CacheDecision
+checkCacheWithAnalyses cache files =
+    let
+        fileResults =
+            files
+                |> List.map
+                    (\file ->
+                        let
+                            currentHashes =
+                                file.analysis.declarations
+                                    |> List.map (\decl -> ( decl.name, decl.semanticHash ))
+                                    |> Dict.fromList
+
+                            cachedFile =
+                                Dict.get file.path cache
+                        in
+                        case cachedFile of
+                            Nothing ->
+                                { path = file.path, status = FileMiss, cachedErrors = [] }
+
+                            Just fileCache ->
+                                let
+                                    fileCacheDecls =
+                                        fileCache
+                                            |> Dict.remove "__module__"
+                                            |> Dict.remove "__fileAspects__"
+
+                                    declsMatch =
+                                        Dict.foldl
+                                            (\name hash acc ->
+                                                acc
+                                                    && (Dict.get name fileCacheDecls
+                                                            |> Maybe.map (\entry -> entry.semanticHash == hash)
+                                                            |> Maybe.withDefault False
+                                                       )
+                                            )
+                                            (Dict.size currentHashes == Dict.size fileCacheDecls)
+                                            currentHashes
+
+                                    currentFullHash =
+                                        file.analysis.aspectHashes.fullHash
+
+                                    cachedFullHash =
+                                        Dict.get "__fileAspects__" fileCache
+                                            |> Maybe.map .semanticHash
+                                            |> Maybe.withDefault ""
+
+                                    allMatch =
+                                        declsMatch && (currentFullHash == cachedFullHash)
+                                in
+                                if allMatch then
+                                    { path = file.path
+                                    , status = FileHit
+                                    , cachedErrors =
+                                        fileCache
+                                            |> Dict.values
+                                            |> List.concatMap .errors
+                                    }
+
+                                else
+                                    { path = file.path, status = FileMiss, cachedErrors = [] }
+                    )
+
+        allHit =
+            List.all (\result -> result.status == FileHit) fileResults
+
+        staleFiles =
+            fileResults |> List.filter (\result -> result.status == FileMiss) |> List.map .path
+
+        cachedErrors =
+            fileResults |> List.filter (\result -> result.status == FileHit) |> List.concatMap .cachedErrors
+    in
+    if List.isEmpty (Dict.keys cache) then
+        ColdMiss (List.map .path files)
+
+    else if allHit then
+        FullCacheHit cachedErrors
+
+    else
+        PartialMiss { cachedErrors = cachedErrors, staleFiles = staleFiles }
+
+
+updateCacheWithAnalyses :
+    CacheState
+    -> List AnalyzedTargetFile
+    -> List ReviewError
+    -> CacheState
+updateCacheWithAnalyses previousCache files errors =
+    let
+        errorsByFile =
+            errors
+                |> List.foldl
+                    (\err acc ->
+                        Dict.update err.filePath
+                            (\existing -> Just (err :: Maybe.withDefault [] existing))
+                            acc
+                    )
+                    Dict.empty
+    in
+    files
+        |> List.foldl
+            (\file acc ->
+                let
+                    fileErrors =
+                        Dict.get file.path errorsByFile |> Maybe.withDefault []
+
+                    fileCache =
+                        mapErrorsToDeclarations file.analysis.declarations fileErrors
+
+                    fileCacheWithAspects =
+                        Dict.insert "__fileAspects__"
+                            { semanticHash = file.analysis.aspectHashes.fullHash, errors = [] }
+                            fileCache
+                in
+                Dict.insert file.path fileCacheWithAspects acc
+            )
+            previousCache
+
+
 {-| Encode CacheState to a JSON string for persistence to disk.
 -}
 encodeCacheState : CacheState -> String
@@ -799,6 +989,233 @@ decodeCacheState json =
     in
     Json.Decode.decodeString decoder json
         |> Result.toMaybe
+
+
+encodeFileAspectHashes : SemanticHash.FileAspectHashes -> Json.Encode.Value
+encodeFileAspectHashes hashes =
+    Json.Encode.object
+        [ ( "expressionsHash", Json.Encode.string hashes.expressionsHash )
+        , ( "declNamesHash", Json.Encode.string hashes.declNamesHash )
+        , ( "importsHash", Json.Encode.string hashes.importsHash )
+        , ( "exposingHash", Json.Encode.string hashes.exposingHash )
+        , ( "customTypesHash", Json.Encode.string hashes.customTypesHash )
+        , ( "fullHash", Json.Encode.string hashes.fullHash )
+        ]
+
+
+fileAspectHashesDecoder : Json.Decode.Decoder SemanticHash.FileAspectHashes
+fileAspectHashesDecoder =
+    Json.Decode.map6
+        (\expressionsHash declNamesHash importsHash exposingHash customTypesHash fullHash ->
+            { expressionsHash = expressionsHash
+            , declNamesHash = declNamesHash
+            , importsHash = importsHash
+            , exposingHash = exposingHash
+            , customTypesHash = customTypesHash
+            , fullHash = fullHash
+            }
+        )
+        (Json.Decode.field "expressionsHash" Json.Decode.string)
+        (Json.Decode.field "declNamesHash" Json.Decode.string)
+        (Json.Decode.field "importsHash" Json.Decode.string)
+        (Json.Decode.field "exposingHash" Json.Decode.string)
+        (Json.Decode.field "customTypesHash" Json.Decode.string)
+        (Json.Decode.field "fullHash" Json.Decode.string)
+
+
+encodeFileAnalysisCache : Dict String FileAnalysis -> String
+encodeFileAnalysisCache cache =
+    cache
+        |> Dict.toList
+        |> Json.Encode.list
+            (\( filePath, analysis ) ->
+                Json.Encode.object
+                    [ ( "file", Json.Encode.string filePath )
+                    , ( "sourceHash", Json.Encode.string analysis.sourceHash )
+                    , ( "astJson", Json.Encode.string analysis.astJson )
+                    , ( "aspectHashes", encodeFileAspectHashes analysis.aspectHashes )
+                    , ( "moduleName", Json.Encode.string analysis.moduleName )
+                    , ( "imports", Json.Encode.list Json.Encode.string analysis.imports )
+                    , ( "declarations"
+                      , analysis.declarations
+                            |> Json.Encode.list
+                                (\decl ->
+                                    Json.Encode.object
+                                        [ ( "name", Json.Encode.string decl.name )
+                                        , ( "semanticHash", Json.Encode.string decl.semanticHash )
+                                        , ( "startLine", Json.Encode.int decl.startLine )
+                                        , ( "endLine", Json.Encode.int decl.endLine )
+                                        ]
+                                )
+                      )
+                    ]
+            )
+        |> Json.Encode.encode 0
+
+
+decodeFileAnalysisCache : String -> Maybe (Dict String FileAnalysis)
+decodeFileAnalysisCache json =
+    let
+        declarationDecoder =
+            Json.Decode.map4
+                (\name semanticHash startLine endLine ->
+                    { name = name
+                    , semanticHash = semanticHash
+                    , startLine = startLine
+                    , endLine = endLine
+                    }
+                )
+                (Json.Decode.field "name" Json.Decode.string)
+                (Json.Decode.field "semanticHash" Json.Decode.string)
+                (Json.Decode.field "startLine" Json.Decode.int)
+                (Json.Decode.field "endLine" Json.Decode.int)
+
+        analysisDecoder =
+            Json.Decode.map7
+                (\filePath sourceHash astJson aspectHashes moduleName imports declarations ->
+                    ( filePath
+                    , { sourceHash = sourceHash
+                      , astJson = astJson
+                      , aspectHashes = aspectHashes
+                      , declarations = declarations
+                      , moduleName = moduleName
+                      , imports = imports
+                      }
+                    )
+                )
+                (Json.Decode.field "file" Json.Decode.string)
+                (Json.Decode.field "sourceHash" Json.Decode.string)
+                (Json.Decode.field "astJson" Json.Decode.string)
+                (Json.Decode.field "aspectHashes" fileAspectHashesDecoder)
+                (Json.Decode.field "moduleName" Json.Decode.string)
+                (Json.Decode.field "imports" (Json.Decode.list Json.Decode.string))
+                (Json.Decode.field "declarations" (Json.Decode.list declarationDecoder))
+    in
+    Json.Decode.decodeString (Json.Decode.list analysisDecoder |> Json.Decode.map Dict.fromList) json
+        |> Result.toMaybe
+
+
+analyzeSourceFile : String -> Maybe FileAnalysis
+analyzeSourceFile source =
+    case Elm.Parser.parseToFile source of
+        Ok file ->
+            Just
+                { sourceHash = hashSourceContents source
+                , astJson =
+                    Elm.Syntax.File.encode file
+                        |> Json.Encode.encode 0
+                , aspectHashes = SemanticHash.computeAspectHashesFromFile file
+                , declarations = getDeclarationHashesFromFile file
+                , moduleName = moduleNameFromFile file
+                , imports = importsFromFile file
+                }
+
+        Err _ ->
+            Nothing
+
+
+persistFileAnalysisCache : String -> Dict String FileAnalysis -> BackendTask FatalError ()
+persistFileAnalysisCache path cache =
+    Script.writeFile
+        { path = path
+        , body = encodeFileAnalysisCache cache
+        }
+        |> BackendTask.allowFatal
+
+
+loadAnalyzedTargetFiles : Config -> List String -> BackendTask FatalError (List AnalyzedTargetFile)
+loadAnalyzedTargetFiles config files =
+    let
+        cachePath =
+            Path.toString config.buildDirectory ++ "/review-file-analysis-cache.json"
+    in
+    Do.do
+        (File.rawFile cachePath
+            |> BackendTask.toResult
+            |> BackendTask.map
+                (\result ->
+                    result
+                        |> Result.toMaybe
+                        |> Maybe.andThen decodeFileAnalysisCache
+                        |> Maybe.withDefault Dict.empty
+                )
+        )
+    <| \previousCache ->
+    Do.do (readTargetFiles files) <| \targetFileContents ->
+    let
+        currentPaths =
+            targetFileContents |> List.map .path |> Set.fromList
+
+        cachePathsChanged =
+            (previousCache |> Dict.keys |> Set.fromList) /= currentPaths
+
+        analyzedResults =
+            targetFileContents
+                |> List.map
+                    (\file ->
+                        let
+                            currentHash =
+                                hashSourceContents file.source
+                        in
+                        case Dict.get file.path previousCache of
+                            Just cached ->
+                                if cached.sourceHash == currentHash then
+                                    { wasMiss = False
+                                    , analyzed =
+                                        Just
+                                            { path = file.path
+                                            , source = file.source
+                                            , analysis = cached
+                                            }
+                                    }
+
+                                else
+                                    { wasMiss = True
+                                    , analyzed =
+                                        analyzeSourceFile file.source
+                                            |> Maybe.map
+                                                (\analysis ->
+                                                    { path = file.path
+                                                    , source = file.source
+                                                    , analysis = analysis
+                                                    }
+                                                )
+                                    }
+
+                            Nothing ->
+                                { wasMiss = True
+                                , analyzed =
+                                    analyzeSourceFile file.source
+                                        |> Maybe.map
+                                            (\analysis ->
+                                                { path = file.path
+                                                , source = file.source
+                                                , analysis = analysis
+                                                }
+                                            )
+                                }
+                    )
+
+        analyzedFiles =
+            analyzedResults |> List.filterMap .analyzed
+
+        updatedCache =
+            analyzedFiles
+                |> List.map (\file -> ( file.path, file.analysis ))
+                |> Dict.fromList
+
+        cacheMissed =
+            analyzedResults |> List.any .wasMiss
+    in
+    Do.do
+        (if cacheMissed || cachePathsChanged then
+            persistFileAnalysisCache cachePath updatedCache
+
+         else
+            BackendTask.succeed ()
+        )
+    <| \_ ->
+    BackendTask.succeed analyzedFiles
 
 
 {-| Parse a source file on the HOST side and encode the AST as JSON.
@@ -1103,10 +1520,10 @@ task config =
         )
     <| \previousCache ->
     Do.do (resolveTargetFiles preparedConfig) <| \targetFiles ->
-    Do.do (readTargetFiles targetFiles) <| \targetFileContents ->
+    Do.do (loadAnalyzedTargetFiles preparedConfig targetFiles) <| \targetFileContents ->
     let
         decision =
-            checkCache previousCache targetFileContents
+            checkCacheWithAnalyses previousCache targetFileContents
     in
     case decision of
         FullCacheHit errors ->
@@ -1123,7 +1540,7 @@ task config =
                     parseReviewOutput output
 
                 newCache =
-                    updateCache Dict.empty targetFileContents errors
+                    updateCacheWithAnalyses Dict.empty targetFileContents errors
             in
             Do.do (persistCache declCachePath newCache) <| \_ ->
             reportErrors errors
@@ -1143,7 +1560,7 @@ task config =
                     parseReviewOutput output
 
                 newCache =
-                    updateCache previousCache targetFileContents freshErrors
+                    updateCacheWithAnalyses previousCache targetFileContents freshErrors
             in
             Do.do (persistCache declCachePath newCache) <| \_ ->
             reportErrors freshErrors
@@ -1425,8 +1842,8 @@ Project rules re-eval on full project.
 loadAndEvalHybridPartial :
     Config
     -> List { index : Int, name : String, ruleType : RuleType }
-    -> List { path : String, source : String }
-    -> List { path : String, source : String }
+    -> List AnalyzedTargetFile
+    -> List AnalyzedTargetFile
     -> List ReviewError
     -> BackendTask FatalError String
 loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cachedErrors =
@@ -1438,8 +1855,8 @@ loadAndEvalHybridPartialWithProject :
     Config
     -> InterpreterProject
     -> List { index : Int, name : String, ruleType : RuleType }
-    -> List { path : String, source : String }
-    -> List { path : String, source : String }
+    -> List AnalyzedTargetFile
+    -> List AnalyzedTargetFile
     -> List ReviewError
     -> BackendTask FatalError String
 loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContents staleFileContents cachedErrors =
@@ -1448,22 +1865,26 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             FNV1a.hash reviewRunnerHelperSource |> String.fromInt
 
         projectSemanticKey =
-            computeSemanticKey allFileContents
+            computeSemanticKeyFromAnalyses allFileContents
 
         staleModulesWithAst =
             staleFileContents
-                |> List.filterMap
-                    (\{ path, source } ->
-                        encodeFileAsJson source
-                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
+                |> List.map
+                    (\file ->
+                        { path = file.path
+                        , source = file.source
+                        , astJson = file.analysis.astJson
+                        }
                     )
 
         allModulesWithAst =
             allFileContents
-                |> List.filterMap
-                    (\{ path, source } ->
-                        encodeFileAsJson source
-                            |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
+                |> List.map
+                    (\file ->
+                        { path = file.path
+                        , source = file.source
+                        , astJson = file.analysis.astJson
+                        }
                     )
 
         -- Per-file aspect hashes for narrow project rule keys
@@ -1471,19 +1892,23 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
         allFileAspectHashes =
             allFileContents
                 |> List.map
-                    (\{ path, source } ->
-                        ( path, SemanticHash.computeAspectHashesFromSource source )
+                    (\file ->
+                        ( file.path, file.analysis.aspectHashes )
                     )
                 |> Dict.fromList
 
         depGraph : DepGraph.Graph
         depGraph =
-            DepGraph.buildGraph
-                { sourceDirectories = config.sourceDirs
-                , files =
-                    allFileContents
-                        |> List.map (\{ path, source } -> { filePath = path, content = source })
-                }
+            DepGraph.buildGraphFromModuleData
+                (allFileContents
+                    |> List.map
+                        (\file ->
+                            { filePath = file.path
+                            , moduleName = file.analysis.moduleName
+                            , imports = file.analysis.imports
+                            }
+                        )
+                )
 
         moduleRules =
             ruleInfo |> List.filter (\r -> r.ruleType == ModuleRule)
@@ -1517,13 +1942,19 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 []
 
             else
-                staleModulesWithAst
+                staleFileContents
                     |> List.indexedMap
                         (\fileIdx file ->
                             let
                                 fileHashes =
                                     Dict.get file.path allFileAspectHashes
-                                        |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
+                                        |> Maybe.withDefault file.analysis.aspectHashes
+
+                                moduleWithAst =
+                                    { path = file.path
+                                    , source = file.source
+                                    , astJson = file.analysis.astJson
+                                    }
 
                                 fileNarrowKey =
                                     narrowCacheKey moduleRuleProfile file.path fileHashes allFileAspectHashes depGraph
@@ -1538,7 +1969,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                     case
                                         InterpreterProject.prepareAndEval reviewProject
                                             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                            , expression = buildExpressionForRules moduleRuleIndices [ file ]
+                                            , expression = buildExpressionForRules moduleRuleIndices [ moduleWithAst ]
                                             , sourceOverrides = [ reviewRunnerHelperSource ]
                                             }
                                     of
@@ -1660,7 +2091,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                         let
                                             fileHashes =
                                                 Dict.get file.path allFileAspectHashes
-                                                    |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
+                                                    |> Maybe.withDefault file.analysis.aspectHashes
                                         in
                                         { path = file.path
                                         , narrowKey =
@@ -1678,7 +2109,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                         let
                                             fileHashes =
                                                 Dict.get file.path allFileAspectHashes
-                                                    |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
+                                                    |> Maybe.withDefault file.analysis.aspectHashes
                                         in
                                         { path = file.path
                                         , narrowKey =
