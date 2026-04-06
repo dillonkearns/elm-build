@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithValues, prepareAndEvalWithYield, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithValues, prepareAndEvalWithYield, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -1171,12 +1171,11 @@ resumes with that Value via the continuation.
 
 This is the BackendTask driver loop: eval → yield → handle → resume → repeat.
 -}
-prepareAndEvalWithYield :
+prepareRawEvalWithYield :
     InterpreterProject
     -> { imports : List String, expression : String, sourceOverrides : List String, intercepts : FastDict.Dict String Types.Intercept, injectedValues : FastDict.Dict String Types.Value }
-    -> (String -> Types.Value -> BackendTask FatalError Types.Value)
-    -> BackendTask FatalError (Result String Types.Value)
-prepareAndEvalWithYield (InterpreterProject project) { imports, expression, sourceOverrides, intercepts, injectedValues } yieldHandler =
+    -> Types.EvalResult Types.Value
+prepareRawEvalWithYield (InterpreterProject project) { imports, expression, sourceOverrides, intercepts, injectedValues } =
     let
         wrapperSource =
             generateWrapper imports expression
@@ -1238,7 +1237,38 @@ prepareAndEvalWithYield (InterpreterProject project) { imports, expression, sour
                     Ok parsedModules ->
                         Eval.Module.evalWithEnvFromFilesAndValuesAndInterceptsRaw env parsedModules injectedValues intercepts (FunctionOrValue [] "results")
     in
-    driveYields yieldHandler rawResult
+    rawResult
+
+
+{-| Evaluate with intercepts that can yield to the framework.
+
+When an intercept yields (EvYield tag payload resume), the yieldHandler
+BackendTask runs with (tag, payload), producing a Value. The eval then
+resumes with that Value via the continuation.
+
+This is the BackendTask driver loop: eval → yield → handle → resume → repeat.
+-}
+prepareAndEvalWithYield :
+    InterpreterProject
+    -> { imports : List String, expression : String, sourceOverrides : List String, intercepts : FastDict.Dict String Types.Intercept, injectedValues : FastDict.Dict String Types.Value }
+    -> (String -> Types.Value -> BackendTask FatalError Types.Value)
+    -> BackendTask FatalError (Result String Types.Value)
+prepareAndEvalWithYield project evalConfig yieldHandler =
+    driveYields yieldHandler (prepareRawEvalWithYield project evalConfig)
+
+
+{-| Like `prepareAndEvalWithYield`, but threads caller-managed state through the
+yield loop. Useful for in-memory caching experiments where the state should
+live outside the interpreter and be updated on each yield.
+-}
+prepareAndEvalWithYieldState :
+    InterpreterProject
+    -> { imports : List String, expression : String, sourceOverrides : List String, intercepts : FastDict.Dict String Types.Intercept, injectedValues : FastDict.Dict String Types.Value }
+    -> state
+    -> (state -> String -> Types.Value -> BackendTask FatalError ( state, Types.Value ))
+    -> BackendTask FatalError ( Result String Types.Value, state )
+prepareAndEvalWithYieldState project evalConfig initialState yieldHandler =
+    driveYieldsState initialState yieldHandler (prepareRawEvalWithYield project evalConfig)
 
 
 {-| Drive the yield loop: handle EvYield via BackendTask, resume, repeat.
@@ -1267,6 +1297,33 @@ driveYields yieldHandler evalResult =
                 |> BackendTask.andThen
                     (\resumeValue ->
                         driveYields yieldHandler (resume resumeValue)
+                    )
+
+
+driveYieldsState :
+    state
+    -> (state -> String -> Types.Value -> BackendTask FatalError ( state, Types.Value ))
+    -> Types.EvalResult Types.Value
+    -> BackendTask FatalError ( Result String Types.Value, state )
+driveYieldsState state yieldHandler evalResult =
+    case evalResult of
+        Types.EvOk value ->
+            BackendTask.succeed ( Ok value, state )
+
+        Types.EvErr evalErr ->
+            BackendTask.succeed ( Err (formatError (Types.EvalError evalErr)), state )
+
+        Types.EvOkTrace value _ _ ->
+            BackendTask.succeed ( Ok value, state )
+
+        Types.EvErrTrace evalErr _ _ ->
+            BackendTask.succeed ( Err (formatError (Types.EvalError evalErr)), state )
+
+        Types.EvYield tag payload resume ->
+            yieldHandler state tag payload
+                |> BackendTask.andThen
+                    (\( nextState, resumeValue ) ->
+                        driveYieldsState nextState yieldHandler (resume resumeValue)
                     )
 
 

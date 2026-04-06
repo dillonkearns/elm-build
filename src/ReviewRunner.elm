@@ -2993,7 +2993,7 @@ buildReviewIntercepts preloadedCaches =
     FastDict.fromList
         [ ( "Review.Rule.initialCacheMarker"
           , Types.Intercept
-                (\args _ _ ->
+                (\_ args _ _ ->
                     case args of
                         [ Types.String ruleName, Types.Int ruleId, defaultCache ] ->
                             case Dict.get (ruleCacheValueKey ruleName ruleId) preloadedCaches of
@@ -3009,7 +3009,7 @@ buildReviewIntercepts preloadedCaches =
           )
         , ( "Review.Rule.finalCacheMarker"
           , Types.Intercept
-                (\args _ _ ->
+                (\_ args _ _ ->
                     case args of
                         [ Types.String ruleName, Types.Int ruleId, cache ] ->
                             -- Yield to save cache to disk
@@ -3030,7 +3030,7 @@ buildReviewIntercepts preloadedCaches =
           )
         , ( "Review.Cache.ContextHash.createContextHashMarker"
           , Types.Intercept
-                (\args _ _ ->
+                (\_ args _ _ ->
                     case args of
                         [ context ] ->
                             -- Deep hash the context for cache key comparison
@@ -3042,7 +3042,7 @@ buildReviewIntercepts preloadedCaches =
           )
         , ( "ReviewRunnerHelper.projectCacheMarker"
           , Types.Intercept
-                (\args _ _ ->
+                (\_ args _ _ ->
                     case args of
                         [ project ] ->
                             Types.EvYield "project-cache"
@@ -3055,7 +3055,7 @@ buildReviewIntercepts preloadedCaches =
           )
         , ( "Review.Cache.ContextHash.sort"
           , Types.Intercept
-                (\args _ _ ->
+                (\_ args _ _ ->
                     case args of
                         [ Types.List items ] ->
                             -- Sort ContextHash values by their Int hash.
