@@ -21,8 +21,8 @@
             "elm/time": "1.0.0",
             "elm-explorations/test": "2.2.1",
             "elmcraft/core-extra": "2.3.0",
+            "lamdera/codecs": "1.0.0",
             "mdgriffith/elm-codegen": "6.0.2",
-            "micahhahn/elm-safe-recursion": "2.0.0",
             "miniBill/elm-fast-dict": "1.2.5",
             "miniBill/elm-parser-error-extra": "1.0.0",
             "miniBill/elm-rope": "1.1.1",
@@ -33,7 +33,8 @@
             "stil4m/elm-syntax": "7.3.9",
             "the-sett/elm-pretty-printer": "3.3.1",
             "the-sett/elm-syntax-dsl": "6.0.5",
-            "wolfadex/elm-ansi": "3.0.1"
+            "wolfadex/elm-ansi": "3.0.1",
+            "elm/bytes": "1.0.8"
         },
         "indirect": {
             "Chadtech/elm-bool-extra": "2.4.2",
@@ -45,7 +46,6 @@
             "dillonkearns/elm-form": "3.1.0",
             "dillonkearns/elm-ts-json": "2.1.2",
             "elm/browser": "1.0.2",
-            "elm/bytes": "1.0.8",
             "elm/file": "1.0.5",
             "elm/html": "1.0.1",
             "elm/http": "2.0.0",
