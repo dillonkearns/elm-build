@@ -16,6 +16,8 @@
 - Fixed the rule-value cache bridge to key by `ruleName-ruleId` instead of only `ruleName`.
 - Added a manifest-validated serialized project cache path for warm `FullProject` rule evaluation.
 - Tested broader cached-project reuse for `ImportersOf`/`DependenciesOf`, then reverted it after it erased the subgraph-narrowing win.
+- Tested warm rule-cache reuse for narrowed `ImportersOf`/`DependenciesOf` slices, then reverted it after cache I/O outweighed any skip benefit.
+- Batched `ImportersOf` + `DependenciesOf` slice evaluations into a single interpreter call when both miss, to reduce fixed per-eval overhead on warm partial runs.
 
 ### Benchmarks
 
@@ -68,11 +70,41 @@ After the project-cache experiment:
   - `warm`: `400.0ms`
   - `warm_1_file_changed`: `3510.0ms`
 
+After the narrowed warm-rule-cache experiment:
+
+- `ImportersOf` warm_1_file_changed: `3180.0ms` (up from `2790.0ms`)
+- `DependenciesOf` warm_1_file_changed: `3270.0ms` (up from `2750.0ms`)
+- Mixed warm_1_file_changed: `3950.0ms` (up from `3510.0ms`)
+
+Single-rule warm_1_file_changed timings on the same fixture:
+
+- `NoUnused.Exports`: `3100.0ms`
+- `NoUnused.CustomTypeConstructors`: `3030.0ms`
+- `NoUnused.CustomTypeConstructorArgs`: `3020.0ms`
+- `NoUnused.Parameters`: `2810.0ms`
+- `NoUnused.Variables`: `2890.0ms`
+
+After batching narrowed project-rule evaluations:
+
+- Mixed full config on the same fixture:
+  - `cold`: `71620.0ms`
+  - `warm`: `410.0ms`
+  - `warm_1_file_changed`: `3210.0ms`
+- Project-only (`NoUnused.Exports`, `NoUnused.CustomTypeConstructors`, `NoUnused.CustomTypeConstructorArgs`, `NoUnused.Parameters`, `NoUnused.Variables`) on the same fixture:
+  - `cold`: `45710.0ms`
+  - `warm`: `370.0ms`
+  - `warm_1_file_changed`: `3010.0ms`
+- Group warm_1_file_changed after batching:
+  - `ImportersOf`: `2780.0ms`
+  - `DependenciesOf`: `2580.0ms`
+
 ### Takeaways
 
 - The unfair-advantage warm path is now much closer to the target shape: `37.2s -> 3.74s` on the 12-file fixture for a real 1-file semantic change.
 - Warm no-change stays sub-second and is slightly better after removing the unconditional review-app prepare step from the hot path.
 - The new host analysis cache mostly attacks parse/AST overhead, so its biggest win showed up on cold and full-hit warm paths. The 1-file warm path improved modestly because it is now dominated more by interpreter/rule execution than host parsing.
 - Cached-project reuse is not the next big win for narrowed `ImportersOf` / `DependenciesOf` project rules. The existing affected-subgraph strategy is much better there.
-- The real next performance step for 1-file warm runs is still rule-specific contribution caching, where a file change updates folded project-rule state instead of rerunning whole rule logic over any slice.
+- Warm rule-cache reuse is also not paying for narrowed slices in this architecture: the rule-cache serialization/deserialization cost is higher than the skip benefit here.
+- The single-rule timings show that fixed interpreter/evaluation overhead is now a major remaining cost. Batching multiple narrowed project-rule slices into one interpreter call helps even without a new cache.
+- The real next performance step for 1-file warm runs is still rule-specific contribution caching, where a file change updates folded project-rule state instead of rerunning whole rule logic over any slice, or alternatively a daemon that keeps the interpreter state warm in memory.
 - The next big opportunities are project-rule contribution caches, smaller AST transport than JSON, and eventually daemonized in-memory state.

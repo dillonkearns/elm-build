@@ -100,6 +100,18 @@ type alias ProjectEvalOutputCache =
     }
 
 
+type alias PerFileRuleKey =
+    { path : String
+    , narrowKey : String
+    }
+
+
+type alias PerFileRuleCheck =
+    { path : String
+    , hit : Bool
+    }
+
+
 cacheSchemaVersion : String
 cacheSchemaVersion =
     "review-runner-v4"
@@ -1507,7 +1519,7 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (buildProject, extractRuleCaches, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedProject, runReviewWithCachedRules, runRulesByIndices, runSingleRule)"
+        [ "module ReviewRunnerHelper exposing (buildProject, extractRuleCaches, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedProject, runReviewWithCachedRules, runRulesByIndices, runSingleRule, runTwoRuleGroups)"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
@@ -1609,6 +1621,11 @@ reviewRunnerHelperSource =
         , "            in"
         , "            errors |> List.map formatError |> String.join \"\\n\""
         , "        Nothing -> \"\""
+        , ""
+        , "runTwoRuleGroups firstIndices firstModules secondIndices secondModules ="
+        , "    ( runRulesByIndices firstIndices firstModules"
+        , "    , runRulesByIndices secondIndices secondModules"
+        , "    )"
         , ""
         , "ruleCount = List.length ReviewConfig.config"
         , ""
@@ -2252,322 +2269,193 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                         }
                                     )
                     in
-                    -- Check ImportersOf per-file caches
-                    Do.do (Script.exec "mkdir" [ "-p", prCacheDir ]) <| \_ ->
-                    Do.do
-                        (if List.isEmpty importersOfRules then
-                            BackendTask.succeed { allHit = True, outputs = "", fpIncluded = False }
-
-                         else
-                            Do.do
-                                (importersPerFileKeys
-                                    |> List.map
-                                        (\{ path, narrowKey } ->
-                                            let
-                                                safePath =
-                                                    path |> String.replace "/" "_"
-                                            in
-                                            File.rawFile (prCacheDir ++ "/" ++ safePath ++ ".key")
-                                                |> BackendTask.toResult
-                                                |> BackendTask.map
-                                                    (\result ->
-                                                        case result of
-                                                            Ok storedKey ->
-                                                                { path = path, hit = storedKey == narrowKey }
-
-                                                            Err _ ->
-                                                                { path = path, hit = False }
-                                                    )
-                                        )
-                                    |> BackendTask.Extra.combine
-                                )
-                            <| \checks ->
-                            if List.all .hit checks then
-                                -- All ImportersOf per-file caches valid
-                                Do.do
-                                    (importersPerFileKeys
-                                        |> List.map
-                                            (\{ path } ->
-                                                File.rawFile (prCacheDir ++ "/" ++ (path |> String.replace "/" "_") ++ ".txt")
-                                                    |> BackendTask.allowFatal
-                                            )
-                                        |> BackendTask.Extra.combine
-                                    )
-                                <| \cached ->
-                                BackendTask.succeed
-                                    { allHit = True
-                                    , fpIncluded = False
-                                    , outputs =
-                                        cached
-                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
-                                            |> String.join "\n"
-                                    }
-
-                            else
-                                -- Some ImportersOf files missed — only re-eval
-                                -- the affected reverse-dependency slice.
-                                let
-                                    ioIndices =
-                                        importersOfRules |> List.map .index
-
-                                    missedPaths =
-                                        checks
-                                            |> List.filter (not << .hit)
-                                            |> List.map .path
-
-                                    affectedEvalPaths =
-                                        missedPaths
-                                            |> List.foldl
-                                                (\path acc ->
-                                                    Set.union acc (DepGraph.reverseDeps depGraph path)
-                                                )
-                                                Set.empty
-
-                                    affectedModules =
-                                        allModulesWithAst
-                                            |> List.filter (\file -> Set.member file.path affectedEvalPaths)
-
-                                    result =
-                                        InterpreterProject.prepareAndEval reviewProject
-                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                            , expression = buildExpressionForRules ioIndices affectedModules
-                                            , sourceOverrides = [ reviewRunnerHelperSource ]
-                                            }
-
-                                    ioOutput =
-                                        case result of
-                                            Ok s ->
-                                                s
-
-                                            Err e ->
-                                                e
-
-                                    ioErrors =
-                                        parseReviewOutput ioOutput
-
-                                    freshMissOutputs =
-                                        missedPaths
-                                            |> List.map
-                                                (\path ->
-                                                    ioErrors
-                                                        |> List.filter (\err -> err.filePath == path)
-                                                        |> List.map formatErrorLine
-                                                        |> String.join "\n"
-                                                )
-                                in
-                                Do.do
-                                    (checks
-                                        |> List.filterMap
-                                            (\check ->
-                                                if check.hit then
-                                                    Just
-                                                        (File.rawFile (prCacheDir ++ "/" ++ cacheFileComponent check.path ++ ".txt")
-                                                            |> BackendTask.allowFatal
-                                                        )
-
-                                                else
-                                                    Nothing
-                                            )
-                                        |> BackendTask.Extra.combine
-                                    )
-                                <| \cachedHitOutputs ->
-                                Do.do
-                                    (importersPerFileKeys
-                                        |> List.filter (\{ path } -> List.member path missedPaths)
-                                        |> List.map
-                                            (\{ path, narrowKey } ->
-                                                let
-                                                    safePath =
-                                                        cacheFileComponent path
-
-                                                    fileErrors =
-                                                        ioErrors
-                                                            |> List.filter (\err -> err.filePath == path)
-                                                            |> List.map formatErrorLine
-                                                            |> String.join "\n"
-                                                in
-                                                Script.writeFile { path = prCacheDir ++ "/" ++ safePath ++ ".key", body = narrowKey }
-                                                    |> BackendTask.allowFatal
-                                                    |> BackendTask.andThen
-                                                        (\_ ->
-                                                            Script.writeFile { path = prCacheDir ++ "/" ++ safePath ++ ".txt", body = fileErrors }
-                                                                |> BackendTask.allowFatal
-                                                        )
-                                            )
-                                        |> BackendTask.Extra.combine
-                                    )
-                                <| \_ ->
-                                BackendTask.succeed
-                                    { allHit = False
-                                    , fpIncluded = False
-                                    , outputs =
-                                        cachedHitOutputs
-                                            ++ freshMissOutputs
-                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
-                                            |> String.join "\n"
-                                    }
-                        )
-                    <| \importersResult ->
-                    -- Check DependenciesOf per-file caches (same pattern as ImportersOf)
                     let
                         doCacheDir =
                             Path.toString config.buildDirectory ++ "/pr-deps-of"
                     in
+                    Do.do (Script.exec "mkdir" [ "-p", prCacheDir ]) <| \_ ->
                     Do.do (Script.exec "mkdir" [ "-p", doCacheDir ]) <| \_ ->
                     Do.do
-                        (if List.isEmpty dependenciesOfRules then
-                            BackendTask.succeed { allHit = True, outputs = "", fpIncluded = False }
+                        (if List.isEmpty importersOfRules then
+                            BackendTask.succeed []
 
                          else
-                            Do.do
-                                (depsPerFileKeys
-                                    |> List.map
-                                        (\{ path, narrowKey } ->
-                                            let
-                                                safePath =
-                                                    path |> String.replace "/" "_"
-                                            in
-                                            File.rawFile (doCacheDir ++ "/" ++ safePath ++ ".key")
-                                                |> BackendTask.toResult
-                                                |> BackendTask.map
-                                                    (\result ->
-                                                        case result of
-                                                            Ok storedKey ->
-                                                                { path = path, hit = storedKey == narrowKey }
+                            checkPerFileRuleCache prCacheDir importersPerFileKeys
+                        )
+                    <| \importersChecks ->
+                    Do.do
+                        (if List.isEmpty dependenciesOfRules then
+                            BackendTask.succeed []
 
-                                                            Err _ ->
-                                                                { path = path, hit = False }
-                                                    )
-                                        )
-                                    |> BackendTask.Extra.combine
-                                )
-                            <| \checks ->
-                            if List.all .hit checks then
-                                -- All DependenciesOf per-file caches valid
-                                Do.do
-                                    (depsPerFileKeys
-                                        |> List.map
-                                            (\{ path } ->
-                                                File.rawFile (doCacheDir ++ "/" ++ (path |> String.replace "/" "_") ++ ".txt")
-                                                    |> BackendTask.allowFatal
+                         else
+                            checkPerFileRuleCache doCacheDir depsPerFileKeys
+                        )
+                    <| \depsChecks ->
+                    let
+                        ioIndices =
+                            importersOfRules |> List.map .index
+
+                        doIndices =
+                            dependenciesOfRules |> List.map .index
+
+                        importersAllHit =
+                            List.isEmpty importersOfRules || List.all .hit importersChecks
+
+                        depsAllHit =
+                            List.isEmpty dependenciesOfRules || List.all .hit depsChecks
+
+                        importersMissedPaths =
+                            importersChecks
+                                |> List.filter (not << .hit)
+                                |> List.map .path
+
+                        depsMissedPaths =
+                            depsChecks
+                                |> List.filter (not << .hit)
+                                |> List.map .path
+
+                        importersAffectedModules =
+                            let
+                                affectedEvalPaths =
+                                    importersMissedPaths
+                                        |> List.foldl
+                                            (\path acc ->
+                                                Set.union acc (DepGraph.reverseDeps depGraph path)
                                             )
-                                        |> BackendTask.Extra.combine
-                                    )
-                                <| \cached ->
-                                BackendTask.succeed
-                                    { allHit = True
-                                    , fpIncluded = False
-                                    , outputs =
-                                        cached
-                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
-                                            |> String.join "\n"
+                                            Set.empty
+                            in
+                            allModulesWithAst
+                                |> List.filter (\file -> Set.member file.path affectedEvalPaths)
+
+                        depsAffectedModules =
+                            let
+                                affectedEvalPaths =
+                                    depsMissedPaths
+                                        |> List.foldl
+                                            (\path acc ->
+                                                Set.union acc (DepGraph.transitiveDeps depGraph path)
+                                            )
+                                            Set.empty
+                            in
+                            allModulesWithAst
+                                |> List.filter (\file -> Set.member file.path affectedEvalPaths)
+                    in
+                    Do.do
+                        (readPerFileRuleOutputs
+                            prCacheDir
+                            (if importersAllHit then
+                                importersPerFileKeys |> List.map .path
+
+                             else
+                                importersChecks
+                                    |> List.filter .hit
+                                    |> List.map .path
+                            )
+                        )
+                    <| \importersCachedOutputs ->
+                    Do.do
+                        (readPerFileRuleOutputs
+                            doCacheDir
+                            (if depsAllHit then
+                                depsPerFileKeys |> List.map .path
+
+                             else
+                                depsChecks
+                                    |> List.filter .hit
+                                    |> List.map .path
+                            )
+                        )
+                    <| \depsCachedOutputs ->
+                    let
+                        evaluatedOutputs =
+                            case ( importersAllHit, depsAllHit ) of
+                                ( False, False ) ->
+                                    evalTwoProjectRuleSlices reviewProject ioIndices importersAffectedModules doIndices depsAffectedModules
+
+                                ( False, True ) ->
+                                    { firstOutput = runProjectRulesFresh reviewProject ioIndices importersAffectedModules
+                                    , secondOutput = ""
                                     }
+
+                                ( True, False ) ->
+                                    { firstOutput = ""
+                                    , secondOutput = runProjectRulesFresh reviewProject doIndices depsAffectedModules
+                                    }
+
+                                ( True, True ) ->
+                                    { firstOutput = "", secondOutput = "" }
+
+                        ioErrors =
+                            if importersAllHit then
+                                []
 
                             else
-                                -- Some DependenciesOf files missed — only re-eval
-                                -- the affected dependency slice.
-                                let
-                                    doIndices =
-                                        dependenciesOfRules |> List.map .index
+                                parseReviewOutput evaluatedOutputs.firstOutput
 
-                                    missedPaths =
-                                        checks
-                                            |> List.filter (not << .hit)
-                                            |> List.map .path
+                        doErrors =
+                            if depsAllHit then
+                                []
 
-                                    affectedEvalPaths =
-                                        missedPaths
-                                            |> List.foldl
-                                                (\path acc ->
-                                                    Set.union acc (DepGraph.transitiveDeps depGraph path)
-                                                )
-                                                Set.empty
+                            else
+                                parseReviewOutput evaluatedOutputs.secondOutput
 
-                                    affectedModules =
-                                        allModulesWithAst
-                                            |> List.filter (\file -> Set.member file.path affectedEvalPaths)
-
-                                    doResult =
-                                        InterpreterProject.prepareAndEval reviewProject
-                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                            , expression = buildExpressionForRules doIndices affectedModules
-                                            , sourceOverrides = [ reviewRunnerHelperSource ]
-                                            }
-
-                                    doOutput =
-                                        case doResult of
-                                            Ok s ->
-                                                s
-
-                                            Err e ->
-                                                e
-
-                                    doErrors =
-                                        parseReviewOutput doOutput
-
-                                    freshMissOutputs =
-                                        missedPaths
-                                            |> List.map
-                                                (\path ->
-                                                    doErrors
-                                                        |> List.filter (\err -> err.filePath == path)
-                                                        |> List.map formatErrorLine
-                                                        |> String.join "\n"
-                                                )
-                                in
-                                Do.do
-                                    (checks
-                                        |> List.filterMap
-                                            (\check ->
-                                                if check.hit then
-                                                    Just
-                                                        (File.rawFile (doCacheDir ++ "/" ++ cacheFileComponent check.path ++ ".txt")
-                                                            |> BackendTask.allowFatal
-                                                        )
-
-                                                else
-                                                    Nothing
-                                            )
-                                        |> BackendTask.Extra.combine
-                                    )
-                                <| \cachedHitOutputs ->
-                                Do.do
-                                    (depsPerFileKeys
-                                        |> List.filter (\{ path } -> List.member path missedPaths)
-                                        |> List.map
-                                            (\{ path, narrowKey } ->
-                                                let
-                                                    safePath =
-                                                        cacheFileComponent path
-
-                                                    fileErrors =
-                                                        doErrors
-                                                            |> List.filter (\err -> err.filePath == path)
-                                                            |> List.map formatErrorLine
-                                                            |> String.join "\n"
-                                                in
-                                                Script.writeFile { path = doCacheDir ++ "/" ++ safePath ++ ".key", body = narrowKey }
-                                                    |> BackendTask.allowFatal
-                                                    |> BackendTask.andThen
-                                                        (\_ ->
-                                                            Script.writeFile { path = doCacheDir ++ "/" ++ safePath ++ ".txt", body = fileErrors }
-                                                                |> BackendTask.allowFatal
-                                                        )
-                                            )
-                                        |> BackendTask.Extra.combine
-                                    )
-                                <| \_ ->
-                                BackendTask.succeed
-                                    { allHit = False
-                                    , outputs =
-                                        cachedHitOutputs
-                                            ++ freshMissOutputs
-                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                        freshImportersOutputs =
+                            importersMissedPaths
+                                |> List.map
+                                    (\path ->
+                                        ioErrors
+                                            |> List.filter (\err -> err.filePath == path)
+                                            |> List.map formatErrorLine
                                             |> String.join "\n"
-                                    , fpIncluded = False
-                                    }
+                                    )
+
+                        freshDepsOutputs =
+                            depsMissedPaths
+                                |> List.map
+                                    (\path ->
+                                        doErrors
+                                            |> List.filter (\err -> err.filePath == path)
+                                            |> List.map formatErrorLine
+                                            |> String.join "\n"
+                                    )
+                    in
+                    Do.do
+                        (if importersAllHit then
+                            BackendTask.succeed ()
+
+                         else
+                            writePerFileRuleOutputs prCacheDir importersPerFileKeys importersMissedPaths ioErrors
                         )
-                    <| \depsOfResult ->
+                    <| \_ ->
+                    Do.do
+                        (if depsAllHit then
+                            BackendTask.succeed ()
+
+                         else
+                            writePerFileRuleOutputs doCacheDir depsPerFileKeys depsMissedPaths doErrors
+                        )
+                    <| \_ ->
+                    let
+                        importersResult =
+                            { allHit = importersAllHit
+                            , fpIncluded = False
+                            , outputs =
+                                importersCachedOutputs
+                                    ++ freshImportersOutputs
+                                    |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                                    |> String.join "\n"
+                            }
+
+                        depsOfResult =
+                            { allHit = depsAllHit
+                            , fpIncluded = False
+                            , outputs =
+                                depsCachedOutputs
+                                    ++ freshDepsOutputs
+                                    |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                                    |> String.join "\n"
+                            }
+                    in
                     -- Handle DependenciesOf + FullProject rules together.
                     -- When DependenciesOf missed, we already ran its eval above.
                     -- Now check FullProject separately.
@@ -3034,6 +2922,70 @@ cacheFileComponent path =
         |> String.replace "/" "_"
 
 
+checkPerFileRuleCache : String -> List PerFileRuleKey -> BackendTask FatalError (List PerFileRuleCheck)
+checkPerFileRuleCache cacheDir perFileKeys =
+    perFileKeys
+        |> List.map
+            (\{ path, narrowKey } ->
+                File.rawFile (cacheDir ++ "/" ++ cacheFileComponent path ++ ".key")
+                    |> BackendTask.toResult
+                    |> BackendTask.map
+                        (\result ->
+                            case result of
+                                Ok storedKey ->
+                                    { path = path, hit = storedKey == narrowKey }
+
+                                Err _ ->
+                                    { path = path, hit = False }
+                        )
+            )
+        |> BackendTask.Extra.combine
+
+
+readPerFileRuleOutputs : String -> List String -> BackendTask FatalError (List String)
+readPerFileRuleOutputs cacheDir paths =
+    paths
+        |> List.map
+            (\path ->
+                File.rawFile (cacheDir ++ "/" ++ cacheFileComponent path ++ ".txt")
+                    |> BackendTask.allowFatal
+            )
+        |> BackendTask.Extra.combine
+
+
+writePerFileRuleOutputs :
+    String
+    -> List PerFileRuleKey
+    -> List String
+    -> List ReviewError
+    -> BackendTask FatalError ()
+writePerFileRuleOutputs cacheDir perFileKeys targetPaths errors =
+    perFileKeys
+        |> List.filter (\{ path } -> List.member path targetPaths)
+        |> List.map
+            (\{ path, narrowKey } ->
+                let
+                    safePath =
+                        cacheFileComponent path
+
+                    fileErrors =
+                        errors
+                            |> List.filter (\err -> err.filePath == path)
+                            |> List.map formatErrorLine
+                            |> String.join "\n"
+                in
+                Script.writeFile { path = cacheDir ++ "/" ++ safePath ++ ".key", body = narrowKey }
+                    |> BackendTask.allowFatal
+                    |> BackendTask.andThen
+                        (\_ ->
+                            Script.writeFile { path = cacheDir ++ "/" ++ safePath ++ ".txt", body = fileErrors }
+                                |> BackendTask.allowFatal
+                        )
+            )
+        |> BackendTask.Extra.combine
+        |> BackendTask.map (\_ -> ())
+
+
 buildReviewIntercepts :
     Dict String Types.Value
     -> FastDict.Dict String Types.Intercept
@@ -3251,6 +3203,44 @@ runProjectRulesFresh reviewProject prIndices modulesWithAst =
 
         Err err ->
             err
+
+
+evalTwoProjectRuleSlices :
+    InterpreterProject
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> { firstOutput : String, secondOutput : String }
+evalTwoProjectRuleSlices reviewProject firstIndices firstModules secondIndices secondModules =
+    let
+        indexList indices =
+            "[ " ++ (indices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+
+        expression =
+            "ReviewRunnerHelper.runTwoRuleGroups "
+                ++ indexList firstIndices
+                ++ " "
+                ++ buildModuleListWithAst firstModules
+                ++ " "
+                ++ indexList secondIndices
+                ++ " "
+                ++ buildModuleListWithAst secondModules
+    in
+    case
+        InterpreterProject.prepareAndEvalRaw reviewProject
+            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+            , expression = expression
+            , sourceOverrides = [ reviewRunnerHelperSource ]
+            }
+    of
+        Ok (Types.Tuple (Types.String firstOutput) (Types.String secondOutput)) ->
+            { firstOutput = firstOutput, secondOutput = secondOutput }
+
+        _ ->
+            { firstOutput = runProjectRulesFresh reviewProject firstIndices firstModules
+            , secondOutput = runProjectRulesFresh reviewProject secondIndices secondModules
+            }
 
 
 projectRuleYieldHandler : String -> String -> Types.Value -> BackendTask FatalError Types.Value
