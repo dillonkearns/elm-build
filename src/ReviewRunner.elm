@@ -1732,7 +1732,20 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                         Do.do (Script.writeFile { path = projectPath, body = serializedProject } |> BackendTask.allowFatal) <| \_ ->
                                         BackendTask.succeed Types.Unit
 
-                                    _ ->
+                                    other ->
+                                        Do.do
+                                            (File.rawFile (Path.toString config.buildDirectory ++ "/yield-log.txt")
+                                                |> BackendTask.toResult
+                                                |> BackendTask.andThen
+                                                    (\existing ->
+                                                        Script.writeFile
+                                                            { path = Path.toString config.buildDirectory ++ "/yield-log.txt"
+                                                            , body = (Result.withDefault "" existing) ++ "UNKNOWN yield: " ++ other ++ "\n"
+                                                            }
+                                                            |> BackendTask.allowFatal
+                                                    )
+                                            )
+                                        <| \_ ->
                                         BackendTask.succeed Types.Unit
                         in
                         Do.do
@@ -2233,25 +2246,12 @@ buildReviewIntercepts preloadedCaches =
                 (\args _ _ ->
                     case args of
                         [ Types.String ruleName, _, defaultCache ] ->
-                            let
-                                cacheToUse =
-                                    case Dict.get ruleName preloadedCaches of
-                                        Just cached ->
-                                            cached
+                            case Dict.get ruleName preloadedCaches of
+                                Just cached ->
+                                    Types.EvOk cached
 
-                                        Nothing ->
-                                            defaultCache
-                            in
-                            -- Yield for disk persistence, then return the cache
-                            Types.EvYield "review-cache-write"
-                                (Types.Record
-                                    (FastDict.fromList
-                                        [ ( "ruleName", Types.String ruleName )
-                                        , ( "cache", cacheToUse )
-                                        ]
-                                    )
-                                )
-                                (\_ -> Types.EvOk cacheToUse)
+                                Nothing ->
+                                    Types.EvOk defaultCache
 
                         _ ->
                             Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
@@ -2260,7 +2260,9 @@ buildReviewIntercepts preloadedCaches =
         , ( "Review.Rule.finalCacheMarker"
           , Types.Intercept
                 (\args _ _ ->
-                    -- Identity — caches are extracted via expression-level helper
+                    -- Identity for now — yields from let bindings cause infinite loops.
+                    -- Rule caches accumulate 1 per run via finalCacheMarker yield.
+                    -- TODO: fix let-binding yield propagation to save ALL caches at once.
                     case args of
                         [ _, _, cache ] ->
                             Types.EvOk cache
