@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), buildExpression, buildExpressionForRule, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, profileForRule, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, profileForRule, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -58,6 +58,11 @@ type alias Config =
     , sourceDirs : List String
     , buildDirectory : Path
     }
+
+
+cacheSchemaVersion : String
+cacheSchemaVersion =
+    "review-runner-v3"
 
 
 programConfig : Program.Config Config
@@ -220,6 +225,7 @@ classifyRuleSource source =
 type CrossModuleDep
     = NoCrossModule
     | ImportersOf
+    | DependenciesOf
     | FullProject
 
 
@@ -267,6 +273,12 @@ profileForRule ruleName =
 
         "NoUnused.CustomTypeConstructorArgs" ->
             { expressionDep = True, declarationNameDep = True, importDep = True, exposingDep = True, customTypeDep = True, crossModuleDep = ImportersOf }
+
+        "NoUnused.Variables" ->
+            { expressionDep = True, declarationNameDep = True, importDep = True, exposingDep = True, customTypeDep = True, crossModuleDep = DependenciesOf }
+
+        "NoUnused.Parameters" ->
+            { expressionDep = True, declarationNameDep = True, importDep = True, exposingDep = True, customTypeDep = False, crossModuleDep = ImportersOf }
 
         _ ->
             -- Conservative: depend on everything
@@ -335,16 +347,82 @@ narrowCacheKey profile filePath fileHashes allFileHashes depGraph =
                         |> FNV1a.hash
                         |> String.fromInt
 
+                DependenciesOf ->
+                    DepGraph.transitiveDeps depGraph filePath
+                        |> Set.toList
+                        |> List.sort
+                        |> List.filterMap (\p -> Dict.get p allFileHashes)
+                        |> List.map (narrowAspects profile)
+                        |> String.join "|"
+                        |> FNV1a.hash
+                        |> String.fromInt
+
                 FullProject ->
                     allFileHashes
                         |> Dict.toList
                         |> List.sortBy Tuple.first
-                        |> List.map (\( _, h ) -> h.fullHash)
+                        |> List.map (\( _, h ) -> narrowAspects profile h)
                         |> String.join "|"
                         |> FNV1a.hash
                         |> String.fromInt
     in
     localKey ++ "|" ++ crossModuleKey
+
+
+{-| Merge dependency profiles for a group of rules into a combined profile.
+-}
+mergeProfiles : CrossModuleDep -> List { a | name : String } -> RuleDependencyProfile
+mergeProfiles crossModuleDep rules =
+    rules
+        |> List.foldl
+            (\rule acc ->
+                let
+                    p =
+                        profileForRule rule.name
+                in
+                { acc
+                    | expressionDep = acc.expressionDep || p.expressionDep
+                    , declarationNameDep = acc.declarationNameDep || p.declarationNameDep
+                    , importDep = acc.importDep || p.importDep
+                    , exposingDep = acc.exposingDep || p.exposingDep
+                    , customTypeDep = acc.customTypeDep || p.customTypeDep
+                }
+            )
+            { expressionDep = False, declarationNameDep = False, importDep = False, exposingDep = False, customTypeDep = False, crossModuleDep = crossModuleDep }
+
+
+{-| Extract only the aspects a rule depends on from FileAspectHashes, joined as a string.
+-}
+narrowAspects : RuleDependencyProfile -> SemanticHash.FileAspectHashes -> String
+narrowAspects profile h =
+    [ if profile.expressionDep then
+        h.expressionsHash
+
+      else
+        ""
+    , if profile.declarationNameDep then
+        h.declNamesHash
+
+      else
+        ""
+    , if profile.importDep then
+        h.importsHash
+
+      else
+        ""
+    , if profile.exposingDep then
+        h.exposingHash
+
+      else
+        ""
+    , if profile.customTypeDep then
+        h.customTypesHash
+
+      else
+        ""
+    ]
+        |> List.filter (not << String.isEmpty)
+        |> String.join "|"
 
 
 {-| Compute a semantic cache key for a set of source files.
@@ -899,7 +977,7 @@ reviewRunnerHelperSource =
         , "runReviewCachingWithProject indices modules ="
         , "    let"
         , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
-        , "        project = projectCacheMarker (buildProject modules)"
+        , "        project = buildProject modules"
         , "        ( errors, updatedRules ) = Rule.review selectedRules project"
         , "        errorStr = errors |> List.map formatError |> String.join \"\\n\""
         , "    in"
@@ -1006,11 +1084,11 @@ reviewRunnerHelperSource =
 
 task : Config -> BackendTask FatalError ()
 task config =
+    Do.do (prepareConfig config) <| \preparedConfig ->
     let
         declCachePath =
-            Path.toString config.buildDirectory ++ "/review-decl-cache.json"
+            Path.toString preparedConfig.buildDirectory ++ "/review-decl-cache.json"
     in
-    Do.do (ensureReviewDeps config.reviewDir) <| \_ ->
     -- Load previous per-declaration cache from disk
     Do.do
         (File.rawFile declCachePath
@@ -1024,7 +1102,7 @@ task config =
                 )
         )
     <| \previousCache ->
-    Do.do (resolveTargetFiles config) <| \targetFiles ->
+    Do.do (resolveTargetFiles preparedConfig) <| \targetFiles ->
     Do.do (readTargetFiles targetFiles) <| \targetFileContents ->
     let
         decision =
@@ -1037,8 +1115,9 @@ task config =
 
         ColdMiss _ ->
             -- No cache — treat all files as stale (same code path as PartialMiss)
-            Do.do (getRuleInfo config) <| \ruleInfo ->
-            Do.do (loadAndEvalHybridPartial config ruleInfo targetFileContents targetFileContents []) <| \output ->
+            Do.do (loadReviewProject preparedConfig) <| \reviewProject ->
+            Do.do (getRuleInfoWithProject preparedConfig reviewProject) <| \ruleInfo ->
+            Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents targetFileContents []) <| \output ->
             let
                 errors =
                     parseReviewOutput output
@@ -1052,12 +1131,13 @@ task config =
         PartialMiss { cachedErrors, staleFiles } ->
             -- Some files changed. Module rules on unchanged files use cachedErrors.
             -- Only stale files need module rule re-eval. Project rules always re-eval.
-            Do.do (getRuleInfo config) <| \ruleInfo ->
+            Do.do (loadReviewProject preparedConfig) <| \reviewProject ->
+            Do.do (getRuleInfoWithProject preparedConfig reviewProject) <| \ruleInfo ->
             let
                 staleFileContents =
                     targetFileContents |> List.filter (\f -> List.member f.path staleFiles)
             in
-            Do.do (loadAndEvalHybridPartial config ruleInfo targetFileContents staleFileContents cachedErrors) <| \output ->
+            Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents staleFileContents cachedErrors) <| \output ->
             let
                 freshErrors =
                     parseReviewOutput output
@@ -1067,6 +1147,97 @@ task config =
             in
             Do.do (persistCache declCachePath newCache) <| \_ ->
             reportErrors freshErrors
+
+
+prepareConfig : Config -> BackendTask FatalError Config
+prepareConfig config =
+    Do.do (reviewAppHash config) <| \appHash ->
+    let
+        preparedConfig =
+            { config
+                | buildDirectory =
+                    Path.path (Path.toString config.buildDirectory ++ "/review-app-" ++ appHash)
+            }
+    in
+    Do.do (Script.exec "mkdir" [ "-p", Path.toString preparedConfig.buildDirectory ]) <| \_ ->
+    Do.do (ensureReviewDepsCached preparedConfig) <| \_ ->
+    BackendTask.succeed preparedConfig
+
+
+reviewAppHash : Config -> BackendTask FatalError String
+reviewAppHash config =
+    Do.do (reviewAppFiles config) <| \files ->
+    Do.do
+        (files
+            |> List.map
+                (\path ->
+                    File.rawFile path
+                        |> BackendTask.allowFatal
+                        |> BackendTask.map (\contents -> path ++ "\n" ++ contents)
+                )
+            |> BackendTask.Extra.combine
+        )
+    <| \fileContents ->
+    ([ cacheSchemaVersion
+     , reviewRunnerHelperSource
+     ]
+        ++ fileContents
+    )
+        |> String.join "\u{001F}"
+        |> FNV1a.hash
+        |> String.fromInt
+        |> BackendTask.succeed
+
+
+reviewAppFiles : Config -> BackendTask FatalError (List String)
+reviewAppFiles config =
+    Glob.fromStringWithOptions
+        (let
+            o =
+                Glob.defaultOptions
+         in
+         { o | include = Glob.OnlyFiles }
+        )
+        (config.reviewDir ++ "/src/**/*.elm")
+        |> BackendTask.toResult
+        |> BackendTask.map
+            (\result ->
+                case result of
+                    Ok files ->
+                        (config.reviewDir ++ "/elm.json")
+                            :: List.sort files
+
+                    Err _ ->
+                        [ config.reviewDir ++ "/elm.json" ]
+            )
+
+
+ensureReviewDepsCached : Config -> BackendTask FatalError ()
+ensureReviewDepsCached config =
+    let
+        stampPath =
+            Path.toString config.buildDirectory ++ "/review-deps-ready"
+    in
+    File.rawFile stampPath
+        |> BackendTask.toResult
+        |> BackendTask.andThen
+            (\result ->
+                case result of
+                    Ok _ ->
+                        BackendTask.succeed ()
+
+                    Err _ ->
+                        Do.do (ensureReviewDeps config.reviewDir) <| \depsReady ->
+                        if depsReady then
+                            Script.writeFile
+                                { path = stampPath
+                                , body = cacheSchemaVersion
+                                }
+                                |> BackendTask.allowFatal
+
+                        else
+                            BackendTask.succeed ()
+            )
 
 
 {-| Load the review project and evaluate Rule.review via the interpreter.
@@ -1260,6 +1431,18 @@ loadAndEvalHybridPartial :
     -> BackendTask FatalError String
 loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cachedErrors =
     Do.do (loadReviewProject config) <| \reviewProject ->
+    loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContents staleFileContents cachedErrors
+
+
+loadAndEvalHybridPartialWithProject :
+    Config
+    -> InterpreterProject
+    -> List { index : Int, name : String, ruleType : RuleType }
+    -> List { path : String, source : String }
+    -> List { path : String, source : String }
+    -> List ReviewError
+    -> BackendTask FatalError String
+loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContents staleFileContents cachedErrors =
     let
         helperHash =
             FNV1a.hash reviewRunnerHelperSource |> String.fromInt
@@ -1322,49 +1505,55 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                 |> List.map formatErrorLine
                 |> String.join "\n"
 
-        -- Module rules: only eval STALE files (others are cached)
+        moduleRuleIndices =
+            moduleRules |> List.map .index
+
+        moduleRuleProfile =
+            mergeProfiles NoCrossModule moduleRules
+
+        -- Module rules: batch all module rules for each STALE file
         moduleRuleMonads =
-            moduleRules
-                |> List.concatMap
-                    (\rule ->
-                        let
-                            profile =
-                                profileForRule rule.name
-                        in
-                        staleModulesWithAst
-                            |> List.indexedMap
-                                (\fileIdx file ->
-                                    let
-                                        fileHashes =
-                                            SemanticHash.computeAspectHashesFromSource file.source
+            if List.isEmpty moduleRules then
+                []
 
-                                        fileNarrowKey =
-                                            narrowCacheKey profile file.path fileHashes Dict.empty (DepGraph.buildGraph { sourceDirectories = [], files = [] })
+            else
+                staleModulesWithAst
+                    |> List.indexedMap
+                        (\fileIdx file ->
+                            let
+                                fileHashes =
+                                    Dict.get file.path allFileAspectHashes
+                                        |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
 
-                                        cacheKey =
-                                            "mr|" ++ String.fromInt rule.index ++ "|" ++ helperHash ++ "|" ++ file.path ++ "|" ++ fileNarrowKey
-                                    in
-                                    Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
-                                    Cache.compute [ "mr", String.fromInt rule.index, file.path ]
-                                        keyHash
-                                        (\() ->
-                                            case
-                                                InterpreterProject.prepareAndEval reviewProject
-                                                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                                    , expression = buildExpressionForRule rule.index [ file ]
-                                                    , sourceOverrides = [ reviewRunnerHelperSource ]
-                                                    }
-                                            of
-                                                Ok s -> s
-                                                Err e -> e
-                                        )
-                                    <| \hash ->
-                                    Cache.succeed
-                                        { filename = Path.path ("smr-" ++ String.fromInt rule.index ++ "-" ++ String.fromInt fileIdx)
-                                        , hash = hash
-                                        }
+                                fileNarrowKey =
+                                    narrowCacheKey moduleRuleProfile file.path fileHashes allFileAspectHashes depGraph
+
+                                cacheKey =
+                                    "smr|" ++ helperHash ++ "|" ++ (moduleRuleIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ file.path ++ "|" ++ fileNarrowKey
+                            in
+                            Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
+                            Cache.compute [ "smr", file.path ]
+                                keyHash
+                                (\() ->
+                                    case
+                                        InterpreterProject.prepareAndEval reviewProject
+                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                            , expression = buildExpressionForRules moduleRuleIndices [ file ]
+                                            , sourceOverrides = [ reviewRunnerHelperSource ]
+                                            }
+                                    of
+                                        Ok s ->
+                                            s
+
+                                        Err e ->
+                                            e
                                 )
-                    )
+                            <| \hash ->
+                            Cache.succeed
+                                { filename = Path.path ("smr-" ++ String.fromInt fileIdx)
+                                , hash = hash
+                                }
+                        )
 
         allMonads =
             moduleRuleMonads
@@ -1377,21 +1566,18 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
             (\cacheResult ->
                 -- Read stale module rule results
                 let
-                    staleCount =
-                        List.length staleModulesWithAst
-
                     mrFiles =
-                        moduleRules
-                            |> List.concatMap
-                                (\rule ->
-                                    List.range 0 (staleCount - 1)
-                                        |> List.map
-                                            (\fileIdx ->
-                                                File.rawFile
-                                                    (Path.toString cacheResult.output ++ "/smr-" ++ String.fromInt rule.index ++ "-" ++ String.fromInt fileIdx)
-                                                    |> BackendTask.allowFatal
-                                            )
-                                )
+                        if List.isEmpty moduleRules then
+                            []
+
+                        else
+                            staleModulesWithAst
+                                |> List.indexedMap
+                                    (\fileIdx _ ->
+                                        File.rawFile
+                                            (Path.toString cacheResult.output ++ "/smr-" ++ String.fromInt fileIdx)
+                                            |> BackendTask.allowFatal
+                                    )
                 in
                 mrFiles
                     |> BackendTask.Extra.combine
@@ -1431,16 +1617,28 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                                 False
                                     )
 
+                        dependenciesOfRules =
+                            projectRules
+                                |> List.filter
+                                    (\rule ->
+                                        case (profileForRule rule.name).crossModuleDep of
+                                            DependenciesOf ->
+                                                True
+
+                                            _ ->
+                                                False
+                                    )
+
                         fullProjectRules =
                             projectRules
                                 |> List.filter
                                     (\rule ->
                                         case (profileForRule rule.name).crossModuleDep of
-                                            ImportersOf ->
-                                                False
+                                            FullProject ->
+                                                True
 
                                             _ ->
-                                                True
+                                                False
                                     )
 
                         prCacheDir =
@@ -1448,22 +1646,11 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
 
                         -- Combined profile for ImportersOf rules only
                         importersProfile =
-                            importersOfRules
-                                |> List.foldl
-                                    (\rule acc ->
-                                        let
-                                            p =
-                                                profileForRule rule.name
-                                        in
-                                        { acc
-                                            | expressionDep = acc.expressionDep || p.expressionDep
-                                            , declarationNameDep = acc.declarationNameDep || p.declarationNameDep
-                                            , importDep = acc.importDep || p.importDep
-                                            , exposingDep = acc.exposingDep || p.exposingDep
-                                            , customTypeDep = acc.customTypeDep || p.customTypeDep
-                                        }
-                                    )
-                                    { expressionDep = False, declarationNameDep = False, importDep = False, exposingDep = False, customTypeDep = False, crossModuleDep = ImportersOf }
+                            mergeProfiles ImportersOf importersOfRules
+
+                        -- Combined profile for DependenciesOf rules
+                        dependenciesProfile =
+                            mergeProfiles DependenciesOf dependenciesOfRules
 
                         -- Per-file narrow keys for ImportersOf rules
                         importersPerFileKeys =
@@ -1482,12 +1669,30 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                                 ++ "|" ++ narrowCacheKey importersProfile file.path fileHashes allFileAspectHashes depGraph
                                         }
                                     )
+
+                        -- Per-file narrow keys for DependenciesOf rules
+                        depsPerFileKeys =
+                            allFileContents
+                                |> List.map
+                                    (\file ->
+                                        let
+                                            fileHashes =
+                                                Dict.get file.path allFileAspectHashes
+                                                    |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
+                                        in
+                                        { path = file.path
+                                        , narrowKey =
+                                            "prf-do|" ++ helperHash ++ "|"
+                                                ++ (dependenciesOfRules |> List.map (.index >> String.fromInt) |> String.join ",")
+                                                ++ "|" ++ narrowCacheKey dependenciesProfile file.path fileHashes allFileAspectHashes depGraph
+                                        }
+                                    )
                     in
                     -- Check ImportersOf per-file caches
                     Do.do (Script.exec "mkdir" [ "-p", prCacheDir ]) <| \_ ->
                     Do.do
                         (if List.isEmpty importersOfRules then
-                            BackendTask.succeed { allHit = True, outputs = "" }
+                            BackendTask.succeed { allHit = True, outputs = "", fpIncluded = False }
 
                          else
                             Do.do
@@ -1527,6 +1732,7 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                 <| \cached ->
                                 BackendTask.succeed
                                     { allHit = True
+                                    , fpIncluded = False
                                     , outputs =
                                         cached
                                             |> List.filter (\s -> not (String.isEmpty (String.trim s)))
@@ -1534,15 +1740,33 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                     }
 
                             else
-                                -- Some ImportersOf files missed — eval ImportersOf rules
+                                -- Some ImportersOf files missed — only re-eval
+                                -- the affected reverse-dependency slice.
                                 let
                                     ioIndices =
                                         importersOfRules |> List.map .index
 
+                                    missedPaths =
+                                        checks
+                                            |> List.filter (not << .hit)
+                                            |> List.map .path
+
+                                    affectedEvalPaths =
+                                        missedPaths
+                                            |> List.foldl
+                                                (\path acc ->
+                                                    Set.union acc (DepGraph.reverseDeps depGraph path)
+                                                )
+                                                Set.empty
+
+                                    affectedModules =
+                                        allModulesWithAst
+                                            |> List.filter (\file -> Set.member file.path affectedEvalPaths)
+
                                     result =
                                         InterpreterProject.prepareAndEval reviewProject
                                             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                            , expression = buildExpressionForRules ioIndices allModulesWithAst
+                                            , expression = buildExpressionForRules ioIndices affectedModules
                                             , sourceOverrides = [ reviewRunnerHelperSource ]
                                             }
 
@@ -1553,15 +1777,41 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
 
                                     ioErrors =
                                         parseReviewOutput ioOutput
+
+                                    freshMissOutputs =
+                                        missedPaths
+                                            |> List.map
+                                                (\path ->
+                                                    ioErrors
+                                                        |> List.filter (\err -> err.filePath == path)
+                                                        |> List.map formatErrorLine
+                                                        |> String.join "\n"
+                                                )
                                 in
-                                -- Write per-file caches for ImportersOf rules
+                                Do.do
+                                    (checks
+                                        |> List.filterMap
+                                            (\check ->
+                                                if check.hit then
+                                                    Just
+                                                        (File.rawFile (prCacheDir ++ "/" ++ cacheFileComponent check.path ++ ".txt")
+                                                            |> BackendTask.allowFatal
+                                                        )
+
+                                                else
+                                                    Nothing
+                                            )
+                                        |> BackendTask.Extra.combine
+                                    )
+                                <| \cachedHitOutputs ->
                                 Do.do
                                     (importersPerFileKeys
+                                        |> List.filter (\{ path } -> List.member path missedPaths)
                                         |> List.map
                                             (\{ path, narrowKey } ->
                                                 let
                                                     safePath =
-                                                        path |> String.replace "/" "_"
+                                                        cacheFileComponent path
 
                                                     fileErrors =
                                                         ioErrors
@@ -1580,16 +1830,194 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                         |> BackendTask.Extra.combine
                                     )
                                 <| \_ ->
-                                BackendTask.succeed { allHit = False, outputs = ioOutput }
+                                BackendTask.succeed
+                                    { allHit = False
+                                    , fpIncluded = False
+                                    , outputs =
+                                        cachedHitOutputs
+                                            ++ freshMissOutputs
+                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                                            |> String.join "\n"
+                                    }
                         )
                     <| \importersResult ->
-                    -- Now handle FullProject rules (always re-eval on any change)
+                    -- Check DependenciesOf per-file caches (same pattern as ImportersOf)
+                    let
+                        doCacheDir =
+                            Path.toString config.buildDirectory ++ "/pr-deps-of"
+                    in
+                    Do.do (Script.exec "mkdir" [ "-p", doCacheDir ]) <| \_ ->
+                    Do.do
+                        (if List.isEmpty dependenciesOfRules then
+                            BackendTask.succeed { allHit = True, outputs = "", fpIncluded = False }
+
+                         else
+                            Do.do
+                                (depsPerFileKeys
+                                    |> List.map
+                                        (\{ path, narrowKey } ->
+                                            let
+                                                safePath =
+                                                    path |> String.replace "/" "_"
+                                            in
+                                            File.rawFile (doCacheDir ++ "/" ++ safePath ++ ".key")
+                                                |> BackendTask.toResult
+                                                |> BackendTask.map
+                                                    (\result ->
+                                                        case result of
+                                                            Ok storedKey ->
+                                                                { path = path, hit = storedKey == narrowKey }
+
+                                                            Err _ ->
+                                                                { path = path, hit = False }
+                                                    )
+                                        )
+                                    |> BackendTask.Extra.combine
+                                )
+                            <| \checks ->
+                            if List.all .hit checks then
+                                -- All DependenciesOf per-file caches valid
+                                Do.do
+                                    (depsPerFileKeys
+                                        |> List.map
+                                            (\{ path } ->
+                                                File.rawFile (doCacheDir ++ "/" ++ (path |> String.replace "/" "_") ++ ".txt")
+                                                    |> BackendTask.allowFatal
+                                            )
+                                        |> BackendTask.Extra.combine
+                                    )
+                                <| \cached ->
+                                BackendTask.succeed
+                                    { allHit = True
+                                    , fpIncluded = False
+                                    , outputs =
+                                        cached
+                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                                            |> String.join "\n"
+                                    }
+
+                            else
+                                -- Some DependenciesOf files missed — only re-eval
+                                -- the affected dependency slice.
+                                let
+                                    doIndices =
+                                        dependenciesOfRules |> List.map .index
+
+                                    missedPaths =
+                                        checks
+                                            |> List.filter (not << .hit)
+                                            |> List.map .path
+
+                                    affectedEvalPaths =
+                                        missedPaths
+                                            |> List.foldl
+                                                (\path acc ->
+                                                    Set.union acc (DepGraph.transitiveDeps depGraph path)
+                                                )
+                                                Set.empty
+
+                                    affectedModules =
+                                        allModulesWithAst
+                                            |> List.filter (\file -> Set.member file.path affectedEvalPaths)
+
+                                    doResult =
+                                        InterpreterProject.prepareAndEval reviewProject
+                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                            , expression = buildExpressionForRules doIndices affectedModules
+                                            , sourceOverrides = [ reviewRunnerHelperSource ]
+                                            }
+
+                                    doOutput =
+                                        case doResult of
+                                            Ok s -> s
+                                            Err e -> e
+
+                                    doErrors =
+                                        parseReviewOutput doOutput
+
+                                    freshMissOutputs =
+                                        missedPaths
+                                            |> List.map
+                                                (\path ->
+                                                    doErrors
+                                                        |> List.filter (\err -> err.filePath == path)
+                                                        |> List.map formatErrorLine
+                                                        |> String.join "\n"
+                                                )
+                                in
+                                Do.do
+                                    (checks
+                                        |> List.filterMap
+                                            (\check ->
+                                                if check.hit then
+                                                    Just
+                                                        (File.rawFile (doCacheDir ++ "/" ++ cacheFileComponent check.path ++ ".txt")
+                                                            |> BackendTask.allowFatal
+                                                        )
+
+                                                else
+                                                    Nothing
+                                            )
+                                        |> BackendTask.Extra.combine
+                                    )
+                                <| \cachedHitOutputs ->
+                                Do.do
+                                    (depsPerFileKeys
+                                        |> List.filter (\{ path } -> List.member path missedPaths)
+                                        |> List.map
+                                            (\{ path, narrowKey } ->
+                                                let
+                                                    safePath =
+                                                        cacheFileComponent path
+
+                                                    fileErrors =
+                                                        doErrors
+                                                            |> List.filter (\err -> err.filePath == path)
+                                                            |> List.map formatErrorLine
+                                                            |> String.join "\n"
+                                                in
+                                                Script.writeFile { path = doCacheDir ++ "/" ++ safePath ++ ".key", body = narrowKey }
+                                                    |> BackendTask.allowFatal
+                                                    |> BackendTask.andThen
+                                                        (\_ ->
+                                                            Script.writeFile { path = doCacheDir ++ "/" ++ safePath ++ ".txt", body = fileErrors }
+                                                                |> BackendTask.allowFatal
+                                                        )
+                                            )
+                                        |> BackendTask.Extra.combine
+                                    )
+                                <| \_ ->
+                                BackendTask.succeed
+                                    { allHit = False
+                                    , outputs =
+                                        cachedHitOutputs
+                                            ++ freshMissOutputs
+                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                                            |> String.join "\n"
+                                    , fpIncluded = False
+                                    }
+                        )
+                    <| \depsOfResult ->
+                    -- Handle DependenciesOf + FullProject rules together.
+                    -- When DependenciesOf missed, we already ran its eval above.
+                    -- Now check FullProject separately.
                     let
                         fpIndices =
                             fullProjectRules |> List.map .index
 
+                        fullProjectProfile =
+                            mergeProfiles FullProject fullProjectRules
+
                         fpCacheKey =
-                            "pr-fp|" ++ helperHash ++ "|" ++ (fpIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ projectSemanticKey
+                            "pr-fp|" ++ helperHash ++ "|" ++ (fpIndices |> List.map String.fromInt |> String.join ",") ++ "|"
+                                ++ (allFileAspectHashes
+                                        |> Dict.toList
+                                        |> List.sortBy Tuple.first
+                                        |> List.map (\( _, h ) -> narrowAspects fullProjectProfile h)
+                                        |> String.join "|"
+                                        |> FNV1a.hash
+                                        |> String.fromInt
+                                   )
 
                         fpKeyPath =
                             Path.toString config.buildDirectory ++ "/pr-fp-cache.key"
@@ -1597,9 +2025,11 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                         fpDataPath =
                             Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
                     in
-                    if List.isEmpty fullProjectRules then
+                    if List.isEmpty fullProjectRules || depsOfResult.fpIncluded then
+                        -- FullProject rules were already included in the combined DepsOf eval
+                        -- or there are no FullProject rules. Just return combined outputs.
                         BackendTask.succeed
-                            ([ moduleRuleOutput, importersResult.outputs ]
+                            ([ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs ]
                                 |> List.filter (not << String.isEmpty)
                                 |> String.join "\n"
                             )
@@ -1607,20 +2037,6 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                     else
                         -- Load cached rule Values AND cached Project from disk
                         Do.do (loadRuleCaches (Path.toString config.buildDirectory)) <| \preloadedCaches ->
-                        Do.do
-                            (File.rawFile (Path.toString config.buildDirectory ++ "/project-cache.json")
-                                |> BackendTask.toResult
-                                |> BackendTask.map
-                                    (\r ->
-                                        case r of
-                                            Ok json ->
-                                                ValueCodec.decodeValue json
-
-                                            Err _ ->
-                                                Nothing
-                                    )
-                            )
-                        <| \maybeCachedProject ->
                         let
                             intercepts =
                                 buildReviewIntercepts preloadedCaches
@@ -1759,21 +2175,25 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                 yieldHandler
                             )
                         <| \result ->
-                        case result of
-                            Ok (Types.Tuple (Types.String errorStr) _) ->
+                        let
+                            handleSuccess errorStr =
                                 Do.do (Script.writeFile { path = fpKeyPath, body = fpCacheKey } |> BackendTask.allowFatal) <| \_ ->
                                 Do.do (Script.writeFile { path = fpDataPath, body = errorStr } |> BackendTask.allowFatal) <| \_ ->
                                 BackendTask.succeed
-                                    ([ moduleRuleOutput, importersResult.outputs, errorStr ]
+                                    ([ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, errorStr ]
                                         |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
                                         |> String.join "\n"
                                     )
+                        in
+                        case result of
+                            Ok (Types.Tuple (Types.String errorStr) _) ->
+                                handleSuccess errorStr
 
                             Ok (Types.String errorStr) ->
                                 Do.do (Script.writeFile { path = fpKeyPath, body = fpCacheKey } |> BackendTask.allowFatal) <| \_ ->
                                 Do.do (Script.writeFile { path = fpDataPath, body = errorStr } |> BackendTask.allowFatal) <| \_ ->
                                 BackendTask.succeed
-                                    ([ moduleRuleOutput, importersResult.outputs, errorStr ]
+                                    ([ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, errorStr ]
                                         |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
                                         |> String.join "\n"
                                     )
@@ -1833,7 +2253,7 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                         )
                                     |> BackendTask.map
                                         (\fpOutput ->
-                                            [ moduleRuleOutput, importersResult.outputs, fpOutput ]
+                                            [ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, fpOutput ]
                                                 |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
                                                 |> String.join "\n"
                                         )
@@ -1843,7 +2263,7 @@ loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cache
                                 evalProjectRulesSingle reviewProject fpIndices allModulesWithAst fpKeyPath fpDataPath fpCacheKey
                                     |> BackendTask.map
                                         (\fpOutput ->
-                                            [ moduleRuleOutput, importersResult.outputs, fpOutput ]
+                                            [ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, fpOutput ]
                                                 |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
                                                 |> String.join "\n"
                                         )
@@ -1859,6 +2279,16 @@ loadAndEvalHybrid :
     -> BackendTask FatalError String
 loadAndEvalHybrid config ruleInfo targetFileContents =
     Do.do (loadReviewProject config) <| \reviewProject ->
+    loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents
+
+
+loadAndEvalHybridWithProject :
+    Config
+    -> InterpreterProject
+    -> List { index : Int, name : String, ruleType : RuleType }
+    -> List { path : String, source : String }
+    -> BackendTask FatalError String
+loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents =
     let
         helperHash =
             FNV1a.hash reviewRunnerHelperSource |> String.fromInt
@@ -1899,50 +2329,55 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
         projectRules =
             ruleInfo |> List.filter (\r -> r.ruleType == ProjectRule)
 
-        -- Module rules: one Cache.compute per (rule, file) with NARROW key
+        moduleRuleIndices =
+            moduleRules |> List.map .index
+
+        moduleRuleProfile =
+            mergeProfiles NoCrossModule moduleRules
+
+        -- Module rules: batch all module rules for each file
         moduleRuleMonads =
-            moduleRules
-                |> List.concatMap
-                    (\rule ->
-                        let
-                            profile =
-                                profileForRule rule.name
-                        in
-                        modulesWithAst
-                            |> List.indexedMap
-                                (\fileIdx file ->
-                                    let
-                                        fileHashes =
-                                            Dict.get file.path allFileAspectHashes
-                                                |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
+            if List.isEmpty moduleRules then
+                []
 
-                                        fileNarrowKey =
-                                            narrowCacheKey profile file.path fileHashes allFileAspectHashes depGraph
+            else
+                modulesWithAst
+                    |> List.indexedMap
+                        (\fileIdx file ->
+                            let
+                                fileHashes =
+                                    Dict.get file.path allFileAspectHashes
+                                        |> Maybe.withDefault (SemanticHash.computeAspectHashesFromSource file.source)
 
-                                        cacheKey =
-                                            "mr|" ++ String.fromInt rule.index ++ "|" ++ helperHash ++ "|" ++ file.path ++ "|" ++ fileNarrowKey
-                                    in
-                                    Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
-                                    Cache.compute [ "mr", String.fromInt rule.index, file.path ]
-                                        keyHash
-                                        (\() ->
-                                            case
-                                                InterpreterProject.prepareAndEval reviewProject
-                                                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                                    , expression = buildExpressionForRule rule.index [ file ]
-                                                    , sourceOverrides = [ reviewRunnerHelperSource ]
-                                                    }
-                                            of
-                                                Ok s -> s
-                                                Err e -> e
-                                        )
-                                    <| \hash ->
-                                    Cache.succeed
-                                        { filename = Path.path ("mr-" ++ String.fromInt rule.index ++ "-" ++ String.fromInt fileIdx)
-                                        , hash = hash
-                                        }
+                                fileNarrowKey =
+                                    narrowCacheKey moduleRuleProfile file.path fileHashes allFileAspectHashes depGraph
+
+                                cacheKey =
+                                    "mrf|" ++ helperHash ++ "|" ++ (moduleRuleIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ file.path ++ "|" ++ fileNarrowKey
+                            in
+                            Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
+                            Cache.compute [ "mrf", file.path ]
+                                keyHash
+                                (\() ->
+                                    case
+                                        InterpreterProject.prepareAndEval reviewProject
+                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                            , expression = buildExpressionForRules moduleRuleIndices [ file ]
+                                            , sourceOverrides = [ reviewRunnerHelperSource ]
+                                            }
+                                    of
+                                        Ok s ->
+                                            s
+
+                                        Err e ->
+                                            e
                                 )
-                    )
+                            <| \hash ->
+                            Cache.succeed
+                                { filename = Path.path ("mrf-" ++ String.fromInt fileIdx)
+                                , hash = hash
+                                }
+                        )
 
         allMonads =
             moduleRuleMonads
@@ -1955,17 +2390,17 @@ loadAndEvalHybrid config ruleInfo targetFileContents =
             (\cacheResult ->
                 let
                     mrFiles =
-                        moduleRules
-                            |> List.concatMap
-                                (\rule ->
-                                    List.indexedMap
-                                        (\fileIdx _ ->
-                                            File.rawFile
-                                                (Path.toString cacheResult.output ++ "/mr-" ++ String.fromInt rule.index ++ "-" ++ String.fromInt fileIdx)
-                                                |> BackendTask.allowFatal
-                                        )
-                                        modulesWithAst
-                                )
+                        if List.isEmpty moduleRules then
+                            []
+
+                        else
+                            modulesWithAst
+                                |> List.indexedMap
+                                    (\fileIdx _ ->
+                                        File.rawFile
+                                            (Path.toString cacheResult.output ++ "/mrf-" ++ String.fromInt fileIdx)
+                                            |> BackendTask.allowFatal
+                                    )
                 in
                 mrFiles
                     |> BackendTask.Extra.combine
@@ -2236,6 +2671,12 @@ boolStr b =
         "False"
 
 
+cacheFileComponent : String -> String
+cacheFileComponent path =
+    path
+        |> String.replace "/" "_"
+
+
 buildReviewIntercepts :
     Dict String Types.Value
     -> FastDict.Dict String Types.Intercept
@@ -2246,7 +2687,6 @@ buildReviewIntercepts preloadedCaches =
                 (\args _ _ ->
                     case args of
                         [ Types.String ruleName, _, defaultCache ] ->
-                            -- Load from disk cache if available (no yield — just pure lookup)
                             case Dict.get ruleName preloadedCaches of
                                 Just cached ->
                                     Types.EvOk cached
@@ -2263,7 +2703,7 @@ buildReviewIntercepts preloadedCaches =
                 (\args _ _ ->
                     case args of
                         [ Types.String ruleName, _, cache ] ->
-                            -- Yield the POPULATED cache for disk persistence
+                            -- Yield to save cache to disk
                             Types.EvYield "review-cache-write"
                                 (Types.Record
                                     (FastDict.fromList
@@ -2594,6 +3034,14 @@ getRuleInfo :
     -> BackendTask FatalError (List { index : Int, name : String, ruleType : RuleType })
 getRuleInfo config =
     Do.do (loadReviewProject config) <| \reviewProject ->
+    getRuleInfoWithProject config reviewProject
+
+
+getRuleInfoWithProject :
+    Config
+    -> InterpreterProject
+    -> BackendTask FatalError (List { index : Int, name : String, ruleType : RuleType })
+getRuleInfoWithProject config reviewProject =
     Cache.run { jobs = Nothing } config.buildDirectory
         (InterpreterProject.evalWithSourceOverrides reviewProject
             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
@@ -2788,12 +3236,20 @@ readTargetFiles files =
         |> BackendTask.Extra.combine
 
 
-ensureReviewDeps : String -> BackendTask FatalError ()
+ensureReviewDeps : String -> BackendTask FatalError Bool
 ensureReviewDeps reviewDir =
     Script.exec "elm" [ "make", "src/ReviewConfig.elm", "--output", "/dev/null" ]
         |> BackendTask.inDir reviewDir
         |> BackendTask.toResult
-        |> BackendTask.map (\_ -> ())
+        |> BackendTask.map
+            (\result ->
+                case result of
+                    Ok _ ->
+                        True
+
+                    Err _ ->
+                        False
+            )
 
 
 kernelPackages : Set.Set String
