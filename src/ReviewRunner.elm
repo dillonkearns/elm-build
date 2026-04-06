@@ -2246,6 +2246,7 @@ buildReviewIntercepts preloadedCaches =
                 (\args _ _ ->
                     case args of
                         [ Types.String ruleName, _, defaultCache ] ->
+                            -- Load from disk cache if available (no yield — just pure lookup)
                             case Dict.get ruleName preloadedCaches of
                                 Just cached ->
                                     Types.EvOk cached
@@ -2260,12 +2261,18 @@ buildReviewIntercepts preloadedCaches =
         , ( "Review.Rule.finalCacheMarker"
           , Types.Intercept
                 (\args _ _ ->
-                    -- Identity for now — yields from let bindings cause infinite loops.
-                    -- Rule caches accumulate 1 per run via finalCacheMarker yield.
-                    -- TODO: fix let-binding yield propagation to save ALL caches at once.
                     case args of
-                        [ _, _, cache ] ->
-                            Types.EvOk cache
+                        [ Types.String ruleName, _, cache ] ->
+                            -- Yield the POPULATED cache for disk persistence
+                            Types.EvYield "review-cache-write"
+                                (Types.Record
+                                    (FastDict.fromList
+                                        [ ( "ruleName", Types.String ruleName )
+                                        , ( "cache", cache )
+                                        ]
+                                    )
+                                )
+                                (\_ -> Types.EvOk cache)
 
                         _ ->
                             Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
