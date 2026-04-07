@@ -566,3 +566,39 @@ Read:
 - The next thing worth measuring is an even leaner shared payload path:
   - either pre-wrapped `Types.Value` arrays so the intercepts stop allocating `Types.String`
   - or better timing around payload setup / intercept construction so we can confirm exactly where the remaining setup cost sits.
+
+### Upstream BST Union Port
+
+I also tested upstream `miniBill/elm-build` commit `a8a8d4041b4a55f0bb288c4fbc567e1ca4b60ede` (`Faster BST union`).
+
+It did not cherry-pick cleanly because this repo has already deleted `src/BST.elm`; the equivalent BST implementation now lives inline inside `src/Cache.elm` as the backing store for `HashSet`.
+
+So I ported the algorithm change there instead:
+
+- `innerHashSetUnion` now unions by merging sorted BST contents and rebuilding a balanced tree
+- `innerHashSetFromList` now goes through `innerHashSetFromSortedList`
+- the inlined BST also picked up the upstream `unique` helper to dedupe adjacent sorted entries
+
+Compared against the pushed baseline commit `0d6fe24`, the `small-12` full matrix improved across the board:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Cold | `104.53s` | `102.13s` |
+| Warm | `0.33s` | `0.32s` |
+| Warm 1-file body edit | `1.64s` | `1.54s` |
+| Warm 1-file comment-only | `0.56s` | `0.52s` |
+| Warm import-graph change | `4.48s` | `4.30s` |
+
+Internal timings moved the same direction:
+
+| Scenario | Before internal | After internal |
+|---|---:|---:|
+| Cold | `104.00s` | `101.54s` |
+| Warm 1-file body edit | `1.07s` | `1.00s` |
+| Warm import-graph change | `3.92s` | `3.77s` |
+
+Current read:
+
+- This upstream BST change looks like a real keeper.
+- The effect is broad rather than specialized: it helps cold, warm no-change, body-edit, and import-graph paths all at once.
+- It is still a modest constant-factor win, not a new architecture-level breakthrough, but it is exactly the kind of low-risk improvement we should probably keep stacking.
