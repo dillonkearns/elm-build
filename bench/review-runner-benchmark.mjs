@@ -16,6 +16,9 @@ const fixtureFilter = process.argv.includes("--fixture")
   ? process.argv[process.argv.indexOf("--fixture") + 1]
   : null;
 const skipBundle = process.argv.includes("--skip-bundle");
+const importersCacheMode = process.argv.includes("--importers-cache-mode")
+  ? process.argv[process.argv.indexOf("--importers-cache-mode") + 1]
+  : "fresh";
 
 const smallFixtureFiles = [
   "Coverage.elm",
@@ -113,7 +116,7 @@ function bundleRunner() {
   );
 }
 
-function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath }) {
+function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersCacheMode }) {
   const start = performance.now();
   const result = spawnSync(
     "node",
@@ -125,6 +128,8 @@ function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath }) {
       fixtureSrcDir,
       "--build",
       buildDir,
+      "--importers-cache-mode",
+      importersCacheMode,
       "--perf-trace-json",
       tracePath,
     ],
@@ -163,6 +168,7 @@ function sumStageMs(trace) {
 function scenarioResult(name, runResult) {
   return {
     name,
+    importers_cache_mode: importersCacheMode,
     wall_ms: Math.round(runResult.wallMs),
     internal_ms: sumStageMs(runResult.trace),
     exit_code: runResult.exitCode,
@@ -206,6 +212,7 @@ function runScenarioSequence({ fixtureName, fileNames }) {
       fixtureSrcDir: workspace.fixtureSrcDir,
       buildDir: workspace.buildDir,
       tracePath: path.join(workspace.root, traceName),
+      importersCacheMode,
     });
   }
 
@@ -255,6 +262,7 @@ function fixtureResult(name, fileNames) {
 
 function printFixtureSummary(result) {
   console.log(`\nFixture: ${result.fixture} (${result.file_count} files)`);
+  console.log(`Importers cache mode: ${importersCacheMode}`);
   console.log("scenario                   wall(s)  internal(s)  decision");
 
   for (const scenario of result.scenarios) {
@@ -286,6 +294,7 @@ function main() {
   const results = {
     date: new Date().toISOString(),
     runner: path.relative(repoRoot, distRunnerPath),
+    importers_cache_mode: importersCacheMode,
     fixtures: selectedFixtures.map((fixture) => fixtureResult(fixture.name, fixture.fileNames)),
   };
 

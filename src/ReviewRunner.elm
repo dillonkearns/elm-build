@@ -61,8 +61,15 @@ type alias Config =
     , buildDirectory : Path
     , memoizedFunctions : Set.Set String
     , memoProfile : Bool
+    , importersCacheMode : ImportersCacheMode
     , perfTraceJson : Maybe String
     }
+
+
+type ImportersCacheMode
+    = ImportersAuto
+    | ImportersFresh
+    | ImportersSplit
 
 
 type alias InputRevision =
@@ -139,6 +146,23 @@ type alias ProjectEvalOutputCache =
     }
 
 
+type alias LoadedRuleCaches =
+    { baseCaches : Dict String Types.Value
+    , moduleEntries : Dict String (Dict String Types.Value)
+    , entryCount : Int
+    , bytes : Int
+    }
+
+
+type alias ProjectRuleEvalResult =
+    { output : String
+    , memoCache : MemoRuntime.MemoCache
+    , memoStats : MemoRuntime.MemoStats
+    , loadedRuleCaches : LoadedRuleCaches
+    , counters : Dict String Int
+    }
+
+
 type alias PerFileRuleKey =
     { path : String
     , narrowKey : String
@@ -187,7 +211,7 @@ type alias Timed a =
 
 cacheSchemaVersion : String
 cacheSchemaVersion =
-    "review-runner-v4"
+    "review-runner-v6"
 
 
 programConfig : Program.Config Config
@@ -220,6 +244,14 @@ programConfig =
                         |> Option.withDescription "Write per-function memo stats to memo-profile.log in the build directory"
                     )
                 |> OptionsParser.with
+                    (Option.optionalKeywordArg "importers-cache-mode"
+                        |> Option.map
+                            (Maybe.map parseImportersCacheMode
+                                >> Maybe.withDefault ImportersAuto
+                            )
+                        |> Option.withDescription "ImportersOf project-rule strategy: auto, fresh, or split (default: auto)"
+                    )
+                |> OptionsParser.with
                     (Option.optionalKeywordArg "perf-trace-json"
                         |> Option.withDescription "Write structured review-runner perf trace JSON to the given path"
                     )
@@ -241,6 +273,19 @@ parseMemoizedFunctions rawValue =
         |> List.map String.trim
         |> List.filter (not << String.isEmpty)
         |> Set.fromList
+
+
+parseImportersCacheMode : String -> ImportersCacheMode
+parseImportersCacheMode rawValue =
+    case String.toLower (String.trim rawValue) of
+        "auto" ->
+            ImportersAuto
+
+        "split" ->
+            ImportersSplit
+
+        _ ->
+            ImportersFresh
 
 
 run : Script
@@ -1459,6 +1504,22 @@ memoStatsCounters prefix memoStats =
                 |> Dict.fromList
     in
     mergeCounterDicts [ baseCounters, topCounters ]
+
+
+mergeMemoStats : MemoRuntime.MemoStats -> MemoRuntime.MemoStats -> MemoRuntime.MemoStats
+mergeMemoStats left right =
+    { enabled = left.enabled || right.enabled
+    , lookups = left.lookups + right.lookups
+    , hits = left.hits + right.hits
+    , misses = left.misses + right.misses
+    , stores = left.stores + right.stores
+    , byFunction =
+        if left.lookups >= right.lookups then
+            left.byFunction
+
+        else
+            right.byFunction
+    }
 
 
 errorCounters : List ReviewError -> Dict String Int
@@ -2923,6 +2984,21 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         allModulesWithAst
                             |> List.filter (\file -> Set.member file.path affectedEvalPaths)
 
+                    useSplitImportersCache =
+                        case config.importersCacheMode of
+                            ImportersAuto ->
+                                if List.length staleFileContents < List.length allFileContents && List.length importersAffectedModules > 1 then
+                                    True
+
+                                else
+                                    False
+
+                            ImportersSplit ->
+                                True
+
+                            ImportersFresh ->
+                                False
+
                     depsAffectedModules =
                         let
                             affectedEvalPaths =
@@ -2977,55 +3053,125 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 <| \depsCachedOutputs ->
                 Do.do (BackendTask.succeed MemoRuntime.emptyMemoCache) <| \initialMemoCache ->
                 Do.do
-                    (case ( importersAllHit, depsAllHit ) of
-                        ( False, False ) ->
-                            evalTwoProjectRuleSlicesWithMemo reviewProject ioIndices importersAffectedModules doIndices depsAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
+                    (if importersAllHit then
+                        BackendTask.succeed
+                            { output = ""
+                            , memoCache = initialMemoCache
+                            , memoStats = MemoRuntime.emptyMemoStats
+                            , loadedRuleCaches =
+                                { baseCaches = Dict.empty
+                                , moduleEntries = Dict.empty
+                                , entryCount = 0
+                                , bytes = 0
+                                }
+                            , counters = Dict.empty
+                            }
 
-                        ( False, True ) ->
-                            runProjectRulesFreshWithMemo reviewProject ioIndices importersAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
-                                |> BackendTask.map
-                                    (\ioResult ->
-                                        { firstOutput = ioResult.output
-                                        , secondOutput = ""
-                                        , memoCache = ioResult.memoCache
-                                        , memoStats = ioResult.memoStats
-                                        }
+                     else
+                        if useSplitImportersCache then
+                            runProjectRulesWithWarmRuleCaches
+                                (Path.toString config.buildDirectory)
+                                reviewProject
+                                ioIndices
+                                (importersAffectedModules
+                                    |> List.map .path
+                                    |> List.filter
+                                        (\path ->
+                                            staleFileContents
+                                                |> List.any (\file -> file.path == path)
+                                                |> not
+                                        )
+                                )
+                                importersAffectedModules
+                                config.memoizedFunctions
+                                config.memoProfile
+                                initialMemoCache
+
+                        else
+                            Do.do
+                                (withTiming "project.importers.fresh_eval"
+                                    (runProjectRulesFreshWithMemo
+                                        reviewProject
+                                        ioIndices
+                                        importersAffectedModules
+                                        config.memoizedFunctions
+                                        config.memoProfile
+                                        initialMemoCache
                                     )
-
-                        ( True, False ) ->
-                            runProjectRulesFreshWithMemo reviewProject doIndices depsAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
-                                |> BackendTask.map
-                                    (\doResult ->
-                                        { firstOutput = ""
-                                        , secondOutput = doResult.output
-                                        , memoCache = doResult.memoCache
-                                        , memoStats = doResult.memoStats
-                                        }
-                                    )
-
-                        ( True, True ) ->
+                                )
+                            <| \freshTimed ->
                             BackendTask.succeed
-                                { firstOutput = ""
-                                , secondOutput = ""
-                                , memoCache = initialMemoCache
-                                , memoStats = MemoRuntime.emptyMemoStats
+                                { output = freshTimed.value.output
+                                , memoCache = freshTimed.value.memoCache
+                                , memoStats = freshTimed.value.memoStats
+                                , loadedRuleCaches =
+                                    { baseCaches = Dict.empty
+                                    , moduleEntries = Dict.empty
+                                    , entryCount = 0
+                                    , bytes = 0
+                                    }
+                                , counters =
+                                    Dict.fromList
+                                        [ ( "project.importers.mode.fresh", 1 )
+                                        , ( "project.importers.mode.split", 0 )
+                                        , ( "project.importers.fresh_eval_ms", freshTimed.stage.ms )
+                                        ]
                                 }
                     )
-                <| \evaluatedProjectRules ->
+                <| \importersEval ->
+                Do.do
+                    (if depsAllHit then
+                        BackendTask.succeed
+                            { output = ""
+                            , memoCache = importersEval.memoCache
+                            , memoStats = MemoRuntime.emptyMemoStats
+                            , loadedRuleCaches =
+                                { baseCaches = Dict.empty
+                                , moduleEntries = Dict.empty
+                                , entryCount = 0
+                                , bytes = 0
+                                }
+                            , counters = Dict.empty
+                            }
+
+                     else
+                        runProjectRulesFreshWithMemo
+                            reviewProject
+                            doIndices
+                            depsAffectedModules
+                            config.memoizedFunctions
+                            config.memoProfile
+                            importersEval.memoCache
+                            |> BackendTask.map
+                                (\doResult ->
+                                    { output = doResult.output
+                                    , memoCache = doResult.memoCache
+                                    , memoStats = doResult.memoStats
+                                    , loadedRuleCaches =
+                                        { baseCaches = Dict.empty
+                                        , moduleEntries = Dict.empty
+                                        , entryCount = 0
+                                        , bytes = 0
+                                        }
+                                    , counters = Dict.empty
+                                    }
+                                )
+                    )
+                <| \depsEval ->
                 let
                     ioErrors =
                         if importersAllHit then
                             []
 
                         else
-                            parseReviewOutput evaluatedProjectRules.firstOutput
+                            parseReviewOutput importersEval.output
 
                     doErrors =
                         if depsAllHit then
                             []
 
                         else
-                            parseReviewOutput evaluatedProjectRules.secondOutput
+                            parseReviewOutput depsEval.output
 
                     freshImportersOutputs =
                         importersMissedPaths
@@ -3048,15 +3194,25 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 )
 
                     partialMemoCounters =
-                        memoStatsCounters "memo.partial_project" evaluatedProjectRules.memoStats
+                        mergeMemoStats importersEval.memoStats depsEval.memoStats
+                            |> memoStatsCounters "memo.partial_project"
+
+                    importersRuleCacheCounters =
+                        mergeCounterDicts
+                            [ Dict.fromList
+                                [ ( "project.importers.rule_cache.entries", importersEval.loadedRuleCaches.entryCount )
+                                , ( "project.importers.rule_cache.loaded_bytes", importersEval.loadedRuleCaches.bytes )
+                                ]
+                            , importersEval.counters
+                            ]
                 in
                 Do.do
                     (appendMemoProfileLog
                         config.memoProfile
                         (Path.toString config.buildDirectory)
                         "partial-project-slices"
-                        (MemoRuntime.entryCount evaluatedProjectRules.memoCache)
-                        evaluatedProjectRules.memoStats
+                        (MemoRuntime.entryCount depsEval.memoCache)
+                        (mergeMemoStats importersEval.memoStats depsEval.memoStats)
                     )
                 <| \_ ->
                 Do.do
@@ -3119,7 +3275,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 if List.isEmpty fullProjectRules then
                     BackendTask.succeed
                         { output = combinedProjectOutputs
-                        , counters = mergeCounterDicts [ sliceCounters, partialMemoCounters ]
+                        , counters = mergeCounterDicts [ sliceCounters, importersRuleCacheCounters, partialMemoCounters ]
                         }
 
                 else
@@ -3137,7 +3293,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , key = fpCacheKey
                                 }
                             )
-                            evaluatedProjectRules.memoCache
+                            depsEval.memoCache
                         )
                     <| \fpResult ->
                     BackendTask.succeed
@@ -3149,6 +3305,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         , counters =
                             mergeCounterDicts
                                 [ sliceCounters
+                                , importersRuleCacheCounters
                                 , partialMemoCounters
                                 , memoStatsCounters "memo.full_project" fpResult.memoStats
                                 , Dict.fromList
@@ -3648,42 +3805,72 @@ writePerFileRuleOutputs cacheDir perFileKeys targetPaths errors =
 
 
 buildReviewIntercepts :
-    Dict String Types.Value
+    LoadedRuleCaches
     -> FastDict.Dict String Types.Intercept
-buildReviewIntercepts preloadedCaches =
+buildReviewIntercepts loadedRuleCaches =
     FastDict.fromList
-        [ ( "Review.Rule.initialCacheMarker"
+        [ ( "Review.Rule.initialCachePartsMarker"
           , Types.Intercept
                 (\_ args _ _ ->
                     case args of
-                        [ Types.String ruleName, Types.Int ruleId, defaultCache ] ->
-                            case Dict.get (ruleCacheValueKey ruleName ruleId) preloadedCaches of
-                                Just cached ->
-                                    Types.EvOk cached
+                        [ Types.String ruleName, Types.Int ruleId, defaultSplitCache ] ->
+                            case defaultSplitCache of
+                                Types.Record fields ->
+                                    let
+                                        ruleKey =
+                                            ruleCacheValueKey ruleName ruleId
 
-                                Nothing ->
-                                    Types.EvOk defaultCache
+                                        baseCache =
+                                            Dict.get ruleKey loadedRuleCaches.baseCaches
+                                                |> Maybe.withDefault
+                                                    (FastDict.get "baseCache" fields
+                                                        |> Maybe.withDefault Types.Unit
+                                                    )
+
+                                        moduleContexts =
+                                            Dict.get ruleKey loadedRuleCaches.moduleEntries
+                                                |> Maybe.withDefault Dict.empty
+                                                |> Dict.toList
+                                                |> List.map
+                                                    (\( modulePath, value ) ->
+                                                        Types.Tuple (Types.String modulePath) value
+                                                    )
+                                    in
+                                    Types.EvOk
+                                        (Types.Record
+                                            (FastDict.insert "baseCache" baseCache
+                                                (FastDict.insert "moduleContexts" (Types.List moduleContexts) fields)
+                                            )
+                                        )
+
+                                _ ->
+                                    Types.EvOk defaultSplitCache
 
                         _ ->
                             Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
                 )
           )
-        , ( "Review.Rule.finalCacheMarker"
+        , ( "Review.Rule.initialCacheAllowedPathsMarker"
+          , Types.Intercept
+                (\_ _ _ _ ->
+                    Types.EvOk (Types.List [])
+                )
+          )
+        , ( "Review.Rule.finalCachePartsMarker"
           , Types.Intercept
                 (\_ args _ _ ->
                     case args of
-                        [ Types.String ruleName, Types.Int ruleId, cache ] ->
-                            -- Yield to save cache to disk
-                            Types.EvYield "review-cache-write"
+                        [ Types.String ruleName, Types.Int ruleId, splitCache ] ->
+                            Types.EvYield "review-cache-parts-write"
                                 (Types.Record
                                     (FastDict.fromList
                                         [ ( "ruleName", Types.String ruleName )
                                         , ( "ruleId", Types.Int ruleId )
-                                        , ( "cache", cache )
+                                        , ( "cache", splitCache )
                                         ]
                                     )
                                 )
-                                (\_ -> Types.EvOk cache)
+                                (\_ -> Types.EvOk splitCache)
 
                         _ ->
                             Types.EvOk (args |> List.reverse |> List.head |> Maybe.withDefault Types.Unit)
@@ -3741,14 +3928,33 @@ buildReviewIntercepts preloadedCaches =
         ]
 
 
-{-| Load previously serialized rule cache Values from disk.
-Returns a Dict keyed by "ruleName-ruleId".
+{-| Load split rule caches from disk.
+
+Base caches are stored as `<ruleKey>.base.json`.
+Per-module entries are stored as `<ruleKey>--<safePath>.module.json`.
 -}
-loadRuleCaches : String -> BackendTask FatalError (Dict String Types.Value)
-loadRuleCaches buildDir =
+loadRuleCachesWithStats : String -> List String -> BackendTask FatalError LoadedRuleCaches
+loadRuleCachesWithStats buildDir modulePathsToLoad =
     let
         cacheDir =
             buildDir ++ "/rule-value-cache"
+
+        decodeValueFile toKey filePath =
+            File.rawFile filePath
+                |> BackendTask.toResult
+                |> BackendTask.map
+                    (\content ->
+                        case content of
+                            Ok json ->
+                                { entry =
+                                    ValueCodec.decodeValue json
+                                        |> Maybe.map (\value -> ( toKey filePath, value ))
+                                , bytes = String.length json
+                                }
+
+                            Err _ ->
+                                { entry = Nothing, bytes = 0 }
+                    )
     in
     Glob.fromStringWithOptions
         (let
@@ -3757,7 +3963,7 @@ loadRuleCaches buildDir =
          in
          { o | include = Glob.OnlyFiles }
         )
-        (cacheDir ++ "/*.json")
+        (cacheDir ++ "/*.base.json")
         |> BackendTask.toResult
         |> BackendTask.map
             (\result ->
@@ -3769,44 +3975,136 @@ loadRuleCaches buildDir =
                         []
             )
         |> BackendTask.andThen
-            (\files ->
-                files
-                    |> List.map
-                        (\filePath ->
-                            File.rawFile filePath
-                                |> BackendTask.toResult
-                                |> BackendTask.map
-                                    (\content ->
-                                        case content of
-                                            Ok json ->
-                                                ValueCodec.decodeValue json
-                                                    |> Maybe.map
-                                                        (\value ->
-                                                            let
-                                                                -- Extract key from filename: "RuleName-0.json" -> "RuleName-0"
-                                                                key =
-                                                                    filePath
-                                                                        |> String.split "/"
-                                                                        |> List.reverse
-                                                                        |> List.head
-                                                                        |> Maybe.withDefault ""
-                                                                        |> String.replace ".json" ""
-                                                            in
-                                                            Just ( key, value )
-                                                        )
-                                                    |> Maybe.withDefault Nothing
-
-                                            Err _ ->
-                                                Nothing
+            (\baseFiles ->
+                let
+                    baseDecoders : List (BackendTask FatalError { entry : Maybe ( String, Types.Value ), bytes : Int })
+                    baseDecoders =
+                        baseFiles
+                            |> List.map
+                                (decodeValueFile
+                                    (\filePath ->
+                                        filePath
+                                            |> String.split "/"
+                                            |> List.reverse
+                                            |> List.head
+                                            |> Maybe.withDefault ""
+                                            |> String.replace ".base.json" ""
                                     )
-                        )
-                    |> BackendTask.Extra.combine
-                    |> BackendTask.map
-                        (\results ->
-                            results
-                                |> List.filterMap identity
-                                |> Dict.fromList
-                        )
+                                )
+
+                    moduleFiles :
+                        List
+                            { ruleKey : String
+                            , modulePath : String
+                            , filePath : String
+                            }
+                    moduleFiles =
+                        baseFiles
+                            |> List.concatMap
+                                (\baseFile ->
+                                    let
+                                        ruleKey =
+                                            baseFile
+                                                |> String.split "/"
+                                                |> List.reverse
+                                                |> List.head
+                                                |> Maybe.withDefault ""
+                                                |> String.replace ".base.json" ""
+                                    in
+                                    modulePathsToLoad
+                                        |> List.map
+                                            (\modulePath ->
+                                                { ruleKey = ruleKey
+                                                , modulePath = modulePath
+                                                , filePath =
+                                                    cacheDir
+                                                        ++ "/"
+                                                        ++ ruleKey
+                                                        ++ "--"
+                                                        ++ cacheFileComponent modulePath
+                                                        ++ ".module.json"
+                                                }
+                                            )
+                                )
+
+                    moduleDecoders : List (BackendTask FatalError { entry : Maybe ( String, ( String, Types.Value ) ), bytes : Int })
+                    moduleDecoders =
+                        moduleFiles
+                            |> List.map
+                                (\moduleFile ->
+                                    File.rawFile moduleFile.filePath
+                                        |> BackendTask.toResult
+                                        |> BackendTask.map
+                                            (\content ->
+                                                case content of
+                                                    Ok json ->
+                                                        { entry =
+                                                            ValueCodec.decodeValue json
+                                                                |> Maybe.map
+                                                                    (\value ->
+                                                                        ( moduleFile.ruleKey
+                                                                        , ( moduleFile.modulePath, value )
+                                                                        )
+                                                                    )
+                                                        , bytes = String.length json
+                                                        }
+
+                                                    Err _ ->
+                                                        { entry = Nothing, bytes = 0 }
+                                            )
+                                )
+
+                    baseTask : BackendTask FatalError (List { entry : Maybe ( String, Types.Value ), bytes : Int })
+                    baseTask =
+                        baseDecoders |> BackendTask.Extra.combine
+
+                    moduleTask : BackendTask FatalError (List { entry : Maybe ( String, ( String, Types.Value ) ), bytes : Int })
+                    moduleTask =
+                        moduleDecoders |> BackendTask.Extra.combine
+
+                    combineLoadedCaches :
+                        List { entry : Maybe ( String, Types.Value ), bytes : Int }
+                        -> List { entry : Maybe ( String, ( String, Types.Value ) ), bytes : Int }
+                        -> LoadedRuleCaches
+                    combineLoadedCaches baseResults moduleResults =
+                        let
+                            decodedBaseEntries =
+                                baseResults
+                                    |> List.filterMap .entry
+
+                            decodedModuleEntryList =
+                                moduleResults
+                                    |> List.filterMap .entry
+
+                            decodedModuleEntries =
+                                decodedModuleEntryList
+                                    |> List.foldl
+                                        (\( ruleKey, ( modulePath, value ) ) acc ->
+                                            Dict.update ruleKey
+                                                (\existing ->
+                                                    Just
+                                                        (existing
+                                                            |> Maybe.withDefault Dict.empty
+                                                            |> Dict.insert modulePath value
+                                                        )
+                                                )
+                                                acc
+                                        )
+                                        Dict.empty
+                        in
+                        { baseCaches = Dict.fromList decodedBaseEntries
+                        , moduleEntries = decodedModuleEntries
+                        , entryCount = List.length decodedBaseEntries + List.length decodedModuleEntryList
+                        , bytes =
+                            (baseResults |> List.map .bytes |> List.sum)
+                                + (moduleResults |> List.map .bytes |> List.sum)
+                        }
+                in
+                BackendTask.andThen
+                    (\baseResults ->
+                        BackendTask.map (combineLoadedCaches baseResults) moduleTask
+                    )
+                    baseTask
             )
 
 
@@ -3926,6 +4224,7 @@ runProjectRulesFreshWithMemo reviewProject prIndices modulesWithAst memoizedFunc
             FastDict.singleton modulesVarName (moduleInputsValue modulesWithAst)
     in
     if Set.isEmpty memoizedFunctions then
+        Do.do (BackendTask.succeed ()) <| \_ ->
         BackendTask.succeed
             { output = runProjectRulesFresh reviewProject prIndices modulesWithAst
             , memoCache = memoCache
@@ -3965,6 +4264,143 @@ runProjectRulesFreshWithMemo reviewProject prIndices modulesWithAst memoizedFunc
                     { output = err
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
+                    }
+
+
+runProjectRulesWithWarmRuleCaches :
+    String
+    -> InterpreterProject
+    -> List Int
+    -> List String
+    -> List { path : String, source : String, astJson : String }
+    -> Set.Set String
+    -> Bool
+    -> MemoRuntime.MemoCache
+    -> BackendTask FatalError ProjectRuleEvalResult
+runProjectRulesWithWarmRuleCaches buildDir reviewProject prIndices moduleCachePathsToLoad modulesWithAst memoizedFunctions memoProfile memoCache =
+    let
+        modulesVarName =
+            "reviewModules__"
+
+        expression =
+            buildExpressionForRulesWithModuleVar prIndices modulesVarName
+
+        injectedValues =
+            FastDict.singleton modulesVarName (moduleInputsValue modulesWithAst)
+
+        fallbackOutput () =
+            runProjectRulesFresh reviewProject prIndices modulesWithAst
+    in
+    Do.do
+        (withTiming "project.importers.rule_cache.load"
+            (loadRuleCachesWithStats buildDir moduleCachePathsToLoad)
+        )
+    <| \loadTimed ->
+    let
+        loadedRuleCaches =
+            loadTimed.value
+
+        intercepts =
+            buildReviewIntercepts loadedRuleCaches
+
+        baseCounters =
+            Dict.fromList
+                [ ( "project.importers.mode.fresh", 0 )
+                , ( "project.importers.mode.split", 1 )
+                , ( "project.importers.rule_cache.load_ms", loadTimed.stage.ms )
+                ]
+    in
+    if Set.isEmpty memoizedFunctions then
+        Do.do
+            (withTiming "project.importers.warm_eval"
+                (InterpreterProject.prepareAndEvalWithYield reviewProject
+                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                    , expression = expression
+                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                    , intercepts = intercepts
+                    , injectedValues = injectedValues
+                    }
+                    (projectRuleYieldHandler buildDir)
+                )
+            )
+        <| \evalTimed ->
+        case evalTimed.value of
+            Ok (Types.String output) ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        Dict.insert "project.importers.warm_eval_ms" evalTimed.stage.ms baseCounters
+                    }
+
+            Ok _ ->
+                BackendTask.succeed
+                    { output = fallbackOutput ()
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        Dict.insert "project.importers.warm_eval_ms" evalTimed.stage.ms baseCounters
+                    }
+
+            Err _ ->
+                BackendTask.succeed
+                    { output = fallbackOutput ()
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        Dict.insert "project.importers.warm_eval_ms" evalTimed.stage.ms baseCounters
+                    }
+
+    else
+        Do.do
+            (withTiming "project.importers.warm_eval"
+                (InterpreterProject.prepareAndEvalWithYieldAndMemoizedFunctions reviewProject
+                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                    , expression = expression
+                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                    , intercepts = intercepts
+                    , injectedValues = injectedValues
+                    , memoizedFunctions = memoizedFunctions
+                    , memoCache = memoCache
+                    , collectMemoStats = memoProfile
+                    }
+                    (projectRuleYieldHandler buildDir)
+                )
+            )
+        <| \evalTimed ->
+        case evalTimed.value.result of
+            Ok (Types.String output) ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = evalTimed.value.memoCache
+                    , memoStats = evalTimed.value.memoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        Dict.insert "project.importers.warm_eval_ms" evalTimed.stage.ms baseCounters
+                    }
+
+            Ok _ ->
+                BackendTask.succeed
+                    { output = fallbackOutput ()
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        Dict.insert "project.importers.warm_eval_ms" evalTimed.stage.ms baseCounters
+                    }
+
+            Err _ ->
+                BackendTask.succeed
+                    { output = fallbackOutput ()
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        Dict.insert "project.importers.warm_eval_ms" evalTimed.stage.ms baseCounters
                     }
 
 
@@ -4117,35 +4553,14 @@ evalTwoProjectRuleSlicesWithMemo reviewProject firstIndices firstModules secondI
 projectRuleYieldHandler : String -> String -> Types.Value -> BackendTask FatalError Types.Value
 projectRuleYieldHandler buildDir tag payload =
     let
-        yieldLogPath =
-            buildDir ++ "/yield-log.txt"
-
         ruleCacheDir =
             buildDir ++ "/rule-value-cache"
     in
     case tag of
         "log" ->
-            case payload of
-                Types.String msg ->
-                    Do.do
-                        (File.rawFile yieldLogPath
-                            |> BackendTask.toResult
-                            |> BackendTask.andThen
-                                (\existing ->
-                                    Script.writeFile
-                                        { path = yieldLogPath
-                                        , body = (Result.withDefault "" existing) ++ msg ++ "\n"
-                                        }
-                                        |> BackendTask.allowFatal
-                                )
-                        )
-                    <| \_ ->
-                    BackendTask.succeed Types.Unit
+            BackendTask.succeed Types.Unit
 
-                _ ->
-                    BackendTask.succeed Types.Unit
-
-        "review-cache-write" ->
+        "review-cache-parts-write" ->
             case payload of
                 Types.Record fields ->
                     let
@@ -4178,43 +4593,67 @@ projectRuleYieldHandler buildDir tag payload =
                         cache =
                             FastDict.get "cache" fields
                                 |> Maybe.withDefault Types.Unit
-
-                        serialized =
-                            ValueCodec.encodeValue cache
-
-                        filePath =
-                            ruleCacheDir ++ "/" ++ ruleCacheValueKey ruleName ruleId ++ ".json"
                     in
-                    Do.do
-                        (File.rawFile yieldLogPath
-                            |> BackendTask.toResult
-                            |> BackendTask.andThen
-                                (\existing ->
-                                    let
-                                        prev =
-                                            case existing of
-                                                Ok s ->
-                                                    s
+                    case cache of
+                        Types.Record splitFields ->
+                            let
+                                ruleKey =
+                                    ruleCacheValueKey ruleName ruleId
 
-                                                Err _ ->
-                                                    ""
-                                    in
-                                    Script.writeFile
-                                        { path = yieldLogPath
-                                        , body =
-                                            prev
-                                                ++ ruleCacheValueKey ruleName ruleId
-                                                ++ ": "
-                                                ++ String.fromInt (String.length serialized)
-                                                ++ " bytes\n"
-                                        }
-                                        |> BackendTask.allowFatal
+                                baseCache =
+                                    FastDict.get "baseCache" splitFields
+                                        |> Maybe.withDefault Types.Unit
+
+                                moduleContexts =
+                                    FastDict.get "moduleContexts" splitFields
+                                        |> Maybe.withDefault (Types.List [])
+
+                                basePath =
+                                    ruleCacheDir ++ "/" ++ ruleKey ++ ".base.json"
+                            in
+                            Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
+                            Do.do
+                                (Script.writeFile
+                                    { path = basePath
+                                    , body = ValueCodec.encodeValue baseCache
+                                    }
+                                    |> BackendTask.allowFatal
                                 )
-                        )
-                    <| \_ ->
-                    Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
-                    Do.do (Script.writeFile { path = filePath, body = serialized } |> BackendTask.allowFatal) <| \_ ->
-                    BackendTask.succeed Types.Unit
+                            <| \_ ->
+                            Do.do
+                                (case moduleContexts of
+                                    Types.List entries ->
+                                        entries
+                                            |> List.map
+                                                (\entry ->
+                                                    case entry of
+                                                        Types.Tuple (Types.String modulePath) moduleCacheValue ->
+                                                            Script.writeFile
+                                                                { path =
+                                                                    ruleCacheDir
+                                                                        ++ "/"
+                                                                        ++ ruleKey
+                                                                        ++ "--"
+                                                                        ++ cacheFileComponent modulePath
+                                                                        ++ ".module.json"
+                                                                , body = ValueCodec.encodeValue moduleCacheValue
+                                                                }
+                                                                |> BackendTask.allowFatal
+
+                                                        _ ->
+                                                            BackendTask.succeed ()
+                                                )
+                                            |> BackendTask.Extra.combine
+                                            |> BackendTask.map (\_ -> ())
+
+                                    _ ->
+                                        BackendTask.succeed ()
+                                )
+                            <| \_ ->
+                            BackendTask.succeed Types.Unit
+
+                        _ ->
+                            BackendTask.succeed Types.Unit
 
                 _ ->
                     BackendTask.succeed Types.Unit
@@ -4230,20 +4669,7 @@ projectRuleYieldHandler buildDir tag payload =
             <| \_ ->
             BackendTask.succeed Types.Unit
 
-        other ->
-            Do.do
-                (File.rawFile yieldLogPath
-                    |> BackendTask.toResult
-                    |> BackendTask.andThen
-                        (\existing ->
-                            Script.writeFile
-                                { path = yieldLogPath
-                                , body = (Result.withDefault "" existing) ++ "UNKNOWN yield: " ++ other ++ "\n"
-                                }
-                                |> BackendTask.allowFatal
-                        )
-                )
-            <| \_ ->
+        _ ->
             BackendTask.succeed Types.Unit
 
 
@@ -4297,7 +4723,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
         modulesVarName =
             "reviewModules__"
     in
-    Do.do (loadRuleCaches buildDir) <| \preloadedCaches ->
+    Do.do (loadRuleCachesWithStats buildDir (allFileContents |> List.map .path)) <| \preloadedCaches ->
     Do.do (loadProjectCache buildDir projectMetadata) <| \maybeCachedProject ->
     let
         intercepts =
@@ -4332,7 +4758,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
             Do.do (persistProjectCacheMetadata buildDir projectMetadata) <| \_ ->
             persistProjectEvalOutput maybeOutputCache output
 
-        fallbackOutput =
+        fallbackOutput () =
             runProjectRulesFresh reviewProject prIndices allModulesWithAst
 
         usedCachedProject =
@@ -4375,7 +4801,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     }
 
             Ok _ ->
-                Do.do (persistProjectEvalOutput maybeOutputCache fallbackOutput) <| \output ->
+                Do.do (persistProjectEvalOutput maybeOutputCache (fallbackOutput ())) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -4384,7 +4810,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     }
 
             Err _ ->
-                Do.do (persistProjectEvalOutput maybeOutputCache fallbackOutput) <| \output ->
+                Do.do (persistProjectEvalOutput maybeOutputCache (fallbackOutput ())) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -4429,7 +4855,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     }
 
             Ok _ ->
-                Do.do (persistProjectEvalOutput maybeOutputCache fallbackOutput) <| \output ->
+                Do.do (persistProjectEvalOutput maybeOutputCache (fallbackOutput ())) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -4438,7 +4864,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     }
 
             Err _ ->
-                Do.do (persistProjectEvalOutput maybeOutputCache fallbackOutput) <| \output ->
+                Do.do (persistProjectEvalOutput maybeOutputCache (fallbackOutput ())) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -4879,11 +5305,151 @@ conflictingPackages =
 
 patchSource : String -> String
 patchSource source =
-    if String.contains "runThunk =\n    Elm.Kernel.Test.runThunk" source then
-        source
-            |> String.replace
-                "runThunk =\n    Elm.Kernel.Test.runThunk"
-                "runThunk fn =\n    Ok (fn ())"
+    let
+        patchedKernelThunk =
+            if String.contains "runThunk =\n    Elm.Kernel.Test.runThunk" source then
+                source
+                    |> String.replace
+                        "runThunk =\n    Elm.Kernel.Test.runThunk"
+                        "runThunk fn =\n    Ok (fn ())"
+
+            else
+                source
+
+        reviewRuleCacheFilterOriginal =
+            """removeUnknownModulesFromInitialCache : ValidProject -> ProjectRuleCache projectContext -> ProjectRuleCache projectContext
+removeUnknownModulesFromInitialCache validProject projectRuleCache =
+    { projectRuleCache | moduleContexts = Dict.filter (\\path _ -> ValidProject.doesModuleExist path validProject) projectRuleCache.moduleContexts }
+"""
+
+        reviewRuleCacheFilterPatched =
+            """initialCacheAllowedPathsMarker : () -> List String
+initialCacheAllowedPathsMarker _ =
+    []
+
+
+removeUnknownModulesFromInitialCache : ValidProject -> ProjectRuleCache projectContext -> ProjectRuleCache projectContext
+removeUnknownModulesFromInitialCache validProject projectRuleCache =
+    let
+        allowedPaths =
+            initialCacheAllowedPathsMarker ()
+    in
+    if List.isEmpty allowedPaths then
+        { projectRuleCache | moduleContexts = Dict.filter (\\path _ -> ValidProject.doesModuleExist path validProject) projectRuleCache.moduleContexts }
 
     else
-        source
+        { projectRuleCache | moduleContexts = Dict.filter (\\path _ -> List.member path allowedPaths) projectRuleCache.moduleContexts }
+"""
+
+        initialCacheMarkerOriginal =
+            """initialCacheMarker : String -> Int -> ProjectRuleCache projectContext -> ProjectRuleCache projectContext
+initialCacheMarker _ _ cache =
+    cache
+"""
+
+        initialCacheMarkerPatched =
+            """initialCachePartsMarker : String -> Int -> SplitProjectRuleCache projectContext -> SplitProjectRuleCache projectContext
+initialCachePartsMarker _ _ splitCache =
+    splitCache
+
+
+initialCacheMarker : String -> Int -> ProjectRuleCache projectContext -> ProjectRuleCache projectContext
+initialCacheMarker ruleName ruleId cache =
+    initialCachePartsMarker ruleName ruleId (splitProjectRuleCache cache)
+        |> rehydrateProjectRuleCache
+"""
+
+        finalCacheMarkerOriginal =
+            """finalCacheMarker : String -> Int -> ProjectRuleCache projectContext -> ProjectRuleCache projectContext
+finalCacheMarker _ _ cache =
+    cache
+"""
+
+        finalCacheMarkerPatched =
+            """finalCachePartsMarker : String -> Int -> SplitProjectRuleCache projectContext -> SplitProjectRuleCache projectContext
+finalCachePartsMarker _ _ splitCache =
+    splitCache
+
+
+finalCacheMarker : String -> Int -> ProjectRuleCache projectContext -> ProjectRuleCache projectContext
+finalCacheMarker ruleName ruleId cache =
+    finalCachePartsMarker ruleName ruleId (splitProjectRuleCache cache)
+        |> rehydrateProjectRuleCache
+"""
+
+        projectRuleCacheOriginal =
+            """type alias ProjectRuleCache projectContext =
+    { elmJson : Maybe (ProjectFileCache projectContext)
+    , readme : Maybe (ProjectFileCache projectContext)
+    , extraFiles : Maybe (ExtraFilesCache projectContext)
+    , dependencies : Maybe (ProjectFileCache projectContext)
+    , moduleContexts : Dict String (ModuleCacheEntry projectContext)
+    , finalEvaluationErrors : Maybe (FinalProjectEvaluationCache projectContext)
+    , extract : Maybe (ExtractCache projectContext)
+    }
+"""
+
+        projectRuleCachePatched =
+            """type alias ProjectRuleCache projectContext =
+    { elmJson : Maybe (ProjectFileCache projectContext)
+    , readme : Maybe (ProjectFileCache projectContext)
+    , extraFiles : Maybe (ExtraFilesCache projectContext)
+    , dependencies : Maybe (ProjectFileCache projectContext)
+    , moduleContexts : Dict String (ModuleCacheEntry projectContext)
+    , finalEvaluationErrors : Maybe (FinalProjectEvaluationCache projectContext)
+    , extract : Maybe (ExtractCache projectContext)
+    }
+
+
+type alias SplitProjectRuleCache projectContext =
+    { baseCache : ProjectRuleCache projectContext
+    , moduleContexts : List ( String, ModuleCacheEntry projectContext )
+    }
+
+
+splitProjectRuleCache : ProjectRuleCache projectContext -> SplitProjectRuleCache projectContext
+splitProjectRuleCache cache =
+    { baseCache = { cache | moduleContexts = Dict.empty }
+    , moduleContexts = Dict.toList cache.moduleContexts
+    }
+
+
+rehydrateProjectRuleCache : SplitProjectRuleCache projectContext -> ProjectRuleCache projectContext
+rehydrateProjectRuleCache splitCache =
+    let
+        baseCache =
+            splitCache.baseCache
+    in
+    { baseCache | moduleContexts = Dict.fromList splitCache.moduleContexts }
+"""
+
+        patchedReviewRuleCacheFilter =
+            if String.contains reviewRuleCacheFilterOriginal patchedKernelThunk then
+                patchedKernelThunk
+                    |> String.replace reviewRuleCacheFilterOriginal reviewRuleCacheFilterPatched
+
+            else
+                patchedKernelThunk
+
+        patchedInitialCacheMarker =
+            if String.contains initialCacheMarkerOriginal patchedReviewRuleCacheFilter then
+                patchedReviewRuleCacheFilter
+                    |> String.replace initialCacheMarkerOriginal initialCacheMarkerPatched
+
+            else
+                patchedReviewRuleCacheFilter
+
+        patchedFinalCacheMarker =
+            if String.contains finalCacheMarkerOriginal patchedInitialCacheMarker then
+                patchedInitialCacheMarker
+                    |> String.replace finalCacheMarkerOriginal finalCacheMarkerPatched
+
+            else
+                patchedInitialCacheMarker
+    in
+    if String.contains projectRuleCacheOriginal patchedFinalCacheMarker then
+        patchedFinalCacheMarker
+            |> String.replace projectRuleCacheOriginal projectRuleCachePatched
+
+    else
+        patchedFinalCacheMarker

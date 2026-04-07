@@ -322,3 +322,45 @@ After trying interpreter-local memoization in the runner:
 - Keeping the runner memo plumbing behind a zero-cost bypass is the right shape: we can now try better qualified-function targets without regressing the normal path when the set is empty.
 - The real next performance step for 1-file warm runs is still rule-specific contribution caching, where a file change updates folded project-rule state instead of rerunning whole rule logic over any slice, or alternatively a daemon that keeps the interpreter state warm in memory.
 - The next big opportunities are project-rule contribution caches, smaller AST transport than JSON, and eventually daemonized in-memory state.
+
+### ImportersOf split-cache follow-up
+
+- I revived the narrowed `ImportersOf` warm-rule-cache path, but this time made the strategy selectable with `--importers-cache-mode fresh|split|auto` so it could be compared on the exact same codebase and benchmark harness.
+- I added counters for the split path so the trace now records:
+  - `project.importers.rule_cache.load_ms`
+  - `project.importers.warm_eval_ms`
+  - `project.importers.rule_cache.entries`
+  - `project.importers.rule_cache.loaded_bytes`
+  - `project.importers.mode.fresh`
+  - `project.importers.mode.split`
+- That instrumentation exposed the real bug: the split-cache path was eagerly computing `fallbackOutput = runProjectRulesFresh ...` even on successful warm runs.
+  - Because Elm evaluates `let` bindings eagerly enough here, the fallback fresh project-rule run was happening every time.
+  - Fixing that one bug changed the split-cache experiment from a regression into a small real win.
+
+Measured on `small-12` after the eager-fallback fix:
+
+| Mode | Cold | Warm | Warm 1-file body edit | Warm import-graph change |
+|---|---:|---:|---:|---:|
+| `fresh` | `96.91s` | `0.32s` | `1.52s` | `5.90s` |
+| `split` | `98.61s` | `0.33s` | `1.62s` | `5.61s` |
+| `auto` | `94.13s` | `0.32s` | `1.50s` | `5.82s` |
+
+What the new trace says on `warm_import_graph_change`:
+
+- `fresh`
+  - `project_rule_eval`: `4688ms`
+  - `project.importers.cache_misses`: `2`
+  - `project.importers.affected_modules`: `2`
+- `split`
+  - `project_rule_eval`: `4286ms`
+  - `project.importers.rule_cache.load_ms`: `6ms`
+  - `project.importers.warm_eval_ms`: `29ms`
+  - `project.importers.rule_cache.entries`: `8`
+  - `project.importers.rule_cache.loaded_bytes`: `54874`
+
+Current read:
+
+- The split-cache idea is viable once the accidental eager fallback is removed.
+- It helps on import-graph changes where the narrowed importer slice is a bit wider, but it still loses on the trivial 1-file body-edit case.
+- The `auto` heuristic is directionally right and keeps the body-edit path at the fresh baseline, but on a single run it landed between `fresh` and `split` on the import-graph case, which looks like ordinary run-to-run noise rather than a clear policy win yet.
+- The next step should be to tighten the `auto` policy with a few repeated scenario-specific runs, then keep pushing toward smaller contribution boundaries inside the `ImportersOf` family rather than replaying whole project-rule cache machinery.
