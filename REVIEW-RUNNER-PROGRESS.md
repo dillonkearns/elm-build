@@ -825,3 +825,64 @@ Current read:
   - making the package summary payload cheaper to decode
   - or splitting/reusing it in a way that avoids decoding one large blob every time
 - But the largest end-to-end remaining wall is still `project_rule_eval`, especially on import-graph changes.
+
+### ImportersOf Split-Group Experiment
+
+I tried a more aggressive split inside the `ImportersOf` family:
+
+- `NoUnused.Exports`
+- `NoUnused.CustomTypeConstructorArgs`
+
+into a fold-only subgroup, leaving:
+
+- `NoUnused.CustomTypeConstructors`
+- `NoUnused.Parameters`
+
+in the existing importer-context subgroup.
+
+The reasoning was that the fold-only subgroup does not use `withContextFromImportedModules`, so on a 1-file import change it should be able to:
+
+- re-evaluate only the stale module visitors
+- reuse cached contributions from unchanged modules
+- avoid dragging unchanged direct importers through the more expensive contextual path
+
+The first version was not a win. The big mistake was that the fold-only warm path still loaded cached module entries for **every unchanged file**, which made the extra subgroup cheaper in theory but too expensive in setup.
+
+Tightening that path helped:
+
+- only use split-cache mode for the fold-only subgroup when there is actually an unchanged miss to reuse
+- only load cached module entries for the fold-only missed paths and their direct importers, not the whole unchanged project
+
+Full `small-12` matrix with that tighter auto policy:
+
+| Scenario | Result |
+|---|---:|
+| Cold | `130.46s` |
+| Warm | `0.31s` |
+| Warm 1-file body edit | `1.57s` |
+| Warm 1-file comment-only | `0.54s` |
+| Warm import-graph change | `4.12s` |
+
+That is not a clean cross-commit win over the earlier `3.98s` import-change result, but the source fixture itself has also grown during this work, so I ran an apples-to-apples A/B on the **current** source tree:
+
+`warm_import_graph_change`, current tree, `deps=auto`
+
+| Importers mode | Avg | Run 1 | Run 2 |
+|---|---:|---:|---:|
+| `fresh` | `3.97s` | `4.06s` | `3.88s` |
+| `auto` | `3.82s` | `4.47s` | `3.17s` |
+
+`warm_1_file_body_edit`, current tree, `deps=auto`
+
+| Importers mode | Avg | Run 1 | Run 2 |
+|---|---:|---:|---:|
+| `fresh` | `1.52s` | `1.64s` | `1.40s` |
+| `auto` | `1.53s` | `1.61s` | `1.44s` |
+
+Current read:
+
+- The split-group idea is **not** a clear first-changed-run win.
+- It is close to parity on common body edits.
+- It looks meaningfully better on repeated warm import-graph changes once the narrower subgroup caches are seeded.
+- The remaining gap is still setup/fixed-cost work, not cache file I/O.
+- That suggests the next meaningful win is probably still a **more compact direct contribution artifact**, not more generic `Review.Rule` split-cache choreography.

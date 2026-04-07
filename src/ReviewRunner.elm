@@ -156,6 +156,15 @@ type alias LoadedRuleCaches =
     }
 
 
+emptyLoadedRuleCaches : LoadedRuleCaches
+emptyLoadedRuleCaches =
+    { baseCaches = Dict.empty
+    , moduleEntries = Dict.empty
+    , entryCount = 0
+    , bytes = 0
+    }
+
+
 type alias ProjectRuleEvalResult =
     { output : String
     , memoCache : MemoRuntime.MemoCache
@@ -612,6 +621,52 @@ mergeProfiles crossModuleDep rules =
                 }
             )
             { expressionDep = False, declarationNameDep = False, importDep = False, exposingDep = False, customTypeDep = False, crossModuleDep = crossModuleDep }
+
+
+importersNeedsImporterContext : String -> Bool
+importersNeedsImporterContext ruleName =
+    case ruleName of
+        "NoUnused.Exports" ->
+            False
+
+        "NoUnused.CustomTypeConstructorArgs" ->
+            False
+
+        "NoUnused.CustomTypeConstructors" ->
+            True
+
+        "NoUnused.Parameters" ->
+            True
+
+        _ ->
+            True
+
+
+buildPerFileRuleKeys :
+    String
+    -> String
+    -> List { a | index : Int }
+    -> RuleDependencyProfile
+    -> List AnalyzedTargetFile
+    -> Dict String SemanticHash.FileAspectHashes
+    -> DepGraph.Graph
+    -> List PerFileRuleKey
+buildPerFileRuleKeys keyPrefix helperHash rules profile allFileContents allFileAspectHashes depGraph =
+    allFileContents
+        |> List.map
+            (\file ->
+                let
+                    fileHashes =
+                        Dict.get file.path allFileAspectHashes
+                            |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
+                in
+                { path = file.path
+                , narrowKey =
+                    keyPrefix ++ "|" ++ helperHash ++ "|"
+                        ++ (rules |> List.map (.index >> String.fromInt) |> String.join ",")
+                        ++ "|" ++ narrowCacheKey profile file.path fileHashes allFileAspectHashes depGraph
+                }
+            )
 
 
 {-| Extract only the aspects a rule depends on from FileAspectHashes, joined as a string.
@@ -2964,7 +3019,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
              else
                 let
-                    importersOfRules =
+                    importersAllRules =
                         projectRules
                             |> List.filter
                                 (\rule ->
@@ -2975,6 +3030,14 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                         _ ->
                                             False
                                 )
+
+                    importersFoldOnlyRules =
+                        importersAllRules
+                            |> List.filter (\rule -> not (importersNeedsImporterContext rule.name))
+
+                    importersOfRules =
+                        importersAllRules
+                            |> List.filter (\rule -> importersNeedsImporterContext rule.name)
 
                     dependenciesOfRules =
                         projectRules
@@ -3000,8 +3063,14 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                             False
                                 )
 
+                    prImportersFoldCacheDir =
+                        Path.toString config.buildDirectory ++ "/pr-importers-fold-only"
+
                     prCacheDir =
                         Path.toString config.buildDirectory ++ "/pr-per-file"
+
+                    importersFoldProfile =
+                        mergeProfiles ImportersOf importersFoldOnlyRules
 
                     importersProfile =
                         mergeProfiles ImportersOf importersOfRules
@@ -3009,45 +3078,52 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     dependenciesProfile =
                         mergeProfiles DependenciesOf dependenciesOfRules
 
+                    importersFoldPerFileKeys =
+                        buildPerFileRuleKeys
+                            "prf-iof"
+                            helperHash
+                            importersFoldOnlyRules
+                            importersFoldProfile
+                            allFileContents
+                            allFileAspectHashes
+                            depGraph
+
                     importersPerFileKeys =
-                        allFileContents
-                            |> List.map
-                                (\file ->
-                                    let
-                                        fileHashes =
-                                            Dict.get file.path allFileAspectHashes
-                                                |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
-                                    in
-                                    { path = file.path
-                                    , narrowKey =
-                                        "prf-io|" ++ helperHash ++ "|"
-                                            ++ (importersOfRules |> List.map (.index >> String.fromInt) |> String.join ",")
-                                            ++ "|" ++ narrowCacheKey importersProfile file.path fileHashes allFileAspectHashes depGraph
-                                    }
-                                )
+                        buildPerFileRuleKeys
+                            "prf-ioc"
+                            helperHash
+                            importersOfRules
+                            importersProfile
+                            allFileContents
+                            allFileAspectHashes
+                            depGraph
 
                     depsPerFileKeys =
-                        allFileContents
-                            |> List.map
-                                (\file ->
-                                    let
-                                        fileHashes =
-                                            Dict.get file.path allFileAspectHashes
-                                                |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
-                                    in
-                                    { path = file.path
-                                    , narrowKey =
-                                        "prf-do|" ++ helperHash ++ "|"
-                                            ++ (dependenciesOfRules |> List.map (.index >> String.fromInt) |> String.join ",")
-                                            ++ "|" ++ narrowCacheKey dependenciesProfile file.path fileHashes allFileAspectHashes depGraph
-                                    }
-                                )
+                        buildPerFileRuleKeys
+                            "prf-do"
+                            helperHash
+                            dependenciesOfRules
+                            dependenciesProfile
+                            allFileContents
+                            allFileAspectHashes
+                            depGraph
 
                     doCacheDir =
                         Path.toString config.buildDirectory ++ "/pr-deps-of"
                 in
+                Do.do (Script.exec "mkdir" [ "-p", prImportersFoldCacheDir ]) <| \_ ->
                 Do.do (Script.exec "mkdir" [ "-p", prCacheDir ]) <| \_ ->
                 Do.do (Script.exec "mkdir" [ "-p", doCacheDir ]) <| \_ ->
+                Do.do
+                    (withTiming "project.importers_fold.cache_check"
+                        (if List.isEmpty importersFoldOnlyRules then
+                            BackendTask.succeed []
+
+                         else
+                            checkPerFileRuleCache prImportersFoldCacheDir importersFoldPerFileKeys
+                        )
+                    )
+                <| \importersFoldChecksTimed ->
                 Do.do
                     (withTiming "project.importers.cache_check"
                         (if List.isEmpty importersOfRules then
@@ -3069,11 +3145,17 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     )
                 <| \depsChecksTimed ->
                 let
+                    importersFoldChecks =
+                        importersFoldChecksTimed.value
+
                     importersChecks =
                         importersChecksTimed.value
 
                     depsChecks =
                         depsChecksTimed.value
+
+                    importersFoldIndices =
+                        importersFoldOnlyRules |> List.map .index
 
                     ioIndices =
                         importersOfRules |> List.map .index
@@ -3081,11 +3163,19 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     doIndices =
                         dependenciesOfRules |> List.map .index
 
+                    importersFoldAllHit =
+                        List.isEmpty importersFoldOnlyRules || List.all .hit importersFoldChecks
+
                     importersAllHit =
                         List.isEmpty importersOfRules || List.all .hit importersChecks
 
                     depsAllHit =
                         List.isEmpty dependenciesOfRules || List.all .hit depsChecks
+
+                    importersFoldMissedPaths =
+                        importersFoldChecks
+                            |> List.filter (not << .hit)
+                            |> List.map .path
 
                     importersMissedPaths =
                         importersChecks
@@ -3096,6 +3186,34 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         depsChecks
                             |> List.filter (not << .hit)
                             |> List.map .path
+
+                    importersFoldAffectedModules =
+                        allModulesWithAst
+                            |> List.filter
+                                (\file ->
+                                    staleFileContents
+                                        |> List.any (\stale -> stale.path == file.path)
+                                )
+
+                    importersFoldSupportingPaths =
+                        let
+                            stalePathSet =
+                                staleFileContents
+                                    |> List.map .path
+                                    |> Set.fromList
+
+                            requiredPaths =
+                                importersFoldMissedPaths
+                                    |> List.foldl
+                                        (\path acc ->
+                                            Set.insert path
+                                                (Set.union acc (DepGraph.directReverseDeps depGraph path))
+                                        )
+                                        Set.empty
+                        in
+                        requiredPaths
+                            |> Set.diff stalePathSet
+                            |> Set.toList
 
                     importersAffectedModules =
                         let
@@ -3118,6 +3236,25 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
                                 else
                                     False
+
+                            ImportersSplit ->
+                                True
+
+                            ImportersFresh ->
+                                False
+
+                    useSplitImportersFoldCache =
+                        case config.importersCacheMode of
+                            ImportersAuto ->
+                                List.length staleFileContents < List.length allFileContents
+                                    && (importersFoldMissedPaths
+                                            |> List.any
+                                                (\path ->
+                                                    staleFileContents
+                                                        |> List.any (\file -> file.path == path)
+                                                        |> not
+                                                )
+                                       )
 
                             ImportersSplit ->
                                 True
@@ -3155,7 +3292,11 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
                     sliceCounters =
                         Dict.fromList
-                            [ ( "project.importers.rule_count", List.length importersOfRules )
+                            [ ( "project.importers.rule_count", List.length importersAllRules )
+                            , ( "project.importers_fold.rule_count", List.length importersFoldOnlyRules )
+                            , ( "project.importers_fold.cache_hits", importersFoldChecks |> List.filter .hit |> List.length )
+                            , ( "project.importers_fold.cache_misses", List.length importersFoldMissedPaths )
+                            , ( "project.importers_fold.affected_modules", List.length importersFoldAffectedModules )
                             , ( "project.importers.cache_hits", importersChecks |> List.filter .hit |> List.length )
                             , ( "project.importers.cache_misses", List.length importersMissedPaths )
                             , ( "project.importers.affected_modules", List.length importersAffectedModules )
@@ -3164,10 +3305,26 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             , ( "project.deps.cache_misses", List.length depsMissedPaths )
                             , ( "project.deps.affected_modules", List.length depsAffectedModules )
                             , ( "project.full.rule_count", List.length fullProjectRules )
+                            , ( "project.importers_fold.cache_check_ms", importersFoldChecksTimed.stage.ms )
                             , ( "project.importers.cache_check_ms", importersChecksTimed.stage.ms )
                             , ( "project.deps.cache_check_ms", depsChecksTimed.stage.ms )
                             ]
                 in
+                Do.do
+                    (withTiming "project.importers_fold.cached_output_read"
+                        (readPerFileRuleOutputs
+                            prImportersFoldCacheDir
+                            (if importersFoldAllHit then
+                                importersFoldPerFileKeys |> List.map .path
+
+                             else
+                                importersFoldChecks
+                                    |> List.filter .hit
+                                    |> List.map .path
+                            )
+                        )
+                    )
+                <| \importersFoldCachedOutputsTimed ->
                 Do.do
                     (withTiming "project.importers.cached_output_read"
                         (readPerFileRuleOutputs
@@ -3199,6 +3356,9 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     )
                 <| \depsCachedOutputsTimed ->
                 let
+                    importersFoldCachedOutputs =
+                        importersFoldCachedOutputsTimed.value
+
                     importersCachedOutputs =
                         importersCachedOutputsTimed.value
 
@@ -3207,18 +3367,80 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 in
                 Do.do (BackendTask.succeed MemoRuntime.emptyMemoCache) <| \initialMemoCache ->
                 Do.do
-                    (withTiming "project.importers.eval_total"
-                        (if importersAllHit then
+                    (withTiming "project.importers_fold.eval_total"
+                        (if importersFoldAllHit then
                             BackendTask.succeed
                                 { output = ""
                                 , memoCache = initialMemoCache
                                 , memoStats = MemoRuntime.emptyMemoStats
-                                , loadedRuleCaches =
-                                    { baseCaches = Dict.empty
-                                    , moduleEntries = Dict.empty
-                                    , entryCount = 0
-                                    , bytes = 0
+                                , loadedRuleCaches = emptyLoadedRuleCaches
+                                , counters = Dict.empty
+                                }
+
+                         else
+                            if useSplitImportersFoldCache then
+                            runProjectRulesWithWarmRuleCaches
+                                "project.importers_fold"
+                                (Path.toString config.buildDirectory)
+                                reviewProject
+                                importersFoldIndices
+                                importersFoldSupportingPaths
+                                importersFoldAffectedModules
+                                (staleFileContents |> List.map .path)
+                                config.memoizedFunctions
+                                config.memoProfile
+                                initialMemoCache
+
+                            else
+                                Do.do
+                                    (withTiming "project.importers_fold.fresh_eval"
+                                    (runProjectRulesWithCacheWrite
+                                        (Path.toString config.buildDirectory)
+                                        reviewProject
+                                        importersFoldIndices
+                                        importersFoldAffectedModules
+                                        (staleFileContents |> List.map .path)
+                                        config.memoizedFunctions
+                                        config.memoProfile
+                                        initialMemoCache
+                                        )
+                                    )
+                                <| \freshTimed ->
+                                BackendTask.succeed
+                                    { output = freshTimed.value.output
+                                    , memoCache = freshTimed.value.memoCache
+                                    , memoStats = freshTimed.value.memoStats
+                                    , loadedRuleCaches = emptyLoadedRuleCaches
+                                    , counters =
+                                        Dict.fromList
+                                            [ ( "project.importers_fold.mode.fresh", 1 )
+                                            , ( "project.importers_fold.mode.split", 0 )
+                                            , ( "project.importers_fold.fresh_eval_ms", freshTimed.stage.ms )
+                                            ]
                                     }
+                        )
+                    )
+                <| \importersFoldEvalTimed ->
+                let
+                    importersFoldEvalBase =
+                        importersFoldEvalTimed.value
+
+                    importersFoldEval =
+                        { importersFoldEvalBase
+                            | counters =
+                                Dict.insert "project.importers_fold.eval_total_ms"
+                                    importersFoldEvalTimed.stage.ms
+                                    importersFoldEvalBase.counters
+                        }
+                in
+                Do.do
+                    (withTiming "project.importers.eval_total"
+                        (if importersAllHit then
+                            BackendTask.succeed
+                                { output = ""
+                                , memoCache = importersFoldEval.memoCache
+                                , memoStats = MemoRuntime.emptyMemoStats
+                                , loadedRuleCaches = emptyLoadedRuleCaches
                                 , counters = Dict.empty
                                 }
 
@@ -3242,7 +3464,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                     importersMissedPaths
                                     config.memoizedFunctions
                                     config.memoProfile
-                                    initialMemoCache
+                                    importersFoldEval.memoCache
 
                             else
                                 Do.do
@@ -3255,7 +3477,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                             importersMissedPaths
                                             config.memoizedFunctions
                                             config.memoProfile
-                                            initialMemoCache
+                                            importersFoldEval.memoCache
                                         )
                                     )
                                 <| \freshTimed ->
@@ -3263,12 +3485,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                     { output = freshTimed.value.output
                                     , memoCache = freshTimed.value.memoCache
                                     , memoStats = freshTimed.value.memoStats
-                                    , loadedRuleCaches =
-                                        { baseCaches = Dict.empty
-                                        , moduleEntries = Dict.empty
-                                        , entryCount = 0
-                                        , bytes = 0
-                                        }
+                                    , loadedRuleCaches = emptyLoadedRuleCaches
                                     , counters =
                                         Dict.fromList
                                             [ ( "project.importers.mode.fresh", 1 )
@@ -3298,12 +3515,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 { output = ""
                                 , memoCache = importersEval.memoCache
                                 , memoStats = MemoRuntime.emptyMemoStats
-                                , loadedRuleCaches =
-                                    { baseCaches = Dict.empty
-                                    , moduleEntries = Dict.empty
-                                    , entryCount = 0
-                                    , bytes = 0
-                                    }
+                                , loadedRuleCaches = emptyLoadedRuleCaches
                                 , counters = Dict.empty
                                 }
 
@@ -3363,12 +3575,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                     { output = depsTimed.value.output
                                     , memoCache = depsTimed.value.memoCache
                                     , memoStats = depsTimed.value.memoStats
-                                    , loadedRuleCaches =
-                                        { baseCaches = Dict.empty
-                                        , moduleEntries = Dict.empty
-                                        , entryCount = 0
-                                        , bytes = 0
-                                        }
+                                    , loadedRuleCaches = emptyLoadedRuleCaches
                                     , counters =
                                         Dict.fromList
                                             [ ( "project.deps.mode.fresh", 1 )
@@ -3396,6 +3603,13 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         (deferTask
                             (\() ->
                                 let
+                                    ioFoldErrors =
+                                        if importersFoldAllHit then
+                                            []
+
+                                        else
+                                            parseReviewOutput importersFoldEval.output
+
                                     ioErrors =
                                         if importersAllHit then
                                             []
@@ -3409,6 +3623,16 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
                                         else
                                             parseReviewOutput depsEval.output
+
+                                    freshImportersFoldOutputs =
+                                        importersFoldMissedPaths
+                                            |> List.map
+                                                (\path ->
+                                                    ioFoldErrors
+                                                        |> List.filter (\err -> err.filePath == path)
+                                                        |> List.map formatErrorLine
+                                                        |> String.join "\n"
+                                                )
 
                                     freshImportersOutputs =
                                         importersMissedPaths
@@ -3431,24 +3655,36 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                                 )
 
                                     partialMemoCounters =
-                                        mergeMemoStats importersEval.memoStats depsEval.memoStats
+                                        mergeMemoStats
+                                            (mergeMemoStats importersFoldEval.memoStats importersEval.memoStats)
+                                            depsEval.memoStats
                                             |> memoStatsCounters "memo.partial_project"
 
                                     importersRuleCacheCounters =
                                         mergeCounterDicts
                                             [ Dict.fromList
-                                                [ ( "project.importers.rule_cache.entries", importersEval.loadedRuleCaches.entryCount )
+                                                [ ( "project.importers_fold.rule_cache.entries", importersFoldEval.loadedRuleCaches.entryCount )
+                                                , ( "project.importers_fold.rule_cache.loaded_bytes", importersFoldEval.loadedRuleCaches.bytes )
+                                                , ( "project.importers_fold.cached_output_read_ms", importersFoldCachedOutputsTimed.stage.ms )
+                                                , ( "project.importers.rule_cache.entries", importersEval.loadedRuleCaches.entryCount )
                                                 , ( "project.importers.rule_cache.loaded_bytes", importersEval.loadedRuleCaches.bytes )
                                                 , ( "project.importers.cached_output_read_ms", importersCachedOutputsTimed.stage.ms )
                                                 , ( "project.deps.cached_output_read_ms", depsCachedOutputsTimed.stage.ms )
+                                                , ( "project.importers.eval_total_ms"
+                                                  , Maybe.withDefault 0 (Dict.get "project.importers.eval_total_ms" importersEval.counters)
+                                                        + Maybe.withDefault 0 (Dict.get "project.importers_fold.eval_total_ms" importersFoldEval.counters)
+                                                  )
                                                 ]
+                                            , importersFoldEval.counters
                                             , importersEval.counters
                                             , depsEval.counters
                                             ]
                                 in
                                 BackendTask.succeed
-                                    { ioErrors = ioErrors
+                                    { ioFoldErrors = ioFoldErrors
+                                    , ioErrors = ioErrors
                                     , doErrors = doErrors
+                                    , freshImportersFoldOutputs = freshImportersFoldOutputs
                                     , freshImportersOutputs = freshImportersOutputs
                                     , freshDepsOutputs = freshDepsOutputs
                                     , partialMemoCounters = partialMemoCounters
@@ -3459,11 +3695,17 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     )
                 <| \postprocessTimed ->
                 let
+                    ioFoldErrors =
+                        postprocessTimed.value.ioFoldErrors
+
                     ioErrors =
                         postprocessTimed.value.ioErrors
 
                     doErrors =
                         postprocessTimed.value.doErrors
+
+                    freshImportersFoldOutputs =
+                        postprocessTimed.value.freshImportersFoldOutputs
 
                     freshImportersOutputs =
                         postprocessTimed.value.freshImportersOutputs
@@ -3485,9 +3727,22 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         (Path.toString config.buildDirectory)
                         "partial-project-slices"
                         (MemoRuntime.entryCount depsEval.memoCache)
-                        (mergeMemoStats importersEval.memoStats depsEval.memoStats)
+                        (mergeMemoStats
+                            (mergeMemoStats importersFoldEval.memoStats importersEval.memoStats)
+                            depsEval.memoStats
+                        )
                     )
                 <| \_ ->
+                Do.do
+                    (withTiming "project.importers_fold.cache_write"
+                        (if importersFoldAllHit then
+                            BackendTask.succeed ()
+
+                         else
+                            writePerFileRuleOutputs prImportersFoldCacheDir importersFoldPerFileKeys importersFoldMissedPaths ioFoldErrors
+                        )
+                    )
+                <| \importersFoldWriteTimed ->
                 Do.do
                     (withTiming "project.importers.cache_write"
                         (if importersAllHit then
@@ -3510,7 +3765,9 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 <| \depsWriteTimed ->
                 let
                     importersResult =
-                        importersCachedOutputs
+                        importersFoldCachedOutputs
+                            ++ freshImportersFoldOutputs
+                            ++ importersCachedOutputs
                             ++ freshImportersOutputs
                             |> List.filter (\s -> not (String.isEmpty (String.trim s)))
                             |> String.join "\n"
@@ -3558,7 +3815,8 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , importersRuleCacheCounters
                                 , partialMemoCounters
                                 , Dict.fromList
-                                    [ ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
+                                    [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
+                                    , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
                                     , ( "project.deps.cache_write_ms", depsWriteTimed.stage.ms )
                                     ]
                                 ]
@@ -3594,7 +3852,8 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , importersRuleCacheCounters
                                 , partialMemoCounters
                                 , Dict.fromList
-                                    [ ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
+                                    [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
+                                    , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
                                     , ( "project.deps.cache_write_ms", depsWriteTimed.stage.ms )
                                     ]
                                 , memoStatsCounters "memo.full_project" fpResult.memoStats
