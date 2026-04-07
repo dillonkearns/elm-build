@@ -886,3 +886,52 @@ Current read:
 - It looks meaningfully better on repeated warm import-graph changes once the narrower subgroup caches are seeded.
 - The remaining gap is still setup/fixed-cost work, not cache file I/O.
 - That suggests the next meaningful win is probably still a **more compact direct contribution artifact**, not more generic `Review.Rule` split-cache choreography.
+
+### Differential Correctness Harness
+
+I added a real runner-vs-CLI differential harness:
+
+- [bench/review-diff-benchmark.mjs](/Users/dillonkearns/src/github.com/dillonkearns/elm-build2/bench/review-diff-benchmark.mjs)
+- [bench/results/review-diff-scenarios.json](/Users/dillonkearns/src/github.com/dillonkearns/elm-build2/bench/results/review-diff-scenarios.json)
+
+To make that possible, the runner now has a machine-readable mode:
+
+- `--report=json`
+
+which emits a stable JSON list of:
+
+- `rule`
+- `path`
+- `line`
+- `column`
+- `message`
+
+The first `small-12` differential run was very useful. It found **no runner-only errors**, but it did find runner under-reporting versus `elm-review`:
+
+| Scenario | Runner | CLI | Missing from runner |
+|---|---:|---:|---:|
+| Cold | `430` | `431` | `1` |
+| Warm | `430` | `431` | `1` |
+| Warm 1-file body edit | `431` | `432` | `1` |
+| Warm 1-file comment-only | `430` | `431` | `1` |
+| Warm import-graph change | `430` | `435` | `5` |
+
+The persistent missing finding in every scenario is:
+
+- `NoUnused.Variables` in `src/SemanticHash.elm`
+- missing import warning for `TypeAnnotation`
+
+And on `warm_import_graph_change`, the runner also misses four CLI-reported `NoUnused.Exports` findings in `src/ProjectSources.elm`:
+
+- `loadPackageDeps`
+- `loadPackageDepsCached`
+- `loadProjectSources`
+- `resolvePackageVersions`
+
+Current read:
+
+- This harness is a big step forward because we now have a repeatable way to catch correctness regressions while optimizing.
+- The current runner is **close**, but not yet fully equivalent to `elm-review` even on the benchmark fixture.
+- The persistent `NoUnused.Variables` miss suggests there is still one baseline project-rule correctness gap, independent of warm caching.
+- The extra `NoUnused.Exports` misses on import-graph change strongly suggest our narrowed `ImportersOf` invalidation/reuse is still too aggressive in at least one path.
+- That means the next perf work should stay coupled to this harness; correctness should be treated as a gate, not a secondary check.

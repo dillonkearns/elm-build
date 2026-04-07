@@ -1,0 +1,158 @@
+{
+  "date": "2026-04-07T22:52:41.564Z",
+  "runner": "dist/review-runner-bench.mjs",
+  "cli_runner": "elm-review",
+  "importers_cache_mode": "auto",
+  "deps_cache_mode": "auto",
+  "fixtures": [
+    {
+      "fixture": "small-12",
+      "file_count": 12,
+      "scenarios": [
+        {
+          "name": "cold",
+          "runner_exit_code": 1,
+          "cli_exit_code": 1,
+          "cache_decision": "cold_miss",
+          "diff": {
+            "matches": false,
+            "runner_count": 430,
+            "cli_count": 431,
+            "only_runner_count": 0,
+            "only_cli_count": 1,
+            "only_runner_examples": [],
+            "only_cli_examples": [
+              {
+                "rule": "NoUnused.Variables",
+                "path": "src/SemanticHash.elm",
+                "line": 21,
+                "column": 44,
+                "message": "Imported type `TypeAnnotation` is not used"
+              }
+            ]
+          }
+        },
+        {
+          "name": "warm",
+          "runner_exit_code": 1,
+          "cli_exit_code": 1,
+          "cache_decision": "full_hit",
+          "diff": {
+            "matches": false,
+            "runner_count": 430,
+            "cli_count": 431,
+            "only_runner_count": 0,
+            "only_cli_count": 1,
+            "only_runner_examples": [],
+            "only_cli_examples": [
+              {
+                "rule": "NoUnused.Variables",
+                "path": "src/SemanticHash.elm",
+                "line": 21,
+                "column": 44,
+                "message": "Imported type `TypeAnnotation` is not used"
+              }
+            ]
+          }
+        },
+        {
+          "name": "warm_1_file_body_edit",
+          "runner_exit_code": 1,
+          "cli_exit_code": 1,
+          "cache_decision": "partial_miss",
+          "diff": {
+            "matches": false,
+            "runner_count": 431,
+            "cli_count": 432,
+            "only_runner_count": 0,
+            "only_cli_count": 1,
+            "only_runner_examples": [],
+            "only_cli_examples": [
+              {
+                "rule": "NoUnused.Variables",
+                "path": "src/SemanticHash.elm",
+                "line": 21,
+                "column": 44,
+                "message": "Imported type `TypeAnnotation` is not used"
+              }
+            ]
+          }
+        },
+        {
+          "name": "warm_1_file_comment_only",
+          "runner_exit_code": 1,
+          "cli_exit_code": 1,
+          "cache_decision": "full_hit",
+          "diff": {
+            "matches": false,
+            "runner_count": 430,
+            "cli_count": 431,
+            "only_runner_count": 0,
+            "only_cli_count": 1,
+            "only_runner_examples": [],
+            "only_cli_examples": [
+              {
+                "rule": "NoUnused.Variables",
+                "path": "src/SemanticHash.elm",
+                "line": 21,
+                "column": 44,
+                "message": "Imported type `TypeAnnotation` is not used"
+              }
+            ]
+          }
+        },
+        {
+          "name": "warm_import_graph_change",
+          "runner_exit_code": 1,
+          "cli_exit_code": 1,
+          "cache_decision": "partial_miss",
+          "diff": {
+            "matches": false,
+            "runner_count": 430,
+            "cli_count": 435,
+            "only_runner_count": 0,
+            "only_cli_count": 5,
+            "only_runner_examples": [],
+            "only_cli_examples": [
+              {
+                "rule": "NoUnused.Exports",
+                "path": "src/ProjectSources.elm",
+                "line": 1,
+                "column": 33,
+                "message": "Exposed function or value `loadPackageDeps` is never used outside this module"
+              },
+              {
+                "rule": "NoUnused.Exports",
+                "path": "src/ProjectSources.elm",
+                "line": 1,
+                "column": 50,
+                "message": "Exposed function or value `loadPackageDepsCached` is never used outside this module"
+              },
+              {
+                "rule": "NoUnused.Exports",
+                "path": "src/ProjectSources.elm",
+                "line": 1,
+                "column": 73,
+                "message": "Exposed function or value `loadProjectSources` is never used outside this module"
+              },
+              {
+                "rule": "NoUnused.Exports",
+                "path": "src/ProjectSources.elm",
+                "line": 1,
+                "column": 93,
+                "message": "Exposed function or value `resolvePackageVersions` is never used outside this module"
+              },
+              {
+                "rule": "NoUnused.Variables",
+                "path": "src/SemanticHash.elm",
+                "line": 21,
+                "column": 44,
+                "message": "Imported type `TypeAnnotation` is not used"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

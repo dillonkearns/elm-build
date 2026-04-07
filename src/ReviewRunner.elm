@@ -64,6 +64,7 @@ type alias Config =
     , memoProfile : Bool
     , importersCacheMode : ImportersCacheMode
     , depsCacheMode : ImportersCacheMode
+    , reportFormat : ReportFormat
     , perfTraceJson : Maybe String
     }
 
@@ -72,6 +73,11 @@ type ImportersCacheMode
     = ImportersAuto
     | ImportersFresh
     | ImportersSplit
+
+
+type ReportFormat
+    = ReportHuman
+    | ReportJson
 
 
 type alias InputRevision =
@@ -271,6 +277,14 @@ programConfig =
                         |> Option.withDescription "DependenciesOf project-rule strategy: auto, fresh, or split (default: auto)"
                     )
                 |> OptionsParser.with
+                    (Option.optionalKeywordArg "report"
+                        |> Option.map
+                            (Maybe.map parseReportFormat
+                                >> Maybe.withDefault ReportHuman
+                            )
+                        |> Option.withDescription "Output format: human or json (default: human)"
+                    )
+                |> OptionsParser.with
                     (Option.optionalKeywordArg "perf-trace-json"
                         |> Option.withDescription "Write structured review-runner perf trace JSON to the given path"
                     )
@@ -305,6 +319,16 @@ parseImportersCacheMode rawValue =
 
         _ ->
             ImportersFresh
+
+
+parseReportFormat : String -> ReportFormat
+parseReportFormat rawValue =
+    case String.toLower (String.trim rawValue) of
+        "json" ->
+            ReportJson
+
+        _ ->
+            ReportHuman
 
 
 run : Script
@@ -2416,7 +2440,7 @@ task config =
                     }
                 )
             <| \_ ->
-            reportErrors errors
+            reportErrors preparedConfig.reportFormat errors
     in
     case decision of
         FullCacheHit errors ->
@@ -5749,6 +5773,22 @@ formatErrorLine err =
     "RULE:" ++ err.ruleName ++ "|FILE:" ++ err.filePath ++ "|LINE:" ++ String.fromInt err.line ++ "|COL:" ++ String.fromInt err.column ++ "|MSG:" ++ err.message
 
 
+encodeReviewErrors : List ReviewError -> String
+encodeReviewErrors errors =
+    errors
+        |> Json.Encode.list
+            (\err ->
+                Json.Encode.object
+                    [ ( "rule", Json.Encode.string err.ruleName )
+                    , ( "path", Json.Encode.string err.filePath )
+                    , ( "line", Json.Encode.int err.line )
+                    , ( "column", Json.Encode.int err.column )
+                    , ( "message", Json.Encode.string err.message )
+                    ]
+            )
+        |> Json.Encode.encode 0
+
+
 {-| Get the number of rules in ReviewConfig.config by evaluating through the interpreter.
 -}
 getRuleCount : Config -> BackendTask FatalError Int
@@ -6010,24 +6050,39 @@ persistCache path cache =
 
 {-| Report errors and exit with appropriate code.
 -}
-reportErrors : List ReviewError -> BackendTask FatalError ()
-reportErrors errors =
-    if List.isEmpty errors then
-        Script.log (Ansi.Color.fontColor Ansi.Color.brightGreen "No errors found!")
+reportErrors : ReportFormat -> List ReviewError -> BackendTask FatalError ()
+reportErrors reportFormat errors =
+    case reportFormat of
+        ReportJson ->
+            Do.do (Script.log (encodeReviewErrors errors)) <| \_ ->
+            if List.isEmpty errors then
+                BackendTask.succeed ()
 
-    else
-        Do.do (displayErrors errors) <| \_ ->
-        Do.log
-            (Ansi.Color.fontColor Ansi.Color.brightRed
-                ("\nI found " ++ String.fromInt (List.length errors) ++ " error(s) in " ++ String.fromInt (countFiles errors) ++ " file(s).")
-            )
-        <| \_ ->
-        BackendTask.fail
-            (FatalError.build
-                { title = ""
-                , body = ""
-                }
-            )
+            else
+                BackendTask.fail
+                    (FatalError.build
+                        { title = ""
+                        , body = ""
+                        }
+                    )
+
+        ReportHuman ->
+            if List.isEmpty errors then
+                Script.log (Ansi.Color.fontColor Ansi.Color.brightGreen "No errors found!")
+
+            else
+                Do.do (displayErrors errors) <| \_ ->
+                Do.log
+                    (Ansi.Color.fontColor Ansi.Color.brightRed
+                        ("\nI found " ++ String.fromInt (List.length errors) ++ " error(s) in " ++ String.fromInt (countFiles errors) ++ " file(s).")
+                    )
+                <| \_ ->
+                BackendTask.fail
+                    (FatalError.build
+                        { title = ""
+                        , body = ""
+                        }
+                    )
 
 
 countFiles : List ReviewError -> Int
