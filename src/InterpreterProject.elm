@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithValues, prepareAndEvalWithYield, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -24,6 +24,7 @@ import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.File exposing (File)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
+import MemoRuntime
 import SemanticHash
 import Eval.Module
 import FatalError exposing (FatalError)
@@ -1163,6 +1164,72 @@ prepareAndEvalWithValues (InterpreterProject project) { imports, expression, sou
                         |> Result.mapError formatError
 
 
+{-| Like `prepareAndEvalRaw`, but uses the interpreter's internal memo runtime
+for selected qualified function names and returns the updated memo cache so it
+can be reused across later invocations.
+-}
+prepareAndEvalWithMemoizedFunctions :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , memoizedFunctions : Set String
+        , memoCache : MemoRuntime.MemoCache
+        , collectMemoStats : Bool
+        }
+    ->
+        Result String
+            { value : Types.Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+prepareAndEvalWithMemoizedFunctions (InterpreterProject project) { imports, expression, sourceOverrides, memoizedFunctions, memoCache, collectMemoStats } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        parsedNewModules =
+            (sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parsedNewModules of
+        Err err ->
+            Err (formatError err)
+
+        Ok newFiles ->
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    Eval.Module.evalWithEnvFromFilesAndMemo baseEnv newFiles memoizedFunctions memoCache collectMemoStats (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+                Nothing ->
+                    let
+                        { userSources } =
+                            prepareEvalSources (InterpreterProject project) { imports = imports, expression = expression }
+
+                        allSources =
+                            let
+                                len =
+                                    List.length userSources
+
+                                beforeWrapper =
+                                    List.take (len - 1) userSources
+
+                                wrapper =
+                                    List.drop (len - 1) userSources
+                            in
+                            beforeWrapper ++ sourceOverrides ++ wrapper
+                    in
+                    Eval.Module.evalWithMemoizedFunctions project.packageEnv allSources memoizedFunctions memoCache collectMemoStats (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+
 {-| Evaluate with intercepts that can yield to the framework.
 
 When an intercept yields (EvYield tag payload resume), the yieldHandler
@@ -1176,6 +1243,29 @@ prepareRawEvalWithYield :
     -> { imports : List String, expression : String, sourceOverrides : List String, intercepts : FastDict.Dict String Types.Intercept, injectedValues : FastDict.Dict String Types.Value }
     -> Types.EvalResult Types.Value
 prepareRawEvalWithYield (InterpreterProject project) { imports, expression, sourceOverrides, intercepts, injectedValues } =
+    prepareRawEvalWithYieldAndMemo
+        (InterpreterProject project)
+        { imports = imports
+        , expression = expression
+        , sourceOverrides = sourceOverrides
+        , intercepts = intercepts
+        , injectedValues = injectedValues
+        , memoizedFunctions = Set.empty
+        }
+
+
+prepareRawEvalWithYieldAndMemo :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , intercepts : FastDict.Dict String Types.Intercept
+        , injectedValues : FastDict.Dict String Types.Value
+        , memoizedFunctions : Set String
+        }
+    -> Types.EvalResult Types.Value
+prepareRawEvalWithYieldAndMemo (InterpreterProject project) { imports, expression, sourceOverrides, intercepts, injectedValues, memoizedFunctions } =
     let
         wrapperSource =
             generateWrapper imports expression
@@ -1214,7 +1304,7 @@ prepareRawEvalWithYield (InterpreterProject project) { imports, expression, sour
 
         rawResult =
             if FastDict.isEmpty injectedValues then
-                Eval.Module.evalWithInterceptsRaw env evalSources intercepts (FunctionOrValue [] "results")
+                Eval.Module.evalWithInterceptsAndMemoRaw env evalSources intercepts memoizedFunctions (FunctionOrValue [] "results")
 
             else
                 -- Need to inject values AND use intercepts.
@@ -1235,7 +1325,7 @@ prepareRawEvalWithYield (InterpreterProject project) { imports, expression, sour
                         Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Parse error in prepareAndEvalWithYield" }
 
                     Ok parsedModules ->
-                        Eval.Module.evalWithEnvFromFilesAndValuesAndInterceptsRaw env parsedModules injectedValues intercepts (FunctionOrValue [] "results")
+                        Eval.Module.evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw env parsedModules injectedValues intercepts memoizedFunctions (FunctionOrValue [] "results")
     in
     rawResult
 
@@ -1255,6 +1345,46 @@ prepareAndEvalWithYield :
     -> BackendTask FatalError (Result String Types.Value)
 prepareAndEvalWithYield project evalConfig yieldHandler =
     driveYields yieldHandler (prepareRawEvalWithYield project evalConfig)
+
+
+prepareAndEvalWithYieldAndMemoizedFunctions :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , intercepts : FastDict.Dict String Types.Intercept
+        , injectedValues : FastDict.Dict String Types.Value
+        , memoizedFunctions : Set String
+        , memoCache : MemoRuntime.MemoCache
+        , collectMemoStats : Bool
+        }
+    -> (String -> Types.Value -> BackendTask FatalError Types.Value)
+    ->
+        BackendTask FatalError
+            { result : Result String Types.Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+prepareAndEvalWithYieldAndMemoizedFunctions project evalConfig yieldHandler =
+    driveYieldsAndMemo
+        evalConfig.memoCache
+        (if evalConfig.collectMemoStats then
+            MemoRuntime.emptyMemoStats
+
+         else
+            MemoRuntime.disabledMemoStats
+        )
+        yieldHandler
+        (prepareRawEvalWithYieldAndMemo project
+            { imports = evalConfig.imports
+            , expression = evalConfig.expression
+            , sourceOverrides = evalConfig.sourceOverrides
+            , intercepts = evalConfig.intercepts
+            , injectedValues = evalConfig.injectedValues
+            , memoizedFunctions = evalConfig.memoizedFunctions
+            }
+        )
 
 
 {-| Like `prepareAndEvalWithYield`, but threads caller-managed state through the
@@ -1291,6 +1421,12 @@ driveYields yieldHandler evalResult =
         Types.EvErrTrace evalErr _ _ ->
             BackendTask.succeed (Err (formatError (Types.EvalError evalErr)))
 
+        Types.EvMemoLookup _ resume ->
+            driveYields yieldHandler (resume Nothing)
+
+        Types.EvMemoStore _ next ->
+            driveYields yieldHandler next
+
         Types.EvYield tag payload resume ->
             -- Handle the yield via BackendTask, then resume eval
             yieldHandler tag payload
@@ -1319,12 +1455,86 @@ driveYieldsState state yieldHandler evalResult =
         Types.EvErrTrace evalErr _ _ ->
             BackendTask.succeed ( Err (formatError (Types.EvalError evalErr)), state )
 
+        Types.EvMemoLookup _ resume ->
+            driveYieldsState state yieldHandler (resume Nothing)
+
+        Types.EvMemoStore _ next ->
+            driveYieldsState state yieldHandler next
+
         Types.EvYield tag payload resume ->
             yieldHandler state tag payload
                 |> BackendTask.andThen
                     (\( nextState, resumeValue ) ->
                         driveYieldsState nextState yieldHandler (resume resumeValue)
                     )
+
+
+driveYieldsAndMemo :
+    MemoRuntime.MemoCache
+    -> MemoRuntime.MemoStats
+    -> (String -> Types.Value -> BackendTask FatalError Types.Value)
+    -> Types.EvalResult Types.Value
+    ->
+        BackendTask FatalError
+            { result : Result String Types.Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+driveYieldsAndMemo memoCache memoStats yieldHandler evalResult =
+    case evalResult of
+        Types.EvOk value ->
+            BackendTask.succeed
+                { result = Ok value
+                , memoCache = memoCache
+                , memoStats = memoStats
+                }
+
+        Types.EvErr evalErr ->
+            BackendTask.succeed
+                { result = Err (formatError (Types.EvalError evalErr))
+                , memoCache = memoCache
+                , memoStats = memoStats
+                }
+
+        Types.EvOkTrace value _ _ ->
+            BackendTask.succeed
+                { result = Ok value
+                , memoCache = memoCache
+                , memoStats = memoStats
+                }
+
+        Types.EvErrTrace evalErr _ _ ->
+            BackendTask.succeed
+                { result = Err (formatError (Types.EvalError evalErr))
+                , memoCache = memoCache
+                , memoStats = memoStats
+                }
+
+        Types.EvMemoLookup payload resume ->
+            let
+                ( nextCache, nextStats, maybeValue ) =
+                    Eval.Module.handleInternalMemoLookup memoCache memoStats payload
+            in
+            driveYieldsAndMemo nextCache nextStats yieldHandler (resume maybeValue)
+
+        Types.EvMemoStore payload next ->
+            let
+                ( nextCache, nextStats ) =
+                    Eval.Module.handleInternalMemoStore memoCache memoStats payload
+            in
+            driveYieldsAndMemo nextCache nextStats yieldHandler next
+
+        Types.EvYield tag payload resume ->
+            case Eval.Module.handleInternalMemoYield memoCache memoStats tag payload of
+                Just ( nextCache, nextStats, resumeValue ) ->
+                    driveYieldsAndMemo nextCache nextStats yieldHandler (resume resumeValue)
+
+                Nothing ->
+                    yieldHandler tag payload
+                        |> BackendTask.andThen
+                            (\resumeValue ->
+                                driveYieldsAndMemo memoCache memoStats yieldHandler (resume resumeValue)
+                            )
 
 
 {-| Like prepareAndEval but with function intercepts (synchronous, no yield support).

@@ -36,6 +36,7 @@ import Json.Encode
 import SemanticHash
 import BackendTask.Time
 import InterpreterProject exposing (InterpreterProject)
+import MemoRuntime
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
@@ -58,14 +59,8 @@ type alias Config =
     { reviewDir : String
     , sourceDirs : List String
     , buildDirectory : Path
-    }
-
-
-type alias DeclarationHashInfo =
-    { name : String
-    , semanticHash : String
-    , startLine : Int
-    , endLine : Int
+    , memoizedFunctions : Set.Set String
+    , memoProfile : Bool
     }
 
 
@@ -137,7 +132,33 @@ programConfig =
                         |> Option.map (Maybe.withDefault ".elm-review-build" >> Path.path)
                         |> Option.withDescription "Build/cache directory (default: .elm-review-build)"
                     )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "memoize-functions"
+                        |> Option.map (Maybe.map parseMemoizedFunctions >> Maybe.withDefault Set.empty)
+                        |> Option.withDescription "Comma-separated qualified Elm function names to memoize inside the interpreter"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "memo-profile"
+                        |> Option.withDescription "Write per-function memo stats to memo-profile.log in the build directory"
+                    )
             )
+
+
+type alias DeclarationHashInfo =
+    { name : String
+    , semanticHash : String
+    , startLine : Int
+    , endLine : Int
+    }
+
+
+parseMemoizedFunctions : String -> Set.Set String
+parseMemoizedFunctions rawValue =
+    rawValue
+        |> String.split ","
+        |> List.map String.trim
+        |> List.filter (not << String.isEmpty)
+        |> Set.fromList
 
 
 run : Script
@@ -2366,38 +2387,55 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             )
                         )
                     <| \depsCachedOutputs ->
+                    Do.do (BackendTask.succeed MemoRuntime.emptyMemoCache) <| \initialMemoCache ->
                     let
-                        evaluatedOutputs =
+                        evaluatedProjectRules =
                             case ( importersAllHit, depsAllHit ) of
                                 ( False, False ) ->
-                                    evalTwoProjectRuleSlices reviewProject ioIndices importersAffectedModules doIndices depsAffectedModules
+                                    evalTwoProjectRuleSlicesWithMemo reviewProject ioIndices importersAffectedModules doIndices depsAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
 
                                 ( False, True ) ->
-                                    { firstOutput = runProjectRulesFresh reviewProject ioIndices importersAffectedModules
+                                    let
+                                        ioResult =
+                                            runProjectRulesFreshWithMemo reviewProject ioIndices importersAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
+                                    in
+                                    { firstOutput = ioResult.output
                                     , secondOutput = ""
+                                    , memoCache = ioResult.memoCache
+                                    , memoStats = ioResult.memoStats
                                     }
 
                                 ( True, False ) ->
+                                    let
+                                        doResult =
+                                            runProjectRulesFreshWithMemo reviewProject doIndices depsAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
+                                    in
                                     { firstOutput = ""
-                                    , secondOutput = runProjectRulesFresh reviewProject doIndices depsAffectedModules
+                                    , secondOutput = doResult.output
+                                    , memoCache = doResult.memoCache
+                                    , memoStats = doResult.memoStats
                                     }
 
                                 ( True, True ) ->
-                                    { firstOutput = "", secondOutput = "" }
+                                    { firstOutput = ""
+                                    , secondOutput = ""
+                                    , memoCache = initialMemoCache
+                                    , memoStats = MemoRuntime.emptyMemoStats
+                                    }
 
                         ioErrors =
                             if importersAllHit then
                                 []
 
                             else
-                                parseReviewOutput evaluatedOutputs.firstOutput
+                                parseReviewOutput evaluatedProjectRules.firstOutput
 
                         doErrors =
                             if depsAllHit then
                                 []
 
                             else
-                                parseReviewOutput evaluatedOutputs.secondOutput
+                                parseReviewOutput evaluatedProjectRules.secondOutput
 
                         freshImportersOutputs =
                             importersMissedPaths
@@ -2419,6 +2457,15 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                             |> String.join "\n"
                                     )
                     in
+                    Do.do
+                        (appendMemoProfileLog
+                            config.memoProfile
+                            (Path.toString config.buildDirectory)
+                            "partial-project-slices"
+                            (MemoRuntime.entryCount evaluatedProjectRules.memoCache)
+                            evaluatedProjectRules.memoStats
+                        )
+                    <| \_ ->
                     Do.do
                         (if importersAllHit then
                             BackendTask.succeed ()
@@ -2482,36 +2529,38 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
                         fpDataPath =
                             Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
-                    in
-                    if List.isEmpty fullProjectRules || depsOfResult.fpIncluded then
-                        -- FullProject rules were already included in the combined DepsOf eval
-                        -- or there are no FullProject rules. Just return combined outputs.
-                        BackendTask.succeed
-                            ([ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs ]
+
+                        combinedProjectOutputs =
+                            [ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs ]
                                 |> List.filter (not << String.isEmpty)
                                 |> String.join "\n"
-                            )
+                    in
+                    if List.isEmpty fullProjectRules || depsOfResult.fpIncluded then
+                        BackendTask.succeed combinedProjectOutputs
 
                     else
-                        evalProjectRulesWithWarmState
-                            config
-                            reviewProject
-                            helperHash
-                            fpIndices
-                            allFileContents
-                            staleFileContents
-                            (Just
-                                { keyPath = fpKeyPath
-                                , dataPath = fpDataPath
-                                , key = fpCacheKey
-                                }
-                            )
-                            |> BackendTask.map
-                                (\fpOutput ->
-                                    [ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs, fpOutput ]
-                                        |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
-                                        |> String.join "\n"
+                        Do.do
+                            (evalProjectRulesWithWarmState
+                                config
+                                reviewProject
+                                helperHash
+                                fpIndices
+                                allFileContents
+                                staleFileContents
+                                (Just
+                                    { keyPath = fpKeyPath
+                                    , dataPath = fpDataPath
+                                    , key = fpCacheKey
+                                    }
                                 )
+                                evaluatedProjectRules.memoCache
+                            )
+                        <| \fpResult ->
+                        BackendTask.succeed
+                            ([ combinedProjectOutputs, fpResult.output ]
+                                |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                |> String.join "\n"
+                            )
             )
 
 
@@ -2721,14 +2770,14 @@ loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents =
                                                                 BackendTask.succeed cachedPrErrors
 
                                                             Err _ ->
-                                                                evalProjectRulesSingle reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                                                evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
                                                     )
 
                                         else
-                                            evalProjectRulesSingle reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                            evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
 
                                     Err _ ->
-                                        evalProjectRulesSingle reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                        evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
                             )
                         |> BackendTask.map
                             (\prOutput ->
@@ -3185,6 +3234,36 @@ persistProjectEvalOutput maybeOutputCache output =
             BackendTask.succeed output
 
 
+appendMemoProfileLog : Bool -> String -> String -> Int -> MemoRuntime.MemoStats -> BackendTask FatalError ()
+appendMemoProfileLog enabled buildDir label memoEntryCount memoStats =
+    if not enabled || memoStats.lookups <= 0 then
+        BackendTask.succeed ()
+
+    else
+        let
+            logPath =
+                buildDir ++ "/memo-profile.log"
+
+            section =
+                String.join "\n"
+                    [ "## " ++ label
+                    , MemoRuntime.formatMemoStats memoEntryCount memoStats
+                    , ""
+                    ]
+        in
+        Do.do
+            (File.rawFile logPath
+                |> BackendTask.toResult
+            )
+        <| \existing ->
+        Script.writeFile
+            { path = logPath
+            , body = Result.withDefault "" existing ++ section
+            }
+            |> BackendTask.allowFatal
+            |> BackendTask.map (\_ -> ())
+
+
 runProjectRulesFresh :
     InterpreterProject
     -> List Int
@@ -3203,6 +3282,57 @@ runProjectRulesFresh reviewProject prIndices modulesWithAst =
 
         Err err ->
             err
+
+
+runProjectRulesFreshWithMemo :
+    InterpreterProject
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> Set.Set String
+    -> Bool
+    -> MemoRuntime.MemoCache
+    ->
+        { output : String
+        , memoCache : MemoRuntime.MemoCache
+        , memoStats : MemoRuntime.MemoStats
+        }
+runProjectRulesFreshWithMemo reviewProject prIndices modulesWithAst memoizedFunctions memoProfile memoCache =
+    if Set.isEmpty memoizedFunctions then
+        { output = runProjectRulesFresh reviewProject prIndices modulesWithAst
+        , memoCache = memoCache
+        , memoStats = MemoRuntime.emptyMemoStats
+        }
+
+    else
+        case
+            InterpreterProject.prepareAndEvalWithMemoizedFunctions reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = buildExpressionForRules prIndices modulesWithAst
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                , memoizedFunctions = memoizedFunctions
+                , memoCache = memoCache
+                , collectMemoStats = memoProfile
+                }
+        of
+            Ok evalResult ->
+                case evalResult.value of
+                    Types.String output ->
+                        { output = output
+                        , memoCache = evalResult.memoCache
+                        , memoStats = evalResult.memoStats
+                        }
+
+                    _ ->
+                        { output = runProjectRulesFresh reviewProject prIndices modulesWithAst
+                        , memoCache = memoCache
+                        , memoStats = MemoRuntime.emptyMemoStats
+                        }
+
+            Err err ->
+                { output = err
+                , memoCache = memoCache
+                , memoStats = MemoRuntime.emptyMemoStats
+                }
 
 
 evalTwoProjectRuleSlices :
@@ -3241,6 +3371,96 @@ evalTwoProjectRuleSlices reviewProject firstIndices firstModules secondIndices s
             { firstOutput = runProjectRulesFresh reviewProject firstIndices firstModules
             , secondOutput = runProjectRulesFresh reviewProject secondIndices secondModules
             }
+
+
+evalTwoProjectRuleSlicesWithMemo :
+    InterpreterProject
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> Set.Set String
+    -> Bool
+    -> MemoRuntime.MemoCache
+    ->
+        { firstOutput : String
+        , secondOutput : String
+        , memoCache : MemoRuntime.MemoCache
+        , memoStats : MemoRuntime.MemoStats
+        }
+evalTwoProjectRuleSlicesWithMemo reviewProject firstIndices firstModules secondIndices secondModules memoizedFunctions memoProfile memoCache =
+    let
+        indexList indices =
+            "[ " ++ (indices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+
+        expression =
+            "ReviewRunnerHelper.runTwoRuleGroups "
+                ++ indexList firstIndices
+                ++ " "
+                ++ buildModuleListWithAst firstModules
+                ++ " "
+                ++ indexList secondIndices
+                ++ " "
+                ++ buildModuleListWithAst secondModules
+    in
+    if Set.isEmpty memoizedFunctions then
+        let
+            result =
+                evalTwoProjectRuleSlices reviewProject firstIndices firstModules secondIndices secondModules
+        in
+        { firstOutput = result.firstOutput
+        , secondOutput = result.secondOutput
+        , memoCache = memoCache
+        , memoStats = MemoRuntime.emptyMemoStats
+        }
+
+    else
+        case
+            InterpreterProject.prepareAndEvalWithMemoizedFunctions reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = expression
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                , memoizedFunctions = memoizedFunctions
+                , memoCache = memoCache
+                , collectMemoStats = memoProfile
+                }
+        of
+            Ok evalResult ->
+                case evalResult.value of
+                    Types.Tuple (Types.String firstOutput) (Types.String secondOutput) ->
+                        { firstOutput = firstOutput
+                        , secondOutput = secondOutput
+                        , memoCache = evalResult.memoCache
+                        , memoStats = evalResult.memoStats
+                        }
+
+                    _ ->
+                        let
+                            firstResult =
+                                runProjectRulesFreshWithMemo reviewProject firstIndices firstModules memoizedFunctions memoProfile memoCache
+
+                            secondResult =
+                                runProjectRulesFreshWithMemo reviewProject secondIndices secondModules memoizedFunctions memoProfile firstResult.memoCache
+                        in
+                        { firstOutput = firstResult.output
+                        , secondOutput = secondResult.output
+                        , memoCache = secondResult.memoCache
+                        , memoStats = secondResult.memoStats
+                        }
+
+            Err _ ->
+                let
+                    firstResult =
+                        runProjectRulesFreshWithMemo reviewProject firstIndices firstModules memoizedFunctions memoProfile memoCache
+
+                    secondResult =
+                        runProjectRulesFreshWithMemo reviewProject secondIndices secondModules memoizedFunctions memoProfile firstResult.memoCache
+                in
+                { firstOutput = firstResult.output
+                , secondOutput = secondResult.output
+                , memoCache = secondResult.memoCache
+                , memoStats = secondResult.memoStats
+                }
 
 
 projectRuleYieldHandler : String -> String -> Types.Value -> BackendTask FatalError Types.Value
@@ -3384,8 +3604,13 @@ evalProjectRulesWithWarmState :
     -> List AnalyzedTargetFile
     -> List AnalyzedTargetFile
     -> Maybe ProjectEvalOutputCache
-    -> BackendTask FatalError String
-evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileContents staleFileContents maybeOutputCache =
+    -> MemoRuntime.MemoCache
+    ->
+        BackendTask FatalError
+            { output : String
+            , memoCache : MemoRuntime.MemoCache
+            }
+evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileContents staleFileContents maybeOutputCache memoCache =
     let
         buildDir =
             Path.toString config.buildDirectory
@@ -3451,48 +3676,119 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
         fallbackOutput =
             runProjectRulesFresh reviewProject prIndices allModulesWithAst
     in
-    Do.do
-        (InterpreterProject.prepareAndEvalWithYield reviewProject
-            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-            , expression = expression
-            , sourceOverrides = [ reviewRunnerHelperSource ]
-            , intercepts = intercepts
-            , injectedValues = injectedValues
-            }
-            (projectRuleYieldHandler buildDir)
-        )
-    <| \result ->
-    case result of
-        Ok (Types.Tuple (Types.String output) _) ->
-            persistWarmOutput output
+    if Set.isEmpty config.memoizedFunctions then
+        Do.do
+            (InterpreterProject.prepareAndEvalWithYield reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = expression
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                , intercepts = intercepts
+                , injectedValues = injectedValues
+                }
+                (projectRuleYieldHandler buildDir)
+            )
+        <| \result ->
+        case result of
+            Ok (Types.Tuple (Types.String output) _) ->
+                Do.do (persistWarmOutput output) <| \_ ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    }
 
-        Ok (Types.String output) ->
-            persistWarmOutput output
+            Ok (Types.String output) ->
+                Do.do (persistWarmOutput output) <| \_ ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    }
 
-        Ok _ ->
-            persistProjectEvalOutput maybeOutputCache fallbackOutput
+            Ok _ ->
+                Do.do (persistProjectEvalOutput maybeOutputCache fallbackOutput) <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    }
 
-        Err _ ->
-            persistProjectEvalOutput maybeOutputCache fallbackOutput
+            Err _ ->
+                Do.do (persistProjectEvalOutput maybeOutputCache fallbackOutput) <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    }
+
+    else
+        Do.do
+            (InterpreterProject.prepareAndEvalWithYieldAndMemoizedFunctions reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = expression
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                , intercepts = intercepts
+                , injectedValues = injectedValues
+                , memoizedFunctions = config.memoizedFunctions
+                , memoCache = memoCache
+                , collectMemoStats = config.memoProfile
+                }
+                (projectRuleYieldHandler buildDir)
+            )
+        <| \result ->
+        case result.result of
+            Ok (Types.Tuple (Types.String output) _) ->
+                Do.do (appendMemoProfileLog config.memoProfile buildDir "full-project-warm" (MemoRuntime.entryCount result.memoCache) result.memoStats) <| \_ ->
+                Do.do (persistWarmOutput output) <| \_ ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = result.memoCache
+                    }
+
+            Ok (Types.String output) ->
+                Do.do (appendMemoProfileLog config.memoProfile buildDir "full-project-warm" (MemoRuntime.entryCount result.memoCache) result.memoStats) <| \_ ->
+                Do.do (persistWarmOutput output) <| \_ ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = result.memoCache
+                    }
+
+            Ok _ ->
+                Do.do (persistProjectEvalOutput maybeOutputCache fallbackOutput) <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    }
+
+            Err _ ->
+                Do.do (persistProjectEvalOutput maybeOutputCache fallbackOutput) <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    }
 
 
 evalProjectRulesSingle :
-    InterpreterProject
+    String
+    -> Set.Set String
+    -> Bool
+    -> InterpreterProject
     -> List Int
     -> List { path : String, source : String, astJson : String }
     -> String
     -> String
     -> String
     -> BackendTask FatalError String
-evalProjectRulesSingle reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
-    runProjectRulesFresh reviewProject prIndices modulesWithAst
-        |> persistProjectEvalOutput
-            (Just
-                { keyPath = cacheKeyPath
-                , dataPath = cacheDataPath
-                , key = cacheKey
-                }
-            )
+evalProjectRulesSingle buildDir memoizedFunctions memoProfile reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
+    let
+        evalResult =
+            runProjectRulesFreshWithMemo reviewProject prIndices modulesWithAst memoizedFunctions memoProfile MemoRuntime.emptyMemoCache
+    in
+    Do.do (appendMemoProfileLog memoProfile buildDir "project-rules-cold" (MemoRuntime.entryCount evalResult.memoCache) evalResult.memoStats) <| \_ ->
+    persistProjectEvalOutput
+        (Just
+            { keyPath = cacheKeyPath
+            , dataPath = cacheDataPath
+            , key = cacheKey
+            }
+        )
+        evalResult.output
 
 
 {-| Two-pass project rule evaluation with Value injection (kept for reference).

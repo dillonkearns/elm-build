@@ -1,17 +1,14 @@
 module InterpreterMemoBenchmark exposing (run)
 
-{-| Benchmark the eval-loop-hook memoization shape directly.
+{-| Benchmark three memoization cost models on the same pure Elm workload:
 
-This measures a generic memo intercept that:
+- plain evaluation with no memoization
+- host-driven hook memoization via `EvYield`
+- interpreter-local memoization with cache reuse across invocations
 
-- uses the interpreter's qualified-function intercept seam
-- performs lookup/store via `EvYield`
-- keeps the memo table purely in memory in the yield driver
-
-The goal is to answer a narrow question before we invest in a larger runtime
-memo refactor:
-
-Is a hook-driven memo layer fast enough when we avoid disk and serialization?
+The goal is to validate the runtime-local design and measure whether avoiding
+host round-trips improves the constant factors we care about before wiring this
+into the review runner.
 -}
 
 import BackendTask exposing (BackendTask)
@@ -26,6 +23,7 @@ import EvalResult
 import FatalError exposing (FatalError)
 import FastDict
 import InterpreterProject
+import MemoRuntime
 import Pages.Script as Script exposing (Script)
 import Path
 import Set
@@ -35,10 +33,18 @@ import Types
 
 type alias Config =
     { iterations : Int
+    , workScale : Int
+    , scenario : Maybe String
     }
 
 
-type alias MemoState =
+type alias ScenarioSpec =
+    { name : String
+    , inputs : List Int
+    }
+
+
+type alias HookMemoState =
     { cache : FastDict.Dict String Types.Value
     , lookups : Int
     , hits : Int
@@ -50,17 +56,26 @@ type alias MemoState =
 
 type alias ScenarioResult =
     { name : String
+    , callCount : Int
+    , uniqueInputCount : Int
     , probeCalls : Int
     , probeValue : String
-    , memoColdLookups : Int
     , plainValue : String
-    , memoColdValue : String
-    , memoWarmValue : String
+    , hookColdValue : String
+    , hookWarmValue : String
+    , internalColdValue : String
+    , internalWarmValue : String
     , plainAvgMs : Float
-    , memoColdAvgMs : Float
-    , memoWarmAvgMs : Float
-    , coldStats : MemoState
-    , warmStats : MemoState
+    , hookColdAvgMs : Float
+    , hookWarmAvgMs : Float
+    , internalColdAvgMs : Float
+    , internalWarmAvgMs : Float
+    , hookColdStats : HookMemoState
+    , hookWarmStats : HookMemoState
+    , internalColdStats : MemoRuntime.MemoStats
+    , internalWarmStats : MemoRuntime.MemoStats
+    , internalColdEntries : Int
+    , internalWarmEntries : Int
     }
 
 
@@ -75,9 +90,24 @@ programConfig =
                             (\maybeIterations ->
                                 maybeIterations
                                     |> Maybe.andThen String.toInt
-                                    |> Maybe.withDefault 5
+                                    |> Maybe.withDefault 1
                             )
-                        |> Option.withDescription "Benchmark iterations per scenario (default: 5)"
+                        |> Option.withDescription "Benchmark iterations per scenario (default: 1)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "work-scale"
+                        |> Option.map
+                            (\maybeWorkScale ->
+                                maybeWorkScale
+                                    |> Maybe.andThen String.toInt
+                                    |> Maybe.map (max 1)
+                                    |> Maybe.withDefault 1
+                            )
+                        |> Option.withDescription "Scale scenario call counts linearly (default: 1)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "scenario"
+                        |> Option.withDescription "Run only the named scenario (default: all)"
                     )
             )
 
@@ -100,9 +130,8 @@ task config =
             (\project ->
                 let
                     scenarios =
-                        [ ( "single-call", 1, 2000 )
-                        , ( "repeat-8", 8, 2000 )
-                        ]
+                        benchmarkScenarios config.workScale
+                            |> filterScenarios config.scenario
                 in
                 scenarios
                     |> runScenarios config.iterations project
@@ -119,15 +148,15 @@ task config =
 runScenarios :
     Int
     -> InterpreterProject.InterpreterProject
-    -> List ( String, Int, Int )
+    -> List ScenarioSpec
     -> BackendTask FatalError (List ScenarioResult)
 runScenarios iterations project scenarios =
     case scenarios of
         [] ->
             BackendTask.succeed []
 
-        ( name, repeats, n ) :: rest ->
-            benchmarkScenario iterations project name repeats n
+        scenario :: rest ->
+            benchmarkScenario iterations project scenario
                 |> BackendTask.andThen
                     (\result ->
                         runScenarios iterations project rest
@@ -135,61 +164,88 @@ runScenarios iterations project scenarios =
                     )
 
 
-benchmarkScenario :
+benchmarkScenario : 
     Int
     -> InterpreterProject.InterpreterProject
-    -> String
-    -> Int
-    -> Int
+    -> ScenarioSpec
     -> BackendTask FatalError ScenarioResult
-benchmarkScenario iterations project name repeats n =
+benchmarkScenario iterations project scenario =
     let
         sources =
-            benchmarkSources repeats n
+            benchmarkSources scenario.inputs
     in
-    runProbe project sources emptyMemoState
+    runProbe project sources emptyHookMemoState
         |> BackendTask.andThen
             (\( probeValue, probePlainState ) ->
                 runPlain project sources
                     |> BackendTask.andThen
                         (\plainValue ->
-                            runMemo project sources emptyMemoState
+                            runHookMemo project sources emptyHookMemoState
                                 |> BackendTask.andThen
-                                    (\( memoColdValue, primedStateWithStats ) ->
+                                    (\( hookColdValue, hookPrimedStateWithStats ) ->
                                         let
-                                            coldSampleState =
-                                                primedStateWithStats
+                                            hookColdSampleState =
+                                                hookPrimedStateWithStats
 
-                                            primedState =
-                                                resetMemoStats primedStateWithStats
+                                            hookPrimedState =
+                                                resetHookMemoStats hookPrimedStateWithStats
                                         in
-                                        measureAverageMs iterations (\_ -> runPlain project sources |> BackendTask.map (\_ -> ()))
+                                        runInternalMemo project sources MemoRuntime.emptyMemoCache
                                             |> BackendTask.andThen
-                                                (\plainAvgMs ->
-                                                    measureAverageMs iterations (\_ -> runMemo project sources emptyMemoState |> BackendTask.map (\_ -> ()))
+                                                (\internalColdResult ->
+                                                    let
+                                                        internalPrimedCache =
+                                                            internalColdResult.memoCache
+                                                    in
+                                                    measureAverageMs iterations (\_ -> runPlain project sources |> BackendTask.map (\_ -> ()))
                                                         |> BackendTask.andThen
-                                                            (\memoColdAvgMs ->
-                                                                runMemo project sources primedState
+                                                            (\plainAvgMs ->
+                                                                measureAverageMs iterations (\_ -> runHookMemo project sources emptyHookMemoState |> BackendTask.map (\_ -> ()))
                                                                     |> BackendTask.andThen
-                                                                        (\( memoWarmValue, warmSampleState ) ->
-                                                                            measureAverageMs iterations (\_ -> runMemo project sources primedState |> BackendTask.map (\_ -> ()))
-                                                                                |> BackendTask.map
-                                                                                    (\memoWarmAvgMs ->
-                                                                                        { name = name
-                                                                                        , probeCalls = probePlainState.probeCalls
-                                                                                        , probeValue = valueSummary probeValue
-                                                                                        , memoColdLookups = coldSampleState.lookups
-                                                                                        , plainValue = valueSummary plainValue
-                                                                                        , memoColdValue = valueSummary memoColdValue
-                                                                                        , memoWarmValue = valueSummary memoWarmValue
-                                                                                        , plainAvgMs = plainAvgMs
-                                                                                        , memoColdAvgMs = memoColdAvgMs
-                                                                                        , memoWarmAvgMs = memoWarmAvgMs
-                                                                                        , coldStats = coldSampleState
-                                                                                        , warmStats = warmSampleState
-                                                                                        }
-                                                                                    )
-                                                                        )
+                                                                    (\hookColdAvgMs ->
+                                                                        runHookMemo project sources hookPrimedState
+                                                                            |> BackendTask.andThen
+                                                                                (\( hookWarmValue, hookWarmSampleState ) ->
+                                                                                    measureAverageMs iterations (\_ -> runHookMemo project sources hookPrimedState |> BackendTask.map (\_ -> ()))
+                                                                                        |> BackendTask.andThen
+                                                                                            (\hookWarmAvgMs ->
+                                                                                                measureAverageMs iterations (\_ -> runInternalMemo project sources MemoRuntime.emptyMemoCache |> BackendTask.map (\_ -> ()))
+                                                                                                    |> BackendTask.andThen
+                                                                                                        (\internalColdAvgMs ->
+                                                                                                            runInternalMemo project sources internalPrimedCache
+                                                                                                                |> BackendTask.andThen
+                                                                                                                    (\internalWarmResult ->
+                                                                                                                        measureAverageMs iterations (\_ -> runInternalMemo project sources internalPrimedCache |> BackendTask.map (\_ -> ()))
+                                                                                                                            |> BackendTask.map
+                                                                                                                                (\internalWarmAvgMs ->
+                                                                                                                                    { name = scenario.name
+                                                                                                                                    , callCount = List.length scenario.inputs
+                                                                                                                                    , uniqueInputCount = uniqueCount scenario.inputs
+                                                                                                                                    , probeCalls = probePlainState.probeCalls
+                                                                                                                                    , probeValue = valueSummary probeValue
+                                                                                                                                    , plainValue = valueSummary plainValue
+                                                                                                                                    , hookColdValue = valueSummary hookColdValue
+                                                                                                                                    , hookWarmValue = valueSummary hookWarmValue
+                                                                                                                                    , internalColdValue = valueSummary internalColdResult.value
+                                                                                                                                    , internalWarmValue = valueSummary internalWarmResult.value
+                                                                                                                                    , plainAvgMs = plainAvgMs
+                                                                                                                                    , hookColdAvgMs = hookColdAvgMs
+                                                                                                                                    , hookWarmAvgMs = hookWarmAvgMs
+                                                                                                                                    , internalColdAvgMs = internalColdAvgMs
+                                                                                                                                    , internalWarmAvgMs = internalWarmAvgMs
+                                                                                                                                    , hookColdStats = hookColdSampleState
+                                                                                                                                    , hookWarmStats = hookWarmSampleState
+                                                                                                                                    , internalColdStats = internalColdResult.memoStats
+                                                                                                                                    , internalWarmStats = internalWarmResult.memoStats
+                                                                                                                                    , internalColdEntries = memoCacheEntryCount internalColdResult.memoCache
+                                                                                                                                    , internalWarmEntries = memoCacheEntryCount internalWarmResult.memoCache
+                                                                                                                                    }
+                                                                                                                                )
+                                                                                                                    )
+                                                                                                        )
+                                                                                            )
+                                                                                )
+                                                                    )
                                                             )
                                                 )
                                     )
@@ -216,8 +272,8 @@ runPlain project sources =
 runProbe :
     InterpreterProject.InterpreterProject
     -> List String
-    -> MemoState
-    -> BackendTask FatalError ( Types.Value, MemoState )
+    -> HookMemoState
+    -> BackendTask FatalError ( Types.Value, HookMemoState )
 runProbe project sources initialState =
     InterpreterProject.prepareAndEvalWithYieldState project
         { imports = [ "MemoBench" ]
@@ -239,12 +295,12 @@ runProbe project sources initialState =
             )
 
 
-runMemo :
+runHookMemo :
     InterpreterProject.InterpreterProject
     -> List String
-    -> MemoState
-    -> BackendTask FatalError ( Types.Value, MemoState )
-runMemo project sources initialState =
+    -> HookMemoState
+    -> BackendTask FatalError ( Types.Value, HookMemoState )
+runHookMemo project sources initialState =
     InterpreterProject.prepareAndEvalWithYieldState project
         { imports = [ "MemoBench" ]
         , expression = "MemoBench.results"
@@ -263,6 +319,34 @@ runMemo project sources initialState =
                     Err err ->
                         BackendTask.fail (FatalError.fromString ("Memo benchmark eval failed: " ++ err))
             )
+
+
+runInternalMemo :
+    InterpreterProject.InterpreterProject
+    -> List String
+    -> MemoRuntime.MemoCache
+    ->
+        BackendTask FatalError
+            { value : Types.Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+runInternalMemo project sources memoCache =
+    case
+        InterpreterProject.prepareAndEvalWithMemoizedFunctions project
+            { imports = [ "MemoBench" ]
+            , expression = "MemoBench.results"
+            , sourceOverrides = sources
+            , memoizedFunctions = Set.singleton "ExpensiveHelper.expensive"
+            , memoCache = memoCache
+            , collectMemoStats = True
+            }
+    of
+        Ok result ->
+            BackendTask.succeed result
+
+        Err err ->
+            BackendTask.fail (FatalError.fromString ("Internal memo benchmark eval failed: " ++ err))
 
 
 probeIntercepts : FastDict.Dict String Types.Intercept
@@ -349,10 +433,10 @@ memoKey qualifiedName args =
 
 
 handleMemoYield :
-    MemoState
+    HookMemoState
     -> String
     -> Types.Value
-    -> BackendTask FatalError ( MemoState, Types.Value )
+    -> BackendTask FatalError ( HookMemoState, Types.Value )
 handleMemoYield state tag payload =
     case tag of
         "memo-lookup" ->
@@ -413,8 +497,8 @@ maybeNothing =
     Types.Custom { moduleName = [ "Maybe" ], name = "Nothing" } []
 
 
-emptyMemoState : MemoState
-emptyMemoState =
+emptyHookMemoState : HookMemoState
+emptyHookMemoState =
     { cache = FastDict.empty
     , lookups = 0
     , hits = 0
@@ -424,8 +508,8 @@ emptyMemoState =
     }
 
 
-resetMemoStats : MemoState -> MemoState
-resetMemoStats state =
+resetHookMemoStats : HookMemoState -> HookMemoState
+resetHookMemoStats state =
     { cache = state.cache
     , lookups = 0
     , hits = 0
@@ -437,7 +521,7 @@ resetMemoStats state =
 
 measureAverageMs : Int -> (() -> BackendTask FatalError a) -> BackendTask FatalError Float
 measureAverageMs iterations taskThunk =
-    timeTask (runRepeatedly iterations taskThunk)
+    timeTask (\() -> runRepeatedly iterations taskThunk)
         |> BackendTask.map
             (\{ elapsedMs } ->
                 if iterations <= 0 then
@@ -461,10 +545,10 @@ runRepeatedly remaining taskThunk =
                 )
 
 
-timeTask : BackendTask FatalError a -> BackendTask FatalError { elapsedMs : Int, value : a }
-timeTask taskToTime =
+timeTask : (() -> BackendTask FatalError a) -> BackendTask FatalError { elapsedMs : Int, value : a }
+timeTask taskThunk =
     Do.do BackendTask.Time.now <| \start ->
-    Do.do taskToTime <| \value ->
+    Do.do (taskThunk ()) <| \value ->
     Do.do BackendTask.Time.now <| \finish ->
     BackendTask.succeed
         { elapsedMs = Time.posixToMillis finish - Time.posixToMillis start
@@ -472,13 +556,65 @@ timeTask taskToTime =
         }
 
 
-benchmarkSources : Int -> Int -> List String
-benchmarkSources repeats n =
+benchmarkScenarios : Int -> List ScenarioSpec
+benchmarkScenarios workScale =
+    let
+        hotArg =
+            1000
+
+        sameArgCount =
+            8 * workScale
+
+        mixedUniqueCount =
+            4 * workScale
+
+        mixedCopies =
+            4
+
+        uniqueCount_ =
+            8 * workScale
+
+        sameArgCalls count =
+            List.repeat count hotArg
+
+        repeatCycle copies values =
+            List.range 1 copies
+                |> List.concatMap (\_ -> values)
+    in
+    [ { name = "single-call"
+      , inputs = [ hotArg ]
+      }
+    , { name = "same-arg-" ++ String.fromInt sameArgCount
+      , inputs = sameArgCalls sameArgCount
+      }
+    , { name = "mixed-" ++ String.fromInt (mixedUniqueCount * mixedCopies) ++ "-" ++ String.fromInt mixedUniqueCount ++ "unique"
+      , inputs = repeatCycle mixedCopies (List.range (hotArg - mixedUniqueCount + 1) hotArg)
+      }
+    , { name = "unique-" ++ String.fromInt uniqueCount_
+      , inputs = List.range (hotArg - uniqueCount_ + 1) hotArg
+      }
+    ]
+
+
+filterScenarios : Maybe String -> List ScenarioSpec -> List ScenarioSpec
+filterScenarios maybeName scenarios =
+    case maybeName of
+        Nothing ->
+            scenarios
+
+        Just name ->
+            scenarios
+                |> List.filter (\scenario -> scenario.name == name)
+
+
+benchmarkSources : List Int -> List String
+benchmarkSources inputs =
     let
         resultExpression =
-            List.range 1 repeats
-                |> List.map (\_ -> "ExpensiveHelper.expensive " ++ String.fromInt n)
-                |> String.join "\n        + "
+            sumExpression "ExpensiveHelper.expensive" inputs
+
+        probeExpression =
+            sumExpression "ExpensiveHelper.probe" inputs
     in
     [ """module ExpensiveHelper exposing (expensive, probe)
 
@@ -509,10 +645,7 @@ import ExpensiveHelper
 probeResults : Int
 probeResults =
     """
-        ++ (List.range 1 repeats
-                |> List.map (\_ -> "ExpensiveHelper.probe " ++ String.fromInt n)
-                |> String.join "\n        + "
-           )
+        ++ probeExpression
         ++ """
 
 results : Int
@@ -528,29 +661,40 @@ logScenario result =
     Script.log
         (String.join "\n"
             [ "Scenario: " ++ result.name
+            , "  shape: calls=" ++ String.fromInt result.callCount ++ ", uniqueInputs=" ++ String.fromInt result.uniqueInputCount
             , "  probe calls: " ++ String.fromInt result.probeCalls
             , "  probe value: " ++ result.probeValue
-            , "  memo cold lookups: " ++ String.fromInt result.memoColdLookups
-            , "  values: plain=" ++ result.plainValue ++ ", cold=" ++ result.memoColdValue ++ ", warm=" ++ result.memoWarmValue
+            , "  values: plain=" ++ result.plainValue ++ ", hookCold=" ++ result.hookColdValue ++ ", hookWarm=" ++ result.hookWarmValue ++ ", internalCold=" ++ result.internalColdValue ++ ", internalWarm=" ++ result.internalWarmValue
             , "  plain avg: " ++ formatMs result.plainAvgMs
-            , "  memo cold avg: " ++ formatMs result.memoColdAvgMs
-            , "  memo warm avg: " ++ formatMs result.memoWarmAvgMs
-            , "  cold stats: " ++ formatMemoState result.coldStats
-            , "  warm stats: " ++ formatMemoState result.warmStats
+            , "  hook cold avg: " ++ formatMs result.hookColdAvgMs
+            , "  hook warm avg: " ++ formatMs result.hookWarmAvgMs
+            , "  internal cold avg: " ++ formatMs result.internalColdAvgMs
+            , "  internal warm avg: " ++ formatMs result.internalWarmAvgMs
+            , "  ratios vs plain: hookCold=" ++ formatRatio result.plainAvgMs result.hookColdAvgMs ++ ", hookWarm=" ++ formatRatio result.plainAvgMs result.hookWarmAvgMs ++ ", internalCold=" ++ formatRatio result.plainAvgMs result.internalColdAvgMs ++ ", internalWarm=" ++ formatRatio result.plainAvgMs result.internalWarmAvgMs
+            , "  hook cold stats: " ++ formatHookMemoState result.hookColdStats
+            , "  hook warm stats: " ++ formatHookMemoState result.hookWarmStats
+            , "  internal cold stats: " ++ formatInternalMemoStats result.internalColdEntries result.internalColdStats
+            , "  internal warm stats: " ++ formatInternalMemoStats result.internalWarmEntries result.internalWarmStats
             ]
         )
 
 
-formatMemoState : MemoState -> String
-formatMemoState state =
+formatHookMemoState : HookMemoState -> String
+formatHookMemoState state =
     String.join ", "
         [ "lookups=" ++ String.fromInt state.lookups
         , "hits=" ++ String.fromInt state.hits
         , "misses=" ++ String.fromInt state.misses
         , "stores=" ++ String.fromInt state.stores
+        , "hitRate=" ++ formatHitRate state.hits state.lookups
         , "probeCalls=" ++ String.fromInt state.probeCalls
         , "entries=" ++ String.fromInt (state.cache |> FastDict.toList |> List.length)
         ]
+
+
+formatInternalMemoStats : Int -> MemoRuntime.MemoStats -> String
+formatInternalMemoStats entryCount stats =
+    MemoRuntime.formatMemoStats entryCount stats
 
 
 formatMs : Float -> String
@@ -562,6 +706,32 @@ formatMs value =
     String.fromFloat rounded ++ "ms"
 
 
+formatRatio : Float -> Float -> String
+formatRatio baseline candidate =
+    if baseline <= 0 || candidate <= 0 then
+        "n/a"
+
+    else
+        let
+            rounded =
+                toFloat (round ((baseline / candidate) * 100)) / 100
+        in
+        String.fromFloat rounded ++ "x"
+
+
+formatHitRate : Int -> Int -> String
+formatHitRate hits lookups =
+    if lookups <= 0 then
+        "0%"
+
+    else
+        let
+            rounded =
+                toFloat (round ((toFloat hits / toFloat lookups) * 1000)) / 10
+        in
+        String.fromFloat rounded ++ "%"
+
+
 valueSummary : Types.Value -> String
 valueSummary value =
     case value of
@@ -570,6 +740,31 @@ valueSummary value =
 
         _ ->
             "non-int"
+
+
+sumExpression : String -> List Int -> String
+sumExpression qualifiedName inputs =
+    case inputs |> List.map (\input -> qualifiedName ++ " " ++ String.fromInt input) of
+        [] ->
+            "0"
+
+        calls ->
+            """List.foldl (\\value acc -> acc + value) 0
+        [ """
+                ++ String.join "\n        , " calls
+                ++ "\n        ]"
+
+
+uniqueCount : List Int -> Int
+uniqueCount inputs =
+    inputs
+        |> Set.fromList
+        |> Set.size
+
+
+memoCacheEntryCount : MemoRuntime.MemoCache -> Int
+memoCacheEntryCount memoCache =
+    MemoRuntime.entryCount memoCache
 
 
 sequenceTasks : List (BackendTask FatalError a) -> BackendTask FatalError (List a)
