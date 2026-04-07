@@ -911,16 +911,35 @@ hashSetUnion (HashSet a) (HashSet b) =
 
 innerHashSetUnion : BST comparable -> BST comparable -> BST comparable
 innerHashSetUnion l r =
-    case l of
-        BSTLeaf ->
-            r
+    innerHashSetFromSortedList
+        (mergeSorted
+            (innerHashSetToAscendingList l)
+            (innerHashSetToAscendingList r)
+            []
+        )
 
-        BSTNode lk ll lr ->
-            let
-                ( rl, rr ) =
-                    split lk r
-            in
-            BSTNode lk (innerHashSetUnion ll rl) (innerHashSetUnion lr rr)
+
+mergeSorted : List comparable -> List comparable -> List comparable -> List comparable
+mergeSorted l r acc =
+    case l of
+        [] ->
+            List.reverse (List.reverse r ++ acc)
+
+        lh :: lt ->
+            case r of
+                [] ->
+                    List.reverse (List.reverse l ++ acc)
+
+                rh :: rt ->
+                    case compare lh rh of
+                        EQ ->
+                            mergeSorted lt rt (lh :: acc)
+
+                        LT ->
+                            mergeSorted lt r (lh :: acc)
+
+                        GT ->
+                            mergeSorted l rt (rh :: acc)
 
 
 split : comparable -> BST comparable -> ( BST comparable, BST comparable )
@@ -972,12 +991,36 @@ innerHashSetToList s =
     go s []
 
 
+innerHashSetToAscendingList : BST a -> List a
+innerHashSetToAscendingList s =
+    let
+        go : BST a -> List a -> List a
+        go t acc =
+            case t of
+                BSTLeaf ->
+                    acc
+
+                BSTNode k l r ->
+                    go r acc
+                        |> (::) k
+                        |> go l
+    in
+    go s []
+
+
 innerHashSetFromList : List comparable -> BST comparable
 innerHashSetFromList list =
+    innerHashSetFromSortedList (List.sort list)
+
+
+innerHashSetFromSortedList : List comparable -> BST comparable
+innerHashSetFromSortedList list =
     let
         arr : Array comparable
         arr =
-            Array.fromList (List.sort list)
+            list
+                |> unique
+                |> Array.fromList
 
         go fromIncluded toExcluded =
             if fromIncluded >= toExcluded then
@@ -997,3 +1040,26 @@ innerHashSetFromList list =
                         BSTNode k (go fromIncluded mid) (go (mid + 1) toExcluded)
     in
     go 0 (Array.length arr)
+
+
+unique : List comparable -> List comparable
+unique list =
+    case list of
+        [] ->
+            []
+
+        h :: t ->
+            let
+                ( nh, nt ) =
+                    List.foldl
+                        (\e ( l, a ) ->
+                            if e == l then
+                                ( l, a )
+
+                            else
+                                ( e, l :: a )
+                        )
+                        ( h, [] )
+                        t
+            in
+            List.reverse (nh :: nt)
