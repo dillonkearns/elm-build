@@ -762,3 +762,66 @@ Current read:
 - The real blocker is AST roundtrip correctness for review-app package sources.
 - The next useful step is **not** more transport tuning. It is a focused validator to identify which package modules fail `AstWireCodec` roundtrip and why.
 - If that turns out to be too broad a codec project, the next alternative is caching a later boundary than raw parsed files, such as a smaller package-env artifact that avoids reparsing without requiring full AST roundtrip fidelity.
+
+### Package Module Summary Cache
+
+I replaced the parsed-package-source blob with a smaller cache boundary: package module summaries.
+
+Instead of persisting full parsed `File` ASTs for review-app package sources, the new cache stores the per-module pieces that `buildModuleEnv` actually needs:
+
+- module name
+- module interface
+- resolved imported names
+- function implementations needed in the shared env
+
+The codec also strips source ranges from those cached function/interface payloads on disk, because package dependencies do not need real source locations to execute correctly in the interpreter.
+
+This changed the review-app warm-load profile in the right direction:
+
+| Metric | Parsed AST blob | Package summary blob |
+|---|---:|---:|
+| cache bytes | `3,327,828` | `2,479,004` |
+| warm body-edit cache decode | `317ms` | `232ms` |
+| warm import-change cache decode | `312ms` | `227ms` |
+| warm body-edit `load_review_project` | `461ms` | `312ms` |
+| warm import-change `load_review_project` | `448ms` | `307ms` |
+
+Full `small-12` matrix after switching to package summaries:
+
+| Scenario | Previous `bytesDecode` AST blob | Package summary cache |
+|---|---:|---:|
+| Cold | `117.97s` | `104.10s` |
+| Warm | `0.34s` | `0.31s` |
+| Warm 1-file body edit | `1.75s` | `1.50s` |
+| Warm 1-file comment-only | `0.56s` | `0.53s` |
+| Warm import-graph change | `4.82s` | `3.98s` |
+
+This is also a real improvement over the earlier non-package-cache baseline:
+
+| Scenario | Earlier stable baseline | Package summary cache |
+|---|---:|---:|
+| Warm 1-file body edit | `1.54s` | `1.50s` |
+| Warm import-graph change | `4.30s` | `3.98s` |
+
+Important internal timings from the new run:
+
+- cold:
+  - `parse_package_sources_ms`: `151ms`
+  - `build_package_summaries_from_parsed_ms`: `6ms`
+  - `build_package_env_from_summaries_ms`: `3ms`
+- warm 1-file body edit:
+  - `decode_package_summary_cache_ms`: `232ms`
+  - `build_package_env_from_summaries_ms`: `4ms`
+- warm import-graph change:
+  - `decode_package_summary_cache_ms`: `227ms`
+  - `build_package_env_from_summaries_ms`: `3ms`
+
+Current read:
+
+- This was the right cache boundary shift.
+- We are no longer paying the old `buildProjectEnvFromParsed` fold on warm partial runs in any meaningful way.
+- The remaining fixed review-app warm-load cost is now mostly decoding the package summary blob itself.
+- That means the next review-app-side opportunities are:
+  - making the package summary payload cheaper to decode
+  - or splitting/reusing it in a way that avoids decoding one large blob every time
+- But the largest end-to-end remaining wall is still `project_rule_eval`, especially on import-graph changes.

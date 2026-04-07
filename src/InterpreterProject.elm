@@ -23,11 +23,12 @@ import Dict exposing (Dict)
 import Elm.Interface exposing (Exposed)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
-import Elm.Syntax.Expression exposing (Expression(..))
+import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation)
 import Elm.Syntax.File exposing (File)
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
+import Elm.Syntax.Infix exposing (InfixDirection(..))
 import Eval.Module
 import FastDict
 import FatalError exposing (FatalError)
@@ -39,6 +40,7 @@ import Path exposing (Path)
 import ProjectSources
 import SemanticHash
 import Set exposing (Set)
+import Syntax exposing (fakeNode)
 import Time
 import Types
 
@@ -50,29 +52,27 @@ type alias ModuleGraph =
     }
 
 
-type alias ParsedProjectSource =
-    { file : File
-    , moduleName : ModuleName
-    , interface : List Exposed
-    }
+type alias CachedPackageModuleSummary =
+    Eval.Module.CachedModuleSummary
 
 
 type alias LoadProfile =
     { resolveSourceDirectoriesMs : Int
     , loadPackageSourcesMs : Int
-    , parsedPackageCacheHit : Int
-    , parsedPackageCacheRoundtripOk : Int
-    , parsedPackageCacheBytes : Int
-    , loadParsedPackageCacheMs : Int
-    , decodeParsedPackageCacheMs : Int
-    , validateParsedPackageCacheMs : Int
-    , writeParsedPackageCacheMs : Int
+    , packageSummaryCacheHit : Int
+    , packageSummaryCacheRoundtripOk : Int
+    , packageSummaryCacheBytes : Int
+    , loadPackageSummaryCacheMs : Int
+    , decodePackageSummaryCacheMs : Int
+    , validatePackageSummaryCacheMs : Int
+    , writePackageSummaryCacheMs : Int
     , globUserSourcesMs : Int
     , readUserSourcesMs : Int
     , readExtraSourcesMs : Int
     , buildGraphMs : Int
     , parsePackageSourcesMs : Int
-    , buildPackageEnvFromParsedMs : Int
+    , buildPackageSummariesFromParsedMs : Int
+    , buildPackageEnvFromSummariesMs : Int
     , buildPackageEnvMs : Int
     , buildBaseUserEnvMs : Int
     , buildSemanticIndexMs : Int
@@ -102,37 +102,27 @@ withTiming work =
         }
 
 
-parsedPackageCacheVersion : String
-parsedPackageCacheVersion =
-    "v3"
+packageSummaryCacheVersion : String
+packageSummaryCacheVersion =
+    "v4"
 
 
-parsedPackageCacheBlobPath : String -> String
-parsedPackageCacheBlobPath cacheDir =
-    cacheDir ++ "/parsed-package-sources-" ++ parsedPackageCacheVersion ++ ".blob"
+packageSummaryCacheBlobPath : String -> String
+packageSummaryCacheBlobPath cacheDir =
+    cacheDir ++ "/package-module-summaries-" ++ packageSummaryCacheVersion ++ ".blob"
 
 
-encodeParsedPackageSourcesCache : List ParsedProjectSource -> Bytes.Bytes
-encodeParsedPackageSourcesCache parsedSources =
-    parsedSources
-        |> List.map .file
-        |> Lamdera.Wire3.encodeList AstWireCodec.encodeFile
+encodePackageSummaryCache : List CachedPackageModuleSummary -> Bytes.Bytes
+encodePackageSummaryCache summaries =
+    summaries
+        |> Lamdera.Wire3.encodeList encodeCachedPackageModuleSummary
         |> Lamdera.Wire3.bytesEncode
 
 
-parsedProjectSourceFromFile : File -> ParsedProjectSource
-parsedProjectSourceFromFile file =
-    { file = file
-    , moduleName = Eval.Module.fileModuleName file
-    , interface = Eval.Module.buildInterfaceFromFile file
-    }
-
-
-decodeParsedPackageSourcesCache : Bytes.Bytes -> Maybe (List ParsedProjectSource)
-decodeParsedPackageSourcesCache bytes =
+decodePackageSummaryCache : Bytes.Bytes -> Maybe (List CachedPackageModuleSummary)
+decodePackageSummaryCache bytes =
     bytes
-        |> Lamdera.Wire3.bytesDecode (Lamdera.Wire3.decodeList AstWireCodec.decodeFile)
-        |> Maybe.map (List.map parsedProjectSourceFromFile)
+        |> Lamdera.Wire3.bytesDecode (Lamdera.Wire3.decodeList decodeCachedPackageModuleSummary)
 
 
 writeBinaryFile : { path : String, bytes : Bytes.Bytes } -> BackendTask FatalError ()
@@ -149,6 +139,213 @@ writeBinaryFile { path, bytes } =
         )
         (Decode.succeed ())
         |> BackendTask.allowFatal
+
+
+encodeCachedPackageModuleSummary : CachedPackageModuleSummary -> Lamdera.Wire3.Encoder
+encodeCachedPackageModuleSummary summary =
+    Lamdera.Wire3.encodeSequenceWithoutLength
+        [ encodeModuleName summary.moduleName
+        , Lamdera.Wire3.encodeList encodeExposed summary.interface
+        , encodeImportedNames summary.importedNames
+        , Lamdera.Wire3.encodeList encodeFunctionImplementationNoRanges summary.functions
+        ]
+
+
+decodeCachedPackageModuleSummary : Lamdera.Wire3.Decoder CachedPackageModuleSummary
+decodeCachedPackageModuleSummary =
+    Lamdera.Wire3.succeedDecode
+        (\moduleName interface importedNames functions ->
+            { moduleName = moduleName
+            , interface = interface
+            , importedNames = importedNames
+            , functions = functions
+            }
+        )
+        |> Lamdera.Wire3.andMapDecode decodeModuleName
+        |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeExposed)
+        |> Lamdera.Wire3.andMapDecode decodeImportedNames
+        |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeFunctionImplementationNoRanges)
+
+
+encodeModuleName : ModuleName -> Lamdera.Wire3.Encoder
+encodeModuleName moduleName =
+    Lamdera.Wire3.encodeList Lamdera.Wire3.encodeString moduleName
+
+
+decodeModuleName : Lamdera.Wire3.Decoder ModuleName
+decodeModuleName =
+    Lamdera.Wire3.decodeList Lamdera.Wire3.decodeString
+
+
+encodeExposed : Exposed -> Lamdera.Wire3.Encoder
+encodeExposed exposed =
+    case exposed of
+        Elm.Interface.Function name ->
+            Lamdera.Wire3.encodeSequenceWithoutLength
+                [ Lamdera.Wire3.encodeInt 0
+                , Lamdera.Wire3.encodeString name
+                ]
+
+        Elm.Interface.CustomType ( name, constructors ) ->
+            Lamdera.Wire3.encodeSequenceWithoutLength
+                [ Lamdera.Wire3.encodeInt 1
+                , Lamdera.Wire3.encodeString name
+                , Lamdera.Wire3.encodeList Lamdera.Wire3.encodeString constructors
+                ]
+
+        Elm.Interface.Alias name ->
+            Lamdera.Wire3.encodeSequenceWithoutLength
+                [ Lamdera.Wire3.encodeInt 2
+                , Lamdera.Wire3.encodeString name
+                ]
+
+        Elm.Interface.Operator infix_ ->
+            Lamdera.Wire3.encodeSequenceWithoutLength
+                [ Lamdera.Wire3.encodeInt 3
+                , encodeInfixDirectionRaw (Node.value infix_.direction)
+                , Lamdera.Wire3.encodeInt (Node.value infix_.precedence)
+                , Lamdera.Wire3.encodeString (Node.value infix_.operator)
+                , Lamdera.Wire3.encodeString (Node.value infix_.function)
+                ]
+
+
+decodeExposed : Lamdera.Wire3.Decoder Exposed
+decodeExposed =
+    Lamdera.Wire3.decodeInt
+        |> Lamdera.Wire3.andThenDecode
+            (\tag ->
+                case tag of
+                    0 ->
+                        Lamdera.Wire3.succeedDecode Elm.Interface.Function
+                            |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+
+                    1 ->
+                        Lamdera.Wire3.succeedDecode (\name constructors -> Elm.Interface.CustomType ( name, constructors ))
+                            |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+                            |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList Lamdera.Wire3.decodeString)
+
+                    2 ->
+                        Lamdera.Wire3.succeedDecode Elm.Interface.Alias
+                            |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+
+                    _ ->
+                        Lamdera.Wire3.succeedDecode
+                            (\direction precedence operator_ function_ ->
+                                Elm.Interface.Operator
+                                    { direction = fakeNode direction
+                                    , precedence = fakeNode precedence
+                                    , operator = fakeNode operator_
+                                    , function = fakeNode function_
+                                    }
+                            )
+                            |> Lamdera.Wire3.andMapDecode decodeInfixDirectionRaw
+                            |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeInt
+                            |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+                            |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+            )
+
+
+encodeImportedNames : Types.ImportedNames -> Lamdera.Wire3.Encoder
+encodeImportedNames importedNames =
+    Lamdera.Wire3.encodeSequenceWithoutLength
+        [ encodeQualifiedMapping importedNames.aliases
+        , encodeQualifiedMapping importedNames.exposedValues
+        , encodeQualifiedMapping importedNames.exposedConstructors
+        ]
+
+
+decodeImportedNames : Lamdera.Wire3.Decoder Types.ImportedNames
+decodeImportedNames =
+    Lamdera.Wire3.succeedDecode
+        (\aliases exposedValues exposedConstructors ->
+            { aliases = aliases
+            , exposedValues = exposedValues
+            , exposedConstructors = exposedConstructors
+            }
+        )
+        |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
+        |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
+        |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
+
+
+encodeQualifiedMapping : FastDict.Dict String ( ModuleName, String ) -> Lamdera.Wire3.Encoder
+encodeQualifiedMapping mapping =
+    mapping
+        |> FastDict.toList
+        |> Lamdera.Wire3.encodeList
+            (\( name, ( moduleName, moduleKey ) ) ->
+                Lamdera.Wire3.encodeSequenceWithoutLength
+                    [ Lamdera.Wire3.encodeString name
+                    , encodeModuleName moduleName
+                    , Lamdera.Wire3.encodeString moduleKey
+                    ]
+            )
+
+
+decodeQualifiedMapping : Lamdera.Wire3.Decoder (FastDict.Dict String ( ModuleName, String ))
+decodeQualifiedMapping =
+    Lamdera.Wire3.succeedDecode FastDict.fromList
+        |> Lamdera.Wire3.andMapDecode
+            (Lamdera.Wire3.decodeList
+                (Lamdera.Wire3.succeedDecode (\name moduleName moduleKey -> ( name, ( moduleName, moduleKey ) ))
+                    |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+                    |> Lamdera.Wire3.andMapDecode decodeModuleName
+                    |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+                )
+            )
+
+
+encodeFunctionImplementationNoRanges : FunctionImplementation -> Lamdera.Wire3.Encoder
+encodeFunctionImplementationNoRanges implementation =
+    Lamdera.Wire3.encodeSequenceWithoutLength
+        [ Lamdera.Wire3.encodeString (Node.value implementation.name)
+        , Lamdera.Wire3.encodeList (AstWireCodec.encodePattern << Node.value) implementation.arguments
+        , AstWireCodec.encodeExpression (Node.value implementation.expression)
+        ]
+
+
+decodeFunctionImplementationNoRanges : Lamdera.Wire3.Decoder FunctionImplementation
+decodeFunctionImplementationNoRanges =
+    Lamdera.Wire3.succeedDecode
+        (\name arguments expression ->
+            { name = fakeNode name
+            , arguments = List.map fakeNode arguments
+            , expression = fakeNode expression
+            }
+        )
+        |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+        |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList AstWireCodec.decodePattern)
+        |> Lamdera.Wire3.andMapDecode AstWireCodec.decodeExpression
+
+
+encodeInfixDirectionRaw : InfixDirection -> Lamdera.Wire3.Encoder
+encodeInfixDirectionRaw direction =
+    case direction of
+        Left ->
+            Lamdera.Wire3.encodeInt 0
+
+        Right ->
+            Lamdera.Wire3.encodeInt 1
+
+        Non ->
+            Lamdera.Wire3.encodeInt 2
+
+
+decodeInfixDirectionRaw : Lamdera.Wire3.Decoder InfixDirection
+decodeInfixDirectionRaw =
+    Lamdera.Wire3.decodeInt
+        |> Lamdera.Wire3.andThenDecode
+            (\tag ->
+                case tag of
+                    0 ->
+                        Lamdera.Wire3.succeedDecode Left
+
+                    1 ->
+                        Lamdera.Wire3.succeedDecode Right
+
+                    _ ->
+                        Lamdera.Wire3.succeedDecode Non
+            )
 
 
 type InterpreterProject
@@ -399,28 +596,29 @@ loadWithProfile config =
         buildGraphMs =
             stageMs graphStart graphFinish
 
-        parsedPackageCachePath : Maybe String
-        parsedPackageCachePath =
+        packageSummaryCachePath : Maybe String
+        packageSummaryCachePath =
             config.packageParseCacheDir
-                |> Maybe.map parsedPackageCacheBlobPath
+                |> Maybe.map packageSummaryCacheBlobPath
 
-        parseAndSeedPackageSources :
-            { parsedPackageCacheHit : Int
-            , loadParsedPackageCacheMs : Int
-            , decodeParsedPackageCacheMs : Int
+        parseAndSeedPackageSummaries :
+            { packageSummaryCacheHit : Int
+            , loadPackageSummaryCacheMs : Int
+            , decodePackageSummaryCacheMs : Int
             }
             -> BackendTask FatalError
-                { parsedPackageSources : List ParsedProjectSource
-                , parsedPackageCacheHit : Int
-                , parsedPackageCacheRoundtripOk : Int
-                , parsedPackageCacheBytes : Int
-                , loadParsedPackageCacheMs : Int
-                , decodeParsedPackageCacheMs : Int
-                , validateParsedPackageCacheMs : Int
+                { packageSummaries : List CachedPackageModuleSummary
+                , packageSummaryCacheHit : Int
+                , packageSummaryCacheRoundtripOk : Int
+                , packageSummaryCacheBytes : Int
+                , loadPackageSummaryCacheMs : Int
+                , decodePackageSummaryCacheMs : Int
+                , validatePackageSummaryCacheMs : Int
                 , parsePackageSourcesMs : Int
-                , writeParsedPackageCacheMs : Int
+                , buildPackageSummariesFromParsedMs : Int
+                , writePackageSummaryCacheMs : Int
                 }
-        parseAndSeedPackageSources cacheMetrics =
+        parseAndSeedPackageSummaries cacheMetrics =
             Do.do BackendTask.Time.now <| \parsePackageSourcesStart ->
             let
                 parsedPackageSourcesResult =
@@ -436,34 +634,45 @@ loadWithProfile config =
                     BackendTask.fail (FatalError.fromString "Failed to build package environment")
 
                 Ok parsedPackageSources ->
-                    case parsedPackageCachePath of
+                    Do.do BackendTask.Time.now <| \buildPackageSummariesStart ->
+                    let
+                        packageSummaries =
+                            Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources
+                    in
+                    Do.do BackendTask.Time.now <| \buildPackageSummariesFinish ->
+                    let
+                        buildPackageSummariesFromParsedMs =
+                            stageMs buildPackageSummariesStart buildPackageSummariesFinish
+                    in
+                    case packageSummaryCachePath of
                         Just cachePath ->
                             let
                                 cacheBytes =
-                                    encodeParsedPackageSourcesCache parsedPackageSources
+                                    encodePackageSummaryCache packageSummaries
                             in
                             Do.do BackendTask.Time.now <| \validateCacheStart ->
                             let
                                 cacheRoundtripOk =
-                                    decodeParsedPackageSourcesCache cacheBytes /= Nothing
+                                    decodePackageSummaryCache cacheBytes /= Nothing
                             in
                             Do.do BackendTask.Time.now <| \validateCacheFinish ->
                             let
                                 baseInfo =
-                                    { parsedPackageSources = parsedPackageSources
-                                    , parsedPackageCacheHit = cacheMetrics.parsedPackageCacheHit
-                                    , parsedPackageCacheRoundtripOk =
+                                    { packageSummaries = packageSummaries
+                                    , packageSummaryCacheHit = cacheMetrics.packageSummaryCacheHit
+                                    , packageSummaryCacheRoundtripOk =
                                         if cacheRoundtripOk then
                                             1
 
                                         else
                                             0
-                                    , parsedPackageCacheBytes = Bytes.width cacheBytes
-                                    , loadParsedPackageCacheMs = cacheMetrics.loadParsedPackageCacheMs
-                                    , decodeParsedPackageCacheMs = cacheMetrics.decodeParsedPackageCacheMs
-                                    , validateParsedPackageCacheMs = stageMs validateCacheStart validateCacheFinish
+                                    , packageSummaryCacheBytes = Bytes.width cacheBytes
+                                    , loadPackageSummaryCacheMs = cacheMetrics.loadPackageSummaryCacheMs
+                                    , decodePackageSummaryCacheMs = cacheMetrics.decodePackageSummaryCacheMs
+                                    , validatePackageSummaryCacheMs = stageMs validateCacheStart validateCacheFinish
                                     , parsePackageSourcesMs = parsePackageSourcesMs
-                                    , writeParsedPackageCacheMs = 0
+                                    , buildPackageSummariesFromParsedMs = buildPackageSummariesFromParsedMs
+                                    , writePackageSummaryCacheMs = 0
                                     }
                             in
                             if cacheRoundtripOk then
@@ -477,26 +686,27 @@ loadWithProfile config =
                                     )
                                 <| \writeCacheTimed ->
                                 BackendTask.succeed
-                                    { baseInfo | writeParsedPackageCacheMs = writeCacheTimed.ms }
+                                    { baseInfo | writePackageSummaryCacheMs = writeCacheTimed.ms }
 
                             else
                                 BackendTask.succeed baseInfo
 
                         Nothing ->
                             BackendTask.succeed
-                                { parsedPackageSources = parsedPackageSources
-                                , parsedPackageCacheHit = cacheMetrics.parsedPackageCacheHit
-                                , parsedPackageCacheRoundtripOk = 0
-                                , parsedPackageCacheBytes = 0
-                                , loadParsedPackageCacheMs = cacheMetrics.loadParsedPackageCacheMs
-                                , decodeParsedPackageCacheMs = cacheMetrics.decodeParsedPackageCacheMs
-                                , validateParsedPackageCacheMs = 0
+                                { packageSummaries = packageSummaries
+                                , packageSummaryCacheHit = cacheMetrics.packageSummaryCacheHit
+                                , packageSummaryCacheRoundtripOk = 0
+                                , packageSummaryCacheBytes = 0
+                                , loadPackageSummaryCacheMs = cacheMetrics.loadPackageSummaryCacheMs
+                                , decodePackageSummaryCacheMs = cacheMetrics.decodePackageSummaryCacheMs
+                                , validatePackageSummaryCacheMs = 0
                                 , parsePackageSourcesMs = parsePackageSourcesMs
-                                , writeParsedPackageCacheMs = 0
+                                , buildPackageSummariesFromParsedMs = buildPackageSummariesFromParsedMs
+                                , writePackageSummaryCacheMs = 0
                                 }
     in
     Do.do
-        (case parsedPackageCachePath of
+        (case packageSummaryCachePath of
             Just cachePath ->
                 Do.do (File.exists cachePath |> BackendTask.allowFatal) <| \cacheExists ->
                 if cacheExists then
@@ -504,62 +714,65 @@ loadWithProfile config =
                     Do.do BackendTask.Time.now <| \decodeCacheStart ->
                     let
                         decodedCache =
-                            decodeParsedPackageSourcesCache readCacheTimed.value
+                            decodePackageSummaryCache readCacheTimed.value
                     in
                     Do.do BackendTask.Time.now <| \decodeCacheFinish ->
                     case decodedCache of
-                        Just parsedPackageSources ->
+                        Just packageSummaries ->
                             BackendTask.succeed
-                                { parsedPackageSources = parsedPackageSources
-                                , parsedPackageCacheHit = 1
-                                , parsedPackageCacheRoundtripOk = 1
-                                , parsedPackageCacheBytes = Bytes.width readCacheTimed.value
-                                , loadParsedPackageCacheMs = readCacheTimed.ms
-                                , decodeParsedPackageCacheMs = stageMs decodeCacheStart decodeCacheFinish
-                                , validateParsedPackageCacheMs = 0
+                                { packageSummaries = packageSummaries
+                                , packageSummaryCacheHit = 1
+                                , packageSummaryCacheRoundtripOk = 1
+                                , packageSummaryCacheBytes = Bytes.width readCacheTimed.value
+                                , loadPackageSummaryCacheMs = readCacheTimed.ms
+                                , decodePackageSummaryCacheMs = stageMs decodeCacheStart decodeCacheFinish
+                                , validatePackageSummaryCacheMs = 0
                                 , parsePackageSourcesMs = 0
-                                , writeParsedPackageCacheMs = 0
+                                , buildPackageSummariesFromParsedMs = 0
+                                , writePackageSummaryCacheMs = 0
                                 }
 
                         Nothing ->
-                            parseAndSeedPackageSources
-                                { parsedPackageCacheHit = 0
-                                , loadParsedPackageCacheMs = readCacheTimed.ms
-                                , decodeParsedPackageCacheMs = stageMs decodeCacheStart decodeCacheFinish
+                            parseAndSeedPackageSummaries
+                                { packageSummaryCacheHit = 0
+                                , loadPackageSummaryCacheMs = readCacheTimed.ms
+                                , decodePackageSummaryCacheMs = stageMs decodeCacheStart decodeCacheFinish
                                 }
 
                 else
-                    parseAndSeedPackageSources
-                        { parsedPackageCacheHit = 0
-                        , loadParsedPackageCacheMs = 0
-                        , decodeParsedPackageCacheMs = 0
+                    parseAndSeedPackageSummaries
+                        { packageSummaryCacheHit = 0
+                        , loadPackageSummaryCacheMs = 0
+                        , decodePackageSummaryCacheMs = 0
                         }
 
             Nothing ->
-                parseAndSeedPackageSources
-                    { parsedPackageCacheHit = 0
-                    , loadParsedPackageCacheMs = 0
-                    , decodeParsedPackageCacheMs = 0
+                parseAndSeedPackageSummaries
+                    { packageSummaryCacheHit = 0
+                    , loadPackageSummaryCacheMs = 0
+                    , decodePackageSummaryCacheMs = 0
                     }
         )
-    <| \parsedPackageSourcesInfo ->
+    <| \packageSummariesInfo ->
     let
-        parsedPackageSources =
-            parsedPackageSourcesInfo.parsedPackageSources
+        packageSummaries =
+            packageSummariesInfo.packageSummaries
     in
             Do.do BackendTask.Time.now <| \buildPackageEnvStart ->
             let
                 pkgEnvResult : Result Types.Error Eval.Module.ProjectEnv
                 pkgEnvResult =
-                    Eval.Module.buildProjectEnvFromParsed parsedPackageSources
+                    Eval.Module.buildProjectEnvFromSummaries packageSummaries
             in
             Do.do BackendTask.Time.now <| \buildPackageEnvFinish ->
             let
-                buildPackageEnvFromParsedMs =
+                buildPackageEnvFromSummariesMs =
                     stageMs buildPackageEnvStart buildPackageEnvFinish
 
                 buildPackageEnvMs =
-                    parsedPackageSourcesInfo.parsePackageSourcesMs + buildPackageEnvFromParsedMs
+                    packageSummariesInfo.parsePackageSourcesMs
+                        + packageSummariesInfo.buildPackageSummariesFromParsedMs
+                        + buildPackageEnvFromSummariesMs
             in
             case pkgEnvResult of
                 Err _ ->
@@ -641,16 +854,17 @@ loadWithProfile config =
                             , globUserSourcesMs = elmFilesTimed.ms
                             , readUserSourcesMs = userFileContentsTimed.ms
                             , readExtraSourcesMs = extraFileContentsTimed.ms
-                            , parsedPackageCacheHit = parsedPackageSourcesInfo.parsedPackageCacheHit
-                            , parsedPackageCacheRoundtripOk = parsedPackageSourcesInfo.parsedPackageCacheRoundtripOk
-                            , parsedPackageCacheBytes = parsedPackageSourcesInfo.parsedPackageCacheBytes
-                            , loadParsedPackageCacheMs = parsedPackageSourcesInfo.loadParsedPackageCacheMs
-                            , decodeParsedPackageCacheMs = parsedPackageSourcesInfo.decodeParsedPackageCacheMs
-                            , validateParsedPackageCacheMs = parsedPackageSourcesInfo.validateParsedPackageCacheMs
-                            , writeParsedPackageCacheMs = parsedPackageSourcesInfo.writeParsedPackageCacheMs
+                            , packageSummaryCacheHit = packageSummariesInfo.packageSummaryCacheHit
+                            , packageSummaryCacheRoundtripOk = packageSummariesInfo.packageSummaryCacheRoundtripOk
+                            , packageSummaryCacheBytes = packageSummariesInfo.packageSummaryCacheBytes
+                            , loadPackageSummaryCacheMs = packageSummariesInfo.loadPackageSummaryCacheMs
+                            , decodePackageSummaryCacheMs = packageSummariesInfo.decodePackageSummaryCacheMs
+                            , validatePackageSummaryCacheMs = packageSummariesInfo.validatePackageSummaryCacheMs
+                            , writePackageSummaryCacheMs = packageSummariesInfo.writePackageSummaryCacheMs
                             , buildGraphMs = buildGraphMs
-                            , parsePackageSourcesMs = parsedPackageSourcesInfo.parsePackageSourcesMs
-                            , buildPackageEnvFromParsedMs = buildPackageEnvFromParsedMs
+                            , parsePackageSourcesMs = packageSummariesInfo.parsePackageSourcesMs
+                            , buildPackageSummariesFromParsedMs = packageSummariesInfo.buildPackageSummariesFromParsedMs
+                            , buildPackageEnvFromSummariesMs = buildPackageEnvFromSummariesMs
                             , buildPackageEnvMs = buildPackageEnvMs
                             , buildBaseUserEnvMs = buildBaseUserEnvMs
                             , buildSemanticIndexMs = buildSemanticIndexMs

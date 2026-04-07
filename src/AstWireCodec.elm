@@ -1,15 +1,19 @@
 module AstWireCodec exposing
     ( decodeDeclaration
+    , decodeExpression
     , decodeFile
     , decodeFromBytes
     , decodeImport
     , decodeModule
     , decodeNode
+    , decodePattern
     , encodeDeclaration
+    , encodeExpression
     , encodeFile
     , encodeImport
     , encodeModule
     , encodeNode
+    , encodePattern
     , encodeToBytes
     )
 
