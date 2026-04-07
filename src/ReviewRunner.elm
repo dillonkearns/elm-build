@@ -4339,7 +4339,8 @@ readPerFileRuleOutputs cacheDir paths =
         |> List.map
             (\path ->
                 File.rawFile (cacheDir ++ "/" ++ cacheFileComponent path ++ ".txt")
-                    |> BackendTask.allowFatal
+                    |> BackendTask.toResult
+                    |> BackendTask.map (Result.withDefault "")
             )
         |> BackendTask.Extra.combine
 
