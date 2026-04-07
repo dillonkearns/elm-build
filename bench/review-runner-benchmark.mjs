@@ -18,7 +18,10 @@ const fixtureFilter = process.argv.includes("--fixture")
 const skipBundle = process.argv.includes("--skip-bundle");
 const importersCacheMode = process.argv.includes("--importers-cache-mode")
   ? process.argv[process.argv.indexOf("--importers-cache-mode") + 1]
-  : "fresh";
+  : "auto";
+const depsCacheMode = process.argv.includes("--deps-cache-mode")
+  ? process.argv[process.argv.indexOf("--deps-cache-mode") + 1]
+  : "auto";
 
 const smallFixtureFiles = [
   "Coverage.elm",
@@ -116,7 +119,7 @@ function bundleRunner() {
   );
 }
 
-function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersCacheMode }) {
+function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersCacheMode, depsCacheMode }) {
   const start = performance.now();
   const result = spawnSync(
     "node",
@@ -130,6 +133,8 @@ function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersC
       buildDir,
       "--importers-cache-mode",
       importersCacheMode,
+      "--deps-cache-mode",
+      depsCacheMode,
       "--perf-trace-json",
       tracePath,
     ],
@@ -169,6 +174,7 @@ function scenarioResult(name, runResult) {
   return {
     name,
     importers_cache_mode: importersCacheMode,
+    deps_cache_mode: depsCacheMode,
     wall_ms: Math.round(runResult.wallMs),
     internal_ms: sumStageMs(runResult.trace),
     exit_code: runResult.exitCode,
@@ -213,6 +219,7 @@ function runScenarioSequence({ fixtureName, fileNames }) {
       buildDir: workspace.buildDir,
       tracePath: path.join(workspace.root, traceName),
       importersCacheMode,
+      depsCacheMode,
     });
   }
 
@@ -263,6 +270,7 @@ function fixtureResult(name, fileNames) {
 function printFixtureSummary(result) {
   console.log(`\nFixture: ${result.fixture} (${result.file_count} files)`);
   console.log(`Importers cache mode: ${importersCacheMode}`);
+  console.log(`Deps cache mode: ${depsCacheMode}`);
   console.log("scenario                   wall(s)  internal(s)  decision");
 
   for (const scenario of result.scenarios) {
@@ -295,6 +303,7 @@ function main() {
     date: new Date().toISOString(),
     runner: path.relative(repoRoot, distRunnerPath),
     importers_cache_mode: importersCacheMode,
+    deps_cache_mode: depsCacheMode,
     fixtures: selectedFixtures.map((fixture) => fixtureResult(fixture.name, fixture.fileNames)),
   };
 

@@ -364,3 +364,205 @@ Current read:
 - It helps on import-graph changes where the narrowed importer slice is a bit wider, but it still loses on the trivial 1-file body-edit case.
 - The `auto` heuristic is directionally right and keeps the body-edit path at the fresh baseline, but on a single run it landed between `fresh` and `split` on the import-graph case, which looks like ordinary run-to-run noise rather than a clear policy win yet.
 - The next step should be to tighten the `auto` policy with a few repeated scenario-specific runs, then keep pushing toward smaller contribution boundaries inside the `ImportersOf` family rather than replaying whole project-rule cache machinery.
+
+### Scenario Bench And DependenciesOf Split Cache
+
+- I added a dedicated scenario benchmark runner in `bench/review-runner-scenario-benchmark.mjs` to isolate one warm case at a time.
+- The first version accidentally destroyed warm state by copying the build to a different path; that benchmark paid off because it exposed another path-identity dependency in the runner.
+- I then rewired the scenario runner to keep a fixed warmed workspace per mode and restore the source file between repeats instead of moving the build directory around.
+
+Isolated `small-12` `warm_import_graph_change` measurements:
+
+| Importers | Deps | Wall |
+|---|---|---:|
+| `fresh` | `auto` | `5.80s` |
+| `split` | `auto` | `5.59s` |
+| `split` | `fresh` | `5.57s` |
+| `split` | `split` | `4.32s` |
+
+- The `DependenciesOf` family turned out to be worth the same split-cache treatment as `ImportersOf`.
+- I reused the same split cache plumbing for `DependenciesOf` and added `--deps-cache-mode fresh|split|auto`.
+- On the isolated scenario, `split/split` was the first combination that clearly pushed the warm import-graph path into a new band (`4.32s`).
+
+That still did **not** immediately show up in the full sequential matrix. The trace explained why:
+
+- The isolated scenario bench seeded split caches up front.
+- The full `auto` matrix often used the fresh narrowed path first, which meant there were no split-cache artifacts available when a later wider invalidation wanted to reuse them.
+- In other words, `auto` was choosing the right reuse strategy later, but had nothing to reuse yet.
+
+I fixed that by changing the fresh narrowed project-rule path to also run through the yield/intercept path with empty preloaded caches, so it writes split-cache artifacts even when it is not reusing any.
+
+After that cache-seeding fix, the full `small-12` matrix with `auto/auto` became:
+
+| Mode | Cold | Warm | Warm 1-file body edit | Warm import-graph change |
+|---|---:|---:|---:|---:|
+| `auto/auto` before cache seeding | `95.69s` | `0.32s` | `1.52s` | `5.89s` |
+| `auto/auto` after cache seeding | `97.49s` | `0.33s` | `1.59s` | `4.44s` |
+
+Current read:
+
+- This is the first time the full sequential matrix inherited the broader split-cache win instead of only the isolated scenario benchmark.
+- The import-graph case improved by about `1.45s` on the full harness (`5.89s -> 4.44s`).
+- The 1-file body-edit case regressed slightly (`1.52s -> 1.59s`) because the fresh narrowed path now also seeds split-cache artifacts, but that overhead is much smaller than the import-graph win.
+- The next question is whether that slight body-edit regression is acceptable as-is, or whether the cache-seeding step should be made more selective.
+
+### Partial Project Bottleneck Isolation
+
+I kept pushing on the partial project-rule path, but this round turned into a measurement win more than a direct perf win.
+
+First, I tried shrinking the split-cache payload and tuning the `split`/`fresh` policy further:
+
+| Variant | Warm 1-file body edit | Warm import-graph change |
+|---|---:|---:|
+| `auto/auto` stable control | `1.64s` | `4.51s` |
+| `split/split` | `1.61s` | `4.48s` |
+
+That was basically a wash, so I added better counters inside the partial project phase:
+
+- `project.importers.eval_total_ms`
+- `project.deps.eval_total_ms`
+- `project.postprocess_ms`
+- separate `project.deps.rule_cache.load_ms` / `project.deps.warm_eval_ms` counters instead of accidentally folding them into `project.importers.*`
+
+On the restored `auto/auto` run, the important read for `warm_import_graph_change` is:
+
+| Counter | Time |
+|---|---:|
+| `project_rule_eval` | `3245ms` |
+| `project.importers.eval_total_ms` | `2174ms` |
+| `project.importers.rule_cache.load_ms` | `6ms` |
+| `project.importers.warm_eval_ms` | `33ms` |
+| `project.deps.eval_total_ms` | `1050ms` |
+| `project.deps.rule_cache.load_ms` | `6ms` |
+| `project.deps.warm_eval_ms` | `6ms` |
+| `project.postprocess_ms` | `1ms` |
+
+That changes the diagnosis a lot:
+
+- The remaining cost is **not** cache-file loading.
+- It is **not** the interpreter's warm eval loop itself.
+- It is **not** the host-side postprocess/parsing of rule output.
+- The cost is concentrated inside the *setup* of the `ImportersOf` / `DependenciesOf` partial branches before the actual warm eval call.
+
+The most likely culprit is the module payload transport/allocation path, especially constructing `moduleInputsValue modulesWithAst` with full `source` and `astJson` strings for every partial project eval.
+
+I tested one direct bypass idea: pass only `path + source` into the interpreter and leave `astJson` blank so `ReviewRunnerHelper.buildProject` falls back to `Project.addModule`.
+
+That regressed:
+
+| Variant | Warm 1-file body edit | Warm import-graph change |
+|---|---:|---:|
+| Restored control | `1.64s` | `4.51s` |
+| Source-only payload experiment | `1.60s` | `5.71s` |
+
+So I reverted that experiment. The transport boundary is still the right place to attack, but the simple "drop AST JSON and reparse from source" version is not the answer.
+
+Current read:
+
+- The best current full-matrix result is still the split-cache-enabled path around `4.5s` for `warm_import_graph_change`.
+- The next promising work is not more split-cache tuning. It is a better module payload transport that avoids rebuilding/copying large `Types.Value` trees for `{ path, source, astJson }` on every partial project-rule eval.
+- A likely next direction is a lower-level payload/reference path inside the interpreter or helper layer, rather than reparsing from source or serializing giant AST strings repeatedly.
+
+### Handle-Based Partial Module Payloads
+
+I tried the more direct "shared references" version next:
+
+- Keep the actual `{ path, source, astJson }` payloads in a host-side table.
+- Inject only `List Int` handles into the partial project-rule helper.
+- Add `ReviewRunnerHelper.moduleHandlePathMarker`, `moduleHandleSourceMarker`, and `moduleHandleAstJsonMarker`.
+- Resolve those markers through interpreter intercepts instead of constructing a giant nested `Types.Value` list of module records up front.
+
+That turned out to be the first transport-level change that actually helped.
+
+`small-12`, full matrix, `auto/auto`:
+
+| Scenario | Before handle path | After handle path |
+|---|---:|---:|
+| Cold | `100.54s` | `105.56s` |
+| Warm | `0.33s` | `0.31s` |
+| Warm 1-file body edit | `1.64s` | `1.55s` |
+| Warm 1-file comment-only | `0.55s` | `0.53s` |
+| Warm import-graph change | `4.51s` | `4.23s` |
+
+The more detailed counters for `warm_import_graph_change` also moved in the right direction:
+
+| Counter | Before | After |
+|---|---:|---:|
+| `project.importers.eval_total_ms` | `2174ms` | `2019ms` |
+| `project.deps.eval_total_ms` | `1050ms` | `1004ms` |
+| `project.importers.warm_eval_ms` | `33ms` | `26ms` |
+| `project.deps.warm_eval_ms` | `6ms` | `7ms` |
+
+So the benefit is small-but-real and lines up with the earlier diagnosis:
+
+- The win is coming from reducing the partial-branch setup/transport cost.
+- The cache load path was already cheap.
+- Replacing the full injected module-record payload with lightweight handles is measurably better than rebuilding those values each time.
+
+Current read:
+
+- This is the clearest positive result yet for the "share references instead of reallocating big payload trees" direction.
+- The next likely step is to push this same handle/reference idea deeper: avoid rebuilding handle->payload tables unnecessarily, and look for other partial-project seams where we still inject large immutable values eagerly.
+
+I tried exactly that next: build one shared handle table for the whole partial run, then derive only small subset handle lists for the importers/deps branches.
+
+That did **not** produce a clear second-step improvement over the simpler handle path. In the follow-up full-matrix run it landed back in roughly the earlier band rather than beating it, so I reverted that refinement and kept the simpler per-branch handle table.
+
+Current read:
+
+- The first handle/reference step was the real win.
+- The extra shared-table layer did not obviously help, at least in the current implementation.
+- The next promising direction is probably not "more handle table factoring", but a deeper bypass where the interpreter/helper can consume shared module payloads with fewer per-handle marker calls.
+
+I also tried collapsing the three per-handle markers (`path`, `source`, `astJson`) into a single payload marker returning the full record.
+
+That also did **not** win. In practice it landed worse than the simpler handle path, so I reverted it.
+
+Current read:
+
+- The good result is still the original handle/reference change itself.
+- Neither of the follow-up refactors on top of that handle path clearly improved things:
+  - shared handle table across the full partial run
+  - single payload marker instead of 3 marker lookups
+- That suggests the next meaningful gain probably needs a deeper interpreter/runtime seam, not another small rearrangement of the current helper-marker approach.
+
+### Array-Backed Shared Module Payloads
+
+I kept the same handle-based partial-project strategy, but changed the shared payload backing store from:
+
+- `Dict Int { path, source, astJson }`
+
+to:
+
+- `Array String` for `paths`
+- `Array String` for `sources`
+- `Array String` for `astJsons`
+
+That removes the `Dict.fromList` tree build and the per-handle record allocation from the hot setup path while keeping the same helper markers and interpreter behavior.
+
+Full `small-12` matrix, `auto/auto`:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Cold | `103.49s` | `104.53s` |
+| Warm | `0.34s` | `0.33s` |
+| Warm 1-file body edit | `1.70s` | `1.64s` |
+| Warm 1-file comment-only | `0.56s` | `0.56s` |
+| Warm import-graph change | `4.53s` | `4.48s` |
+
+Isolated `small-12` `warm_import_graph_change`, `auto/auto`, repeated on one warmed workspace:
+
+| Run | Wall |
+|---|---:|
+| 1 | `4.51s` |
+| 2 | `3.15s` |
+| 3 | `3.17s` |
+
+Read:
+
+- This looks like a small real improvement, not a breakthrough.
+- It helps the two warm partial-miss cases a bit, especially the 1-file body edit path.
+- The remaining large cost is still the setup around partial project-rule evaluation, not rule-cache I/O or the actual warm eval loop.
+- The next thing worth measuring is an even leaner shared payload path:
+  - either pre-wrapped `Types.Value` arrays so the intercepts stop allocating `Types.String`
+  - or better timing around payload setup / intercept construction so we can confirm exactly where the remaining setup cost sits.
