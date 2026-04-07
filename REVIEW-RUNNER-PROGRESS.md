@@ -1,5 +1,112 @@
 # Review Runner Progress
 
+## 2026-04-07
+
+### Implemented
+
+- Reshaped the host-side file analysis cache into explicit query-style pieces:
+  - `ParsedAst`
+  - `ModuleSummary`
+  - `BodySummary`
+  - `InputRevision`
+  - `Durability`
+- Added structured perf tracing to `ReviewRunner` via `--perf-trace-json`.
+- Recorded top-level stage timings for:
+  - `prepare_config`
+  - declaration cache load
+  - target-file resolution
+  - file reads
+  - host parse/analysis
+  - review project load
+  - rule info load
+  - module-rule eval
+  - project-rule eval
+  - declaration cache persist
+- Recorded counters for:
+  - file-analysis cache hits/misses/bytes
+  - declaration-cache bytes
+  - target file count
+  - stale file count
+  - source and AST JSON byte totals
+  - project-rule family cache hits/misses and affected-module counts
+  - memo stats when memoized project-rule evaluation is enabled
+- Added a stable benchmark harness at `bench/review-runner-benchmark.mjs`.
+  - It bundles `src/ReviewRunner.elm` once with `bundle-script`
+  - runs a fixed scenario matrix
+  - writes machine-readable results to `bench/results/review-runner-scenarios.json`
+- The benchmark harness now keeps one stable build directory per fixture and mutates/restores files in place for warm-change scenarios.
+  - I explicitly tried cloning the warmed build directory to a new temp path first
+  - that invalidated too much state and produced near-cold timings
+  - so the path-stable in-place mutation flow is now the canonical benchmark shape
+
+### Benchmarks
+
+Stable benchmark harness, `small-12` fixture, `bench/review` config:
+
+- `cold`: `89.09s`
+- `warm`: `0.33s`
+- `warm_1_file_body_edit`: `1.53s`
+- `warm_1_file_comment_only`: `0.50s`
+- `warm_import_graph_change`: `29.54s`
+
+Selected internal stage timings from the same run:
+
+- `cold`
+  - `module_rule_eval`: `34.90s`
+  - `project_rule_eval`: `56.02s`
+- `warm_1_file_body_edit`
+  - `module_rule_eval`: `0.35s`
+  - `project_rule_eval`: `0.31s`
+- `warm_import_graph_change`
+  - `module_rule_eval`: `0.28s`
+  - `project_rule_eval`: `29.09s`
+
+Selected counters from the same run:
+
+- `warm_1_file_body_edit`
+  - `analysis_cache.hits`: `11`
+  - `analysis_cache.misses`: `1`
+  - `project.importers.cache_hits`: `11`
+  - `project.importers.cache_misses`: `1`
+  - `project.deps.cache_hits`: `11`
+  - `project.deps.cache_misses`: `1`
+- `warm_import_graph_change`
+  - `analysis_cache.hits`: `11`
+  - `analysis_cache.misses`: `1`
+  - `project.importers.cache_hits`: `9`
+  - `project.importers.cache_misses`: `3`
+  - `project.importers.affected_modules`: `4`
+  - `project.deps.cache_hits`: `11`
+  - `project.deps.cache_misses`: `1`
+  - `project.deps.affected_modules`: `3`
+
+### Takeaways
+
+- The new benchmark harness is a better signal than the earlier ad hoc measurements because it distinguishes:
+  - semantic body edits
+  - comment-only edits
+  - import-graph edits
+- Comment-only edits are already in the right shape:
+  - one file misses the host analysis cache by source hash
+  - but the declaration cache still yields a `full_hit`
+  - end-to-end time stays around `0.50s`
+- Body edits are also in a much better place than the older `3s+` band on this fixture:
+  - the new harness measured `1.53s`
+  - both module-rule and project-rule phases were sub-second
+- Import-graph edits are now the clearest remaining hot path:
+  - the same harness measured `29.54s`
+  - almost all of that time was in `project_rule_eval`
+  - the trace shows that a single import change fans out into several `ImportersOf` misses and affected modules
+- That makes the next optimization target much clearer:
+  - contribution caches and/or backdated summaries for import-sensitive project-rule families
+  - not more generic helper-function memoization
+- The failed cloned-build benchmark path was still useful:
+  - it showed that some warm cache value is path-stable only when the build directory itself stays fixed
+  - so future cross-invocation cache design should assume the stable cache root is part of the performance model
+- The perf trace plus stable benchmark matrix are now in place, so future caching experiments can be evaluated against the same scenario set instead of one-off stopwatch numbers
+- The next big question is whether we can turn import-graph changes into the same “small bounded recompute” shape that body edits now have
+
+
 ## 2026-04-06
 
 ### Implemented

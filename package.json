@@ -4,6 +4,7 @@
         "elm-pages": "^3.3.4"
     },
     "scripts": {
-        "start": "bunx elm-pages run src/Build.elm"
+        "start": "bunx elm-pages run src/Build.elm",
+        "bench:review-runner": "node bench/review-runner-benchmark.mjs"
     }
 }

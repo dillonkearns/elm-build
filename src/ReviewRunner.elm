@@ -61,16 +61,46 @@ type alias Config =
     , buildDirectory : Path
     , memoizedFunctions : Set.Set String
     , memoProfile : Bool
+    , perfTraceJson : Maybe String
+    }
+
+
+type alias InputRevision =
+    { key : String
+    }
+
+
+type Durability
+    = WorkspaceDurability
+    | ReviewAppDurability
+    | DependencyDurability
+
+
+type alias ParsedAst =
+    { astJson : String
+    }
+
+
+type alias ModuleSummary =
+    { revision : InputRevision
+    , durability : Durability
+    , moduleName : String
+    , imports : List String
+    , aspectHashes : SemanticHash.FileAspectHashes
+    }
+
+
+type alias BodySummary =
+    { revision : InputRevision
+    , declarations : List DeclarationHashInfo
     }
 
 
 type alias FileAnalysis =
     { sourceHash : String
-    , astJson : String
-    , aspectHashes : SemanticHash.FileAspectHashes
-    , declarations : List DeclarationHashInfo
-    , moduleName : String
-    , imports : List String
+    , parsedAst : ParsedAst
+    , moduleSummary : ModuleSummary
+    , bodySummary : BodySummary
     }
 
 
@@ -78,6 +108,20 @@ type alias AnalyzedTargetFile =
     { path : String
     , source : String
     , analysis : FileAnalysis
+    }
+
+
+type alias AnalyzedTargetFilesResult =
+    { files : List AnalyzedTargetFile
+    , analysisHits : Int
+    , analysisMisses : Int
+    , sourceBytes : Int
+    , astJsonBytes : Int
+    , cacheEntries : Int
+    , cacheLoadBytes : Int
+    , cacheStoreBytes : Int
+    , readMs : Int
+    , analysisMs : Int
     }
 
 
@@ -104,6 +148,40 @@ type alias PerFileRuleKey =
 type alias PerFileRuleCheck =
     { path : String
     , hit : Bool
+    }
+
+
+type alias PerfStage =
+    { name : String
+    , ms : Int
+    }
+
+
+type alias RuleEvalPerf =
+    { moduleRuleEvalMs : Int
+    , projectRuleEvalMs : Int
+    , counters : Dict String Int
+    }
+
+
+type alias ReviewRunResult =
+    { output : String
+    , perf : RuleEvalPerf
+    }
+
+
+type alias PerfTrace =
+    { schemaVersion : String
+    , reviewAppHash : String
+    , cacheDecision : String
+    , counters : Dict String Int
+    , stages : List PerfStage
+    }
+
+
+type alias Timed a =
+    { value : a
+    , stage : PerfStage
     }
 
 
@@ -140,6 +218,10 @@ programConfig =
                 |> OptionsParser.with
                     (Option.flag "memo-profile"
                         |> Option.withDescription "Write per-function memo stats to memo-profile.log in the build directory"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "perf-trace-json"
+                        |> Option.withDescription "Write structured review-runner perf trace JSON to the given path"
                     )
             )
 
@@ -537,7 +619,7 @@ computeSemanticKeyFromAnalyses : List AnalyzedTargetFile -> String
 computeSemanticKeyFromAnalyses files =
     files
         |> List.sortBy .path
-        |> List.map (\file -> file.path ++ "|" ++ file.analysis.aspectHashes.fullHash)
+        |> List.map (\file -> file.path ++ "|" ++ file.analysis.moduleSummary.aspectHashes.fullHash)
         |> String.join "\n"
         |> FNV1a.hash
         |> String.fromInt
@@ -553,6 +635,29 @@ type alias DeclarationCache =
 hashSourceContents : String -> String
 hashSourceContents source =
     FNV1a.hash source |> String.fromInt
+
+
+moduleSummaryRevisionKey : String -> List String -> SemanticHash.FileAspectHashes -> String
+moduleSummaryRevisionKey moduleName imports aspectHashes =
+    [ moduleName
+    , String.join "," imports
+    , aspectHashes.fullHash
+    ]
+        |> String.join "|"
+        |> FNV1a.hash
+        |> String.fromInt
+
+
+bodySummaryRevisionKey : List DeclarationHashInfo -> String
+bodySummaryRevisionKey declarations =
+    declarations
+        |> List.map
+            (\declaration ->
+                declaration.name ++ ":" ++ declaration.semanticHash
+            )
+        |> String.join "|"
+        |> FNV1a.hash
+        |> String.fromInt
 
 
 moduleNameFromFile : Elm.Syntax.File.File -> String
@@ -852,7 +957,7 @@ checkCacheWithAnalyses cache files =
                     (\file ->
                         let
                             currentHashes =
-                                file.analysis.declarations
+                                file.analysis.bodySummary.declarations
                                     |> List.map (\decl -> ( decl.name, decl.semanticHash ))
                                     |> Dict.fromList
 
@@ -883,7 +988,7 @@ checkCacheWithAnalyses cache files =
                                             currentHashes
 
                                     currentFullHash =
-                                        file.analysis.aspectHashes.fullHash
+                                        file.analysis.moduleSummary.aspectHashes.fullHash
 
                                     cachedFullHash =
                                         Dict.get "__fileAspects__" fileCache
@@ -950,11 +1055,11 @@ updateCacheWithAnalyses previousCache files errors =
                         Dict.get file.path errorsByFile |> Maybe.withDefault []
 
                     fileCache =
-                        mapErrorsToDeclarations file.analysis.declarations fileErrors
+                        mapErrorsToDeclarations file.analysis.bodySummary.declarations fileErrors
 
                     fileCacheWithAspects =
                         Dict.insert "__fileAspects__"
-                            { semanticHash = file.analysis.aspectHashes.fullHash, errors = [] }
+                            { semanticHash = file.analysis.moduleSummary.aspectHashes.fullHash, errors = [] }
                             fileCache
                 in
                 Dict.insert file.path fileCacheWithAspects acc
@@ -1070,6 +1175,39 @@ fileAspectHashesDecoder =
         (Json.Decode.field "fullHash" Json.Decode.string)
 
 
+durabilityToString : Durability -> String
+durabilityToString durability =
+    case durability of
+        WorkspaceDurability ->
+            "workspace"
+
+        ReviewAppDurability ->
+            "review-app"
+
+        DependencyDurability ->
+            "dependency"
+
+
+durabilityDecoder : Json.Decode.Decoder Durability
+durabilityDecoder =
+    Json.Decode.string
+        |> Json.Decode.andThen
+            (\value ->
+                case value of
+                    "workspace" ->
+                        Json.Decode.succeed WorkspaceDurability
+
+                    "review-app" ->
+                        Json.Decode.succeed ReviewAppDurability
+
+                    "dependency" ->
+                        Json.Decode.succeed DependencyDurability
+
+                    _ ->
+                        Json.Decode.fail ("Unknown durability: " ++ value)
+            )
+
+
 encodeFileAnalysisCache : Dict String FileAnalysis -> String
 encodeFileAnalysisCache cache =
     cache
@@ -1079,21 +1217,35 @@ encodeFileAnalysisCache cache =
                 Json.Encode.object
                     [ ( "file", Json.Encode.string filePath )
                     , ( "sourceHash", Json.Encode.string analysis.sourceHash )
-                    , ( "astJson", Json.Encode.string analysis.astJson )
-                    , ( "aspectHashes", encodeFileAspectHashes analysis.aspectHashes )
-                    , ( "moduleName", Json.Encode.string analysis.moduleName )
-                    , ( "imports", Json.Encode.list Json.Encode.string analysis.imports )
-                    , ( "declarations"
-                      , analysis.declarations
-                            |> Json.Encode.list
-                                (\decl ->
-                                    Json.Encode.object
-                                        [ ( "name", Json.Encode.string decl.name )
-                                        , ( "semanticHash", Json.Encode.string decl.semanticHash )
-                                        , ( "startLine", Json.Encode.int decl.startLine )
-                                        , ( "endLine", Json.Encode.int decl.endLine )
-                                        ]
-                                )
+                    , ( "parsedAst"
+                      , Json.Encode.object
+                            [ ( "astJson", Json.Encode.string analysis.parsedAst.astJson ) ]
+                      )
+                    , ( "moduleSummary"
+                      , Json.Encode.object
+                            [ ( "revision", Json.Encode.object [ ( "key", Json.Encode.string analysis.moduleSummary.revision.key ) ] )
+                            , ( "durability", Json.Encode.string (durabilityToString analysis.moduleSummary.durability) )
+                            , ( "moduleName", Json.Encode.string analysis.moduleSummary.moduleName )
+                            , ( "imports", Json.Encode.list Json.Encode.string analysis.moduleSummary.imports )
+                            , ( "aspectHashes", encodeFileAspectHashes analysis.moduleSummary.aspectHashes )
+                            ]
+                      )
+                    , ( "bodySummary"
+                      , Json.Encode.object
+                            [ ( "revision", Json.Encode.object [ ( "key", Json.Encode.string analysis.bodySummary.revision.key ) ] )
+                            , ( "declarations"
+                              , analysis.bodySummary.declarations
+                                    |> Json.Encode.list
+                                        (\decl ->
+                                            Json.Encode.object
+                                                [ ( "name", Json.Encode.string decl.name )
+                                                , ( "semanticHash", Json.Encode.string decl.semanticHash )
+                                                , ( "startLine", Json.Encode.int decl.startLine )
+                                                , ( "endLine", Json.Encode.int decl.endLine )
+                                                ]
+                                        )
+                              )
+                            ]
                       )
                     ]
             )
@@ -1118,25 +1270,56 @@ decodeFileAnalysisCache json =
                 (Json.Decode.field "endLine" Json.Decode.int)
 
         analysisDecoder =
-            Json.Decode.map7
-                (\filePath sourceHash astJson aspectHashes moduleName imports declarations ->
+            Json.Decode.map4
+                (\filePath sourceHash parsedAst summaries ->
                     ( filePath
                     , { sourceHash = sourceHash
-                      , astJson = astJson
-                      , aspectHashes = aspectHashes
-                      , declarations = declarations
-                      , moduleName = moduleName
-                      , imports = imports
+                      , parsedAst = parsedAst
+                      , moduleSummary = summaries.moduleSummary
+                      , bodySummary = summaries.bodySummary
                       }
                     )
                 )
                 (Json.Decode.field "file" Json.Decode.string)
                 (Json.Decode.field "sourceHash" Json.Decode.string)
-                (Json.Decode.field "astJson" Json.Decode.string)
-                (Json.Decode.field "aspectHashes" fileAspectHashesDecoder)
-                (Json.Decode.field "moduleName" Json.Decode.string)
-                (Json.Decode.field "imports" (Json.Decode.list Json.Decode.string))
-                (Json.Decode.field "declarations" (Json.Decode.list declarationDecoder))
+                (Json.Decode.field "parsedAst"
+                    (Json.Decode.map ParsedAst (Json.Decode.field "astJson" Json.Decode.string))
+                )
+                (Json.Decode.map2
+                    (\moduleSummary bodySummary ->
+                        { moduleSummary = moduleSummary
+                        , bodySummary = bodySummary
+                        }
+                    )
+                    (Json.Decode.field "moduleSummary"
+                        (Json.Decode.map5
+                            (\revision durability moduleName imports aspectHashes ->
+                                { revision = revision
+                                , durability = durability
+                                , moduleName = moduleName
+                                , imports = imports
+                                , aspectHashes = aspectHashes
+                                }
+                            )
+                            (Json.Decode.field "revision" (Json.Decode.map InputRevision (Json.Decode.field "key" Json.Decode.string)))
+                            (Json.Decode.field "durability" durabilityDecoder)
+                            (Json.Decode.field "moduleName" Json.Decode.string)
+                            (Json.Decode.field "imports" (Json.Decode.list Json.Decode.string))
+                            (Json.Decode.field "aspectHashes" fileAspectHashesDecoder)
+                        )
+                    )
+                    (Json.Decode.field "bodySummary"
+                        (Json.Decode.map2
+                            (\revision declarations ->
+                                { revision = revision
+                                , declarations = declarations
+                                }
+                            )
+                            (Json.Decode.field "revision" (Json.Decode.map InputRevision (Json.Decode.field "key" Json.Decode.string)))
+                            (Json.Decode.field "declarations" (Json.Decode.list declarationDecoder))
+                        )
+                    )
+                )
     in
     Json.Decode.decodeString (Json.Decode.list analysisDecoder |> Json.Decode.map Dict.fromList) json
         |> Result.toMaybe
@@ -1184,6 +1367,154 @@ decodeProjectCacheMetadata json =
         )
         json
         |> Result.toMaybe
+
+
+emptyRuleEvalPerf : RuleEvalPerf
+emptyRuleEvalPerf =
+    { moduleRuleEvalMs = 0
+    , projectRuleEvalMs = 0
+    , counters = Dict.empty
+    }
+
+
+stageMs : Time.Posix -> Time.Posix -> Int
+stageMs start finish =
+    Time.posixToMillis finish - Time.posixToMillis start
+
+
+mergeCounterDicts : List (Dict String Int) -> Dict String Int
+mergeCounterDicts dicts =
+    dicts
+        |> List.foldl
+            (\dict acc ->
+                Dict.foldl
+                    (\key value innerAcc ->
+                        Dict.update key
+                            (\maybeExisting -> Just (value + Maybe.withDefault 0 maybeExisting))
+                            innerAcc
+                    )
+                    acc
+                    dict
+            )
+            Dict.empty
+
+
+withTiming : String -> BackendTask FatalError a -> BackendTask FatalError (Timed a)
+withTiming name work =
+    Do.do BackendTask.Time.now <| \start ->
+    Do.do work <| \value ->
+    Do.do BackendTask.Time.now <| \finish ->
+    BackendTask.succeed
+        { value = value
+        , stage =
+            { name = name
+            , ms = stageMs start finish
+            }
+        }
+
+
+cacheDecisionToString : CacheDecision -> String
+cacheDecisionToString decision =
+    case decision of
+        FullCacheHit _ ->
+            "full_hit"
+
+        PartialMiss _ ->
+            "partial_miss"
+
+        ColdMiss _ ->
+            "cold_miss"
+
+
+boolToInt : Bool -> Int
+boolToInt value =
+    if value then
+        1
+
+    else
+        0
+
+
+memoStatsCounters : String -> MemoRuntime.MemoStats -> Dict String Int
+memoStatsCounters prefix memoStats =
+    let
+        baseCounters =
+            Dict.fromList
+                [ (prefix ++ ".lookups", memoStats.lookups)
+                , (prefix ++ ".hits", memoStats.hits)
+                , (prefix ++ ".misses", memoStats.misses)
+                , (prefix ++ ".stores", memoStats.stores)
+                ]
+
+        topCounters =
+            MemoRuntime.topFunctionStats 5 memoStats
+                |> List.concatMap
+                    (\( qualifiedName, stats ) ->
+                        [ (prefix ++ ".byFunction." ++ qualifiedName ++ ".lookups", stats.lookups)
+                        , (prefix ++ ".byFunction." ++ qualifiedName ++ ".hits", stats.hits)
+                        , (prefix ++ ".byFunction." ++ qualifiedName ++ ".misses", stats.misses)
+                        , (prefix ++ ".byFunction." ++ qualifiedName ++ ".stores", stats.stores)
+                        ]
+                    )
+                |> Dict.fromList
+    in
+    mergeCounterDicts [ baseCounters, topCounters ]
+
+
+errorCounters : List ReviewError -> Dict String Int
+errorCounters errors =
+    Dict.fromList
+        [ ( "errors.total", List.length errors )
+        , ( "errors.files", countFiles errors )
+        ]
+
+
+reviewAppHashFromPreparedConfig : Config -> String
+reviewAppHashFromPreparedConfig config =
+    Path.toString config.buildDirectory
+        |> String.split "/review-app-"
+        |> List.reverse
+        |> List.head
+        |> Maybe.withDefault "unknown"
+
+
+perfStageEncoder : PerfStage -> Json.Encode.Value
+perfStageEncoder stage =
+    Json.Encode.object
+        [ ( "name", Json.Encode.string stage.name )
+        , ( "ms", Json.Encode.int stage.ms )
+        ]
+
+
+encodePerfTrace : PerfTrace -> String
+encodePerfTrace trace =
+    Json.Encode.object
+        [ ( "schemaVersion", Json.Encode.string trace.schemaVersion )
+        , ( "reviewAppHash", Json.Encode.string trace.reviewAppHash )
+        , ( "cacheDecision", Json.Encode.string trace.cacheDecision )
+        , ( "counters"
+          , trace.counters
+                |> Dict.toList
+                |> Json.Encode.object
+                    << List.map (\( key, value ) -> ( key, Json.Encode.int value ))
+          )
+        , ( "stages", Json.Encode.list perfStageEncoder trace.stages )
+        ]
+        |> Json.Encode.encode 2
+
+
+writePerfTrace : Maybe String -> PerfTrace -> BackendTask FatalError ()
+writePerfTrace maybePath trace =
+    case maybePath of
+        Just path ->
+            Script.writeFile
+                { path = path
+                , body = encodePerfTrace trace
+                }
+                |> BackendTask.allowFatal
+
+        Nothing ->
+            BackendTask.succeed ()
 
 
 projectCacheMetadataFor : String -> List AnalyzedTargetFile -> ProjectCacheMetadata
@@ -1259,15 +1590,37 @@ analyzeSourceFile : String -> Maybe FileAnalysis
 analyzeSourceFile source =
     case Elm.Parser.parseToFile source of
         Ok file ->
+            let
+                moduleName =
+                    moduleNameFromFile file
+
+                imports =
+                    importsFromFile file
+
+                aspectHashes =
+                    SemanticHash.computeAspectHashesFromFile file
+
+                declarations =
+                    getDeclarationHashesFromFile file
+            in
             Just
                 { sourceHash = hashSourceContents source
-                , astJson =
-                    Elm.Syntax.File.encode file
-                        |> Json.Encode.encode 0
-                , aspectHashes = SemanticHash.computeAspectHashesFromFile file
-                , declarations = getDeclarationHashesFromFile file
-                , moduleName = moduleNameFromFile file
-                , imports = importsFromFile file
+                , parsedAst =
+                    { astJson =
+                        Elm.Syntax.File.encode file
+                            |> Json.Encode.encode 0
+                    }
+                , moduleSummary =
+                    { revision = { key = moduleSummaryRevisionKey moduleName imports aspectHashes }
+                    , durability = WorkspaceDurability
+                    , moduleName = moduleName
+                    , imports = imports
+                    , aspectHashes = aspectHashes
+                    }
+                , bodySummary =
+                    { revision = { key = bodySummaryRevisionKey declarations }
+                    , declarations = declarations
+                    }
                 }
 
         Err _ ->
@@ -1283,7 +1636,7 @@ persistFileAnalysisCache path cache =
         |> BackendTask.allowFatal
 
 
-loadAnalyzedTargetFiles : Config -> List String -> BackendTask FatalError (List AnalyzedTargetFile)
+loadAnalyzedTargetFiles : Config -> List String -> BackendTask FatalError AnalyzedTargetFilesResult
 loadAnalyzedTargetFiles config files =
     let
         cachePath =
@@ -1292,16 +1645,26 @@ loadAnalyzedTargetFiles config files =
     Do.do
         (File.rawFile cachePath
             |> BackendTask.toResult
-            |> BackendTask.map
-                (\result ->
-                    result
-                        |> Result.toMaybe
-                        |> Maybe.andThen decodeFileAnalysisCache
-                        |> Maybe.withDefault Dict.empty
-                )
         )
-    <| \previousCache ->
-    Do.do (readTargetFiles files) <| \targetFileContents ->
+    <| \cacheFileResult ->
+    let
+        previousCache =
+            cacheFileResult
+                |> Result.toMaybe
+                |> Maybe.andThen decodeFileAnalysisCache
+                |> Maybe.withDefault Dict.empty
+
+        cacheLoadBytes =
+            cacheFileResult
+                |> Result.map String.length
+                |> Result.withDefault 0
+    in
+    Do.do (withTiming "read_target_files" (readTargetFiles files)) <| \readResult ->
+    let
+        targetFileContents =
+            readResult.value
+    in
+    Do.do BackendTask.Time.now <| \analysisStart ->
     let
         currentPaths =
             targetFileContents |> List.map .path |> Set.fromList
@@ -1366,16 +1729,59 @@ loadAnalyzedTargetFiles config files =
 
         cacheMissed =
             analyzedResults |> List.any .wasMiss
+
+        analysisHits =
+            analyzedResults
+                |> List.filter (.wasMiss >> not)
+                |> List.length
+
+        analysisMisses =
+            analyzedResults
+                |> List.filter .wasMiss
+                |> List.length
+
+        sourceBytes =
+            targetFileContents
+                |> List.map (.source >> String.length)
+                |> List.sum
+
+        astJsonBytes =
+            analyzedFiles
+                |> List.map (\file -> String.length file.analysis.parsedAst.astJson)
+                |> List.sum
+
+        encodedUpdatedCache =
+            if cacheMissed || cachePathsChanged then
+                encodeFileAnalysisCache updatedCache
+
+            else
+                ""
     in
+    Do.do BackendTask.Time.now <| \analysisFinish ->
     Do.do
         (if cacheMissed || cachePathsChanged then
-            persistFileAnalysisCache cachePath updatedCache
+            Script.writeFile
+                { path = cachePath
+                , body = encodedUpdatedCache
+                }
+                |> BackendTask.allowFatal
 
          else
             BackendTask.succeed ()
         )
     <| \_ ->
-    BackendTask.succeed analyzedFiles
+    BackendTask.succeed
+        { files = analyzedFiles
+        , analysisHits = analysisHits
+        , analysisMisses = analysisMisses
+        , sourceBytes = sourceBytes
+        , astJsonBytes = astJsonBytes
+        , cacheEntries = Dict.size updatedCache
+        , cacheLoadBytes = cacheLoadBytes
+        , cacheStoreBytes = String.length encodedUpdatedCache
+        , readMs = readResult.stage.ms
+        , analysisMs = stageMs analysisStart analysisFinish
+        }
 
 
 {-| Parse a source file on the HOST side and encode the AST as JSON.
@@ -1672,69 +2078,206 @@ reviewRunnerHelperSource =
 
 task : Config -> BackendTask FatalError ()
 task config =
-    Do.do (prepareConfig config) <| \preparedConfig ->
+    Do.do (withTiming "prepare_config" (prepareConfig config)) <| \preparedConfigTimed ->
     let
+        preparedConfig =
+            preparedConfigTimed.value
+
         declCachePath =
             Path.toString preparedConfig.buildDirectory ++ "/review-decl-cache.json"
+
+        reviewAppHashValue =
+            reviewAppHashFromPreparedConfig preparedConfig
     in
     -- Load previous per-declaration cache from disk
     Do.do
-        (File.rawFile declCachePath
-            |> BackendTask.toResult
-            |> BackendTask.map
-                (\result ->
-                    result
-                        |> Result.toMaybe
-                        |> Maybe.andThen decodeCacheState
-                        |> Maybe.withDefault Dict.empty
+        (withTiming "load_decl_cache"
+            (File.rawFile declCachePath
+                |> BackendTask.toResult
+                |> BackendTask.map
+                    (\result ->
+                        { cache =
+                            result
+                                |> Result.toMaybe
+                                |> Maybe.andThen decodeCacheState
+                                |> Maybe.withDefault Dict.empty
+                        , bytes =
+                            result
+                                |> Result.map String.length
+                                |> Result.withDefault 0
+                        }
+                    )
                 )
         )
-    <| \previousCache ->
-    Do.do (resolveTargetFiles preparedConfig) <| \targetFiles ->
-    Do.do (loadAnalyzedTargetFiles preparedConfig targetFiles) <| \targetFileContents ->
+    <| \declCacheTimed ->
     let
+        previousCache =
+            declCacheTimed.value.cache
+    in
+    Do.do (withTiming "resolve_target_files" (resolveTargetFiles preparedConfig)) <| \targetFilesTimed ->
+    let
+        targetFiles =
+            targetFilesTimed.value
+    in
+    Do.do (loadAnalyzedTargetFiles preparedConfig targetFiles) <| \analyzedTargetFiles ->
+    let
+        targetFileContents =
+            analyzedTargetFiles.files
+
         decision =
             checkCacheWithAnalyses previousCache targetFileContents
+
+        baseStages =
+            [ preparedConfigTimed.stage
+            , declCacheTimed.stage
+            , targetFilesTimed.stage
+            , { name = "read_target_files", ms = analyzedTargetFiles.readMs }
+            , { name = "analyze_target_files", ms = analyzedTargetFiles.analysisMs }
+            ]
+
+        baseCounters =
+            Dict.fromList
+                [ ( "target.files", List.length targetFileContents )
+                , ( "decl_cache.entries", Dict.size previousCache )
+                , ( "decl_cache.loaded_bytes", declCacheTimed.value.bytes )
+                , ( "analysis_cache.entries", analyzedTargetFiles.cacheEntries )
+                , ( "analysis_cache.loaded_bytes", analyzedTargetFiles.cacheLoadBytes )
+                , ( "analysis_cache.stored_bytes", analyzedTargetFiles.cacheStoreBytes )
+                , ( "analysis_cache.hits", analyzedTargetFiles.analysisHits )
+                , ( "analysis_cache.misses", analyzedTargetFiles.analysisMisses )
+                , ( "source.bytes", analyzedTargetFiles.sourceBytes )
+                , ( "ast_json.bytes", analyzedTargetFiles.astJsonBytes )
+                ]
+
+        finishWithTrace errors extraStages extraCounters =
+            Do.do
+                (writePerfTrace
+                    preparedConfig.perfTraceJson
+                    { schemaVersion = cacheSchemaVersion
+                    , reviewAppHash = reviewAppHashValue
+                    , cacheDecision = cacheDecisionToString decision
+                    , counters = mergeCounterDicts [ baseCounters, extraCounters, errorCounters errors ]
+                    , stages = baseStages ++ extraStages
+                    }
+                )
+            <| \_ ->
+            reportErrors errors
     in
     case decision of
         FullCacheHit errors ->
             -- All declarations cached — skip interpreter entirely
-            reportErrors errors
+            finishWithTrace
+                errors
+                []
+                (Dict.fromList
+                    [ ( "stale.files", 0 )
+                    , ( "decl_cache.stored_bytes", 0 )
+                    ]
+                )
 
         ColdMiss _ ->
             -- No cache — treat all files as stale (same code path as PartialMiss)
-            Do.do (loadReviewProject preparedConfig) <| \reviewProject ->
-            Do.do (getRuleInfoWithProject preparedConfig reviewProject) <| \ruleInfo ->
-            Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents targetFileContents []) <| \output ->
+            Do.do (withTiming "load_review_project" (loadReviewProject preparedConfig)) <| \reviewProjectTimed ->
+            let
+                reviewProject =
+                    reviewProjectTimed.value
+            in
+            Do.do (withTiming "get_rule_info" (getRuleInfoWithProject preparedConfig reviewProject)) <| \ruleInfoTimed ->
+            let
+                ruleInfo =
+                    ruleInfoTimed.value
+            in
+            Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents targetFileContents []) <| \runResult ->
             let
                 errors =
-                    parseReviewOutput output
+                    parseReviewOutput runResult.output
 
                 newCache =
                     updateCacheWithAnalyses Dict.empty targetFileContents errors
+
+                encodedDeclCache =
+                    encodeCacheState newCache
             in
-            Do.do (persistCache declCachePath newCache) <| \_ ->
-            reportErrors errors
+            Do.do
+                (withTiming "persist_decl_cache"
+                    (Script.writeFile
+                        { path = declCachePath
+                        , body = encodedDeclCache
+                        }
+                        |> BackendTask.allowFatal
+                    )
+                )
+            <| \persistDeclCacheTimed ->
+            finishWithTrace
+                errors
+                [ reviewProjectTimed.stage
+                , ruleInfoTimed.stage
+                , { name = "module_rule_eval", ms = runResult.perf.moduleRuleEvalMs }
+                , { name = "project_rule_eval", ms = runResult.perf.projectRuleEvalMs }
+                , persistDeclCacheTimed.stage
+                ]
+                (mergeCounterDicts
+                    [ runResult.perf.counters
+                    , Dict.fromList
+                        [ ( "stale.files", List.length targetFileContents )
+                        , ( "decl_cache.stored_bytes", String.length encodedDeclCache )
+                        ]
+                    ]
+                )
 
         PartialMiss { cachedErrors, staleFiles } ->
             -- Some files changed. Module rules on unchanged files use cachedErrors.
             -- Only stale files need module rule re-eval. Project rules always re-eval.
-            Do.do (loadReviewProject preparedConfig) <| \reviewProject ->
-            Do.do (getRuleInfoWithProject preparedConfig reviewProject) <| \ruleInfo ->
+            Do.do (withTiming "load_review_project" (loadReviewProject preparedConfig)) <| \reviewProjectTimed ->
             let
+                reviewProject =
+                    reviewProjectTimed.value
+            in
+            Do.do (withTiming "get_rule_info" (getRuleInfoWithProject preparedConfig reviewProject)) <| \ruleInfoTimed ->
+            let
+                ruleInfo =
+                    ruleInfoTimed.value
+
                 staleFileContents =
                     targetFileContents |> List.filter (\f -> List.member f.path staleFiles)
             in
-            Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents staleFileContents cachedErrors) <| \output ->
+            Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents staleFileContents cachedErrors) <| \runResult ->
             let
                 freshErrors =
-                    parseReviewOutput output
+                    parseReviewOutput runResult.output
 
                 newCache =
                     updateCacheWithAnalyses previousCache targetFileContents freshErrors
+
+                encodedDeclCache =
+                    encodeCacheState newCache
             in
-            Do.do (persistCache declCachePath newCache) <| \_ ->
-            reportErrors freshErrors
+            Do.do
+                (withTiming "persist_decl_cache"
+                    (Script.writeFile
+                        { path = declCachePath
+                        , body = encodedDeclCache
+                        }
+                        |> BackendTask.allowFatal
+                    )
+                )
+            <| \persistDeclCacheTimed ->
+            finishWithTrace
+                freshErrors
+                [ reviewProjectTimed.stage
+                , ruleInfoTimed.stage
+                , { name = "module_rule_eval", ms = runResult.perf.moduleRuleEvalMs }
+                , { name = "project_rule_eval", ms = runResult.perf.projectRuleEvalMs }
+                , persistDeclCacheTimed.stage
+                ]
+                (mergeCounterDicts
+                    [ runResult.perf.counters
+                    , Dict.fromList
+                        [ ( "stale.files", List.length staleFileContents )
+                        , ( "decl_cache.stored_bytes", String.length encodedDeclCache )
+                        ]
+                    ]
+                )
 
 
 prepareConfig : Config -> BackendTask FatalError Config
@@ -2016,7 +2559,7 @@ loadAndEvalHybridPartial :
     -> List AnalyzedTargetFile
     -> List AnalyzedTargetFile
     -> List ReviewError
-    -> BackendTask FatalError String
+    -> BackendTask FatalError ReviewRunResult
 loadAndEvalHybridPartial config ruleInfo allFileContents staleFileContents cachedErrors =
     Do.do (loadReviewProject config) <| \reviewProject ->
     loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContents staleFileContents cachedErrors
@@ -2029,7 +2572,7 @@ loadAndEvalHybridPartialWithProject :
     -> List AnalyzedTargetFile
     -> List AnalyzedTargetFile
     -> List ReviewError
-    -> BackendTask FatalError String
+    -> BackendTask FatalError ReviewRunResult
 loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContents staleFileContents cachedErrors =
     let
         helperHash =
@@ -2044,7 +2587,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     (\file ->
                         { path = file.path
                         , source = file.source
-                        , astJson = file.analysis.astJson
+                        , astJson = file.analysis.parsedAst.astJson
                         }
                     )
 
@@ -2054,7 +2597,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     (\file ->
                         { path = file.path
                         , source = file.source
-                        , astJson = file.analysis.astJson
+                        , astJson = file.analysis.parsedAst.astJson
                         }
                     )
 
@@ -2064,7 +2607,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             allFileContents
                 |> List.map
                     (\file ->
-                        ( file.path, file.analysis.aspectHashes )
+                        ( file.path, file.analysis.moduleSummary.aspectHashes )
                     )
                 |> Dict.fromList
 
@@ -2075,8 +2618,8 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     |> List.map
                         (\file ->
                             { filePath = file.path
-                            , moduleName = file.analysis.moduleName
-                            , imports = file.analysis.imports
+                            , moduleName = file.analysis.moduleSummary.moduleName
+                            , imports = file.analysis.moduleSummary.imports
                             }
                         )
                 )
@@ -2119,12 +2662,12 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             let
                                 fileHashes =
                                     Dict.get file.path allFileAspectHashes
-                                        |> Maybe.withDefault file.analysis.aspectHashes
+                                        |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
 
                                 moduleWithAst =
                                     { path = file.path
                                     , source = file.source
-                                    , astJson = file.analysis.astJson
+                                    , astJson = file.analysis.parsedAst.astJson
                                     }
 
                                 fileNarrowKey =
@@ -2161,407 +2704,449 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             moduleRuleMonads
                 |> Cache.sequence
                 |> Cache.andThen Cache.combine
+
+        basePerfCounters =
+            Dict.fromList
+                [ ( "rules.module.count", List.length moduleRules )
+                , ( "rules.project.count", List.length projectRules )
+                ]
     in
-    -- Step 1: Run module rules on STALE files only
-    Cache.run { jobs = Nothing } config.buildDirectory allMonads
-        |> BackendTask.andThen
-            (\cacheResult ->
-                -- Read stale module rule results
+    Do.do
+        (withTiming "module_rule_eval"
+            (Cache.run { jobs = Nothing } config.buildDirectory allMonads
+                |> BackendTask.andThen
+                    (\cacheResult ->
+                        let
+                            mrFiles =
+                                if List.isEmpty moduleRules then
+                                    []
+
+                                else
+                                    staleModulesWithAst
+                                        |> List.indexedMap
+                                            (\fileIdx _ ->
+                                                File.rawFile
+                                                    (Path.toString cacheResult.output ++ "/smr-" ++ String.fromInt fileIdx)
+                                                    |> BackendTask.allowFatal
+                                            )
+                        in
+                        mrFiles
+                            |> BackendTask.Extra.combine
+                            |> BackendTask.map
+                                (\staleOutputs ->
+                                    let
+                                        freshModuleErrors =
+                                            staleOutputs
+                                                |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                                |> String.join "\n"
+                                    in
+                                    [ cachedModuleRuleErrors, freshModuleErrors ]
+                                        |> List.filter (not << String.isEmpty)
+                                        |> String.join "\n"
+                                )
+                    )
+            )
+        )
+    <| \modulePhaseTimed ->
+    let
+        moduleRuleOutput =
+            modulePhaseTimed.value
+    in
+    Do.do
+        (withTiming "project_rule_eval"
+            (if List.isEmpty projectRules then
+                BackendTask.succeed
+                    { output = moduleRuleOutput
+                    , counters = Dict.fromList [ ( "project_rules.skipped", 1 ) ]
+                    }
+
+             else
                 let
-                    mrFiles =
-                        if List.isEmpty moduleRules then
+                    importersOfRules =
+                        projectRules
+                            |> List.filter
+                                (\rule ->
+                                    case (profileForRule rule.name).crossModuleDep of
+                                        ImportersOf ->
+                                            True
+
+                                        _ ->
+                                            False
+                                )
+
+                    dependenciesOfRules =
+                        projectRules
+                            |> List.filter
+                                (\rule ->
+                                    case (profileForRule rule.name).crossModuleDep of
+                                        DependenciesOf ->
+                                            True
+
+                                        _ ->
+                                            False
+                                )
+
+                    fullProjectRules =
+                        projectRules
+                            |> List.filter
+                                (\rule ->
+                                    case (profileForRule rule.name).crossModuleDep of
+                                        FullProject ->
+                                            True
+
+                                        _ ->
+                                            False
+                                )
+
+                    prCacheDir =
+                        Path.toString config.buildDirectory ++ "/pr-per-file"
+
+                    importersProfile =
+                        mergeProfiles ImportersOf importersOfRules
+
+                    dependenciesProfile =
+                        mergeProfiles DependenciesOf dependenciesOfRules
+
+                    importersPerFileKeys =
+                        allFileContents
+                            |> List.map
+                                (\file ->
+                                    let
+                                        fileHashes =
+                                            Dict.get file.path allFileAspectHashes
+                                                |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
+                                    in
+                                    { path = file.path
+                                    , narrowKey =
+                                        "prf-io|" ++ helperHash ++ "|"
+                                            ++ (importersOfRules |> List.map (.index >> String.fromInt) |> String.join ",")
+                                            ++ "|" ++ narrowCacheKey importersProfile file.path fileHashes allFileAspectHashes depGraph
+                                    }
+                                )
+
+                    depsPerFileKeys =
+                        allFileContents
+                            |> List.map
+                                (\file ->
+                                    let
+                                        fileHashes =
+                                            Dict.get file.path allFileAspectHashes
+                                                |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
+                                    in
+                                    { path = file.path
+                                    , narrowKey =
+                                        "prf-do|" ++ helperHash ++ "|"
+                                            ++ (dependenciesOfRules |> List.map (.index >> String.fromInt) |> String.join ",")
+                                            ++ "|" ++ narrowCacheKey dependenciesProfile file.path fileHashes allFileAspectHashes depGraph
+                                    }
+                                )
+
+                    doCacheDir =
+                        Path.toString config.buildDirectory ++ "/pr-deps-of"
+                in
+                Do.do (Script.exec "mkdir" [ "-p", prCacheDir ]) <| \_ ->
+                Do.do (Script.exec "mkdir" [ "-p", doCacheDir ]) <| \_ ->
+                Do.do
+                    (if List.isEmpty importersOfRules then
+                        BackendTask.succeed []
+
+                     else
+                        checkPerFileRuleCache prCacheDir importersPerFileKeys
+                    )
+                <| \importersChecks ->
+                Do.do
+                    (if List.isEmpty dependenciesOfRules then
+                        BackendTask.succeed []
+
+                     else
+                        checkPerFileRuleCache doCacheDir depsPerFileKeys
+                    )
+                <| \depsChecks ->
+                let
+                    ioIndices =
+                        importersOfRules |> List.map .index
+
+                    doIndices =
+                        dependenciesOfRules |> List.map .index
+
+                    importersAllHit =
+                        List.isEmpty importersOfRules || List.all .hit importersChecks
+
+                    depsAllHit =
+                        List.isEmpty dependenciesOfRules || List.all .hit depsChecks
+
+                    importersMissedPaths =
+                        importersChecks
+                            |> List.filter (not << .hit)
+                            |> List.map .path
+
+                    depsMissedPaths =
+                        depsChecks
+                            |> List.filter (not << .hit)
+                            |> List.map .path
+
+                    importersAffectedModules =
+                        let
+                            affectedEvalPaths =
+                                importersMissedPaths
+                                    |> List.foldl
+                                        (\path acc ->
+                                            Set.union acc (DepGraph.reverseDeps depGraph path)
+                                        )
+                                        Set.empty
+                        in
+                        allModulesWithAst
+                            |> List.filter (\file -> Set.member file.path affectedEvalPaths)
+
+                    depsAffectedModules =
+                        let
+                            affectedEvalPaths =
+                                depsMissedPaths
+                                    |> List.foldl
+                                        (\path acc ->
+                                            Set.union acc (DepGraph.transitiveDeps depGraph path)
+                                        )
+                                        Set.empty
+                        in
+                        allModulesWithAst
+                            |> List.filter (\file -> Set.member file.path affectedEvalPaths)
+
+                    sliceCounters =
+                        Dict.fromList
+                            [ ( "project.importers.rule_count", List.length importersOfRules )
+                            , ( "project.importers.cache_hits", importersChecks |> List.filter .hit |> List.length )
+                            , ( "project.importers.cache_misses", List.length importersMissedPaths )
+                            , ( "project.importers.affected_modules", List.length importersAffectedModules )
+                            , ( "project.deps.rule_count", List.length dependenciesOfRules )
+                            , ( "project.deps.cache_hits", depsChecks |> List.filter .hit |> List.length )
+                            , ( "project.deps.cache_misses", List.length depsMissedPaths )
+                            , ( "project.deps.affected_modules", List.length depsAffectedModules )
+                            , ( "project.full.rule_count", List.length fullProjectRules )
+                            ]
+                in
+                Do.do
+                    (readPerFileRuleOutputs
+                        prCacheDir
+                        (if importersAllHit then
+                            importersPerFileKeys |> List.map .path
+
+                         else
+                            importersChecks
+                                |> List.filter .hit
+                                |> List.map .path
+                        )
+                    )
+                <| \importersCachedOutputs ->
+                Do.do
+                    (readPerFileRuleOutputs
+                        doCacheDir
+                        (if depsAllHit then
+                            depsPerFileKeys |> List.map .path
+
+                         else
+                            depsChecks
+                                |> List.filter .hit
+                                |> List.map .path
+                        )
+                    )
+                <| \depsCachedOutputs ->
+                Do.do (BackendTask.succeed MemoRuntime.emptyMemoCache) <| \initialMemoCache ->
+                let
+                    evaluatedProjectRules =
+                        case ( importersAllHit, depsAllHit ) of
+                            ( False, False ) ->
+                                evalTwoProjectRuleSlicesWithMemo reviewProject ioIndices importersAffectedModules doIndices depsAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
+
+                            ( False, True ) ->
+                                let
+                                    ioResult =
+                                        runProjectRulesFreshWithMemo reviewProject ioIndices importersAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
+                                in
+                                { firstOutput = ioResult.output
+                                , secondOutput = ""
+                                , memoCache = ioResult.memoCache
+                                , memoStats = ioResult.memoStats
+                                }
+
+                            ( True, False ) ->
+                                let
+                                    doResult =
+                                        runProjectRulesFreshWithMemo reviewProject doIndices depsAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
+                                in
+                                { firstOutput = ""
+                                , secondOutput = doResult.output
+                                , memoCache = doResult.memoCache
+                                , memoStats = doResult.memoStats
+                                }
+
+                            ( True, True ) ->
+                                { firstOutput = ""
+                                , secondOutput = ""
+                                , memoCache = initialMemoCache
+                                , memoStats = MemoRuntime.emptyMemoStats
+                                }
+
+                    ioErrors =
+                        if importersAllHit then
                             []
 
                         else
-                            staleModulesWithAst
-                                |> List.indexedMap
-                                    (\fileIdx _ ->
-                                        File.rawFile
-                                            (Path.toString cacheResult.output ++ "/smr-" ++ String.fromInt fileIdx)
-                                            |> BackendTask.allowFatal
-                                    )
-                in
-                mrFiles
-                    |> BackendTask.Extra.combine
-                    |> BackendTask.map
-                        (\staleOutputs ->
-                            let
-                                freshModuleErrors =
-                                    staleOutputs
-                                        |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                            parseReviewOutput evaluatedProjectRules.firstOutput
+
+                    doErrors =
+                        if depsAllHit then
+                            []
+
+                        else
+                            parseReviewOutput evaluatedProjectRules.secondOutput
+
+                    freshImportersOutputs =
+                        importersMissedPaths
+                            |> List.map
+                                (\path ->
+                                    ioErrors
+                                        |> List.filter (\err -> err.filePath == path)
+                                        |> List.map formatErrorLine
                                         |> String.join "\n"
-                            in
-                            -- Combine: cached unchanged + fresh stale
-                            [ cachedModuleRuleErrors, freshModuleErrors ]
-                                |> List.filter (not << String.isEmpty)
-                                |> String.join "\n"
-                        )
-            )
-        |> BackendTask.andThen
-            (\moduleRuleOutput ->
-                -- Step 2: Project rules — split by profile into two groups:
-                -- Group A (ImportersOf): per-file narrow keys, skip if all hit
-                -- Group B (FullProject): global key, always re-eval on any change
-                if List.isEmpty projectRules then
-                    BackendTask.succeed moduleRuleOutput
+                                )
+
+                    freshDepsOutputs =
+                        depsMissedPaths
+                            |> List.map
+                                (\path ->
+                                    doErrors
+                                        |> List.filter (\err -> err.filePath == path)
+                                        |> List.map formatErrorLine
+                                        |> String.join "\n"
+                                )
+
+                    partialMemoCounters =
+                        memoStatsCounters "memo.partial_project" evaluatedProjectRules.memoStats
+                in
+                Do.do
+                    (appendMemoProfileLog
+                        config.memoProfile
+                        (Path.toString config.buildDirectory)
+                        "partial-project-slices"
+                        (MemoRuntime.entryCount evaluatedProjectRules.memoCache)
+                        evaluatedProjectRules.memoStats
+                    )
+                <| \_ ->
+                Do.do
+                    (if importersAllHit then
+                        BackendTask.succeed ()
+
+                     else
+                        writePerFileRuleOutputs prCacheDir importersPerFileKeys importersMissedPaths ioErrors
+                    )
+                <| \_ ->
+                Do.do
+                    (if depsAllHit then
+                        BackendTask.succeed ()
+
+                     else
+                        writePerFileRuleOutputs doCacheDir depsPerFileKeys depsMissedPaths doErrors
+                    )
+                <| \_ ->
+                let
+                    importersResult =
+                        importersCachedOutputs
+                            ++ freshImportersOutputs
+                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                            |> String.join "\n"
+
+                    depsOfResult =
+                        depsCachedOutputs
+                            ++ freshDepsOutputs
+                            |> List.filter (\s -> not (String.isEmpty (String.trim s)))
+                            |> String.join "\n"
+
+                    fpIndices =
+                        fullProjectRules |> List.map .index
+
+                    fullProjectProfile =
+                        mergeProfiles FullProject fullProjectRules
+
+                    fpCacheKey =
+                        "pr-fp|" ++ helperHash ++ "|" ++ (fpIndices |> List.map String.fromInt |> String.join ",") ++ "|"
+                            ++ (allFileAspectHashes
+                                    |> Dict.toList
+                                    |> List.sortBy Tuple.first
+                                    |> List.map (\( _, h ) -> narrowAspects fullProjectProfile h)
+                                    |> String.join "|"
+                                    |> FNV1a.hash
+                                    |> String.fromInt
+                               )
+
+                    fpKeyPath =
+                        Path.toString config.buildDirectory ++ "/pr-fp-cache.key"
+
+                    fpDataPath =
+                        Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
+
+                    combinedProjectOutputs =
+                        [ moduleRuleOutput, importersResult, depsOfResult ]
+                            |> List.filter (not << String.isEmpty)
+                            |> String.join "\n"
+                in
+                if List.isEmpty fullProjectRules then
+                    BackendTask.succeed
+                        { output = combinedProjectOutputs
+                        , counters = mergeCounterDicts [ sliceCounters, partialMemoCounters ]
+                        }
 
                 else
-                    let
-                        importersOfRules =
-                            projectRules
-                                |> List.filter
-                                    (\rule ->
-                                        case (profileForRule rule.name).crossModuleDep of
-                                            ImportersOf ->
-                                                True
-
-                                            _ ->
-                                                False
-                                    )
-
-                        dependenciesOfRules =
-                            projectRules
-                                |> List.filter
-                                    (\rule ->
-                                        case (profileForRule rule.name).crossModuleDep of
-                                            DependenciesOf ->
-                                                True
-
-                                            _ ->
-                                                False
-                                    )
-
-                        fullProjectRules =
-                            projectRules
-                                |> List.filter
-                                    (\rule ->
-                                        case (profileForRule rule.name).crossModuleDep of
-                                            FullProject ->
-                                                True
-
-                                            _ ->
-                                                False
-                                    )
-
-                        prCacheDir =
-                            Path.toString config.buildDirectory ++ "/pr-per-file"
-
-                        -- Combined profile for ImportersOf rules only
-                        importersProfile =
-                            mergeProfiles ImportersOf importersOfRules
-
-                        -- Combined profile for DependenciesOf rules
-                        dependenciesProfile =
-                            mergeProfiles DependenciesOf dependenciesOfRules
-
-                        -- Per-file narrow keys for ImportersOf rules
-                        importersPerFileKeys =
+                    Do.do
+                        (evalProjectRulesWithWarmState
+                            config
+                            reviewProject
+                            helperHash
+                            fpIndices
                             allFileContents
-                                |> List.map
-                                    (\file ->
-                                        let
-                                            fileHashes =
-                                                Dict.get file.path allFileAspectHashes
-                                                    |> Maybe.withDefault file.analysis.aspectHashes
-                                        in
-                                        { path = file.path
-                                        , narrowKey =
-                                            "prf-io|" ++ helperHash ++ "|"
-                                                ++ (importersOfRules |> List.map (.index >> String.fromInt) |> String.join ",")
-                                                ++ "|" ++ narrowCacheKey importersProfile file.path fileHashes allFileAspectHashes depGraph
-                                        }
-                                    )
-
-                        -- Per-file narrow keys for DependenciesOf rules
-                        depsPerFileKeys =
-                            allFileContents
-                                |> List.map
-                                    (\file ->
-                                        let
-                                            fileHashes =
-                                                Dict.get file.path allFileAspectHashes
-                                                    |> Maybe.withDefault file.analysis.aspectHashes
-                                        in
-                                        { path = file.path
-                                        , narrowKey =
-                                            "prf-do|" ++ helperHash ++ "|"
-                                                ++ (dependenciesOfRules |> List.map (.index >> String.fromInt) |> String.join ",")
-                                                ++ "|" ++ narrowCacheKey dependenciesProfile file.path fileHashes allFileAspectHashes depGraph
-                                        }
-                                    )
-                    in
-                    let
-                        doCacheDir =
-                            Path.toString config.buildDirectory ++ "/pr-deps-of"
-                    in
-                    Do.do (Script.exec "mkdir" [ "-p", prCacheDir ]) <| \_ ->
-                    Do.do (Script.exec "mkdir" [ "-p", doCacheDir ]) <| \_ ->
-                    Do.do
-                        (if List.isEmpty importersOfRules then
-                            BackendTask.succeed []
-
-                         else
-                            checkPerFileRuleCache prCacheDir importersPerFileKeys
-                        )
-                    <| \importersChecks ->
-                    Do.do
-                        (if List.isEmpty dependenciesOfRules then
-                            BackendTask.succeed []
-
-                         else
-                            checkPerFileRuleCache doCacheDir depsPerFileKeys
-                        )
-                    <| \depsChecks ->
-                    let
-                        ioIndices =
-                            importersOfRules |> List.map .index
-
-                        doIndices =
-                            dependenciesOfRules |> List.map .index
-
-                        importersAllHit =
-                            List.isEmpty importersOfRules || List.all .hit importersChecks
-
-                        depsAllHit =
-                            List.isEmpty dependenciesOfRules || List.all .hit depsChecks
-
-                        importersMissedPaths =
-                            importersChecks
-                                |> List.filter (not << .hit)
-                                |> List.map .path
-
-                        depsMissedPaths =
-                            depsChecks
-                                |> List.filter (not << .hit)
-                                |> List.map .path
-
-                        importersAffectedModules =
-                            let
-                                affectedEvalPaths =
-                                    importersMissedPaths
-                                        |> List.foldl
-                                            (\path acc ->
-                                                Set.union acc (DepGraph.reverseDeps depGraph path)
-                                            )
-                                            Set.empty
-                            in
-                            allModulesWithAst
-                                |> List.filter (\file -> Set.member file.path affectedEvalPaths)
-
-                        depsAffectedModules =
-                            let
-                                affectedEvalPaths =
-                                    depsMissedPaths
-                                        |> List.foldl
-                                            (\path acc ->
-                                                Set.union acc (DepGraph.transitiveDeps depGraph path)
-                                            )
-                                            Set.empty
-                            in
-                            allModulesWithAst
-                                |> List.filter (\file -> Set.member file.path affectedEvalPaths)
-                    in
-                    Do.do
-                        (readPerFileRuleOutputs
-                            prCacheDir
-                            (if importersAllHit then
-                                importersPerFileKeys |> List.map .path
-
-                             else
-                                importersChecks
-                                    |> List.filter .hit
-                                    |> List.map .path
+                            staleFileContents
+                            (Just
+                                { keyPath = fpKeyPath
+                                , dataPath = fpDataPath
+                                , key = fpCacheKey
+                                }
                             )
+                            evaluatedProjectRules.memoCache
                         )
-                    <| \importersCachedOutputs ->
-                    Do.do
-                        (readPerFileRuleOutputs
-                            doCacheDir
-                            (if depsAllHit then
-                                depsPerFileKeys |> List.map .path
-
-                             else
-                                depsChecks
-                                    |> List.filter .hit
-                                    |> List.map .path
-                            )
-                        )
-                    <| \depsCachedOutputs ->
-                    Do.do (BackendTask.succeed MemoRuntime.emptyMemoCache) <| \initialMemoCache ->
-                    let
-                        evaluatedProjectRules =
-                            case ( importersAllHit, depsAllHit ) of
-                                ( False, False ) ->
-                                    evalTwoProjectRuleSlicesWithMemo reviewProject ioIndices importersAffectedModules doIndices depsAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
-
-                                ( False, True ) ->
-                                    let
-                                        ioResult =
-                                            runProjectRulesFreshWithMemo reviewProject ioIndices importersAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
-                                    in
-                                    { firstOutput = ioResult.output
-                                    , secondOutput = ""
-                                    , memoCache = ioResult.memoCache
-                                    , memoStats = ioResult.memoStats
-                                    }
-
-                                ( True, False ) ->
-                                    let
-                                        doResult =
-                                            runProjectRulesFreshWithMemo reviewProject doIndices depsAffectedModules config.memoizedFunctions config.memoProfile initialMemoCache
-                                    in
-                                    { firstOutput = ""
-                                    , secondOutput = doResult.output
-                                    , memoCache = doResult.memoCache
-                                    , memoStats = doResult.memoStats
-                                    }
-
-                                ( True, True ) ->
-                                    { firstOutput = ""
-                                    , secondOutput = ""
-                                    , memoCache = initialMemoCache
-                                    , memoStats = MemoRuntime.emptyMemoStats
-                                    }
-
-                        ioErrors =
-                            if importersAllHit then
-                                []
-
-                            else
-                                parseReviewOutput evaluatedProjectRules.firstOutput
-
-                        doErrors =
-                            if depsAllHit then
-                                []
-
-                            else
-                                parseReviewOutput evaluatedProjectRules.secondOutput
-
-                        freshImportersOutputs =
-                            importersMissedPaths
-                                |> List.map
-                                    (\path ->
-                                        ioErrors
-                                            |> List.filter (\err -> err.filePath == path)
-                                            |> List.map formatErrorLine
-                                            |> String.join "\n"
-                                    )
-
-                        freshDepsOutputs =
-                            depsMissedPaths
-                                |> List.map
-                                    (\path ->
-                                        doErrors
-                                            |> List.filter (\err -> err.filePath == path)
-                                            |> List.map formatErrorLine
-                                            |> String.join "\n"
-                                    )
-                    in
-                    Do.do
-                        (appendMemoProfileLog
-                            config.memoProfile
-                            (Path.toString config.buildDirectory)
-                            "partial-project-slices"
-                            (MemoRuntime.entryCount evaluatedProjectRules.memoCache)
-                            evaluatedProjectRules.memoStats
-                        )
-                    <| \_ ->
-                    Do.do
-                        (if importersAllHit then
-                            BackendTask.succeed ()
-
-                         else
-                            writePerFileRuleOutputs prCacheDir importersPerFileKeys importersMissedPaths ioErrors
-                        )
-                    <| \_ ->
-                    Do.do
-                        (if depsAllHit then
-                            BackendTask.succeed ()
-
-                         else
-                            writePerFileRuleOutputs doCacheDir depsPerFileKeys depsMissedPaths doErrors
-                        )
-                    <| \_ ->
-                    let
-                        importersResult =
-                            { allHit = importersAllHit
-                            , fpIncluded = False
-                            , outputs =
-                                importersCachedOutputs
-                                    ++ freshImportersOutputs
-                                    |> List.filter (\s -> not (String.isEmpty (String.trim s)))
-                                    |> String.join "\n"
-                            }
-
-                        depsOfResult =
-                            { allHit = depsAllHit
-                            , fpIncluded = False
-                            , outputs =
-                                depsCachedOutputs
-                                    ++ freshDepsOutputs
-                                    |> List.filter (\s -> not (String.isEmpty (String.trim s)))
-                                    |> String.join "\n"
-                            }
-                    in
-                    -- Handle DependenciesOf + FullProject rules together.
-                    -- When DependenciesOf missed, we already ran its eval above.
-                    -- Now check FullProject separately.
-                    let
-                        fpIndices =
-                            fullProjectRules |> List.map .index
-
-                        fullProjectProfile =
-                            mergeProfiles FullProject fullProjectRules
-
-                        fpCacheKey =
-                            "pr-fp|" ++ helperHash ++ "|" ++ (fpIndices |> List.map String.fromInt |> String.join ",") ++ "|"
-                                ++ (allFileAspectHashes
-                                        |> Dict.toList
-                                        |> List.sortBy Tuple.first
-                                        |> List.map (\( _, h ) -> narrowAspects fullProjectProfile h)
-                                        |> String.join "|"
-                                        |> FNV1a.hash
-                                        |> String.fromInt
-                                   )
-
-                        fpKeyPath =
-                            Path.toString config.buildDirectory ++ "/pr-fp-cache.key"
-
-                        fpDataPath =
-                            Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
-
-                        combinedProjectOutputs =
-                            [ moduleRuleOutput, importersResult.outputs, depsOfResult.outputs ]
-                                |> List.filter (not << String.isEmpty)
-                                |> String.join "\n"
-                    in
-                    if List.isEmpty fullProjectRules || depsOfResult.fpIncluded then
-                        BackendTask.succeed combinedProjectOutputs
-
-                    else
-                        Do.do
-                            (evalProjectRulesWithWarmState
-                                config
-                                reviewProject
-                                helperHash
-                                fpIndices
-                                allFileContents
-                                staleFileContents
-                                (Just
-                                    { keyPath = fpKeyPath
-                                    , dataPath = fpDataPath
-                                    , key = fpCacheKey
-                                    }
-                                )
-                                evaluatedProjectRules.memoCache
-                            )
-                        <| \fpResult ->
-                        BackendTask.succeed
+                    <| \fpResult ->
+                    BackendTask.succeed
+                        { output =
                             ([ combinedProjectOutputs, fpResult.output ]
                                 |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
                                 |> String.join "\n"
                             )
+                        , counters =
+                            mergeCounterDicts
+                                [ sliceCounters
+                                , partialMemoCounters
+                                , memoStatsCounters "memo.full_project" fpResult.memoStats
+                                , Dict.fromList
+                                    [ ( "project.full.used_cached_project", boolToInt fpResult.usedCachedProject )
+                                    ]
+                                ]
+                        }
             )
+        )
+    <| \projectPhaseTimed ->
+    BackendTask.succeed
+        { output = projectPhaseTimed.value.output
+        , perf =
+            { moduleRuleEvalMs = modulePhaseTimed.stage.ms
+            , projectRuleEvalMs = projectPhaseTimed.stage.ms
+            , counters =
+                mergeCounterDicts
+                    [ basePerfCounters
+                    , Dict.fromList
+                        [ ( "module_rules.stale_modules", List.length staleModulesWithAst )
+                        ]
+                    , projectPhaseTimed.value.counters
+                    ]
+            }
+        }
 
 
 {-| Full hybrid evaluation (ColdMiss path). Uses Cache.compute for all rules.
@@ -3609,6 +4194,8 @@ evalProjectRulesWithWarmState :
         BackendTask FatalError
             { output : String
             , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            , usedCachedProject : Bool
             }
 evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileContents staleFileContents maybeOutputCache memoCache =
     let
@@ -3624,7 +4211,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     (\file ->
                         { path = file.path
                         , source = file.source
-                        , astJson = file.analysis.astJson
+                        , astJson = file.analysis.parsedAst.astJson
                         }
                     )
 
@@ -3634,7 +4221,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     (\file ->
                         { path = file.path
                         , source = file.source
-                        , astJson = file.analysis.astJson
+                        , astJson = file.analysis.parsedAst.astJson
                         }
                     )
 
@@ -3675,6 +4262,14 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
 
         fallbackOutput =
             runProjectRulesFresh reviewProject prIndices allModulesWithAst
+
+        usedCachedProject =
+            case maybeCachedProject of
+                Just _ ->
+                    True
+
+                Nothing ->
+                    False
     in
     if Set.isEmpty config.memoizedFunctions then
         Do.do
@@ -3694,6 +4289,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , usedCachedProject = usedCachedProject
                     }
 
             Ok (Types.String output) ->
@@ -3701,6 +4298,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , usedCachedProject = usedCachedProject
                     }
 
             Ok _ ->
@@ -3708,6 +4307,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , usedCachedProject = usedCachedProject
                     }
 
             Err _ ->
@@ -3715,6 +4316,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , usedCachedProject = usedCachedProject
                     }
 
     else
@@ -3739,6 +4342,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 BackendTask.succeed
                     { output = output
                     , memoCache = result.memoCache
+                    , memoStats = result.memoStats
+                    , usedCachedProject = usedCachedProject
                     }
 
             Ok (Types.String output) ->
@@ -3747,6 +4352,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 BackendTask.succeed
                     { output = output
                     , memoCache = result.memoCache
+                    , memoStats = result.memoStats
+                    , usedCachedProject = usedCachedProject
                     }
 
             Ok _ ->
@@ -3754,6 +4361,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , usedCachedProject = usedCachedProject
                     }
 
             Err _ ->
@@ -3761,6 +4370,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , usedCachedProject = usedCachedProject
                     }
 
 
