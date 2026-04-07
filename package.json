@@ -5,6 +5,7 @@
     },
     "scripts": {
         "start": "bunx elm-pages run src/Build.elm",
-        "bench:review-runner": "node bench/review-runner-benchmark.mjs"
+        "bench:review-runner": "node bench/review-runner-benchmark.mjs",
+        "bench:review-cli": "node bench/elm-review-cli-benchmark.mjs"
     }
 }

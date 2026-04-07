@@ -602,3 +602,73 @@ Current read:
 - This upstream BST change looks like a real keeper.
 - The effect is broad rather than specialized: it helps cold, warm no-change, body-edit, and import-graph paths all at once.
 - It is still a modest constant-factor win, not a new architecture-level breakthrough, but it is exactly the kind of low-risk improvement we should probably keep stacking.
+
+### elm-review CLI Baseline
+
+I also checked in a permanent apples-to-apples CLI harness at `bench/elm-review-cli-benchmark.mjs`.
+
+On the same `small-12` fixture and scenario matrix, the stock `elm-review` CLI (`2.13.5`) measured:
+
+| Scenario | elm-review CLI |
+|---|---:|
+| Cold | `2.65s` |
+| Warm | `0.72s` |
+| Warm 1-file body edit | `0.74s` |
+| Warm 1-file comment-only | `0.85s` |
+| Warm import-graph change | `0.76s` |
+
+That makes the current competitive position much clearer:
+
+| Scenario | This runner | elm-review CLI |
+|---|---:|---:|
+| Warm | `0.32s` | `0.72s` |
+| Warm 1-file body edit | `1.54s` | `0.74s` |
+| Warm import-graph change | `4.30s` | `0.76s` |
+
+So the current state is:
+
+- We already beat the CLI on full-hit warm runs.
+- We are still behind on the most important partial-miss paths, especially import-graph changes.
+
+The CLI's own `--benchmark-info` output is also a useful calibration point on this same fixture:
+
+- warm no-change:
+  - `parse/fetch parsed files`: `28.404ms`
+  - `run-review`: `216.708ms`
+  - `process-errors`: `112.906ms`
+  - `review`: `330.421ms`
+- warm body edit:
+  - `parse/fetch parsed files`: `55.303ms`
+  - `run-review`: `221.213ms`
+  - `process-errors`: `111.091ms`
+  - `review`: `333.413ms`
+- warm import-graph change:
+  - `parse/fetch parsed files`: `75.390ms`
+  - `run-review`: `192.167ms`
+  - `process-errors`: `128.582ms`
+  - `review`: `321.524ms`
+
+Against that, our own perf trace says the remaining big costs are not cache file I/O and not the final warm eval loop itself:
+
+- warm body edit:
+  - `load_review_project`: `239ms`
+  - `get_rule_info`: `62ms`
+  - `module_rule_eval`: `258ms`
+  - `project_rule_eval`: `337ms`
+- warm import-graph change:
+  - `load_review_project`: `242ms`
+  - `get_rule_info`: `61ms`
+  - `module_rule_eval`: `268ms`
+  - `project_rule_eval`: `3101ms`
+  - within that, `project.importers.rule_cache.load_ms = 5ms`, `project.importers.warm_eval_ms = 26ms`, `project.importers.eval_total_ms = 2061ms`
+  - and `project.deps.rule_cache.load_ms = 4ms`, `project.deps.warm_eval_ms = 6ms`, `project.deps.eval_total_ms = 1016ms`
+
+Current read:
+
+- Generic helper-function memoization is not the main bottleneck.
+- Disk cache load/store is not the main bottleneck.
+- The biggest remaining cost is setup/allocation/transport around partial project-rule execution, plus the fixed review-project/rule-info reload on partial misses.
+- The best next architectural opportunities are:
+  - disk-backed reuse of the loaded review app / interpreter project / rule info on partial misses
+  - true direct contribution caching and folding for `ImportersOf` / `DependenciesOf`, so we stop re-entering full `Rule.review` setup for unchanged modules
+  - continuing to replace large immutable payload reconstruction with shared handles or prebuilt values where the trace shows setup cost
