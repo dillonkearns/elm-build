@@ -7,6 +7,7 @@ module DepGraph exposing
     , buildGraphFromModuleData
     , transitiveDeps
     , reverseDeps
+    , directReverseDeps
     , moduleNameToFilePath
     , sourcesTestedBy
     )
@@ -238,6 +239,22 @@ reverseDeps ((Graph { deps }) as graph) targetFile =
         |> List.filter
             (\file ->
                 Set.member targetFile (transitiveDeps graph file)
+            )
+        |> Set.fromList
+        |> Set.insert targetFile
+
+
+directReverseDeps : Graph -> String -> Set String
+directReverseDeps (Graph { deps }) targetFile =
+    deps
+        |> Dict.toList
+        |> List.filterMap
+            (\( file, directDeps ) ->
+                if Set.member targetFile directDeps then
+                    Just file
+
+                else
+                    Nothing
             )
         |> Set.fromList
         |> Set.insert targetFile

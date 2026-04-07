@@ -105,6 +105,40 @@ Selected counters from the same run:
   - so future cross-invocation cache design should assume the stable cache root is part of the performance model
 - The perf trace plus stable benchmark matrix are now in place, so future caching experiments can be evaluated against the same scenario set instead of one-off stopwatch numbers
 - The next big question is whether we can turn import-graph changes into the same “small bounded recompute” shape that body edits now have
+- I tested one transport-bypass idea in this same phase as well:
+  - project-rule module slices are now injected into the interpreter as `Types.Value` lists instead of always being embedded inline as huge expression literals
+  - on its own, that did not produce a clear win on the `small-12` matrix
+  - so expression transport is still worth keeping an eye on, but it was not the dominant wall in the bad import-graph case
+- The much more important fix was changing `ImportersOf` invalidation from transitive reverse dependencies to direct reverse dependencies.
+  - The previous logic treated any module that transitively depended on a file as an importer, which was too broad for rules like `NoUnused.Exports`.
+  - On the `small-12` fixture, changing `MathLib` to import `ProjectSources` previously made `Path` miss and pulled `ReviewRunner.elm` into the `ImportersOf` reevaluation slice through transitive reverse deps.
+  - With direct reverse deps instead, the import-change warm path improved from `29.54s` to `6.47s`.
+  - `project_rule_eval` on that scenario dropped from about `28.33s` to `5.13s`.
+  - `project.importers.cache_misses` dropped from `3` to `2`.
+  - `project.importers.affected_modules` dropped from `4` to `2`.
+- I also spot-checked correctness for this change:
+  - the `warm_import_graph_change` scenario after the direct-importer change reported `361` errors
+  - a separate fresh cold run on the same mutated fixture also reported `361` errors
+  - so the narrower invalidation matched the cold result on that scenario
+
+
+## 2026-04-08
+
+### Benchmarks
+
+After switching `ImportersOf` invalidation to direct reverse dependencies:
+
+- `cold`: `97.20s`
+- `warm`: `0.38s`
+- `warm_1_file_body_edit`: `1.63s`
+- `warm_1_file_comment_only`: `0.53s`
+- `warm_import_graph_change`: `6.47s`
+
+Most important stage delta on the same `small-12` fixture:
+
+- `warm_import_graph_change`
+  - before: `project_rule_eval 28.33s`
+  - after: `project_rule_eval 5.13s`
 
 
 ## 2026-04-06

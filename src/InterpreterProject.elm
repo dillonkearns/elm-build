@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -1227,6 +1227,69 @@ prepareAndEvalWithMemoizedFunctions (InterpreterProject project) { imports, expr
                             beforeWrapper ++ sourceOverrides ++ wrapper
                     in
                     Eval.Module.evalWithMemoizedFunctions project.packageEnv allSources memoizedFunctions memoCache collectMemoStats (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+
+prepareAndEvalWithValuesAndMemoizedFunctions :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , injectedValues : FastDict.Dict String Types.Value
+        , memoizedFunctions : Set String
+        , memoCache : MemoRuntime.MemoCache
+        , collectMemoStats : Bool
+        }
+    ->
+        Result String
+            { value : Types.Value
+            , memoCache : MemoRuntime.MemoCache
+            , memoStats : MemoRuntime.MemoStats
+            }
+prepareAndEvalWithValuesAndMemoizedFunctions (InterpreterProject project) { imports, expression, sourceOverrides, injectedValues, memoizedFunctions, memoCache, collectMemoStats } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        parsedNewModules =
+            (sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parsedNewModules of
+        Err err ->
+            Err (formatError err)
+
+        Ok newFiles ->
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    Eval.Module.evalWithEnvFromFilesAndValuesAndMemo baseEnv newFiles injectedValues memoizedFunctions memoCache collectMemoStats (FunctionOrValue [] "results")
+                        |> Result.mapError formatError
+
+                Nothing ->
+                    let
+                        { userSources } =
+                            prepareEvalSources (InterpreterProject project) { imports = imports, expression = expression }
+
+                        allSources =
+                            let
+                                len =
+                                    List.length userSources
+
+                                beforeWrapper =
+                                    List.take (len - 1) userSources
+
+                                wrapper =
+                                    List.drop (len - 1) userSources
+                            in
+                            beforeWrapper ++ sourceOverrides ++ wrapper
+                    in
+                    Eval.Module.evalWithValuesAndMemoizedFunctions project.packageEnv allSources injectedValues memoizedFunctions memoCache collectMemoStats (FunctionOrValue [] "results")
                         |> Result.mapError formatError
 
 
