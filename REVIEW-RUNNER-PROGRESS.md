@@ -672,3 +672,93 @@ Current read:
   - disk-backed reuse of the loaded review app / interpreter project / rule info on partial misses
   - true direct contribution caching and folding for `ImportersOf` / `DependenciesOf`, so we stop re-entering full `Rule.review` setup for unchanged modules
   - continuing to replace large immutable payload reconstruction with shared handles or prebuilt values where the trace shows setup cost
+
+### ruleInfo Cache And Review-App Load Breakdown
+
+I added a disk-backed `ruleInfo` cache scoped under the hashed review-app build directory, plus internal `load_review_project.*` counters from `InterpreterProject.loadWithProfile`.
+
+The direct, durable win is that `get_rule_info` on warm partial misses is now basically gone:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Warm 1-file body edit | `62ms` | `1-2ms` |
+| Warm import-graph change | `61ms` | `1-2ms` |
+
+The first full-matrix run after that cache landed measured:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Cold | `102.13s` | `100.55s` |
+| Warm | `0.32s` | `0.30s` |
+| Warm 1-file body edit | `1.54s` | `1.48s` |
+| Warm 1-file comment-only | `0.52s` | `0.53s` |
+| Warm import-graph change | `4.30s` | `4.22s` |
+
+A repeated full-matrix run after adding the finer parse-vs-build counters was noisier (`1.54s` body edit, `4.44s` import-graph), so the main signal from this round should be taken from the internal timings rather than one wall-clock sample.
+
+The important new diagnosis is inside `load_review_project` itself. On the current warm partial-miss runs:
+
+- warm 1-file body edit:
+  - `load_review_project`: `249ms`
+  - `load_review_project.build_graph_ms`: `42ms`
+  - `load_review_project.parse_package_sources_ms`: `165ms`
+  - `load_review_project.build_package_env_from_parsed_ms`: `12ms`
+  - `load_review_project.build_package_env_ms`: `177ms`
+  - `load_review_project.cache_inputs_ms`: `6ms`
+- warm import-graph change:
+  - `load_review_project`: `267ms`
+  - `load_review_project.build_graph_ms`: `42ms`
+  - `load_review_project.parse_package_sources_ms`: `183ms`
+  - `load_review_project.build_package_env_from_parsed_ms`: `13ms`
+  - `load_review_project.build_package_env_ms`: `196ms`
+  - `load_review_project.cache_inputs_ms`: `6ms`
+
+Current read:
+
+- The fixed partial-miss tax from `get_rule_info` is solved well enough.
+- The fixed partial-miss tax from `load_review_project` is now clearly dominated by package-source parsing, not by source-directory resolution, file reads, or the env fold from parsed modules.
+- That means the next best review-app-side cache is probably **not** a full serialized env snapshot as the first step.
+- The cleaner next target is a disk-backed parsed-package-source cache (or equivalent pre-parsed review-app package snapshot), because that attacks the `~165-183ms` wall directly while leaving the cheap `buildProjectEnvFromParsed` step intact.
+
+### Parsed Package Cache: Binary Experiment And Blocker
+
+I tried the obvious next step: persist parsed review-app package sources and reload them instead of reparsing on every warm partial miss.
+
+There were two iterations:
+
+1. a text/blob transport based on decimal `intList` strings
+2. a Lamdera-wire binary blob written through `custom-backend-task.js` and read back with `BackendTask.File.binaryFile`
+
+The text form was clearly wrong for performance. Decode alone was slower than reparsing, and it never hit reliably.
+
+The binary form gave a much better answer:
+
+- `load_parsed_package_cache_ms` dropped to about `2ms`
+- `decode_parsed_package_cache_ms` dropped to about `2ms`
+- so the file I/O and binary transport were no longer the problem
+
+But the crucial new counter was:
+
+- `load_review_project.parsed_package_cache_roundtrip_ok = 0`
+
+That counter validates the cache **in memory before writing it to disk**, and it still failed. So the blocker is not the filesystem path and not the binary transport. The blocker is that this `AstWireCodec` roundtrip does not currently work for the review-app package source set.
+
+There was a second important finding too: encoding the full parsed package blob on the hot path is itself expensive enough to matter. Leaving that work enabled unconditionally pushed the runner well off baseline. I backed the hot path out again so the current runner stays fast.
+
+Restored `small-12` matrix after taking the package-cache experiment back out of the normal runner path:
+
+| Scenario | Time |
+|---|---:|
+| Cold | `106.94s` |
+| Warm | `0.34s` |
+| Warm 1-file body edit | `1.54s` |
+| Warm 1-file comment-only | `0.59s` |
+| Warm import-graph change | `4.40s` |
+
+Current read:
+
+- A parsed-package-source cache is still conceptually promising.
+- The transport problem is basically solved by the binary approach.
+- The real blocker is AST roundtrip correctness for review-app package sources.
+- The next useful step is **not** more transport tuning. It is a focused validator to identify which package modules fail `AstWireCodec` roundtrip and why.
+- If that turns out to be too broad a codec project, the next alternative is caching a later boundary than raw parsed files, such as a smaller package-env artifact that avoids reparsing without requiring full AST roundtrip fidelity.

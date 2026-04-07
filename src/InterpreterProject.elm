@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, load, loadWith, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, LoadProfile, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -8,29 +8,36 @@ Mirrors `ElmProject` structurally but replaces `elm make` + `node` with
 -}
 
 import BackendTask exposing (BackendTask)
+import BackendTask.Custom
 import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
 import BackendTask.Time
+import AstWireCodec
+import Bytes
 import Cache exposing (FileOrDirectory)
+import Coverage
 import DepGraph
 import Dict exposing (Dict)
-import FastDict
-import Coverage
+import Elm.Interface exposing (Exposed)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.File exposing (File)
+import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
-import MemoRuntime
-import SemanticHash
 import Eval.Module
+import FastDict
 import FatalError exposing (FatalError)
 import Json.Decode as Decode
+import Json.Encode
+import Lamdera.Wire3
+import MemoRuntime
 import Path exposing (Path)
 import ProjectSources
+import SemanticHash
 import Set exposing (Set)
 import Time
 import Types
@@ -41,6 +48,107 @@ type alias ModuleGraph =
     , moduleToFile : Dict String File
     , imports : Dict String (Set String)
     }
+
+
+type alias ParsedProjectSource =
+    { file : File
+    , moduleName : ModuleName
+    , interface : List Exposed
+    }
+
+
+type alias LoadProfile =
+    { resolveSourceDirectoriesMs : Int
+    , loadPackageSourcesMs : Int
+    , parsedPackageCacheHit : Int
+    , parsedPackageCacheRoundtripOk : Int
+    , parsedPackageCacheBytes : Int
+    , loadParsedPackageCacheMs : Int
+    , decodeParsedPackageCacheMs : Int
+    , validateParsedPackageCacheMs : Int
+    , writeParsedPackageCacheMs : Int
+    , globUserSourcesMs : Int
+    , readUserSourcesMs : Int
+    , readExtraSourcesMs : Int
+    , buildGraphMs : Int
+    , parsePackageSourcesMs : Int
+    , buildPackageEnvFromParsedMs : Int
+    , buildPackageEnvMs : Int
+    , buildBaseUserEnvMs : Int
+    , buildSemanticIndexMs : Int
+    , cacheInputsMs : Int
+    }
+
+
+type alias Timed a =
+    { value : a
+    , ms : Int
+    }
+
+
+stageMs : Time.Posix -> Time.Posix -> Int
+stageMs start finish =
+    Time.posixToMillis finish - Time.posixToMillis start
+
+
+withTiming : BackendTask FatalError a -> BackendTask FatalError (Timed a)
+withTiming work =
+    Do.do BackendTask.Time.now <| \start ->
+    Do.do work <| \value ->
+    Do.do BackendTask.Time.now <| \finish ->
+    BackendTask.succeed
+        { value = value
+        , ms = stageMs start finish
+        }
+
+
+parsedPackageCacheVersion : String
+parsedPackageCacheVersion =
+    "v3"
+
+
+parsedPackageCacheBlobPath : String -> String
+parsedPackageCacheBlobPath cacheDir =
+    cacheDir ++ "/parsed-package-sources-" ++ parsedPackageCacheVersion ++ ".blob"
+
+
+encodeParsedPackageSourcesCache : List ParsedProjectSource -> Bytes.Bytes
+encodeParsedPackageSourcesCache parsedSources =
+    parsedSources
+        |> List.map .file
+        |> Lamdera.Wire3.encodeList AstWireCodec.encodeFile
+        |> Lamdera.Wire3.bytesEncode
+
+
+parsedProjectSourceFromFile : File -> ParsedProjectSource
+parsedProjectSourceFromFile file =
+    { file = file
+    , moduleName = Eval.Module.fileModuleName file
+    , interface = Eval.Module.buildInterfaceFromFile file
+    }
+
+
+decodeParsedPackageSourcesCache : Bytes.Bytes -> Maybe (List ParsedProjectSource)
+decodeParsedPackageSourcesCache bytes =
+    bytes
+        |> Lamdera.Wire3.bytesDecode (Lamdera.Wire3.decodeList AstWireCodec.decodeFile)
+        |> Maybe.map (List.map parsedProjectSourceFromFile)
+
+
+writeBinaryFile : { path : String, bytes : Bytes.Bytes } -> BackendTask FatalError ()
+writeBinaryFile { path, bytes } =
+    BackendTask.Custom.run "writeBinaryFile"
+        (Json.Encode.object
+            [ ( "path", Json.Encode.string path )
+            , ( "bytes"
+              , bytes
+                    |> Lamdera.Wire3.intListFromBytes
+                    |> Json.Encode.list Json.Encode.int
+              )
+            ]
+        )
+        (Decode.succeed ())
+        |> BackendTask.allowFatal
 
 
 type InterpreterProject
@@ -95,226 +203,460 @@ loadWith :
     }
     -> BackendTask FatalError InterpreterProject
 loadWith config =
-    -- Resolve source directories from config or elm.json
-    (case config.sourceDirectories of
-        Just dirs ->
-            BackendTask.succeed dirs
+    loadWithProfile
+        { projectDir = config.projectDir
+        , skipPackages = config.skipPackages
+        , patchSource = config.patchSource
+        , extraSourceFiles = config.extraSourceFiles
+        , sourceDirectories = config.sourceDirectories
+        , packageParseCacheDir = Nothing
+        }
+        |> BackendTask.map .project
 
-        Nothing ->
-            readSourceDirectories config.projectDir
-    )
-        |> BackendTask.andThen
-            (\sourceDirectories ->
-                -- Load and patch package sources
-                ProjectSources.loadPackageDepsCached
-                    { projectDir = config.projectDir
-                    , skipPackages = config.skipPackages
-                    }
-                    |> BackendTask.andThen
-                        (\packageSources ->
-                            let
-                                patchedPackageSources : List String
-                                patchedPackageSources =
-                                    List.map config.patchSource packageSources
 
-                                -- Derive user source globs from source directories
-                                userSourceGlobs : List String
-                                userSourceGlobs =
-                                    sourceDirectories
-                                        |> List.map (\dir -> dir ++ "/**/*.elm")
-                            in
-                            -- Glob all user source globs for .elm files
-                            userSourceGlobs
-                                |> List.map
-                                    (\globPattern ->
-                                        Glob.fromStringWithOptions
-                                            (let
-                                                o : Glob.Options
-                                                o =
-                                                    Glob.defaultOptions
-                                             in
-                                             { o | include = Glob.OnlyFiles }
-                                            )
-                                            globPattern
-                                    )
-                                |> BackendTask.Extra.combine
-                                |> BackendTask.map (List.concat >> List.sort)
-                                |> BackendTask.andThen
-                                    (\elmFiles ->
-                                        -- Read each user source file's content
-                                        elmFiles
-                                            |> List.map
-                                                (\filePath ->
-                                                    File.rawFile filePath
-                                                        |> BackendTask.allowFatal
-                                                        |> BackendTask.map (\content -> ( filePath, content ))
-                                                )
-                                            |> BackendTask.Extra.combine
-                                            |> BackendTask.andThen
-                                                (\userFileContents ->
-                                                    -- Read extra source files
-                                                    config.extraSourceFiles
-                                                        |> List.map
-                                                            (\filePath ->
-                                                                File.rawFile filePath
-                                                                    |> BackendTask.allowFatal
-                                                                    |> BackendTask.map (\content -> ( filePath, content ))
-                                                            )
-                                                        |> BackendTask.Extra.combine
-                                                        |> BackendTask.andThen
-                                                            (\extraFileContents ->
-                                                                let
-                                                                    depGraph : DepGraph.Graph
-                                                                    depGraph =
-                                                                        DepGraph.buildGraph
-                                                                            { sourceDirectories = sourceDirectories
-                                                                            , files =
-                                                                                userFileContents
-                                                                                    |> List.map
-                                                                                        (\( filePath, content ) ->
-                                                                                            { filePath = filePath
-                                                                                            , content = content
-                                                                                            }
-                                                                                        )
-                                                                            }
+loadWithProfile :
+    { projectDir : Path
+    , skipPackages : Set String
+    , patchSource : String -> String
+    , extraSourceFiles : List String
+    , sourceDirectories : Maybe (List String)
+    , packageParseCacheDir : Maybe String
+    }
+    -> BackendTask FatalError { project : InterpreterProject, profile : LoadProfile }
+loadWithProfile config =
+    Do.do
+        (withTiming
+            (case config.sourceDirectories of
+                Just dirs ->
+                    BackendTask.succeed dirs
 
-                                                                    allUserPaths : List Path
-                                                                    allUserPaths =
-                                                                        elmFiles
-                                                                            |> List.map Path.path
-
-                                                                    allSourceStrings : List String
-                                                                    allSourceStrings =
-                                                                        patchedPackageSources
-                                                                            ++ List.map Tuple.second extraFileContents
-                                                                            ++ List.map Tuple.second userFileContents
-
-                                                                    allModules : List ( String, String )
-                                                                    allModules =
-                                                                        List.filterMap
-                                                                            (\src ->
-                                                                                DepGraph.parseModuleName src
-                                                                                    |> Maybe.map (\name -> ( name, src ))
-                                                                            )
-                                                                            allSourceStrings
-
-                                                                    -- Pre-parse user source files for reuse across evaluations
-                                                                    userParsedFiles : Dict String File
-                                                                    userParsedFiles =
-                                                                        userFileContents
-                                                                            |> List.filterMap
-                                                                                (\( _, content ) ->
-                                                                                    case Elm.Parser.parseToFile content of
-                                                                                        Ok file ->
-                                                                                            DepGraph.parseModuleName content
-                                                                                                |> Maybe.map (\name -> ( name, file ))
-
-                                                                                        Err _ ->
-                                                                                            Nothing
-                                                                                )
-                                                                            |> Dict.fromList
-
-                                                                    moduleGraph : ModuleGraph
-                                                                    moduleGraph =
-                                                                        { moduleToSource = Dict.fromList allModules
-                                                                        , moduleToFile = userParsedFiles
-                                                                        , imports =
-                                                                            allModules
-                                                                                |> List.map
-                                                                                    (\( name, src ) ->
-                                                                                        ( name, DepGraph.parseImports src |> Set.fromList )
-                                                                                    )
-                                                                                |> Dict.fromList
-                                                                        }
-
-                                                                    allStableSources : List String
-                                                                    allStableSources =
-                                                                        patchedPackageSources ++ List.map Tuple.second extraFileContents
-
-                                                                    pkgModuleNames : Set String
-                                                                    pkgModuleNames =
-                                                                        allStableSources
-                                                                            |> List.filterMap DepGraph.parseModuleName
-                                                                            |> Set.fromList
-
-                                                                    -- Include ALL package sources in the env (not just reachable from user code).
-                                                                    -- This ensures that source overrides added at eval time (e.g. SimpleTestRunner)
-                                                                    -- can reference any package module without the env missing dependencies.
-                                                                    allPackageSources : List String
-                                                                    allPackageSources =
-                                                                        topoSortModules moduleGraph pkgModuleNames
-
-                                                                    pkgEnvResult : Result Types.Error Eval.Module.ProjectEnv
-                                                                    pkgEnvResult =
-                                                                        Eval.Module.buildProjectEnv allPackageSources
-                                                                in
-                                                                case pkgEnvResult of
-                                                                    Err _ ->
-                                                                        BackendTask.fail (FatalError.fromString "Failed to build package environment")
-
-                                                                    Ok pkgEnv ->
-                                                                        let
-                                                                            -- Build baseUserEnv: pkgEnv + all user modules in topo order.
-                                                                            -- This is reused for incremental env building in evalWithFileOverrides.
-                                                                            userModuleNamesSet : Set String
-                                                                            userModuleNamesSet =
-                                                                                userParsedFiles |> Dict.keys |> Set.fromList
-
-                                                                            userModulesInOrder : List File
-                                                                            userModulesInOrder =
-                                                                                topoSortModules moduleGraph userModuleNamesSet
-                                                                                    |> List.filterMap (\src -> DepGraph.parseModuleName src)
-                                                                                    |> List.filterMap (\name -> Dict.get name userParsedFiles)
-
-                                                                            baseUserEnvResult : Maybe Eval.Module.ProjectEnv
-                                                                            baseUserEnvResult =
-                                                                                Eval.Module.extendWithFiles pkgEnv userModulesInOrder
-                                                                                    |> Result.toMaybe
-                                                                        in
-                                                                        Cache.inputs allUserPaths
-                                                                            |> BackendTask.map
-                                                                                (\sourceInputs ->
-                                                                                    InterpreterProject
-                                                                                        { sourceDirectories = sourceDirectories
-                                                                                        , inputsByPath =
-                                                                                            sourceInputs
-                                                                                                |> List.map
-                                                                                                    (\( pathVal, monad ) ->
-                                                                                                        ( Path.toString pathVal
-                                                                                                        , ( pathVal, monad )
-                                                                                                        )
-                                                                                                    )
-                                                                                                |> Dict.fromList
-                                                                                        , userFileContents =
-                                                                                            userFileContents
-                                                                                                |> Dict.fromList
-                                                                                        , depGraph = depGraph
-                                                                                        , patchedPackageSources = patchedPackageSources
-                                                                                        , extraSources =
-                                                                                            extraFileContents
-                                                                                                |> List.map Tuple.second
-                                                                                        , moduleGraph = moduleGraph
-                                                                                        , packageModuleNames = pkgModuleNames
-                                                                                        , packageEnv = pkgEnv
-                                                                                        , baseUserEnv = baseUserEnvResult
-                                                                                        , semanticIndex =
-                                                                                            userFileContents
-                                                                                                |> List.map
-                                                                                                    (\( filePath, content ) ->
-                                                                                                        { moduleName =
-                                                                                                            DepGraph.parseModuleName content
-                                                                                                                |> Maybe.withDefault filePath
-                                                                                                        , source = content
-                                                                                                        }
-                                                                                                    )
-                                                                                                |> SemanticHash.buildMultiModuleIndex
-                                                                                        }
-                                                                                )
-                                                            )
-                                                )
-                                    )
-                        )
+                Nothing ->
+                    readSourceDirectories config.projectDir
             )
+        )
+    <| \sourceDirectoriesTimed ->
+    let
+        sourceDirectories =
+            sourceDirectoriesTimed.value
+    in
+    Do.do
+        (withTiming
+            (ProjectSources.loadPackageDepsCached
+                { projectDir = config.projectDir
+                , skipPackages = config.skipPackages
+                }
+            )
+        )
+    <| \packageSourcesTimed ->
+    let
+        patchedPackageSources : List String
+        patchedPackageSources =
+            List.map config.patchSource packageSourcesTimed.value
+
+        userSourceGlobs : List String
+        userSourceGlobs =
+            sourceDirectories
+                |> List.map (\dir -> dir ++ "/**/*.elm")
+    in
+    Do.do
+        (withTiming
+            (userSourceGlobs
+                |> List.map
+                    (\globPattern ->
+                        Glob.fromStringWithOptions
+                            (let
+                                o : Glob.Options
+                                o =
+                                    Glob.defaultOptions
+                             in
+                             { o | include = Glob.OnlyFiles }
+                            )
+                            globPattern
+                    )
+                |> BackendTask.Extra.combine
+                |> BackendTask.map (List.concat >> List.sort)
+            )
+        )
+    <| \elmFilesTimed ->
+    let
+        elmFiles =
+            elmFilesTimed.value
+    in
+    Do.do
+        (withTiming
+            (elmFiles
+                |> List.map
+                    (\filePath ->
+                        File.rawFile filePath
+                            |> BackendTask.allowFatal
+                            |> BackendTask.map (\content -> ( filePath, content ))
+                    )
+                |> BackendTask.Extra.combine
+            )
+        )
+    <| \userFileContentsTimed ->
+    let
+        userFileContents =
+            userFileContentsTimed.value
+    in
+    Do.do
+        (withTiming
+            (config.extraSourceFiles
+                |> List.map
+                    (\filePath ->
+                        File.rawFile filePath
+                            |> BackendTask.allowFatal
+                            |> BackendTask.map (\content -> ( filePath, content ))
+                    )
+                |> BackendTask.Extra.combine
+            )
+        )
+    <| \extraFileContentsTimed ->
+    let
+        extraFileContents =
+            extraFileContentsTimed.value
+    in
+    Do.do BackendTask.Time.now <| \graphStart ->
+    let
+        depGraph : DepGraph.Graph
+        depGraph =
+            DepGraph.buildGraph
+                { sourceDirectories = sourceDirectories
+                , files =
+                    userFileContents
+                        |> List.map
+                            (\( filePath, content ) ->
+                                { filePath = filePath
+                                , content = content
+                                }
+                            )
+                }
+
+        allUserPaths : List Path
+        allUserPaths =
+            elmFiles
+                |> List.map Path.path
+
+        allSourceStrings : List String
+        allSourceStrings =
+            patchedPackageSources
+                ++ List.map Tuple.second extraFileContents
+                ++ List.map Tuple.second userFileContents
+
+        allModules : List ( String, String )
+        allModules =
+            List.filterMap
+                (\src ->
+                    DepGraph.parseModuleName src
+                        |> Maybe.map (\name -> ( name, src ))
+                )
+                allSourceStrings
+
+        userParsedFiles : Dict String File
+        userParsedFiles =
+            userFileContents
+                |> List.filterMap
+                    (\( _, content ) ->
+                        case Elm.Parser.parseToFile content of
+                            Ok file ->
+                                DepGraph.parseModuleName content
+                                    |> Maybe.map (\name -> ( name, file ))
+
+                            Err _ ->
+                                Nothing
+                    )
+                |> Dict.fromList
+
+        moduleGraph : ModuleGraph
+        moduleGraph =
+            { moduleToSource = Dict.fromList allModules
+            , moduleToFile = userParsedFiles
+            , imports =
+                allModules
+                    |> List.map
+                        (\( name, src ) ->
+                            ( name, DepGraph.parseImports src |> Set.fromList )
+                        )
+                    |> Dict.fromList
+            }
+
+        allStableSources : List String
+        allStableSources =
+            patchedPackageSources ++ List.map Tuple.second extraFileContents
+
+        pkgModuleNames : Set String
+        pkgModuleNames =
+            allStableSources
+                |> List.filterMap DepGraph.parseModuleName
+                |> Set.fromList
+
+        allPackageSources : List String
+        allPackageSources =
+            topoSortModules moduleGraph pkgModuleNames
+    in
+    Do.do BackendTask.Time.now <| \graphFinish ->
+    let
+        buildGraphMs =
+            stageMs graphStart graphFinish
+
+        parsedPackageCachePath : Maybe String
+        parsedPackageCachePath =
+            config.packageParseCacheDir
+                |> Maybe.map parsedPackageCacheBlobPath
+
+        parseAndSeedPackageSources :
+            { parsedPackageCacheHit : Int
+            , loadParsedPackageCacheMs : Int
+            , decodeParsedPackageCacheMs : Int
+            }
+            -> BackendTask FatalError
+                { parsedPackageSources : List ParsedProjectSource
+                , parsedPackageCacheHit : Int
+                , parsedPackageCacheRoundtripOk : Int
+                , parsedPackageCacheBytes : Int
+                , loadParsedPackageCacheMs : Int
+                , decodeParsedPackageCacheMs : Int
+                , validateParsedPackageCacheMs : Int
+                , parsePackageSourcesMs : Int
+                , writeParsedPackageCacheMs : Int
+                }
+        parseAndSeedPackageSources cacheMetrics =
+            Do.do BackendTask.Time.now <| \parsePackageSourcesStart ->
+            let
+                parsedPackageSourcesResult =
+                    Eval.Module.parseProjectSources allPackageSources
+            in
+            Do.do BackendTask.Time.now <| \parsePackageSourcesFinish ->
+            let
+                parsePackageSourcesMs =
+                    stageMs parsePackageSourcesStart parsePackageSourcesFinish
+            in
+            case parsedPackageSourcesResult of
+                Err _ ->
+                    BackendTask.fail (FatalError.fromString "Failed to build package environment")
+
+                Ok parsedPackageSources ->
+                    case parsedPackageCachePath of
+                        Just cachePath ->
+                            let
+                                cacheBytes =
+                                    encodeParsedPackageSourcesCache parsedPackageSources
+                            in
+                            Do.do BackendTask.Time.now <| \validateCacheStart ->
+                            let
+                                cacheRoundtripOk =
+                                    decodeParsedPackageSourcesCache cacheBytes /= Nothing
+                            in
+                            Do.do BackendTask.Time.now <| \validateCacheFinish ->
+                            let
+                                baseInfo =
+                                    { parsedPackageSources = parsedPackageSources
+                                    , parsedPackageCacheHit = cacheMetrics.parsedPackageCacheHit
+                                    , parsedPackageCacheRoundtripOk =
+                                        if cacheRoundtripOk then
+                                            1
+
+                                        else
+                                            0
+                                    , parsedPackageCacheBytes = Bytes.width cacheBytes
+                                    , loadParsedPackageCacheMs = cacheMetrics.loadParsedPackageCacheMs
+                                    , decodeParsedPackageCacheMs = cacheMetrics.decodeParsedPackageCacheMs
+                                    , validateParsedPackageCacheMs = stageMs validateCacheStart validateCacheFinish
+                                    , parsePackageSourcesMs = parsePackageSourcesMs
+                                    , writeParsedPackageCacheMs = 0
+                                    }
+                            in
+                            if cacheRoundtripOk then
+                                Do.do
+                                    (withTiming
+                                        (writeBinaryFile
+                                            { path = cachePath
+                                            , bytes = cacheBytes
+                                            }
+                                        )
+                                    )
+                                <| \writeCacheTimed ->
+                                BackendTask.succeed
+                                    { baseInfo | writeParsedPackageCacheMs = writeCacheTimed.ms }
+
+                            else
+                                BackendTask.succeed baseInfo
+
+                        Nothing ->
+                            BackendTask.succeed
+                                { parsedPackageSources = parsedPackageSources
+                                , parsedPackageCacheHit = cacheMetrics.parsedPackageCacheHit
+                                , parsedPackageCacheRoundtripOk = 0
+                                , parsedPackageCacheBytes = 0
+                                , loadParsedPackageCacheMs = cacheMetrics.loadParsedPackageCacheMs
+                                , decodeParsedPackageCacheMs = cacheMetrics.decodeParsedPackageCacheMs
+                                , validateParsedPackageCacheMs = 0
+                                , parsePackageSourcesMs = parsePackageSourcesMs
+                                , writeParsedPackageCacheMs = 0
+                                }
+    in
+    Do.do
+        (case parsedPackageCachePath of
+            Just cachePath ->
+                Do.do (File.exists cachePath |> BackendTask.allowFatal) <| \cacheExists ->
+                if cacheExists then
+                    Do.do (withTiming (File.binaryFile cachePath |> BackendTask.allowFatal)) <| \readCacheTimed ->
+                    Do.do BackendTask.Time.now <| \decodeCacheStart ->
+                    let
+                        decodedCache =
+                            decodeParsedPackageSourcesCache readCacheTimed.value
+                    in
+                    Do.do BackendTask.Time.now <| \decodeCacheFinish ->
+                    case decodedCache of
+                        Just parsedPackageSources ->
+                            BackendTask.succeed
+                                { parsedPackageSources = parsedPackageSources
+                                , parsedPackageCacheHit = 1
+                                , parsedPackageCacheRoundtripOk = 1
+                                , parsedPackageCacheBytes = Bytes.width readCacheTimed.value
+                                , loadParsedPackageCacheMs = readCacheTimed.ms
+                                , decodeParsedPackageCacheMs = stageMs decodeCacheStart decodeCacheFinish
+                                , validateParsedPackageCacheMs = 0
+                                , parsePackageSourcesMs = 0
+                                , writeParsedPackageCacheMs = 0
+                                }
+
+                        Nothing ->
+                            parseAndSeedPackageSources
+                                { parsedPackageCacheHit = 0
+                                , loadParsedPackageCacheMs = readCacheTimed.ms
+                                , decodeParsedPackageCacheMs = stageMs decodeCacheStart decodeCacheFinish
+                                }
+
+                else
+                    parseAndSeedPackageSources
+                        { parsedPackageCacheHit = 0
+                        , loadParsedPackageCacheMs = 0
+                        , decodeParsedPackageCacheMs = 0
+                        }
+
+            Nothing ->
+                parseAndSeedPackageSources
+                    { parsedPackageCacheHit = 0
+                    , loadParsedPackageCacheMs = 0
+                    , decodeParsedPackageCacheMs = 0
+                    }
+        )
+    <| \parsedPackageSourcesInfo ->
+    let
+        parsedPackageSources =
+            parsedPackageSourcesInfo.parsedPackageSources
+    in
+            Do.do BackendTask.Time.now <| \buildPackageEnvStart ->
+            let
+                pkgEnvResult : Result Types.Error Eval.Module.ProjectEnv
+                pkgEnvResult =
+                    Eval.Module.buildProjectEnvFromParsed parsedPackageSources
+            in
+            Do.do BackendTask.Time.now <| \buildPackageEnvFinish ->
+            let
+                buildPackageEnvFromParsedMs =
+                    stageMs buildPackageEnvStart buildPackageEnvFinish
+
+                buildPackageEnvMs =
+                    parsedPackageSourcesInfo.parsePackageSourcesMs + buildPackageEnvFromParsedMs
+            in
+            case pkgEnvResult of
+                Err _ ->
+                    BackendTask.fail (FatalError.fromString "Failed to build package environment")
+
+                Ok pkgEnv ->
+                    Do.do BackendTask.Time.now <| \baseUserEnvStart ->
+                    let
+                        userModuleNamesSet : Set String
+                        userModuleNamesSet =
+                            userParsedFiles |> Dict.keys |> Set.fromList
+
+                        userModulesInOrder : List File
+                        userModulesInOrder =
+                            topoSortModules moduleGraph userModuleNamesSet
+                                |> List.filterMap (\src -> DepGraph.parseModuleName src)
+                                |> List.filterMap (\name -> Dict.get name userParsedFiles)
+
+                        baseUserEnvResult : Maybe Eval.Module.ProjectEnv
+                        baseUserEnvResult =
+                            Eval.Module.extendWithFiles pkgEnv userModulesInOrder
+                                |> Result.toMaybe
+                    in
+                    Do.do BackendTask.Time.now <| \baseUserEnvFinish ->
+                    let
+                        buildBaseUserEnvMs =
+                            stageMs baseUserEnvStart baseUserEnvFinish
+                    in
+                    Do.do BackendTask.Time.now <| \semanticIndexStart ->
+                    let
+                        semanticIndex =
+                            userFileContents
+                                |> List.map
+                                    (\( filePath, content ) ->
+                                        { moduleName =
+                                            DepGraph.parseModuleName content
+                                                |> Maybe.withDefault filePath
+                                        , source = content
+                                        }
+                                    )
+                                |> SemanticHash.buildMultiModuleIndex
+                    in
+                    Do.do BackendTask.Time.now <| \semanticIndexFinish ->
+                    let
+                        buildSemanticIndexMs =
+                            stageMs semanticIndexStart semanticIndexFinish
+                    in
+                    Do.do (withTiming (Cache.inputs allUserPaths)) <| \sourceInputsTimed ->
+                    BackendTask.succeed
+                        { project =
+                            InterpreterProject
+                                { sourceDirectories = sourceDirectories
+                                , inputsByPath =
+                                    sourceInputsTimed.value
+                                        |> List.map
+                                            (\( pathVal, monad ) ->
+                                                ( Path.toString pathVal
+                                                , ( pathVal, monad )
+                                                )
+                                            )
+                                        |> Dict.fromList
+                                , userFileContents =
+                                    userFileContents
+                                        |> Dict.fromList
+                                , depGraph = depGraph
+                                , patchedPackageSources = patchedPackageSources
+                                , extraSources =
+                                    extraFileContents
+                                        |> List.map Tuple.second
+                                , moduleGraph = moduleGraph
+                                , packageModuleNames = pkgModuleNames
+                                , packageEnv = pkgEnv
+                                , baseUserEnv = baseUserEnvResult
+                                , semanticIndex = semanticIndex
+                                }
+                        , profile =
+                            { resolveSourceDirectoriesMs = sourceDirectoriesTimed.ms
+                            , loadPackageSourcesMs = packageSourcesTimed.ms
+                            , globUserSourcesMs = elmFilesTimed.ms
+                            , readUserSourcesMs = userFileContentsTimed.ms
+                            , readExtraSourcesMs = extraFileContentsTimed.ms
+                            , parsedPackageCacheHit = parsedPackageSourcesInfo.parsedPackageCacheHit
+                            , parsedPackageCacheRoundtripOk = parsedPackageSourcesInfo.parsedPackageCacheRoundtripOk
+                            , parsedPackageCacheBytes = parsedPackageSourcesInfo.parsedPackageCacheBytes
+                            , loadParsedPackageCacheMs = parsedPackageSourcesInfo.loadParsedPackageCacheMs
+                            , decodeParsedPackageCacheMs = parsedPackageSourcesInfo.decodeParsedPackageCacheMs
+                            , validateParsedPackageCacheMs = parsedPackageSourcesInfo.validateParsedPackageCacheMs
+                            , writeParsedPackageCacheMs = parsedPackageSourcesInfo.writeParsedPackageCacheMs
+                            , buildGraphMs = buildGraphMs
+                            , parsePackageSourcesMs = parsedPackageSourcesInfo.parsePackageSourcesMs
+                            , buildPackageEnvFromParsedMs = buildPackageEnvFromParsedMs
+                            , buildPackageEnvMs = buildPackageEnvMs
+                            , buildBaseUserEnvMs = buildBaseUserEnvMs
+                            , buildSemanticIndexMs = buildSemanticIndexMs
+                            , cacheInputsMs = sourceInputsTimed.ms
+                            }
+                        }
 
 
 {-| Read the "source-directories" field from elm.json in the given project directory.

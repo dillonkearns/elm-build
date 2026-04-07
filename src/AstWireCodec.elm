@@ -1,4 +1,17 @@
-module AstWireCodec exposing (encodeFile, decodeFile, encodeToBytes, decodeFromBytes)
+module AstWireCodec exposing
+    ( decodeDeclaration
+    , decodeFile
+    , decodeFromBytes
+    , decodeImport
+    , decodeModule
+    , decodeNode
+    , encodeDeclaration
+    , encodeFile
+    , encodeImport
+    , encodeModule
+    , encodeNode
+    , encodeToBytes
+    )
 
 {-| Binary codecs for Elm.Syntax.File using Lamdera.Wire3 primitives.
 Much more compact than JSON encoding (~3-4x smaller).
@@ -38,8 +51,7 @@ decodeFromBytes bytes =
 
 encodeFile : File -> W.Encoder
 encodeFile { moduleDefinition, imports, declarations, comments } =
-    W.encodeSequence
-        [ encodeNode encodeModule moduleDefinition
+    W.encodeSequenceWithoutLength [ encodeNode encodeModule moduleDefinition
         , W.encodeList (encodeNode encodeImport) imports
         , W.encodeList (encodeNode encodeDeclaration) declarations
         , W.encodeList (encodeNode W.encodeString) comments
@@ -61,7 +73,7 @@ decodeFile =
 
 encodeNode : (a -> W.Encoder) -> Node a -> W.Encoder
 encodeNode enc (Node range value) =
-    W.encodeSequence [ encodeRange range, enc value ]
+    W.encodeSequenceWithoutLength [ encodeRange range, enc value ]
 
 
 decodeNode : W.Decoder a -> W.Decoder (Node a)
@@ -71,8 +83,7 @@ decodeNode dec =
 
 encodeRange : Range -> W.Encoder
 encodeRange { start, end } =
-    W.encodeSequence
-        [ W.encodeInt start.row, W.encodeInt start.column
+    W.encodeSequenceWithoutLength [ W.encodeInt start.row, W.encodeInt start.column
         , W.encodeInt end.row, W.encodeInt end.column
         ]
 
@@ -94,13 +105,19 @@ encodeModule : Module -> W.Encoder
 encodeModule mod =
     case mod of
         NormalModule data ->
-            W.encodeSequence [ W.encodeInt 0, encodeNode encodeModuleName data.moduleName, encodeNode encodeExposing data.exposingList ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 0, encodeNode encodeModuleName data.moduleName, encodeNode encodeExposing data.exposingList ]
 
         PortModule data ->
-            W.encodeSequence [ W.encodeInt 1, encodeNode encodeModuleName data.moduleName, encodeNode encodeExposing data.exposingList ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 1, encodeNode encodeModuleName data.moduleName, encodeNode encodeExposing data.exposingList ]
 
         EffectModule data ->
-            W.encodeSequence [ W.encodeInt 2, encodeNode encodeModuleName data.moduleName, encodeNode encodeExposing data.exposingList ]
+            W.encodeSequenceWithoutLength
+                [ W.encodeInt 2
+                , encodeNode encodeModuleName data.moduleName
+                , encodeNode encodeExposing data.exposingList
+                , W.encodeMaybe (encodeNode W.encodeString) data.command
+                , W.encodeMaybe (encodeNode W.encodeString) data.subscription
+                ]
 
 
 decodeModule : W.Decoder Module
@@ -120,9 +137,11 @@ decodeModule =
                             |> W.andMapDecode (decodeNode decodeExposing)
 
                     _ ->
-                        W.succeedDecode (\mn el -> EffectModule { moduleName = mn, exposingList = el, command = Nothing, subscription = Nothing })
+                        W.succeedDecode (\mn el cmd sub -> EffectModule { moduleName = mn, exposingList = el, command = cmd, subscription = sub })
                             |> W.andMapDecode (decodeNode decodeModuleName)
                             |> W.andMapDecode (decodeNode decodeExposing)
+                            |> W.andMapDecode (W.decodeMaybe (decodeNode W.decodeString))
+                            |> W.andMapDecode (W.decodeMaybe (decodeNode W.decodeString))
             )
 
 
@@ -143,11 +162,11 @@ decodeModuleName =
 encodeExposing : Exposing -> W.Encoder
 encodeExposing exp =
     case exp of
-        All _ ->
-            W.encodeInt 0
+        All range ->
+            W.encodeSequenceWithoutLength [ W.encodeInt 0, encodeRange range ]
 
         Explicit list ->
-            W.encodeSequence [ W.encodeInt 1, W.encodeList (encodeNode encodeTopLevelExpose) list ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 1, W.encodeList (encodeNode encodeTopLevelExpose) list ]
 
 
 decodeExposing : W.Decoder Exposing
@@ -157,7 +176,7 @@ decodeExposing =
             (\tag ->
                 case tag of
                     0 ->
-                        W.succeedDecode (All { start = { row = 0, column = 0 }, end = { row = 0, column = 0 } })
+                        W.succeedDecode All |> W.andMapDecode decodeRange
 
                     _ ->
                         W.succeedDecode Explicit |> W.andMapDecode (W.decodeList (decodeNode decodeTopLevelExpose))
@@ -168,16 +187,16 @@ encodeTopLevelExpose : TopLevelExpose -> W.Encoder
 encodeTopLevelExpose exp =
     case exp of
         InfixExpose s ->
-            W.encodeSequence [ W.encodeInt 0, W.encodeString s ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 0, W.encodeString s ]
 
         FunctionExpose s ->
-            W.encodeSequence [ W.encodeInt 1, W.encodeString s ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 1, W.encodeString s ]
 
         TypeOrAliasExpose s ->
-            W.encodeSequence [ W.encodeInt 2, W.encodeString s ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 2, W.encodeString s ]
 
         TypeExpose { name, open } ->
-            W.encodeSequence [ W.encodeInt 3, W.encodeString name, W.encodeMaybe encodeRange open ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 3, W.encodeString name, W.encodeMaybe encodeRange open ]
 
 
 decodeTopLevelExpose : W.Decoder TopLevelExpose
@@ -199,8 +218,7 @@ decodeTopLevelExpose =
 
 encodeImport : Import -> W.Encoder
 encodeImport { moduleName, moduleAlias, exposingList } =
-    W.encodeSequence
-        [ encodeNode encodeModuleName moduleName
+    W.encodeSequenceWithoutLength [ encodeNode encodeModuleName moduleName
         , W.encodeMaybe (encodeNode encodeModuleName) moduleAlias
         , W.encodeMaybe (encodeNode encodeExposing) exposingList
         ]
@@ -222,16 +240,14 @@ encodeDeclaration : Declaration -> W.Encoder
 encodeDeclaration decl =
     case decl of
         FunctionDeclaration func ->
-            W.encodeSequence
-                [ W.encodeInt 0
+            W.encodeSequenceWithoutLength [ W.encodeInt 0
                 , W.encodeMaybe (encodeNode W.encodeString) func.documentation
                 , W.encodeMaybe (encodeNode encodeSignature) func.signature
                 , encodeNode encodeFunctionImpl func.declaration
                 ]
 
         AliasDeclaration alias_ ->
-            W.encodeSequence
-                [ W.encodeInt 1
+            W.encodeSequenceWithoutLength [ W.encodeInt 1
                 , W.encodeMaybe (encodeNode W.encodeString) alias_.documentation
                 , encodeNode W.encodeString alias_.name
                 , W.encodeList (encodeNode W.encodeString) alias_.generics
@@ -239,8 +255,7 @@ encodeDeclaration decl =
                 ]
 
         CustomTypeDeclaration type_ ->
-            W.encodeSequence
-                [ W.encodeInt 2
+            W.encodeSequenceWithoutLength [ W.encodeInt 2
                 , W.encodeMaybe (encodeNode W.encodeString) type_.documentation
                 , encodeNode W.encodeString type_.name
                 , W.encodeList (encodeNode W.encodeString) type_.generics
@@ -248,13 +263,13 @@ encodeDeclaration decl =
                 ]
 
         PortDeclaration sig ->
-            W.encodeSequence [ W.encodeInt 3, encodeNode W.encodeString sig.name, encodeNode encodeTypeAnnotation sig.typeAnnotation ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 3, encodeNode W.encodeString sig.name, encodeNode encodeTypeAnnotation sig.typeAnnotation ]
 
         InfixDeclaration inf ->
-            W.encodeSequence [ W.encodeInt 4, encodeNode encodeInfixDirection inf.direction, encodeNode W.encodeInt inf.precedence, encodeNode W.encodeString inf.operator, encodeNode W.encodeString inf.function ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 4, encodeNode encodeInfixDirection inf.direction, encodeNode W.encodeInt inf.precedence, encodeNode W.encodeString inf.operator, encodeNode W.encodeString inf.function ]
 
         Destructuring pat expr ->
-            W.encodeSequence [ W.encodeInt 5, encodeNode encodePattern pat, encodeNode encodeExpression expr ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 5, encodeNode encodePattern pat, encodeNode encodeExpression expr ]
 
 
 decodeDeclaration : W.Decoder Declaration
@@ -304,7 +319,7 @@ decodeDeclaration =
 
 encodeValueConstructor : ValueConstructor -> W.Encoder
 encodeValueConstructor { name, arguments } =
-    W.encodeSequence [ encodeNode W.encodeString name, W.encodeList (encodeNode encodeTypeAnnotation) arguments ]
+    W.encodeSequenceWithoutLength [ encodeNode W.encodeString name, W.encodeList (encodeNode encodeTypeAnnotation) arguments ]
 
 
 decodeValueConstructor : W.Decoder ValueConstructor
@@ -316,7 +331,7 @@ decodeValueConstructor =
 
 encodeSignature : Signature -> W.Encoder
 encodeSignature { name, typeAnnotation } =
-    W.encodeSequence [ encodeNode W.encodeString name, encodeNode encodeTypeAnnotation typeAnnotation ]
+    W.encodeSequenceWithoutLength [ encodeNode W.encodeString name, encodeNode encodeTypeAnnotation typeAnnotation ]
 
 
 decodeSignature : W.Decoder Signature
@@ -328,7 +343,7 @@ decodeSignature =
 
 encodeFunctionImpl : Elm.Syntax.Expression.FunctionImplementation -> W.Encoder
 encodeFunctionImpl { name, arguments, expression } =
-    W.encodeSequence [ encodeNode W.encodeString name, W.encodeList (encodeNode encodePattern) arguments, encodeNode encodeExpression expression ]
+    W.encodeSequenceWithoutLength [ encodeNode W.encodeString name, W.encodeList (encodeNode encodePattern) arguments, encodeNode encodeExpression expression ]
 
 
 decodeFunctionImpl : W.Decoder Elm.Syntax.Expression.FunctionImplementation
@@ -362,13 +377,13 @@ decodeInfixDirection =
 encodeTypeAnnotation : TypeAnnotation -> W.Encoder
 encodeTypeAnnotation ta =
     case ta of
-        GenericType s -> W.encodeSequence [ W.encodeInt 0, W.encodeString s ]
-        Typed name args -> W.encodeSequence [ W.encodeInt 1, encodeNode (W.encodePair encodeModuleName W.encodeString) name, W.encodeList (encodeNode encodeTypeAnnotation) args ]
+        GenericType s -> W.encodeSequenceWithoutLength [ W.encodeInt 0, W.encodeString s ]
+        Typed name args -> W.encodeSequenceWithoutLength [ W.encodeInt 1, encodeNode (W.encodePair encodeModuleName W.encodeString) name, W.encodeList (encodeNode encodeTypeAnnotation) args ]
         Unit -> W.encodeInt 2
-        Tupled items -> W.encodeSequence [ W.encodeInt 3, W.encodeList (encodeNode encodeTypeAnnotation) items ]
-        Record fields -> W.encodeSequence [ W.encodeInt 4, W.encodeList (encodeNode encodeRecordField) fields ]
-        GenericRecord name fields -> W.encodeSequence [ W.encodeInt 5, encodeNode W.encodeString name, encodeNode (W.encodeList (encodeNode encodeRecordField)) fields ]
-        FunctionTypeAnnotation left right -> W.encodeSequence [ W.encodeInt 6, encodeNode encodeTypeAnnotation left, encodeNode encodeTypeAnnotation right ]
+        Tupled items -> W.encodeSequenceWithoutLength [ W.encodeInt 3, W.encodeList (encodeNode encodeTypeAnnotation) items ]
+        Record fields -> W.encodeSequenceWithoutLength [ W.encodeInt 4, W.encodeList (encodeNode encodeRecordField) fields ]
+        GenericRecord name fields -> W.encodeSequenceWithoutLength [ W.encodeInt 5, encodeNode W.encodeString name, encodeNode (W.encodeList (encodeNode encodeRecordField)) fields ]
+        FunctionTypeAnnotation left right -> W.encodeSequenceWithoutLength [ W.encodeInt 6, encodeNode encodeTypeAnnotation left, encodeNode encodeTypeAnnotation right ]
 
 
 decodeTypeAnnotation : W.Decoder TypeAnnotation
@@ -389,7 +404,7 @@ decodeTypeAnnotation =
 
 encodeRecordField : RecordField -> W.Encoder
 encodeRecordField ( name, typeAnnotation ) =
-    W.encodeSequence [ encodeNode W.encodeString name, encodeNode encodeTypeAnnotation typeAnnotation ]
+    W.encodeSequenceWithoutLength [ encodeNode W.encodeString name, encodeNode encodeTypeAnnotation typeAnnotation ]
 
 
 decodeRecordField : W.Decoder RecordField
@@ -407,29 +422,29 @@ encodeExpression : Expression -> W.Encoder
 encodeExpression expr =
     case expr of
         UnitExpr -> W.encodeInt 0
-        Application nodes -> W.encodeSequence [ W.encodeInt 1, W.encodeList (encodeNode encodeExpression) nodes ]
-        OperatorApplication op dir left right -> W.encodeSequence [ W.encodeInt 2, W.encodeString op, encodeInfixDirection dir, encodeNode encodeExpression left, encodeNode encodeExpression right ]
-        FunctionOrValue mod name -> W.encodeSequence [ W.encodeInt 3, encodeModuleName mod, W.encodeString name ]
-        IfBlock c t e -> W.encodeSequence [ W.encodeInt 4, encodeNode encodeExpression c, encodeNode encodeExpression t, encodeNode encodeExpression e ]
-        PrefixOperator s -> W.encodeSequence [ W.encodeInt 5, W.encodeString s ]
-        Operator s -> W.encodeSequence [ W.encodeInt 6, W.encodeString s ]
-        Integer i -> W.encodeSequence [ W.encodeInt 7, W.encodeInt i ]
-        Hex i -> W.encodeSequence [ W.encodeInt 8, W.encodeInt i ]
-        Floatable f -> W.encodeSequence [ W.encodeInt 9, W.encodeFloat f ]
-        Negation e -> W.encodeSequence [ W.encodeInt 10, encodeNode encodeExpression e ]
-        Literal s -> W.encodeSequence [ W.encodeInt 11, W.encodeString s ]
-        CharLiteral c -> W.encodeSequence [ W.encodeInt 12, W.encodeChar c ]
-        TupledExpression es -> W.encodeSequence [ W.encodeInt 13, W.encodeList (encodeNode encodeExpression) es ]
-        ParenthesizedExpression e -> W.encodeSequence [ W.encodeInt 14, encodeNode encodeExpression e ]
-        LetExpression lb -> W.encodeSequence [ W.encodeInt 15, encodeLetBlock lb ]
-        CaseExpression cb -> W.encodeSequence [ W.encodeInt 16, encodeCaseBlock cb ]
-        LambdaExpression lam -> W.encodeSequence [ W.encodeInt 17, encodeLambda lam ]
-        RecordExpr fields -> W.encodeSequence [ W.encodeInt 18, W.encodeList (encodeNode encodeRecordSetter) fields ]
-        ListExpr es -> W.encodeSequence [ W.encodeInt 19, W.encodeList (encodeNode encodeExpression) es ]
-        RecordAccess e field -> W.encodeSequence [ W.encodeInt 20, encodeNode encodeExpression e, encodeNode W.encodeString field ]
-        RecordAccessFunction s -> W.encodeSequence [ W.encodeInt 21, W.encodeString s ]
-        RecordUpdateExpression name setters -> W.encodeSequence [ W.encodeInt 22, encodeNode W.encodeString name, W.encodeList (encodeNode encodeRecordSetter) setters ]
-        GLSLExpression s -> W.encodeSequence [ W.encodeInt 23, W.encodeString s ]
+        Application nodes -> W.encodeSequenceWithoutLength [ W.encodeInt 1, W.encodeList (encodeNode encodeExpression) nodes ]
+        OperatorApplication op dir left right -> W.encodeSequenceWithoutLength [ W.encodeInt 2, W.encodeString op, encodeInfixDirection dir, encodeNode encodeExpression left, encodeNode encodeExpression right ]
+        FunctionOrValue mod name -> W.encodeSequenceWithoutLength [ W.encodeInt 3, encodeModuleName mod, W.encodeString name ]
+        IfBlock c t e -> W.encodeSequenceWithoutLength [ W.encodeInt 4, encodeNode encodeExpression c, encodeNode encodeExpression t, encodeNode encodeExpression e ]
+        PrefixOperator s -> W.encodeSequenceWithoutLength [ W.encodeInt 5, W.encodeString s ]
+        Operator s -> W.encodeSequenceWithoutLength [ W.encodeInt 6, W.encodeString s ]
+        Integer i -> W.encodeSequenceWithoutLength [ W.encodeInt 7, W.encodeInt i ]
+        Hex i -> W.encodeSequenceWithoutLength [ W.encodeInt 8, W.encodeInt i ]
+        Floatable f -> W.encodeSequenceWithoutLength [ W.encodeInt 9, W.encodeFloat f ]
+        Negation e -> W.encodeSequenceWithoutLength [ W.encodeInt 10, encodeNode encodeExpression e ]
+        Literal s -> W.encodeSequenceWithoutLength [ W.encodeInt 11, W.encodeString s ]
+        CharLiteral c -> W.encodeSequenceWithoutLength [ W.encodeInt 12, W.encodeChar c ]
+        TupledExpression es -> W.encodeSequenceWithoutLength [ W.encodeInt 13, W.encodeList (encodeNode encodeExpression) es ]
+        ParenthesizedExpression e -> W.encodeSequenceWithoutLength [ W.encodeInt 14, encodeNode encodeExpression e ]
+        LetExpression lb -> W.encodeSequenceWithoutLength [ W.encodeInt 15, encodeLetBlock lb ]
+        CaseExpression cb -> W.encodeSequenceWithoutLength [ W.encodeInt 16, encodeCaseBlock cb ]
+        LambdaExpression lam -> W.encodeSequenceWithoutLength [ W.encodeInt 17, encodeLambda lam ]
+        RecordExpr fields -> W.encodeSequenceWithoutLength [ W.encodeInt 18, W.encodeList (encodeNode encodeRecordSetter) fields ]
+        ListExpr es -> W.encodeSequenceWithoutLength [ W.encodeInt 19, W.encodeList (encodeNode encodeExpression) es ]
+        RecordAccess e field -> W.encodeSequenceWithoutLength [ W.encodeInt 20, encodeNode encodeExpression e, encodeNode W.encodeString field ]
+        RecordAccessFunction s -> W.encodeSequenceWithoutLength [ W.encodeInt 21, W.encodeString s ]
+        RecordUpdateExpression name setters -> W.encodeSequenceWithoutLength [ W.encodeInt 22, encodeNode W.encodeString name, W.encodeList (encodeNode encodeRecordSetter) setters ]
+        GLSLExpression s -> W.encodeSequenceWithoutLength [ W.encodeInt 23, W.encodeString s ]
 
 
 decodeExpression : W.Decoder Expression
@@ -467,7 +482,7 @@ decodeExpression =
 
 encodeRecordSetter : RecordSetter -> W.Encoder
 encodeRecordSetter ( name, expr ) =
-    W.encodeSequence [ encodeNode W.encodeString name, encodeNode encodeExpression expr ]
+    W.encodeSequenceWithoutLength [ encodeNode W.encodeString name, encodeNode encodeExpression expr ]
 
 
 decodeRecordSetter : W.Decoder RecordSetter
@@ -477,7 +492,7 @@ decodeRecordSetter =
 
 encodeLetBlock : LetBlock -> W.Encoder
 encodeLetBlock { declarations, expression } =
-    W.encodeSequence [ W.encodeList (encodeNode encodeLetDeclaration) declarations, encodeNode encodeExpression expression ]
+    W.encodeSequenceWithoutLength [ W.encodeList (encodeNode encodeLetDeclaration) declarations, encodeNode encodeExpression expression ]
 
 
 decodeLetBlock : W.Decoder LetBlock
@@ -491,10 +506,10 @@ encodeLetDeclaration : LetDeclaration -> W.Encoder
 encodeLetDeclaration decl =
     case decl of
         LetFunction func ->
-            W.encodeSequence [ W.encodeInt 0, W.encodeMaybe (encodeNode W.encodeString) func.documentation, W.encodeMaybe (encodeNode encodeSignature) func.signature, encodeNode encodeFunctionImpl func.declaration ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 0, W.encodeMaybe (encodeNode W.encodeString) func.documentation, W.encodeMaybe (encodeNode encodeSignature) func.signature, encodeNode encodeFunctionImpl func.declaration ]
 
         LetDestructuring pat expr ->
-            W.encodeSequence [ W.encodeInt 1, encodeNode encodePattern pat, encodeNode encodeExpression expr ]
+            W.encodeSequenceWithoutLength [ W.encodeInt 1, encodeNode encodePattern pat, encodeNode encodeExpression expr ]
 
 
 decodeLetDeclaration : W.Decoder LetDeclaration
@@ -516,7 +531,7 @@ decodeLetDeclaration =
 
 encodeCaseBlock : CaseBlock -> W.Encoder
 encodeCaseBlock { expression, cases } =
-    W.encodeSequence [ encodeNode encodeExpression expression, W.encodeList encodeCase cases ]
+    W.encodeSequenceWithoutLength [ encodeNode encodeExpression expression, W.encodeList encodeCase cases ]
 
 
 decodeCaseBlock : W.Decoder CaseBlock
@@ -528,7 +543,7 @@ decodeCaseBlock =
 
 encodeCase : ( Node Pattern, Node Expression ) -> W.Encoder
 encodeCase ( pat, expr ) =
-    W.encodeSequence [ encodeNode encodePattern pat, encodeNode encodeExpression expr ]
+    W.encodeSequenceWithoutLength [ encodeNode encodePattern pat, encodeNode encodeExpression expr ]
 
 
 decodeCase : W.Decoder ( Node Pattern, Node Expression )
@@ -538,7 +553,7 @@ decodeCase =
 
 encodeLambda : Lambda -> W.Encoder
 encodeLambda { args, expression } =
-    W.encodeSequence [ W.encodeList (encodeNode encodePattern) args, encodeNode encodeExpression expression ]
+    W.encodeSequenceWithoutLength [ W.encodeList (encodeNode encodePattern) args, encodeNode encodeExpression expression ]
 
 
 decodeLambda : W.Decoder Lambda
@@ -557,19 +572,19 @@ encodePattern pat =
     case pat of
         AllPattern -> W.encodeInt 0
         UnitPattern -> W.encodeInt 1
-        CharPattern c -> W.encodeSequence [ W.encodeInt 2, W.encodeChar c ]
-        StringPattern s -> W.encodeSequence [ W.encodeInt 3, W.encodeString s ]
-        IntPattern i -> W.encodeSequence [ W.encodeInt 4, W.encodeInt i ]
-        HexPattern i -> W.encodeSequence [ W.encodeInt 5, W.encodeInt i ]
-        FloatPattern f -> W.encodeSequence [ W.encodeInt 6, W.encodeFloat f ]
-        TuplePattern ps -> W.encodeSequence [ W.encodeInt 7, W.encodeList (encodeNode encodePattern) ps ]
-        RecordPattern fields -> W.encodeSequence [ W.encodeInt 8, W.encodeList (encodeNode W.encodeString) fields ]
-        UnConsPattern h t -> W.encodeSequence [ W.encodeInt 9, encodeNode encodePattern h, encodeNode encodePattern t ]
-        ListPattern ps -> W.encodeSequence [ W.encodeInt 10, W.encodeList (encodeNode encodePattern) ps ]
-        VarPattern s -> W.encodeSequence [ W.encodeInt 11, W.encodeString s ]
-        NamedPattern { moduleName, name } args -> W.encodeSequence [ W.encodeInt 12, encodeModuleName moduleName, W.encodeString name, W.encodeList (encodeNode encodePattern) args ]
-        AsPattern p alias_ -> W.encodeSequence [ W.encodeInt 13, encodeNode encodePattern p, encodeNode W.encodeString alias_ ]
-        ParenthesizedPattern p -> W.encodeSequence [ W.encodeInt 14, encodeNode encodePattern p ]
+        CharPattern c -> W.encodeSequenceWithoutLength [ W.encodeInt 2, W.encodeChar c ]
+        StringPattern s -> W.encodeSequenceWithoutLength [ W.encodeInt 3, W.encodeString s ]
+        IntPattern i -> W.encodeSequenceWithoutLength [ W.encodeInt 4, W.encodeInt i ]
+        HexPattern i -> W.encodeSequenceWithoutLength [ W.encodeInt 5, W.encodeInt i ]
+        FloatPattern f -> W.encodeSequenceWithoutLength [ W.encodeInt 6, W.encodeFloat f ]
+        TuplePattern ps -> W.encodeSequenceWithoutLength [ W.encodeInt 7, W.encodeList (encodeNode encodePattern) ps ]
+        RecordPattern fields -> W.encodeSequenceWithoutLength [ W.encodeInt 8, W.encodeList (encodeNode W.encodeString) fields ]
+        UnConsPattern h t -> W.encodeSequenceWithoutLength [ W.encodeInt 9, encodeNode encodePattern h, encodeNode encodePattern t ]
+        ListPattern ps -> W.encodeSequenceWithoutLength [ W.encodeInt 10, W.encodeList (encodeNode encodePattern) ps ]
+        VarPattern s -> W.encodeSequenceWithoutLength [ W.encodeInt 11, W.encodeString s ]
+        NamedPattern { moduleName, name } args -> W.encodeSequenceWithoutLength [ W.encodeInt 12, encodeModuleName moduleName, W.encodeString name, W.encodeList (encodeNode encodePattern) args ]
+        AsPattern p alias_ -> W.encodeSequenceWithoutLength [ W.encodeInt 13, encodeNode encodePattern p, encodeNode W.encodeString alias_ ]
+        ParenthesizedPattern p -> W.encodeSequenceWithoutLength [ W.encodeInt 14, encodeNode encodePattern p ]
 
 
 decodePattern : W.Decoder Pattern

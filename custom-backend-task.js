@@ -53,3 +53,21 @@ export function readdir(path) {
         })
     );
 }
+
+/**
+ * @param {{ path: string, bytes: number[] }} input
+ * @returns {Promise<void>}
+ */
+export function writeBinaryFile(input) {
+    const buffer = Buffer.from(input.bytes);
+
+    return new Promise((resolve, reject) =>
+        fs.writeFile(input.path, buffer, (err) => {
+            if (err) {
+                reject(err);
+            } else {
+                resolve();
+            }
+        })
+    );
+}

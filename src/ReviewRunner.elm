@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, profileForRule, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -412,6 +412,19 @@ the full project for cross-module analysis.
 type RuleType
     = ModuleRule
     | ProjectRule
+
+
+type alias RuleInfo =
+    { index : Int
+    , name : String
+    , ruleType : RuleType
+    }
+
+
+type alias LoadedReviewProject =
+    { project : InterpreterProject
+    , counters : Dict String Int
+    }
 
 
 {-| Classify a rule by parsing its source code.
@@ -1496,6 +1509,20 @@ boolToInt value =
         0
 
 
+fileExists : String -> BackendTask FatalError Bool
+fileExists path =
+    Glob.fromStringWithOptions
+        (let
+            options : Glob.Options
+            options =
+                Glob.defaultOptions
+         in
+         { options | include = Glob.OnlyFiles }
+        )
+        path
+        |> BackendTask.map (not << List.isEmpty)
+
+
 memoStatsCounters : String -> MemoRuntime.MemoStats -> Dict String Int
 memoStatsCounters prefix memoStats =
     let
@@ -2350,10 +2377,10 @@ task config =
 
         ColdMiss _ ->
             -- No cache — treat all files as stale (same code path as PartialMiss)
-            Do.do (withTiming "load_review_project" (loadReviewProject preparedConfig)) <| \reviewProjectTimed ->
+            Do.do (withTiming "load_review_project" (loadReviewProjectDetailed preparedConfig)) <| \reviewProjectTimed ->
             let
                 reviewProject =
-                    reviewProjectTimed.value
+                    reviewProjectTimed.value.project
             in
             Do.do (withTiming "get_rule_info" (getRuleInfoWithProject preparedConfig reviewProject)) <| \ruleInfoTimed ->
             let
@@ -2390,7 +2417,8 @@ task config =
                 , persistDeclCacheTimed.stage
                 ]
                 (mergeCounterDicts
-                    [ runResult.perf.counters
+                    [ reviewProjectTimed.value.counters
+                    , runResult.perf.counters
                     , Dict.fromList
                         [ ( "stale.files", List.length targetFileContents )
                         , ( "decl_cache.stored_bytes", String.length encodedDeclCache )
@@ -2401,10 +2429,10 @@ task config =
         PartialMiss { cachedErrors, staleFiles } ->
             -- Some files changed. Module rules on unchanged files use cachedErrors.
             -- Only stale files need module rule re-eval. Project rules always re-eval.
-            Do.do (withTiming "load_review_project" (loadReviewProject preparedConfig)) <| \reviewProjectTimed ->
+            Do.do (withTiming "load_review_project" (loadReviewProjectDetailed preparedConfig)) <| \reviewProjectTimed ->
             let
                 reviewProject =
-                    reviewProjectTimed.value
+                    reviewProjectTimed.value.project
             in
             Do.do (withTiming "get_rule_info" (getRuleInfoWithProject preparedConfig reviewProject)) <| \ruleInfoTimed ->
             let
@@ -2444,7 +2472,8 @@ task config =
                 , persistDeclCacheTimed.stage
                 ]
                 (mergeCounterDicts
-                    [ runResult.perf.counters
+                    [ reviewProjectTimed.value.counters
+                    , runResult.perf.counters
                     , Dict.fromList
                         [ ( "stale.files", List.length staleFileContents )
                         , ( "decl_cache.stored_bytes", String.length encodedDeclCache )
@@ -5492,7 +5521,7 @@ Rule type is determined by matching the rule name against known module rule pack
 -}
 getRuleInfo :
     Config
-    -> BackendTask FatalError (List { index : Int, name : String, ruleType : RuleType })
+    -> BackendTask FatalError (List RuleInfo)
 getRuleInfo config =
     Do.do (loadReviewProject config) <| \reviewProject ->
     getRuleInfoWithProject config reviewProject
@@ -5501,8 +5530,31 @@ getRuleInfo config =
 getRuleInfoWithProject :
     Config
     -> InterpreterProject
-    -> BackendTask FatalError (List { index : Int, name : String, ruleType : RuleType })
+    -> BackendTask FatalError (List RuleInfo)
 getRuleInfoWithProject config reviewProject =
+    Do.do (fileExists (ruleInfoCachePath config)) <| \cacheExists ->
+    if cacheExists then
+        Do.do
+            (File.rawFile (ruleInfoCachePath config)
+                |> BackendTask.allowFatal
+            )
+        <| \cachedJson ->
+        case decodeRuleInfo cachedJson of
+            Ok cachedRuleInfo ->
+                BackendTask.succeed cachedRuleInfo
+
+            Err _ ->
+                computeAndPersistRuleInfo config reviewProject
+
+    else
+        computeAndPersistRuleInfo config reviewProject
+
+
+computeAndPersistRuleInfo :
+    Config
+    -> InterpreterProject
+    -> BackendTask FatalError (List RuleInfo)
+computeAndPersistRuleInfo config reviewProject =
     Cache.run { jobs = Nothing } config.buildDirectory
         (InterpreterProject.evalWithSourceOverrides reviewProject
             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
@@ -5528,6 +5580,82 @@ getRuleInfoWithProject config reviewProject =
                                     )
                         )
             )
+        |> BackendTask.andThen
+            (\ruleInfo ->
+                Script.writeFile
+                    { path = ruleInfoCachePath config
+                    , body = encodeRuleInfo ruleInfo
+                    }
+                    |> BackendTask.allowFatal
+                    |> BackendTask.map (\_ -> ruleInfo)
+            )
+
+
+ruleInfoCachePath : Config -> String
+ruleInfoCachePath config =
+    Path.toString config.buildDirectory ++ "/rule-info.json"
+
+
+encodeRuleInfo : List RuleInfo -> String
+encodeRuleInfo ruleInfo =
+    ruleInfo
+        |> Json.Encode.list
+            (\info ->
+                Json.Encode.object
+                    [ ( "index", Json.Encode.int info.index )
+                    , ( "name", Json.Encode.string info.name )
+                    , ( "ruleType", Json.Encode.string (ruleTypeToString info.ruleType) )
+                    ]
+            )
+        |> Json.Encode.encode 0
+
+
+decodeRuleInfo : String -> Result String (List RuleInfo)
+decodeRuleInfo json =
+    let
+        decoder : Json.Decode.Decoder (List RuleInfo)
+        decoder =
+            Json.Decode.list <|
+                Json.Decode.map3
+                    (\index name ruleType ->
+                        { index = index
+                        , name = name
+                        , ruleType = ruleType
+                        }
+                    )
+                    (Json.Decode.field "index" Json.Decode.int)
+                    (Json.Decode.field "name" Json.Decode.string)
+                    (Json.Decode.field "ruleType" ruleTypeDecoder)
+    in
+    Json.Decode.decodeString decoder json
+        |> Result.mapError Json.Decode.errorToString
+
+
+ruleTypeDecoder : Json.Decode.Decoder RuleType
+ruleTypeDecoder =
+    Json.Decode.string
+        |> Json.Decode.andThen
+            (\raw ->
+                case raw of
+                    "module" ->
+                        Json.Decode.succeed ModuleRule
+
+                    "project" ->
+                        Json.Decode.succeed ProjectRule
+
+                    _ ->
+                        Json.Decode.fail ("Unknown rule type: " ++ raw)
+            )
+
+
+ruleTypeToString : RuleType -> String
+ruleTypeToString ruleType =
+    case ruleType of
+        ModuleRule ->
+            "module"
+
+        ProjectRule ->
+            "project"
 
 
 {-| Classify a rule by its name. Known module-rule packages are classified as ModuleRule.
@@ -5566,13 +5694,47 @@ classifyByRuleName name =
 -}
 loadReviewProject : Config -> BackendTask FatalError InterpreterProject
 loadReviewProject config =
-    InterpreterProject.loadWith
+    loadReviewProjectDetailed config
+        |> BackendTask.map .project
+
+
+loadReviewProjectDetailed : Config -> BackendTask FatalError LoadedReviewProject
+loadReviewProjectDetailed config =
+    InterpreterProject.loadWithProfile
         { projectDir = Path.path config.reviewDir
         , skipPackages = Set.union kernelPackages conflictingPackages
         , patchSource = patchSource
         , extraSourceFiles = []
         , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
+        , packageParseCacheDir = Just (Path.toString config.buildDirectory)
         }
+        |> BackendTask.map
+            (\loaded ->
+                { project = loaded.project
+                , counters =
+                    Dict.fromList
+                        [ ( "load_review_project.resolve_source_directories_ms", loaded.profile.resolveSourceDirectoriesMs )
+                        , ( "load_review_project.load_package_sources_ms", loaded.profile.loadPackageSourcesMs )
+                        , ( "load_review_project.parsed_package_cache_hit", loaded.profile.parsedPackageCacheHit )
+                        , ( "load_review_project.parsed_package_cache_roundtrip_ok", loaded.profile.parsedPackageCacheRoundtripOk )
+                        , ( "load_review_project.parsed_package_cache_bytes", loaded.profile.parsedPackageCacheBytes )
+                        , ( "load_review_project.load_parsed_package_cache_ms", loaded.profile.loadParsedPackageCacheMs )
+                        , ( "load_review_project.decode_parsed_package_cache_ms", loaded.profile.decodeParsedPackageCacheMs )
+                        , ( "load_review_project.validate_parsed_package_cache_ms", loaded.profile.validateParsedPackageCacheMs )
+                        , ( "load_review_project.write_parsed_package_cache_ms", loaded.profile.writeParsedPackageCacheMs )
+                        , ( "load_review_project.glob_user_sources_ms", loaded.profile.globUserSourcesMs )
+                        , ( "load_review_project.read_user_sources_ms", loaded.profile.readUserSourcesMs )
+                        , ( "load_review_project.read_extra_sources_ms", loaded.profile.readExtraSourcesMs )
+                        , ( "load_review_project.build_graph_ms", loaded.profile.buildGraphMs )
+                        , ( "load_review_project.parse_package_sources_ms", loaded.profile.parsePackageSourcesMs )
+                        , ( "load_review_project.build_package_env_from_parsed_ms", loaded.profile.buildPackageEnvFromParsedMs )
+                        , ( "load_review_project.build_package_env_ms", loaded.profile.buildPackageEnvMs )
+                        , ( "load_review_project.build_base_user_env_ms", loaded.profile.buildBaseUserEnvMs )
+                        , ( "load_review_project.build_semantic_index_ms", loaded.profile.buildSemanticIndexMs )
+                        , ( "load_review_project.cache_inputs_ms", loaded.profile.cacheInputsMs )
+                        ]
+                }
+            )
 
 
 {-| Write the per-declaration cache to disk.

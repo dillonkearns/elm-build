@@ -1,6 +1,7 @@
 module RunTests exposing (run)
 
 import Ansi.Color
+import AstWireCodecTests
 import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
 import FatalError exposing (FatalError)
@@ -30,7 +31,7 @@ runAll =
             Random.initialSeed 42
 
         allSuites =
-            Test.describe "All" [ TestAnalysisTests.suite, MutatorTests.suite, MutationTestRunnerTest.suite, DepGraphTests.suite, MutationReportTests.suite, CoverageTests.suite, SemanticHashTests.suite, ReviewRunnerTest.suite ]
+            Test.describe "All" [ TestAnalysisTests.suite, MutatorTests.suite, MutationTestRunnerTest.suite, DepGraphTests.suite, MutationReportTests.suite, CoverageTests.suite, SemanticHashTests.suite, AstWireCodecTests.suite, ReviewRunnerTest.suite ]
 
         runners =
             case Test.Runner.fromTest 100 seed allSuites of
