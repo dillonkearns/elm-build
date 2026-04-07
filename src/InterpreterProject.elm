@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -2000,15 +2000,75 @@ then walks the resulting CallTree to extract all evaluated source ranges.
 Returns both the test result string and the list of covered ranges.
 
 -}
-evalWithCoverage :
+evalSimple :
     InterpreterProject
     ->
         { imports : List String
         , expression : String
         , sourceOverrides : List String
         }
+    -> BackendTask FatalError String
+evalSimple (InterpreterProject project) { imports, expression, sourceOverrides } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        filteredSources =
+            topoSortModules project.moduleGraph neededModules
+
+        userFilteredSources =
+            filteredSources
+                |> List.filter
+                    (\src ->
+                        case DepGraph.parseModuleName src of
+                            Just name ->
+                                not (Set.member name project.packageModuleNames)
+
+                            Nothing ->
+                                True
+                    )
+
+        allSources =
+            userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
+
+        result =
+            Eval.Module.evalWithEnv
+                project.packageEnv
+                allSources
+                (FunctionOrValue [] "results")
+    in
+    BackendTask.succeed
+        (case result of
+            Ok (Types.String s) ->
+                s
+
+            Ok _ ->
+                "ERROR: Expected String result"
+
+            Err (Types.ParsingError _) ->
+                "ERROR: Parsing error"
+
+            Err (Types.EvalError evalErr) ->
+                "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+        )
+
+
+evalWithCoverage :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , probeLines : Set Int
+        }
     -> BackendTask FatalError { result : String, coveredRanges : List Range }
-evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverrides } =
+evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverrides, probeLines } =
     let
         wrapperSource : String
         wrapperSource =
@@ -2043,8 +2103,9 @@ evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverr
         allSources =
             userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
 
-        ( result, callTrees, _ ) =
-            Eval.Module.traceWithEnv
+        ( result, coveredRanges ) =
+            Eval.Module.coverageWithEnvAndLimit Nothing
+                probeLines
                 project.packageEnv
                 allSources
                 (FunctionOrValue [] "results")
@@ -2062,9 +2123,6 @@ evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverr
 
                 Err (Types.EvalError evalErr) ->
                     "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
-
-        coveredRanges =
-            Coverage.extractRanges callTrees
     in
     BackendTask.succeed { result = resultString, coveredRanges = coveredRanges }
 

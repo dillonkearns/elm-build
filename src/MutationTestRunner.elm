@@ -34,6 +34,7 @@ import InterpreterProject exposing (InterpreterProject)
 import Json.Encode
 import MutationReport
 import Mutator exposing (Mutation)
+import SemanticHash
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
@@ -270,21 +271,7 @@ task config =
         -- Determine which files to mutate
         Do.do (resolveFilesToMutate config project sourceDirectories testFile) <| \filesToMutate ->
         Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue ("Mutating " ++ String.fromInt (List.length filesToMutate) ++ " source file(s): " ++ String.join ", " filesToMutate)) <| \_ ->
-        -- Count runners (cheap eval, no tracing overhead)
-        Do.do
-            (InterpreterProject.evalWithCoverage project
-                { imports = evalConfig.imports
-                , expression = "SimpleTestRunner.countTests (" ++ suiteExpr ++ ")"
-                , sourceOverrides = [ simpleTestRunnerSource ]
-                }
-            )
-        <| \countResult ->
-        let
-            runnerCount =
-                String.toInt countResult.result |> Maybe.withDefault 0
-        in
-        Do.log ("  " ++ String.fromInt runnerCount ++ " runners, collecting per-runner coverage...") <| \_ ->
-        -- Read all mutation target files upfront to get line counts for scoping
+        -- Read all mutation target files upfront to get line counts and pre-generate mutations
         Do.do
             (filesToMutate
                 |> List.map
@@ -297,14 +284,99 @@ task config =
                 |> BackendTask.map Dict.fromList
             )
         <| \fileInfo ->
-        -- Per-runner coverage: trace each runner individually, immediately scope
-        -- ranges to each file's line count, and accumulate only the scoped data.
-        -- Raw per-runner ranges are discarded after each step (GC-friendly).
+        let
+            -- Pre-generate mutations to extract probe lines for coverage filtering.
+            -- This gives us O(mutation_sites) coverage instead of O(expressions).
+            allMutationsByFile =
+                Dict.map (\_ fi -> Mutator.generateMutations fi.source) fileInfo
+
+            -- Extract unique line numbers across all mutation sites
+            probeLines =
+                allMutationsByFile
+                    |> Dict.values
+                    |> List.concatMap (List.concatMap (\m -> [ m.spliceRange.start.row, m.spliceRange.end.row ]))
+                    |> Set.fromList
+
+            -- Per-test runner dependency sets: decompose the suite into individual
+            -- test expressions and compute each one's transitive dependencies.
+            -- This enables per-runner precision in mutation selection.
+            childExpressions =
+                case testValues of
+                    [ single ] ->
+                        TestAnalysis.extractDescribeChildrenAsExpressions single testSource
+                            |> Maybe.withDefault []
+
+                    _ ->
+                        []
+        in
+        -- Count runners (cheap eval, no coverage needed)
+        Do.do
+            (InterpreterProject.evalSimple project
+                { imports = evalConfig.imports
+                , expression = "SimpleTestRunner.countTests (" ++ suiteExpr ++ ")"
+                , sourceOverrides = [ simpleTestRunnerSource ]
+                }
+            )
+        <| \countResultStr ->
+        let
+            runnerCount =
+                String.toInt countResultStr |> Maybe.withDefault 0
+        in
+        -- Count runners per child to build child→runner index mapping.
+        -- Only works when children are named references (e.g., "TestModule.testName"),
+        -- not inline expressions. For inline expressions, fall back to coarse mode.
+        Do.do
+            (let
+                childStrings =
+                    case testValues of
+                        [ single ] ->
+                            TestAnalysis.extractDescribeChildren single testSource
+                                |> Maybe.withDefault []
+
+                        _ ->
+                            List.map (\v -> testModuleName ++ "." ++ v) testValues
+
+                allNamed =
+                    childStrings
+                        |> List.all (\s -> not (String.contains " " s))
+             in
+             if allNamed && not (List.isEmpty childStrings) then
+                childStrings
+                    |> BackendTask.Extra.mapSequence
+                        (\childExpr ->
+                            InterpreterProject.evalSimple project
+                                { imports = evalConfig.imports
+                                , expression = "SimpleTestRunner.countTests (" ++ childExpr ++ ")"
+                                , sourceOverrides = [ simpleTestRunnerSource ]
+                                }
+                                |> BackendTask.map (\s -> String.toInt s |> Maybe.withDefault 0)
+                        )
+
+             else
+                -- Inline expressions can't be evaluated for counting —
+                -- skip per-child counting, will use coarse mode
+                BackendTask.succeed []
+            )
+        <| \perChildRunnerCounts ->
+        let
+            -- Build cumulative runner index ranges per child
+            -- e.g., counts [3, 5, 2] → ranges [(0,2), (3,7), (8,9)]
+            perChildRunnerRanges =
+                perChildRunnerCounts
+                    |> List.foldl
+                        (\count ( offset, ranges ) ->
+                            ( offset + count, ranges ++ [ ( offset, offset + count - 1 ) ] )
+                        )
+                        ( 0, [] )
+                    |> Tuple.second
+        in
+        Do.log ("  " ++ String.fromInt runnerCount ++ " runners (" ++ String.fromInt (List.length perChildRunnerCounts) ++ " test groups), collecting per-runner baselines...") <| \_ ->
+        -- Collect per-runner baselines (no coverage — just run each runner once)
         Do.do
             (List.range 0 (runnerCount - 1)
-                |> BackendTask.Extra.foldSequence
-                    (\runnerIndex acc ->
-                        InterpreterProject.evalWithCoverage project
+                |> BackendTask.Extra.mapSequence
+                    (\runnerIndex ->
+                        InterpreterProject.evalSimple project
                             { imports = evalConfig.imports
                             , expression =
                                 "SimpleTestRunner.runNth "
@@ -314,128 +386,146 @@ task config =
                                     ++ ")"
                             , sourceOverrides = [ simpleTestRunnerSource ]
                             }
-                            |> BackendTask.map
-                                (\coverage ->
-                                    let
-                                        -- Scope this runner's ranges to each file immediately
-                                        updatedPerFileData =
-                                            Dict.foldl
-                                                (\fp fi perFile ->
-                                                    let
-                                                        scopedRanges =
-                                                            Coverage.filterRangesToFile fi.lineCount coverage.coveredRanges
-
-                                                        entry =
-                                                            case Dict.get fp perFile of
-                                                                Just existing ->
-                                                                    { existing
-                                                                        | runnerData = existing.runnerData ++ [ { index = runnerIndex, coveredRanges = scopedRanges } ]
-                                                                        , allCoveredRanges = existing.allCoveredRanges ++ scopedRanges
-                                                                    }
-
-                                                                Nothing ->
-                                                                    { source = fi.source
-                                                                    , runnerData = [ { index = runnerIndex, coveredRanges = scopedRanges } ]
-                                                                    , allCoveredRanges = scopedRanges
-                                                                    }
-                                                    in
-                                                    Dict.insert fp entry perFile
-                                                )
-                                                acc.perFileData
-                                                fileInfo
-                                    in
-                                    { baselines = acc.baselines ++ [ coverage.result ]
-                                    , perFileData = updatedPerFileData
-                                    }
-                                )
                     )
-                    { baselines = [], perFileData = Dict.empty }
             )
-        <| \collected ->
-        let
-            perRunnerBaselines =
-                collected.baselines
-
-            perFileData =
-                collected.perFileData
-
-            totalCoveredExpressions =
-                perFileData
-                    |> Dict.values
-                    |> List.concatMap .allCoveredRanges
-                    |> List.length
-        in
-        Do.log ("  " ++ String.fromInt totalCoveredExpressions ++ " covered expression ranges") <| \_ ->
+        <| \perRunnerBaselines ->
+        Do.log ("  Baselines collected. " ++ String.fromInt (List.length perChildRunnerRanges) ++ " test groups with per-runner precision.") <| \_ ->
         Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
         -- Pre-compute the cache directory listing once, instead of per-mutation
         Do.do (Cache.listExisting config.buildDirectory) <| \existingCache ->
         Do.do BackendTask.Time.now <| \startTime ->
+        let
+            -- Build the baseline raw index once (expensive: parses all modules).
+            -- Per mutation, only reparse the mutated module and re-resolve hashes.
+            baselineModules =
+                ({ moduleName = testModuleName, source = testSource }
+                    :: (Dict.toList fileInfo
+                            |> List.filterMap
+                                (\( fp, fi ) ->
+                                    DepGraph.filePathToModuleName sourceDirectories fp
+                                        |> Maybe.map (\modName -> { moduleName = modName, source = fi.source })
+                                )
+                       )
+                )
+
+            baselineRawIndex =
+                SemanticHash.buildRawIndex baselineModules
+
+            baselineSemanticIndex =
+                SemanticHash.resolveRawIndex baselineRawIndex
+
+            -- Per-child dependency sets for precise runner selection.
+            -- Each child expression's transitive deps are computed from the index.
+            perChildDeps =
+                childExpressions
+                    |> List.map (SemanticHash.depsForExpression baselineSemanticIndex testModuleName)
+        in
         -- Run mutations for each file and collect per-file results
         Do.do
             (filesToMutate
                 |> BackendTask.Extra.mapSequence
                     (\mutateFilePath ->
-                        case Dict.get mutateFilePath perFileData of
+                        case Dict.get mutateFilePath fileInfo of
                             Nothing ->
                                 BackendTask.succeed { filePath = mutateFilePath, sourceCode = "", results = [] }
 
-                            Just fileData ->
+                            Just fi ->
                                 let
-                                    mutateSource =
-                                        fileData.source
-
-                                    fileScopedRunnerData =
-                                        fileData.runnerData
-
-                                    fileScopedAllCoveredRanges =
-                                        fileData.allCoveredRanges
-
                                     allMutations =
-                                        Mutator.generateMutations mutateSource
+                                        Dict.get mutateFilePath allMutationsByFile
+                                            |> Maybe.withDefault []
 
                                     mutations =
                                         filterMutations config allMutations
-
-                                    coveredMutations =
-                                        mutations
-                                            |> List.filter (\m -> Coverage.isCovered fileScopedAllCoveredRanges m.spliceRange)
-
-                                    uncoveredMutations =
-                                        mutations
-                                            |> List.filter (\m -> not (Coverage.isCovered fileScopedAllCoveredRanges m.spliceRange))
-
-                                    uncoveredResults =
-                                        uncoveredMutations
-                                            |> List.map (\m -> NoCoverageResult { mutation = m })
                                 in
-                                Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations (" ++ String.fromInt (List.length coveredMutations) ++ " covered, " ++ String.fromInt (List.length uncoveredMutations) ++ " no coverage)") <| \_ ->
+                                Do.log ("  " ++ mutateFilePath ++ ": " ++ String.fromInt (List.length mutations) ++ " mutations") <| \_ ->
                                 Do.do
-                                    (coveredMutations
+                                    (mutations
                                         |> List.indexedMap Tuple.pair
                                         |> BackendTask.Extra.mapSequence
                                             (\( mutIndex, mutation ) ->
                                                 let
                                                     mutationProgress =
-                                                        "    [" ++ String.fromInt (mutIndex + 1) ++ "/" ++ String.fromInt (List.length coveredMutations) ++ "] " ++ mutation.operator ++ " " ++ mutateFilePath ++ ":" ++ String.fromInt mutation.line
+                                                        "    [" ++ String.fromInt (mutIndex + 1) ++ "/" ++ String.fromInt (List.length mutations) ++ "] " ++ mutation.operator ++ " " ++ mutateFilePath ++ ":" ++ String.fromInt mutation.line
+
+                                                    mutatedSource =
+                                                        Mutator.applyMutation fi.source mutation
+
+                                                    mutatedModuleName =
+                                                        DepGraph.filePathToModuleName sourceDirectories mutateFilePath
+                                                            |> Maybe.withDefault ""
+
+                                                    -- Incremental: only reparse the mutated module,
+                                                    -- reuse baseline raw index for everything else.
+                                                    mutatedSemanticIndex =
+                                                        SemanticHash.replaceModuleInRawIndex baselineRawIndex
+                                                            { moduleName = mutatedModuleName, source = mutatedSource }
+                                                            |> SemanticHash.resolveRawIndexIncremental baselineSemanticIndex
+
+                                                    diff =
+                                                        SemanticHash.diffIndices baselineSemanticIndex mutatedSemanticIndex
+
+                                                    -- Per-child precision: check each child's deps against
+                                                    -- changed declarations, then expand to runner indices
+                                                    -- using the precomputed child→runner ranges.
+                                                    affectedIndices =
+                                                        if not (List.isEmpty perChildRunnerRanges) && List.length perChildDeps == List.length perChildRunnerRanges then
+                                                            List.map2
+                                                                (\deps ( startIdx, endIdx ) ->
+                                                                    if Set.isEmpty (Set.intersect deps diff.changed) then
+                                                                        []
+
+                                                                    else
+                                                                        List.range startIdx endIdx
+                                                                )
+                                                                perChildDeps
+                                                                perChildRunnerRanges
+                                                                |> List.concat
+
+                                                        else
+                                                            -- Fallback: check if any test module declaration changed
+                                                            let
+                                                                testModuleAffected =
+                                                                    diff.changed
+                                                                        |> Set.toList
+                                                                        |> List.any (\name -> String.startsWith (testModuleName ++ ".") name)
+                                                            in
+                                                            if testModuleAffected then
+                                                                List.range 0 (runnerCount - 1)
+
+                                                            else
+                                                                []
 
                                                     mutatedFile =
                                                         { file = mutation.getMutatedFile (), hashKey = Mutator.hashKey mutation }
                                                 in
-                                                Do.do
-                                                    (evalMutationWithRelevantRunners
-                                                        { existingCache = existingCache
-                                                        , buildDirectory = config.buildDirectory
-                                                        , project = project
-                                                        , imports = evalConfig.imports
-                                                        , sourceOverrides = [ simpleTestRunnerSource ]
-                                                        , mutatedFile = mutatedFile
-                                                        , mutation = mutation
-                                                        , suiteExpr = suiteExpr
-                                                        , perRunnerBaselines = perRunnerBaselines
-                                                        , perRunnerData = fileScopedRunnerData
-                                                        , runnerCount = runnerCount
-                                                        }
-                                                    )
+                                                if Set.isEmpty diff.changed then
+                                                    -- No declaration hashes changed — provably equivalent
+                                                    Do.log (mutationProgress ++ " " ++ Ansi.Color.fontColor Ansi.Color.yellow "EQUIVALENT" ++ " (0 changed)") <| \_ ->
+                                                    BackendTask.succeed (EquivalentResult { mutation = mutation })
+
+                                                else if List.isEmpty affectedIndices then
+                                                    -- Mutation changed declarations but no test runner
+                                                    -- depends on them — equivalent
+                                                    Do.log (mutationProgress ++ " " ++ Ansi.Color.fontColor Ansi.Color.yellow "EQUIVALENT") <| \_ ->
+                                                    BackendTask.succeed (EquivalentResult { mutation = mutation })
+
+                                                else
+                                                    Do.do
+                                                        (evalMutationWithRelevantRunners
+                                                            { existingCache = existingCache
+                                                            , buildDirectory = config.buildDirectory
+                                                            , project = project
+                                                            , imports = evalConfig.imports
+                                                            , sourceOverrides = [ simpleTestRunnerSource ]
+                                                            , mutatedFile = mutatedFile
+                                                            , mutation = mutation
+                                                            , suiteExpr = suiteExpr
+                                                            , perRunnerBaselines = perRunnerBaselines
+                                                            , runnerCount = runnerCount
+                                                            , affectedIndices = affectedIndices
+                                                            }
+                                                        )
                                                 <| \mutResult ->
                                                 let
                                                     statusStr =
@@ -459,11 +549,11 @@ task config =
                                                 BackendTask.succeed mutResult
                                             )
                                     )
-                                <| \coveredResults ->
+                                <| \mutationResults ->
                                 BackendTask.succeed
                                     { filePath = mutateFilePath
-                                    , sourceCode = mutateSource
-                                    , results = coveredResults ++ uncoveredResults
+                                    , sourceCode = fi.source
+                                    , results = mutationResults
                                     }
                     )
             )
@@ -581,9 +671,13 @@ filterMutations config mutations =
            )
 
 
-{-| Evaluate a mutation by running only relevant runners (those whose coverage
-overlaps the mutation range). Falls back to running all runners if all are
-relevant. Uses per-runner coverage data collected during the baseline phase.
+{-| Evaluate a mutation by running only the semantically affected runners.
+
+Uses semantic hash-based selection: only runners whose test declarations
+transitively depend on any changed declaration need to run. By Elm's purity,
+unchanged runners provably produce identical output.
+
+No fallback needed — the semantic comparison is exact.
 -}
 evalMutationWithRelevantRunners :
     { existingCache : Cache.HashSet
@@ -595,20 +689,13 @@ evalMutationWithRelevantRunners :
     , mutation : Mutation
     , suiteExpr : String
     , perRunnerBaselines : List String
-    , perRunnerData : List { index : Int, coveredRanges : List Range }
     , runnerCount : Int
+    , affectedIndices : List Int
     }
     -> BackendTask FatalError MutationResult
 evalMutationWithRelevantRunners ctx =
-    let
-        relevantIndices =
-            Coverage.relevantRunnerIndices ctx.perRunnerData ctx.mutation.spliceRange
-    in
-    if List.isEmpty relevantIndices then
-        BackendTask.succeed (NoCoverageResult { mutation = ctx.mutation })
-
-    else if List.length relevantIndices == ctx.runnerCount then
-        -- All runners relevant: use runEach (no overhead from index filtering)
+    if List.length ctx.affectedIndices == ctx.runnerCount then
+        -- All runners affected: use runEach (no overhead from index filtering)
         evalMutationWithRunEach
             { existingCache = ctx.existingCache
             , buildDirectory = ctx.buildDirectory
@@ -625,13 +712,13 @@ evalMutationWithRelevantRunners ctx =
         let
             expression =
                 "SimpleTestRunner.runIndices ["
-                    ++ String.join "," (List.map String.fromInt relevantIndices)
+                    ++ String.join "," (List.map String.fromInt ctx.affectedIndices)
                     ++ "] ("
                     ++ ctx.suiteExpr
                     ++ ")"
 
             relevantBaselines =
-                relevantIndices
+                ctx.affectedIndices
                     |> List.filterMap
                         (\i ->
                             ctx.perRunnerBaselines

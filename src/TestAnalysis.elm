@@ -1,4 +1,4 @@
-module TestAnalysis exposing (discoverTestValues, discoverTestValuesViaInterpreter, extractDescribeChildren, getCandidateNames, probeCandidate, usesFuzz)
+module TestAnalysis exposing (discoverTestValues, discoverTestValuesViaInterpreter, extractDescribeChildren, extractDescribeChildrenAsExpressions, getCandidateNames, probeCandidate, usesFuzz)
 
 {-| Static analysis for Elm test modules.
 
@@ -482,6 +482,34 @@ extractDescribeChildren valueName source =
                                                             extractSourceRange source child
                                                 )
                                             )
+
+                                else
+                                    Nothing
+
+                            _ ->
+                                Nothing
+                    )
+                |> List.head
+
+
+extractDescribeChildrenAsExpressions : String -> String -> Maybe (List (Node Expression))
+extractDescribeChildrenAsExpressions valueName source =
+    case Elm.Parser.parseToFile source of
+        Err _ ->
+            Nothing
+
+        Ok file ->
+            file.declarations
+                |> List.filterMap
+                    (\(Node _ decl) ->
+                        case decl of
+                            FunctionDeclaration func ->
+                                let
+                                    (Node _ impl) =
+                                        func.declaration
+                                in
+                                if Node.value impl.name == valueName then
+                                    findDescribeListChildren impl.expression
 
                                 else
                                     Nothing
