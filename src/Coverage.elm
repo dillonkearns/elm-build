@@ -10,6 +10,7 @@ by tracing), and checks whether a mutation's range is covered by any test.
 import Elm.Syntax.Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
 import Rope exposing (Rope)
+import Set
 import Types exposing (CallTree(..))
 
 
@@ -26,12 +27,20 @@ extractRanges trees =
 
 
 extractFromNode : CallTree -> List Range
-extractFromNode (CallNode node) =
-    let
-        (Node range _) =
-            node.expression
-    in
-    range :: extractRanges node.children
+extractFromNode tree =
+    case tree of
+        CallNode node ->
+            let
+                (Node range _) =
+                    node.expression
+            in
+            range :: extractRanges node.children
+
+        CoverageRange range ->
+            [ range ]
+
+        CoverageSet packedSet ->
+            Set.toList packedSet |> List.map Types.unpackRange
 
 
 {-| Check if a target range is covered by any range in the covered list.
