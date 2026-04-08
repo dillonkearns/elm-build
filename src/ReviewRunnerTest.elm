@@ -236,6 +236,40 @@ value =
                         |> Expect.equal
                             [ ( "src/A.elm", "Type constructor `Right` is not used." ) ]
             ]
+        , describe "hostNoUnusedCustomTypeConstructorArgsErrorsForSources"
+            [ test "reports wildcarded constructor argument and suppresses compared constructor" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedCustomTypeConstructorArgsErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (Choice(..), compareChoice)
+
+type Choice
+    = Left Int String
+    | Right Int
+
+compareChoice =
+    Left 1 "x" == Left 2 "y"
+"""
+                          }
+                        , { path = "src/B.elm"
+                          , source = """module B exposing (..)
+
+import A exposing (Choice(..))
+
+value choice =
+    case choice of
+        Left used _ ->
+            used
+
+        Right _ ->
+            0
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.filePath, error.message ))
+                        |> Expect.equal
+                            [ ( "src/A.elm", "Argument is never extracted and therefore never used." ) ]
+            ]
         , describe "crossModuleSummaryFromSource"
             [ test "captures constructor facts generically" <|
                 \_ ->
@@ -286,6 +320,23 @@ value maybeValue =
                                 summary.patternConstructorRefs
                                     |> List.map .name
                                     |> List.sort
+                            , constructorArgumentCounts =
+                                summary.constructorArgumentRanges
+                                    |> Dict.get "Choice"
+                                    |> Maybe.map
+                                        (Dict.toList
+                                            >> List.map (\( name, ranges ) -> ( name, List.length ranges ))
+                                            >> List.sortBy Tuple.first
+                                        )
+                                    |> Maybe.withDefault []
+                            , constructorPatternUsagePositions =
+                                summary.constructorPatternUsages
+                                    |> List.map (\usage -> ( usage.name, usage.usedPositions ))
+                                    |> List.sortBy Tuple.first
+                            , comparisonConstructorRefs =
+                                summary.comparisonConstructorRefs
+                                    |> List.map .name
+                                    |> List.sort
                             }
                                 |> Expect.equal
                                     { declaredConstructors = [ "Left", "Right" ]
@@ -293,6 +344,59 @@ value maybeValue =
                                     , importedOpenTypes = [ "Maybe" ]
                                     , expressionConstructorRefs = [ "Left", "Right" ]
                                     , patternConstructorRefs = [ "Just", "Nothing" ]
+                                    , constructorArgumentCounts = [ ( "Left", 0 ), ( "Right", 0 ) ]
+                                    , constructorPatternUsagePositions = [ ( "Just", [] ), ( "Nothing", [] ) ]
+                                    , comparisonConstructorRefs = []
+                                    }
+
+                        Nothing ->
+                            Expect.fail "Expected crossModuleSummaryFromSource to parse test module"
+            , test "captures constructor argument and comparison facts generically" <|
+                \_ ->
+                    case
+                        ReviewRunner.crossModuleSummaryFromSource
+                            "src/A.elm"
+                            """module A exposing (Choice(..), compareChoice)
+
+type Choice
+    = Left Int String
+    | Right Int
+
+compareChoice =
+    Left 1 "x" == Left 2 "y"
+
+use choice =
+    case choice of
+        Left value _ ->
+            value
+
+        Right _ ->
+            0
+"""
+                    of
+                        Just summary ->
+                            { constructorArgumentCounts =
+                                summary.constructorArgumentRanges
+                                    |> Dict.get "Choice"
+                                    |> Maybe.map
+                                        (Dict.toList
+                                            >> List.map (\( name, ranges ) -> ( name, List.length ranges ))
+                                            >> List.sortBy Tuple.first
+                                        )
+                                    |> Maybe.withDefault []
+                            , constructorPatternUsagePositions =
+                                summary.constructorPatternUsages
+                                    |> List.map (\usage -> ( usage.name, usage.usedPositions ))
+                                    |> List.sortBy Tuple.first
+                            , comparisonConstructorRefs =
+                                summary.comparisonConstructorRefs
+                                    |> List.map .name
+                                    |> List.sort
+                            }
+                                |> Expect.equal
+                                    { constructorArgumentCounts = [ ( "Left", 2 ), ( "Right", 1 ) ]
+                                    , constructorPatternUsagePositions = [ ( "Left", [ 0 ] ), ( "Right", [] ) ]
+                                    , comparisonConstructorRefs = [ "Left", "Left" ]
                                     }
 
                         Nothing ->

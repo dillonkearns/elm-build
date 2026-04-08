@@ -130,6 +130,7 @@ function prepareReviewDir(ruleSet) {
 function runRunner({ fixtureSrcDir, buildDir, root }, reviewDir, name, importersMode) {
   const useHostNoUnusedExports = process.argv.includes("--host-no-unused-exports-experiment");
   const useHostNoUnusedCustomTypeConstructors = process.argv.includes("--host-no-unused-custom-type-constructors-experiment");
+  const useHostNoUnusedCustomTypeConstructorArgs = process.argv.includes("--host-no-unused-custom-type-constructor-args-experiment");
   const tracePath = path.join(root, `${name}.trace.json`);
   console.error(`[${importersMode}] starting ${name}`);
   const start = performance.now();
@@ -155,6 +156,7 @@ function runRunner({ fixtureSrcDir, buildDir, root }, reviewDir, name, importers
       tracePath,
       ...(useHostNoUnusedExports ? ["--host-no-unused-exports-experiment"] : []),
       ...(useHostNoUnusedCustomTypeConstructors ? ["--host-no-unused-custom-type-constructors-experiment"] : []),
+      ...(useHostNoUnusedCustomTypeConstructorArgs ? ["--host-no-unused-custom-type-constructor-args-experiment"] : []),
     ],
     {
       cwd: repoRoot,
@@ -193,6 +195,9 @@ function runRunner({ fixtureSrcDir, buildDir, root }, reviewDir, name, importers
     host_no_unused_custom_type_constructors_enabled: counter("project.host_constructors.enabled"),
     host_no_unused_custom_type_constructors_ms: counter("project.host_constructors.ms"),
     host_no_unused_custom_type_constructors_errors: counter("project.host_constructors.errors"),
+    host_no_unused_custom_type_constructor_args_enabled: counter("project.host_constructor_args.enabled"),
+    host_no_unused_custom_type_constructor_args_ms: counter("project.host_constructor_args.ms"),
+    host_no_unused_custom_type_constructor_args_errors: counter("project.host_constructor_args.errors"),
   };
 }
 

@@ -1370,3 +1370,83 @@ The main remaining caveat is the same as for `NoUnused.Exports`: this is still a
 
 - facts cached natively / host-side
 - policy interpreted when possible on top of those facts
+
+### Host-Native `NoUnused.CustomTypeConstructorArgs` Experiment
+
+I extended the same cached fact layer one step further for `NoUnused.CustomTypeConstructorArgs`.
+
+The additional generic facts needed were:
+
+- constructor argument ranges
+- constructor pattern usages with per-argument used positions
+- constructor refs seen under `==` / `/=`
+
+Those are now stored in `FileAnalysis.crossModuleSummary`, alongside the earlier
+constructor declaration/exposure facts. The relevant architecture point is that
+these are still reusable facts, not rule-specific caches.
+
+#### Direct correctness check
+
+I added unit coverage in
+[src/ReviewRunnerTest.elm](src/ReviewRunnerTest.elm) for both:
+
+- the pure-source host helper
+- the new cross-module summary facts
+
+Then I did a direct JSON check against the isolated fixture.
+
+Both paths reported the exact same single finding:
+
+- `NoUnused.CustomTypeConstructorArgs`
+- `src/ReviewRunner.elm:3492:16`
+- `Argument is never extracted and therefore never used.`
+
+So on the isolated fixture, the host experiment matches the interpreted runner on reported output.
+
+#### Isolated `NoUnused.CustomTypeConstructorArgs` A/B
+
+| Scenario | Interpreted runner | Host via cached facts |
+|---|---:|---:|
+| Cold | `111.19s` | `28.20s` |
+| Warm | `0.35s` | `0.35s` |
+| Warm import-graph change | `5.45s` | `1.31s` |
+
+Important trace details from the host run:
+
+- cold `project_rule_eval`: `3ms`
+- warm import-change `project_rule_eval`: `4ms`
+- host constructor-arg errors on the fixture: `1`
+
+This is the third isolated win on the same seam:
+
+- `NoUnused.Exports`
+- `NoUnused.CustomTypeConstructors`
+- `NoUnused.CustomTypeConstructorArgs`
+
+All three now show the same pattern:
+
+- the expensive wall is in the interpreted `ImportersOf` fold
+- cached host-side facts remove that wall almost entirely
+- warm import-change time drops to about `1.2s - 1.3s` for each isolated rule
+
+#### Combined `ImportersOf` family checkpoint
+
+I also ran the isolated family harness with all three host experiments enabled together:
+
+- `NoUnused.Exports`
+- `NoUnused.CustomTypeConstructors`
+- `NoUnused.CustomTypeConstructorArgs`
+
+Result:
+
+| Scenario | Interpreted family | Three fact-backed host experiments |
+|---|---:|---:|
+| Warm import-graph change | still very large | still very large (`158.09s`) |
+
+The reason is now clearer: once those three rules are effectively removed from the interpreted project-rule wall, `NoUnused.Parameters` becomes the dominant remaining `ImportersOf` cost.
+
+That is useful, because it narrows the next target cleanly:
+
+- the generic cached fact layer is broad enough to support three rules already
+- the next high-value rule in this family is `NoUnused.Parameters`
+- after that, the `ImportersOf` family should be much closer to the CLI-relevant warm partial-miss target
