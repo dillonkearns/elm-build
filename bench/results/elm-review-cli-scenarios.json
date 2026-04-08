@@ -1,5 +1,5 @@
 {
-  "date": "2026-04-08T17:38:08.234Z",
+  "date": "2026-04-08T19:07:42.436Z",
   "runner": "elm-review",
   "fixtures": [
     {
@@ -8,91 +8,91 @@
       "scenarios": [
         {
           "name": "cold",
-          "wall_ms": 2908,
+          "wall_ms": 2953,
           "exit_code": 1,
-          "stdout_length": 536118,
+          "stdout_length": 587984,
           "stderr_length": 0,
           "benchmark_info_ms": {
-            "Computing app hash": 5.874,
-            "Create template project": 15.235,
-            "optimizing review application": 18.752,
-            "Compile review project": 845.857,
-            "optimizing parser application": 2.713,
-            "parse/fetch parsed files": 279.159,
-            "get project files": 281.075,
-            "run-review": 326.813,
-            "apply-suppressions": 0.023,
-            "process-errors": 263.758,
-            "review": 591.301,
-            "Writing error report": 3.133
+            "Computing app hash": 5.148,
+            "Create template project": 14.653,
+            "optimizing review application": 17.79,
+            "Compile review project": 850.087,
+            "optimizing parser application": 2.319,
+            "parse/fetch parsed files": 263.339,
+            "get project files": 265.415,
+            "run-review": 357.265,
+            "apply-suppressions": 0.044,
+            "process-errors": 334.312,
+            "review": 692.457,
+            "Writing error report": 2.802
           }
         },
         {
           "name": "warm",
-          "wall_ms": 997,
+          "wall_ms": 1049,
           "exit_code": 1,
-          "stdout_length": 535967,
+          "stdout_length": 587835,
           "stderr_length": 0,
           "benchmark_info_ms": {
-            "Computing app hash": 6.87,
-            "parse/fetch parsed files": 31.259,
-            "get project files": 33.493,
-            "run-review": 331.489,
+            "Computing app hash": 5.321,
+            "parse/fetch parsed files": 35.693,
+            "get project files": 37.789,
+            "run-review": 347.404,
             "apply-suppressions": 0.03,
-            "process-errors": 277.037,
-            "review": 609.306,
-            "Writing error report": 3.034
+            "process-errors": 332.661,
+            "review": 680.836,
+            "Writing error report": 2.986
           }
         },
         {
           "name": "warm_1_file_body_edit",
-          "wall_ms": 984,
+          "wall_ms": 1058,
           "exit_code": 1,
-          "stdout_length": 537029,
+          "stdout_length": 588896,
           "stderr_length": 0,
           "benchmark_info_ms": {
-            "Computing app hash": 5.483,
-            "parse/fetch parsed files": 44.138,
-            "get project files": 46.603,
-            "run-review": 318.561,
-            "apply-suppressions": 0.029,
-            "process-errors": 266.065,
-            "review": 585.388,
-            "Writing error report": 2.855
+            "Computing app hash": 4.972,
+            "parse/fetch parsed files": 43.336,
+            "get project files": 45.543,
+            "run-review": 347.624,
+            "apply-suppressions": 0.028,
+            "process-errors": 328.609,
+            "review": 676.983,
+            "Writing error report": 2.841
           }
         },
         {
           "name": "warm_1_file_comment_only",
-          "wall_ms": 982,
+          "wall_ms": 1093,
           "exit_code": 1,
-          "stdout_length": 535966,
+          "stdout_length": 587833,
           "stderr_length": 0,
           "benchmark_info_ms": {
-            "Computing app hash": 5.588,
-            "parse/fetch parsed files": 51.52,
-            "get project files": 53.807,
-            "run-review": 318.019,
+            "Computing app hash": 5.026,
+            "parse/fetch parsed files": 49.8,
+            "get project files": 52.265,
+            "run-review": 363.561,
             "apply-suppressions": 0.029,
-            "process-errors": 264.319,
-            "review": 583.1,
-            "Writing error report": 2.815
+            "process-errors": 332.012,
+            "review": 696.33,
+            "Writing error report": 3.544
           }
         },
         {
           "name": "warm_import_graph_change",
-          "wall_ms": 978,
+          "wall_ms": 1138,
           "exit_code": 1,
-          "stdout_length": 536955,
+          "stdout_length": 588823,
           "stderr_length": 0,
           "benchmark_info_ms": {
-            "Computing app hash": 4.964,
-            "parse/fetch parsed files": 49.394,
-            "get project files": 51.563,
-            "run-review": 314.949,
-            "apply-suppressions": 0.03,
-            "process-errors": 263.701,
-            "review": 579.557,
-            "Writing error report": 3.09
+            "Computing app hash": 5.186,
+            "parse/fetch parsed files": 54.259,
+            "get project files": 56.953,
+            "run-review": 351.722,
+            "apply-suppressions": 0.027,
+            "process-errors": 329.58,
+            "review": 682.071,
+            "Writing error report": 2.965
           }
         }
       ]

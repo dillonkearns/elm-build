@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, hostNoUnusedVariablesErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -105,6 +105,7 @@ type alias Config =
     , hostNoUnusedCustomTypeConstructorsExperiment : Bool
     , hostNoUnusedCustomTypeConstructorArgsExperiment : Bool
     , hostNoUnusedParametersExperiment : Bool
+    , hostNoUnusedVariablesExperiment : Bool
     }
 
 
@@ -186,7 +187,9 @@ type alias CrossModuleSummary =
     , moduleName : String
     , moduleNameRange : Range
     , isExposingAll : Bool
+    , valueDeclarationRanges : Dict String Range
     , exposedValues : Dict String Range
+    , localTypeDeclarations : Dict String LocalTypeSummary
     , declaredConstructors : Dict String (Dict String Range)
     , exposedConstructors : Dict String (Dict String Range)
     , constructorArgumentRanges : Dict String (Dict String (List Range))
@@ -194,15 +197,18 @@ type alias CrossModuleSummary =
     , importedValueCandidates : Dict String (Set.Set String)
     , importedOpenTypesByModule : Dict String (Set.Set String)
     , importAllModules : List String
+    , importSummaries : List ImportSummary
     , moduleAliases : Dict String String
     , localDeclarations : Set.Set String
     , dependencyRefs : List DependencyRef
+    , typeRefs : List QualifiedRef
     , expressionConstructorRefs : List QualifiedRef
     , patternConstructorRefs : List QualifiedRef
     , constructorPatternUsages : List ConstructorPatternUsage
     , comparisonConstructorRefs : List QualifiedRef
     , topLevelFunctionSummaries : List TopLevelFunctionSummary
     , nestedFunctionSummaries : List TopLevelFunctionSummary
+    , letBindingSummaries : List LetBindingSummary
     , containsMainLike : Bool
     }
 
@@ -212,6 +218,49 @@ type alias DependencyRef =
     , moduleParts : List String
     , name : String
     }
+
+
+type alias ImportSummary =
+    { moduleName : String
+    , moduleNameRange : Range
+    , importRange : Range
+    , alias : Maybe ImportAliasSummary
+    , exposingAllRange : Maybe Range
+    , explicitElements : List ImportedElementSummary
+    }
+
+
+type alias ImportAliasSummary =
+    { name : String
+    , range : Range
+    }
+
+
+type alias ImportedElementSummary =
+    { name : String
+    , range : Range
+    , openRange : Maybe Range
+    , kind : ImportedElementKind
+    }
+
+
+type ImportedElementKind
+    = ImportedValueKind
+    | ImportedOperatorKind
+    | ImportedTypeKind
+    | ImportedOpenTypeKind
+
+
+type alias LocalTypeSummary =
+    { range : Range
+    , kind : LocalTypeKind
+    }
+
+
+type LocalTypeKind
+    = LocalCustomTypeKind
+    | LocalRecordAliasKind
+    | LocalTypeAliasKind
 
 
 type alias QualifiedRef =
@@ -240,6 +289,12 @@ type alias ParameterBindingSummary =
     { name : String
     , range : Range
     , kind : ParameterBindingKind
+    }
+
+
+type alias LetBindingSummary =
+    { name : String
+    , range : Range
     }
 
 
@@ -309,6 +364,37 @@ type alias HostNoUnusedParametersModule =
     { filePath : String
     , moduleName : String
     , topLevelFunctionSummaries : List TopLevelFunctionSummary
+    }
+
+
+type alias HostNoUnusedVariablesModule =
+    { filePath : String
+    , moduleName : String
+    , isExposingAll : Bool
+    , valueDeclarationRanges : Dict String Range
+    , exposedValues : Dict String Range
+    , localTypeDeclarations : Dict String LocalTypeSummary
+    , letBindingSummaries : List LetBindingSummary
+    , importSummaries : List ImportSummary
+    , qualifiedModuleUses : Set.Set String
+    , topLevelValueUses : Set.Set String
+    , usedTypeNames : Set.Set String
+    }
+
+
+type alias OpenTypeConstructorsIndex =
+    Dict String (Dict String (Set.Set String))
+
+
+type alias PackageDocsModuleSummary =
+    { name : String
+    , unions : List PackageDocsUnionSummary
+    }
+
+
+type alias PackageDocsUnionSummary =
+    { name : String
+    , tags : List String
     }
 
 
@@ -400,7 +486,7 @@ type alias Timed a =
 
 cacheSchemaVersion : String
 cacheSchemaVersion =
-    "review-runner-v8"
+    "review-runner-v10"
 
 
 programConfig : Program.Config Config
@@ -480,6 +566,10 @@ programConfig =
                 |> OptionsParser.with
                     (Option.flag "host-no-unused-parameters-experiment"
                         |> Option.withDescription "Handle NoUnused.Parameters with a host-native experimental implementation"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "host-no-unused-variables-experiment"
+                        |> Option.withDescription "Handle the benchmark-heavy NoUnused.Variables categories with a host-native experimental implementation"
                     )
             )
 
@@ -881,6 +971,7 @@ benchmarkTargetProjectRuntime options =
             , hostNoUnusedCustomTypeConstructorsExperiment = False
             , hostNoUnusedCustomTypeConstructorArgsExperiment = False
             , hostNoUnusedParametersExperiment = False
+            , hostNoUnusedVariablesExperiment = False
             }
     in
     Do.do (withTiming "prepare_config" (prepareConfig config)) <| \preparedConfigTimed ->
@@ -1079,6 +1170,13 @@ hostNoUnusedParametersErrorsForSources sources =
         |> .errors
 
 
+hostNoUnusedVariablesErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoUnusedVariablesErrorsForSources sources =
+    sources
+        |> evaluateHostNoUnusedVariablesForSources
+        |> .errors
+
+
 evaluateHostNoUnusedExportsForAnalyzedFiles :
     List AnalyzedTargetFile
     ->
@@ -1175,6 +1273,33 @@ evaluateHostNoUnusedParametersForAnalyzedFiles analyzedFiles =
             , Dict.fromList
                 [ ( "project.host_parameters.analysis_modules", List.length analyzedFiles )
                 , ( "project.host_parameters.analysis_reused", List.length analyzedFiles )
+                ]
+            ]
+    }
+
+
+evaluateHostNoUnusedVariablesForAnalyzedFiles :
+    OpenTypeConstructorsIndex
+    ->
+    List AnalyzedTargetFile
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+evaluateHostNoUnusedVariablesForAnalyzedFiles packageOpenTypeConstructors analyzedFiles =
+    let
+        evaluation =
+            analyzedFiles
+                |> List.map (.analysis >> .crossModuleSummary)
+                |> hostNoUnusedVariablesFromSummaries packageOpenTypeConstructors
+    in
+    { errors = evaluation.errors
+    , counters =
+        mergeCounterDicts
+            [ evaluation.counters
+            , Dict.fromList
+                [ ( "project.host_variables.analysis_modules", List.length analyzedFiles )
+                , ( "project.host_variables.analysis_reused", List.length analyzedFiles )
                 ]
             ]
     }
@@ -1387,6 +1512,59 @@ evaluateHostNoUnusedParametersForSources sources =
                 [ ( "project.host_parameters.source_files", List.length sources )
                 , ( "project.host_parameters.parsed_modules", List.length summaries )
                 , ( "project.host_parameters.parse_failures", parseFailures )
+                ]
+            ]
+    }
+
+
+evaluateHostNoUnusedVariablesForSources :
+    List { path : String, source : String }
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+evaluateHostNoUnusedVariablesForSources sources =
+    let
+        parsedResults =
+            sources
+                |> List.map
+                    (\sourceFile ->
+                        case crossModuleSummaryFromSource sourceFile.path sourceFile.source of
+                            Just summary ->
+                                Ok summary
+
+                            Nothing ->
+                                Err sourceFile.path
+                    )
+
+        summaries =
+            parsedResults
+                |> List.filterMap Result.toMaybe
+
+        parseFailures =
+            parsedResults
+                |> List.filter
+                    (\result ->
+                        case result of
+                            Err _ ->
+                                True
+
+                            Ok _ ->
+                                False
+                    )
+                |> List.length
+
+        evaluation =
+            hostNoUnusedVariablesFromSummaries Dict.empty summaries
+    in
+    { errors = evaluation.errors
+    , counters =
+        mergeCounterDicts
+            [ evaluation.counters
+            , Dict.fromList
+                [ ( "project.host_variables.source_files", List.length sources )
+                , ( "project.host_variables.parsed_modules", List.length summaries )
+                , ( "project.host_variables.parse_failures", parseFailures )
                 ]
             ]
     }
@@ -1743,6 +1921,534 @@ hostNoUnusedParametersFromSummaries summaries =
             , ( "project.host_parameters.errors", List.length errors )
             ]
     }
+
+
+hostNoUnusedVariablesFromSummaries :
+    OpenTypeConstructorsIndex
+    ->
+    List CrossModuleSummary
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+hostNoUnusedVariablesFromSummaries packageOpenTypeConstructors summaries =
+    let
+        openTypeConstructors =
+            mergeOpenTypeConstructorsIndexes
+                [ openTypeConstructorsIndexFromSummaries summaries
+                , packageOpenTypeConstructors
+                ]
+
+        resolvedModules =
+            summaries
+                |> List.map (resolveHostNoUnusedVariablesModule openTypeConstructors)
+
+        errors =
+            resolvedModules
+                |> List.concatMap hostNoUnusedVariablesErrorsForModule
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "project.host_variables.modules", List.length summaries )
+            , ( "project.host_variables.imports"
+              , summaries
+                    |> List.map (\summary -> List.length summary.importSummaries)
+                    |> List.sum
+              )
+            , ( "project.host_variables.top_level_values"
+              , summaries
+                    |> List.map (\summary -> Dict.size summary.valueDeclarationRanges)
+                    |> List.sum
+              )
+            , ( "project.host_variables.local_types"
+              , summaries
+                    |> List.map (\summary -> Dict.size summary.localTypeDeclarations)
+                    |> List.sum
+              )
+            , ( "project.host_variables.open_type_modules", Dict.size openTypeConstructors )
+            , ( "project.host_variables.errors", List.length errors )
+            ]
+    }
+
+
+implicitPreludeModules : Dict String { exposes : Set.Set String, alias : Maybe String }
+implicitPreludeModules =
+    Dict.fromList
+        [ ( "Basics", { exposes = Set.empty, alias = Nothing } )
+        , ( "List", { exposes = Set.fromList [ "List", "::" ], alias = Nothing } )
+        , ( "Maybe", { exposes = Set.fromList [ "Maybe" ], alias = Nothing } )
+        , ( "Result", { exposes = Set.fromList [ "Result" ], alias = Nothing } )
+        , ( "String", { exposes = Set.fromList [ "String" ], alias = Nothing } )
+        , ( "Char", { exposes = Set.fromList [ "Char" ], alias = Nothing } )
+        , ( "Tuple", { exposes = Set.empty, alias = Nothing } )
+        , ( "Debug", { exposes = Set.empty, alias = Nothing } )
+        , ( "Platform", { exposes = Set.fromList [ "Program" ], alias = Nothing } )
+        , ( "Platform.Cmd", { exposes = Set.fromList [ "Cmd" ], alias = Just "Cmd" } )
+        , ( "Platform.Sub", { exposes = Set.fromList [ "Sub" ], alias = Just "Sub" } )
+        ]
+
+
+openTypeConstructorsIndexFromSummaries : List CrossModuleSummary -> OpenTypeConstructorsIndex
+openTypeConstructorsIndexFromSummaries summaries =
+    summaries
+        |> List.map
+            (\summary ->
+                ( summary.moduleName
+                , summary.declaredConstructors
+                    |> Dict.map (\_ constructors -> constructors |> Dict.keys |> Set.fromList)
+                )
+            )
+        |> Dict.fromList
+
+
+openTypeConstructorsIndexFromTargetProjectSeed : TargetProjectSeed -> OpenTypeConstructorsIndex
+openTypeConstructorsIndexFromTargetProjectSeed targetProjectSeed =
+    targetProjectSeed.directDependencies
+        |> List.concatMap
+            (\dependency ->
+                case Json.Decode.decodeString (Json.Decode.list packageDocsModuleSummaryDecoder) dependency.docsJsonRaw of
+                    Ok docsModules ->
+                        docsModules
+
+                    Err _ ->
+                        []
+            )
+        |> List.map
+            (\docsModule ->
+                ( docsModule.name
+                , docsModule.unions
+                    |> List.map
+                        (\union_ ->
+                            ( union_.name
+                            , union_.tags
+                                |> Set.fromList
+                            )
+                        )
+                    |> Dict.fromList
+                )
+            )
+        |> Dict.fromList
+
+
+mergeOpenTypeConstructorsIndexes : List OpenTypeConstructorsIndex -> OpenTypeConstructorsIndex
+mergeOpenTypeConstructorsIndexes indexes =
+    indexes
+        |> List.foldl
+            (\index acc ->
+                Dict.foldl
+                    (\moduleName typeMap innerAcc ->
+                        Dict.update moduleName
+                            (\maybeExisting ->
+                                Just
+                                    (case maybeExisting of
+                                        Just existing ->
+                                            Dict.union typeMap existing
+
+                                        Nothing ->
+                                            typeMap
+                                    )
+                            )
+                            innerAcc
+                    )
+                    acc
+                    index
+            )
+            Dict.empty
+
+
+packageDocsUnionSummaryDecoder : Json.Decode.Decoder PackageDocsUnionSummary
+packageDocsUnionSummaryDecoder =
+    Json.Decode.map2
+        (\name tags ->
+            { name = name
+            , tags = tags
+            }
+        )
+        (Json.Decode.field "name" Json.Decode.string)
+        (Json.Decode.field "cases" (Json.Decode.list (Json.Decode.index 0 Json.Decode.string)))
+
+
+packageDocsModuleSummaryDecoder : Json.Decode.Decoder PackageDocsModuleSummary
+packageDocsModuleSummaryDecoder =
+    Json.Decode.map2
+        (\name unions ->
+            { name = name
+            , unions = unions
+            }
+        )
+        (Json.Decode.field "name" Json.Decode.string)
+        (Json.Decode.field "unions" (Json.Decode.list packageDocsUnionSummaryDecoder))
+
+
+resolveHostNoUnusedVariablesModule : OpenTypeConstructorsIndex -> CrossModuleSummary -> HostNoUnusedVariablesModule
+resolveHostNoUnusedVariablesModule openTypeConstructors summary =
+    let
+        typeNamesByConstructor =
+            summary.declaredConstructors
+                |> Dict.foldl
+                    (\typeName constructors acc ->
+                        constructors
+                            |> Dict.keys
+                            |> List.foldl (\constructorName innerAcc -> Dict.insert constructorName typeName innerAcc) acc
+                    )
+                    Dict.empty
+
+        typeNamesUsedByConstructors =
+            (summary.expressionConstructorRefs ++ summary.patternConstructorRefs)
+                |> List.filterMap
+                    (\ref ->
+                        if List.isEmpty ref.moduleParts then
+                            Dict.get ref.name typeNamesByConstructor
+
+                        else
+                            Nothing
+                    )
+                |> Set.fromList
+
+        usedTypeNamesFromRefs =
+            summary.typeRefs
+                |> List.filterMap
+                    (\ref ->
+                        if List.isEmpty ref.moduleParts then
+                            Just ref.name
+
+                        else
+                            Nothing
+                    )
+                |> Set.fromList
+
+        unqualifiedConstructorNamesUsed =
+            summary.expressionConstructorRefs
+                ++ summary.patternConstructorRefs
+                ++ summary.comparisonConstructorRefs
+                |> List.filter (\ref -> List.isEmpty ref.moduleParts)
+                |> List.map .name
+                |> Set.fromList
+
+        typeNamesUsedByImportedOpenTypes =
+            summary.importedOpenTypesByModule
+                |> Dict.foldl
+                    (\importedModuleName typeNames acc ->
+                        case Dict.get importedModuleName openTypeConstructors of
+                            Just constructorsByType ->
+                                typeNames
+                                    |> Set.foldl
+                                        (\typeName innerAcc ->
+                                            let
+                                                constructors =
+                                                    Dict.get typeName constructorsByType
+                                                        |> Maybe.withDefault Set.empty
+                                            in
+                                            if Set.isEmpty (Set.intersect constructors unqualifiedConstructorNamesUsed) then
+                                                innerAcc
+
+                                            else
+                                                Set.insert typeName innerAcc
+                                        )
+                                        acc
+
+                            Nothing ->
+                                acc
+                    )
+                    Set.empty
+
+        qualifiedModuleUses =
+            (summary.dependencyRefs
+                |> List.filterMap
+                    (\dependency ->
+                        if List.isEmpty dependency.moduleParts then
+                            Nothing
+
+                        else
+                            let
+                                qualifiedModuleName =
+                                    String.join "." dependency.moduleParts
+                            in
+                            summary.moduleAliases
+                                |> Dict.get qualifiedModuleName
+                                |> Maybe.withDefault qualifiedModuleName
+                                |> Just
+                    )
+             )
+                ++ (summary.typeRefs
+                        |> List.filterMap
+                            (\ref ->
+                                if List.isEmpty ref.moduleParts then
+                                    Nothing
+
+                                else
+                                    let
+                                        qualifiedModuleName =
+                                            String.join "." ref.moduleParts
+                                    in
+                                    summary.moduleAliases
+                                        |> Dict.get qualifiedModuleName
+                                        |> Maybe.withDefault qualifiedModuleName
+                                        |> Just
+                            )
+                   )
+                |> Set.fromList
+
+        topLevelValueUses =
+            summary.dependencyRefs
+                |> List.foldl
+                    (\dependency acc ->
+                        if (not (List.isEmpty dependency.moduleParts)) || dependency.name == dependency.owner then
+                            acc
+
+                        else if Dict.member dependency.name summary.valueDeclarationRanges then
+                            Set.insert dependency.name acc
+
+                        else
+                            acc
+                    )
+                    Set.empty
+    in
+    { filePath = summary.filePath
+    , moduleName = summary.moduleName
+    , isExposingAll = summary.isExposingAll
+    , valueDeclarationRanges = summary.valueDeclarationRanges
+    , exposedValues = summary.exposedValues
+    , localTypeDeclarations = summary.localTypeDeclarations
+    , letBindingSummaries = summary.letBindingSummaries
+    , importSummaries = summary.importSummaries
+    , qualifiedModuleUses = qualifiedModuleUses
+    , topLevelValueUses = topLevelValueUses
+    , usedTypeNames =
+        Set.union typeNamesUsedByImportedOpenTypes
+            (Set.union typeNamesUsedByConstructors usedTypeNamesFromRefs)
+    }
+
+
+hostNoUnusedVariablesErrorsForModule : HostNoUnusedVariablesModule -> List ReviewError
+hostNoUnusedVariablesErrorsForModule moduleInfo =
+    let
+        topLevelValueErrors =
+            if moduleInfo.isExposingAll then
+                []
+
+            else
+                moduleInfo.valueDeclarationRanges
+                    |> Dict.toList
+                    |> List.filterMap
+                        (\( name, range ) ->
+                            if name == "main" || name == "app" then
+                                Nothing
+
+                            else if Dict.member name moduleInfo.exposedValues || Set.member name moduleInfo.topLevelValueUses then
+                                Nothing
+
+                            else
+                                Just
+                                    { ruleName = "NoUnused.Variables"
+                                    , filePath = moduleInfo.filePath
+                                    , line = range.start.row
+                                    , column = range.start.column
+                                    , message = "Top-level variable `" ++ name ++ "` is not used"
+                                    }
+                        )
+
+        localTypeErrors =
+            if moduleInfo.isExposingAll then
+                []
+
+            else
+                moduleInfo.localTypeDeclarations
+                    |> Dict.toList
+                    |> List.filterMap
+                        (\( name, localType ) ->
+                            if Set.member name moduleInfo.usedTypeNames then
+                                Nothing
+
+                            else
+                                Just
+                                    { ruleName = "NoUnused.Variables"
+                                    , filePath = moduleInfo.filePath
+                                    , line = localType.range.start.row
+                                    , column = localType.range.start.column
+                                    , message = localTypeMessage name localType.kind
+                                }
+                        )
+
+        letBindingErrors =
+            moduleInfo.letBindingSummaries
+                |> List.map
+                    (\binding ->
+                        { ruleName = "NoUnused.Variables"
+                        , filePath = moduleInfo.filePath
+                        , line = binding.range.start.row
+                        , column = binding.range.start.column
+                        , message = "`let in` variable `" ++ binding.name ++ "` is not used"
+                        }
+                    )
+
+        importErrors =
+            moduleInfo.importSummaries
+                |> List.concatMap
+                    (\importSummary ->
+                        hostNoUnusedVariablesImportErrors moduleInfo importSummary
+                    )
+    in
+    topLevelValueErrors ++ localTypeErrors ++ letBindingErrors ++ importErrors
+
+
+localTypeMessage : String -> LocalTypeKind -> String
+localTypeMessage name kind =
+    case kind of
+        LocalCustomTypeKind ->
+            "Type `" ++ name ++ "` is not used"
+
+        LocalRecordAliasKind ->
+            "Type `" ++ name ++ "` is not used"
+
+        LocalTypeAliasKind ->
+            "Type alias `" ++ name ++ "` is not used"
+
+
+hostNoUnusedVariablesImportErrors : HostNoUnusedVariablesModule -> ImportSummary -> List ReviewError
+hostNoUnusedVariablesImportErrors moduleInfo importSummary =
+    let
+        moduleUsed =
+            Set.member importSummary.moduleName moduleInfo.qualifiedModuleUses
+                || (importSummary.alias
+                        |> Maybe.map (\aliasSummary -> Set.member aliasSummary.name moduleInfo.qualifiedModuleUses)
+                        |> Maybe.withDefault False
+                   )
+
+        preludeInfo =
+            Dict.get importSummary.moduleName implicitPreludeModules
+
+        unnecessaryImplicitPreludeImportError =
+            case preludeInfo of
+                Just info ->
+                    if
+                        List.isEmpty importSummary.explicitElements
+                            && importSummary.exposingAllRange == Nothing
+                            && (case importSummary.alias of
+                                    Nothing ->
+                                        True
+
+                                    Just aliasSummary ->
+                                        info.alias == Just aliasSummary.name
+                               )
+                    then
+                        Just
+                            { ruleName = "NoUnused.Variables"
+                            , filePath = moduleInfo.filePath
+                            , line = importSummary.moduleNameRange.start.row
+                            , column = importSummary.moduleNameRange.start.column
+                            , message = "Unnecessary import to implicitly imported `" ++ importSummary.moduleName ++ "`"
+                            }
+
+                    else
+                        Nothing
+
+                Nothing ->
+                    Nothing
+
+        explicitPreludeErrors =
+            case Dict.get importSummary.moduleName implicitPreludeModules of
+                Just implicitInfo ->
+                    importSummary.explicitElements
+                        |> List.filterMap
+                            (\element ->
+                                if Set.member element.name implicitInfo.exposes then
+                                    Just
+                                        { ruleName = "NoUnused.Variables"
+                                        , filePath = moduleInfo.filePath
+                                        , line = element.range.start.row
+                                        , column = element.range.start.column
+                                        , message = "Unnecessary import to implicitly imported `" ++ element.name ++ "`"
+                                        }
+
+                                else
+                                    Nothing
+                            )
+
+                Nothing ->
+                    []
+
+        importedTypeErrors =
+            importSummary.explicitElements
+                |> List.filterMap
+                    (\element ->
+                        case element.kind of
+                            ImportedTypeKind ->
+                                if
+                                    Dict.get importSummary.moduleName implicitPreludeModules
+                                        |> Maybe.map (\implicitInfo -> Set.member element.name implicitInfo.exposes)
+                                        |> Maybe.withDefault False
+                                then
+                                    Nothing
+
+                                else if Set.member element.name moduleInfo.usedTypeNames then
+                                    Nothing
+
+                                else
+                                    Just
+                                        { ruleName = "NoUnused.Variables"
+                                        , filePath = moduleInfo.filePath
+                                        , line = element.range.start.row
+                                        , column = element.range.start.column
+                                        , message = "Imported type `" ++ element.name ++ "` is not used"
+                                        }
+
+                            ImportedOpenTypeKind ->
+                                if
+                                    Dict.get importSummary.moduleName implicitPreludeModules
+                                        |> Maybe.map (\implicitInfo -> Set.member element.name implicitInfo.exposes)
+                                        |> Maybe.withDefault False
+                                then
+                                    Nothing
+
+                                else if Set.member element.name moduleInfo.usedTypeNames then
+                                    Nothing
+
+                                else
+                                    Just
+                                        { ruleName = "NoUnused.Variables"
+                                        , filePath = moduleInfo.filePath
+                                        , line = element.range.start.row
+                                        , column = element.range.start.column
+                                        , message = "Imported type `" ++ element.name ++ "` is not used"
+                                        }
+
+                            _ ->
+                                Nothing
+                    )
+    in
+    case unnecessaryImplicitPreludeImportError of
+        Just preludeError ->
+            preludeError :: explicitPreludeErrors ++ importedTypeErrors
+
+        Nothing ->
+            let
+                moduleOrAliasError =
+                    if moduleUsed || (not (List.isEmpty importSummary.explicitElements)) || importSummary.exposingAllRange /= Nothing then
+                        []
+
+                    else
+                        case importSummary.alias of
+                            Just aliasSummary ->
+                                [ { ruleName = "NoUnused.Variables"
+                                  , filePath = moduleInfo.filePath
+                                  , line = aliasSummary.range.start.row
+                                  , column = aliasSummary.range.start.column
+                                  , message = "Module alias `" ++ aliasSummary.name ++ "` is not used"
+                                  }
+                                ]
+
+                            Nothing ->
+                                [ { ruleName = "NoUnused.Variables"
+                                  , filePath = moduleInfo.filePath
+                                  , line = importSummary.moduleNameRange.start.row
+                                  , column = importSummary.moduleNameRange.start.column
+                                  , message = "Imported module `" ++ importSummary.moduleName ++ "` is not used"
+                                  }
+                                ]
+            in
+            moduleOrAliasError ++ explicitPreludeErrors ++ importedTypeErrors
 
 
 resolveHostNoUnusedExportsModule :
@@ -2144,6 +2850,9 @@ buildCrossModuleSummary filePath file =
         valueDeclarations =
             collectValueDeclarations file.declarations
 
+        localTypeDeclarations =
+            collectLocalTypeDeclarations file.declarations
+
         declaredConstructors =
             collectCustomTypeConstructors file.declarations
 
@@ -2155,6 +2864,9 @@ buildCrossModuleSummary filePath file =
 
         nestedFunctionSummaries =
             collectNestedFunctionSummariesFromDeclarations file.declarations
+
+        letBindingSummaries =
+            collectLetBindingSummariesFromDeclarations file.declarations
 
         exposingList =
             Elm.Syntax.Module.exposingList (Node.value file.moduleDefinition)
@@ -2199,7 +2911,9 @@ buildCrossModuleSummary filePath file =
     , moduleName = moduleName
     , moduleNameRange = moduleNameRange
     , isExposingAll = isExposingAll
+    , valueDeclarationRanges = valueDeclarations
     , exposedValues = exposedValues
+    , localTypeDeclarations = localTypeDeclarations
     , declaredConstructors = declaredConstructors
     , exposedConstructors = exposedConstructors
     , constructorArgumentRanges = constructorArgumentRanges
@@ -2207,11 +2921,15 @@ buildCrossModuleSummary filePath file =
     , importedValueCandidates = importInfo.importedValueCandidates
     , importedOpenTypesByModule = importInfo.importedOpenTypesByModule
     , importAllModules = importInfo.importAllModules
+    , importSummaries = List.reverse importInfo.importSummaries
     , moduleAliases = importInfo.moduleAliases
     , localDeclarations = localDeclarations
     , dependencyRefs =
         file.declarations
             |> List.concatMap crossModuleDependencyRefsFromDeclaration
+    , typeRefs =
+        file.declarations
+            |> List.concatMap crossModuleTypeRefsFromDeclaration
     , expressionConstructorRefs =
         file.declarations
             |> List.concatMap crossModuleExpressionConstructorRefsFromDeclaration
@@ -2226,6 +2944,7 @@ buildCrossModuleSummary filePath file =
             |> List.concatMap crossModuleComparisonConstructorRefsFromDeclaration
     , topLevelFunctionSummaries = topLevelFunctionSummaries
     , nestedFunctionSummaries = nestedFunctionSummaries
+    , letBindingSummaries = letBindingSummaries
     , containsMainLike = containsMainLike
     }
 
@@ -2235,6 +2954,7 @@ type alias CrossModuleImportInfo =
     , importedValueCandidates : Dict String (Set.Set String)
     , importedOpenTypesByModule : Dict String (Set.Set String)
     , importAllModules : List String
+    , importSummaries : List ImportSummary
     , moduleAliases : Dict String String
     }
 
@@ -2245,6 +2965,7 @@ initialCrossModuleImportInfo =
     , importedValueCandidates = Dict.empty
     , importedOpenTypesByModule = Dict.empty
     , importAllModules = []
+    , importSummaries = []
     , moduleAliases = Dict.empty
     }
 
@@ -2253,7 +2974,7 @@ collectCrossModuleImportInfo :
     Node Import
     -> CrossModuleImportInfo
     -> CrossModuleImportInfo
-collectCrossModuleImportInfo (Node _ import_) importInfo =
+collectCrossModuleImportInfo ((Node importRange import_) as importNode) importInfo =
     let
         moduleName =
             import_.moduleName
@@ -2263,6 +2984,7 @@ collectCrossModuleImportInfo (Node _ import_) importInfo =
         withImportedModule =
             { importInfo
                 | importedModules = Set.insert moduleName importInfo.importedModules
+                , importSummaries = importSummaryFromImport importNode :: importInfo.importSummaries
             }
 
         withAlias =
@@ -2324,6 +3046,85 @@ collectCrossModuleImportInfo (Node _ import_) importInfo =
             withAlias
 
 
+importSummaryFromImport : Node Import -> ImportSummary
+importSummaryFromImport (Node importRange import_) =
+    let
+        explicitElements =
+            case import_.exposingList |> Maybe.map Node.value of
+                Just (Exposing.Explicit exposedItems) ->
+                    exposedItems
+                        |> List.filterMap importedElementSummaryFromExpose
+
+                _ ->
+                    []
+    in
+    { moduleName =
+        import_.moduleName
+            |> Node.value
+            |> String.join "."
+    , moduleNameRange = Node.range import_.moduleName
+    , importRange = importRange
+    , alias =
+        import_.moduleAlias
+            |> Maybe.map
+                (\aliasNode ->
+                    { name = aliasNode |> Node.value |> String.join "."
+                    , range = Node.range aliasNode
+                    }
+                )
+    , exposingAllRange =
+        case import_.exposingList of
+            Just (Node range (Exposing.All _)) ->
+                Just range
+
+            _ ->
+                Nothing
+    , explicitElements = explicitElements
+    }
+
+
+importedElementSummaryFromExpose : Node TopLevelExpose -> Maybe ImportedElementSummary
+importedElementSummaryFromExpose (Node range exposedItem) =
+    case exposedItem of
+        FunctionExpose valueName ->
+            Just
+                { name = valueName
+                , range = range
+                , openRange = Nothing
+                , kind = ImportedValueKind
+                }
+
+        InfixExpose operatorName ->
+            Just
+                { name = operatorName
+                , range = range
+                , openRange = Nothing
+                , kind = ImportedOperatorKind
+                }
+
+        TypeOrAliasExpose typeName ->
+            Just
+                { name = typeName
+                , range = range
+                , openRange = Nothing
+                , kind = ImportedTypeKind
+                }
+
+        TypeExpose { name, open } ->
+            Just
+                { name = name
+                , range = range
+                , openRange = open
+                , kind =
+                    case open of
+                        Just _ ->
+                            ImportedOpenTypeKind
+
+                        Nothing ->
+                            ImportedTypeKind
+                }
+
+
 collectValueDeclarations : List (Node Declaration) -> Dict String Range
 collectValueDeclarations declarations =
     declarations
@@ -2339,6 +3140,40 @@ collectValueDeclarations declarations =
 
                     PortDeclaration signature ->
                         Dict.insert (Node.value signature.name) (Node.range signature.name) acc
+
+                    _ ->
+                        acc
+            )
+            Dict.empty
+
+
+collectLocalTypeDeclarations : List (Node Declaration) -> Dict String LocalTypeSummary
+collectLocalTypeDeclarations declarations =
+    declarations
+        |> List.foldl
+            (\(Node declarationRange declaration) acc ->
+                case declaration of
+                    CustomTypeDeclaration typeDecl ->
+                        Dict.insert
+                            (Node.value typeDecl.name)
+                            { range = Node.range typeDecl.name
+                            , kind = LocalCustomTypeKind
+                            }
+                            acc
+
+                    AliasDeclaration typeAlias ->
+                        Dict.insert
+                            (Node.value typeAlias.name)
+                            { range = Node.range typeAlias.name
+                            , kind =
+                                case Node.value typeAlias.typeAnnotation of
+                                    Elm.Syntax.TypeAnnotation.Record _ ->
+                                        LocalRecordAliasKind
+
+                                    _ ->
+                                        LocalTypeAliasKind
+                            }
+                            acc
 
                     _ ->
                         acc
@@ -2463,6 +3298,145 @@ collectNestedFunctionSummariesFromDeclarations declarations =
                     _ ->
                         []
             )
+
+
+collectLetBindingSummariesFromDeclarations : List (Node Declaration) -> List LetBindingSummary
+collectLetBindingSummariesFromDeclarations declarations =
+    declarations
+        |> List.concatMap
+            (\(Node _ declaration) ->
+                case declaration of
+                    FunctionDeclaration function ->
+                        collectLetBindingSummariesFromExpression (Node.value function.declaration).expression
+
+                    _ ->
+                        []
+            )
+
+
+collectLetBindingSummariesFromExpression : Node Expression -> List LetBindingSummary
+collectLetBindingSummariesFromExpression (Node _ expr) =
+    case expr of
+        LambdaExpression lambda ->
+            collectLetBindingSummariesFromExpression lambda.expression
+
+        LetExpression letBlock ->
+            let
+                currentBlockSummaries =
+                    letBlockSummaries letBlock
+
+                nestedDeclarationSummaries =
+                    letBlock.declarations
+                        |> List.concatMap collectNestedLetBindingSummariesFromLetDeclaration
+
+                nestedBodySummaries =
+                    collectLetBindingSummariesFromExpression letBlock.expression
+            in
+            currentBlockSummaries ++ nestedDeclarationSummaries ++ nestedBodySummaries
+
+        Application expressions ->
+            expressions
+                |> List.concatMap collectLetBindingSummariesFromExpression
+
+        OperatorApplication _ _ left right ->
+            collectLetBindingSummariesFromExpression left
+                ++ collectLetBindingSummariesFromExpression right
+
+        IfBlock cond thenExpr elseExpr ->
+            [ cond, thenExpr, elseExpr ]
+                |> List.concatMap collectLetBindingSummariesFromExpression
+
+        Negation inner ->
+            collectLetBindingSummariesFromExpression inner
+
+        TupledExpression expressions ->
+            expressions
+                |> List.concatMap collectLetBindingSummariesFromExpression
+
+        ParenthesizedExpression inner ->
+            collectLetBindingSummariesFromExpression inner
+
+        CaseExpression caseBlock ->
+            collectLetBindingSummariesFromExpression caseBlock.expression
+                ++ (caseBlock.cases
+                        |> List.concatMap (\( _, caseExpression ) -> collectLetBindingSummariesFromExpression caseExpression)
+                   )
+
+        RecordExpr setters ->
+            setters
+                |> List.concatMap
+                    (\(Node _ ( _, valueExpression )) ->
+                        collectLetBindingSummariesFromExpression valueExpression
+                    )
+
+        ListExpr expressions ->
+            expressions
+                |> List.concatMap collectLetBindingSummariesFromExpression
+
+        RecordAccess inner _ ->
+            collectLetBindingSummariesFromExpression inner
+
+        RecordUpdateExpression _ setters ->
+            setters
+                |> List.concatMap
+                    (\(Node _ ( _, valueExpression )) ->
+                        collectLetBindingSummariesFromExpression valueExpression
+                    )
+
+        _ ->
+            []
+
+
+letBlockSummaries :
+    { a
+        | declarations : List (Node LetDeclaration)
+        , expression : Node Expression
+    }
+    -> List LetBindingSummary
+letBlockSummaries letBlock =
+    let
+        bindings =
+            letBlock.declarations
+                |> List.concatMap letDeclarationBindingSummaries
+
+        boundNames =
+            bindings
+                |> List.map .name
+                |> Set.fromList
+
+        usedNames =
+            letBlock.declarations
+                |> List.map (collectReferencedNamesInLetDeclaration boundNames Set.empty)
+                |> (::) (collectReferencedNamesInExpression boundNames Set.empty letBlock.expression)
+                |> List.foldl Set.union Set.empty
+    in
+    bindings
+        |> List.filter (\binding -> not (Set.member binding.name usedNames))
+
+
+collectNestedLetBindingSummariesFromLetDeclaration : Node LetDeclaration -> List LetBindingSummary
+collectNestedLetBindingSummariesFromLetDeclaration (Node _ declaration) =
+    case declaration of
+        LetFunction function ->
+            collectLetBindingSummariesFromExpression (Node.value function.declaration).expression
+
+        LetDestructuring _ expression ->
+            collectLetBindingSummariesFromExpression expression
+
+
+letDeclarationBindingSummaries : Node LetDeclaration -> List LetBindingSummary
+letDeclarationBindingSummaries (Node _ declaration) =
+    case declaration of
+        LetFunction function ->
+            let
+                nameNode =
+                    (Node.value function.declaration).name
+            in
+            [ { name = Node.value nameNode, range = Node.range nameNode } ]
+
+        LetDestructuring pattern _ ->
+            collectParameterBindingsFromPattern pattern
+                |> List.map (\binding -> { name = binding.name, range = binding.range })
 
 
 collectNestedFunctionSummariesFromExpression : Node Expression -> List TopLevelFunctionSummary
@@ -2813,13 +3787,21 @@ collectUsedNamesInExpression functionName parameterNames shadowedNames (Node _ e
         RecordAccess inner _ ->
             collectUsedNamesInExpression functionName parameterNames shadowedNames inner
 
-        RecordUpdateExpression _ setters ->
+        RecordUpdateExpression (Node _ recordName) setters ->
+            let
+                baseRecordSummary =
+                    if Set.member recordName parameterNames && not (Set.member recordName shadowedNames) then
+                        { usedNames = Set.singleton recordName, recursiveOnlyNames = Set.empty }
+
+                    else
+                        { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+            in
             setters
                 |> List.map
                     (\(Node _ ( _, valueExpression )) ->
                         collectUsedNamesInExpression functionName parameterNames shadowedNames valueExpression
                     )
-                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+                |> List.foldl mergeFunctionUsageSummary baseRecordSummary
 
         UnitExpr ->
             { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
@@ -2857,6 +3839,163 @@ mergeFunctionUsageSummary left right =
     { usedNames = Set.union left.usedNames right.usedNames
     , recursiveOnlyNames = Set.union left.recursiveOnlyNames right.recursiveOnlyNames
     }
+
+
+collectReferencedNamesInExpression :
+    Set.Set String
+    -> Set.Set String
+    -> Node Expression
+    -> Set.Set String
+collectReferencedNamesInExpression targetNames shadowedNames (Node _ expr) =
+    case expr of
+        FunctionOrValue [] name ->
+            if Set.member name targetNames && not (Set.member name shadowedNames) then
+                Set.singleton name
+
+            else
+                Set.empty
+
+        FunctionOrValue _ _ ->
+            Set.empty
+
+        Application expressions ->
+            expressions
+                |> List.map (collectReferencedNamesInExpression targetNames shadowedNames)
+                |> List.foldl Set.union Set.empty
+
+        OperatorApplication _ _ left right ->
+            Set.union
+                (collectReferencedNamesInExpression targetNames shadowedNames left)
+                (collectReferencedNamesInExpression targetNames shadowedNames right)
+
+        IfBlock cond thenExpr elseExpr ->
+            [ cond, thenExpr, elseExpr ]
+                |> List.map (collectReferencedNamesInExpression targetNames shadowedNames)
+                |> List.foldl Set.union Set.empty
+
+        Negation inner ->
+            collectReferencedNamesInExpression targetNames shadowedNames inner
+
+        TupledExpression expressions ->
+            expressions
+                |> List.map (collectReferencedNamesInExpression targetNames shadowedNames)
+                |> List.foldl Set.union Set.empty
+
+        ParenthesizedExpression inner ->
+            collectReferencedNamesInExpression targetNames shadowedNames inner
+
+        LetExpression letBlock ->
+            let
+                nestedLetNames =
+                    letBlock.declarations
+                        |> List.concatMap letDeclarationBoundNames
+                        |> Set.fromList
+
+                shadowedInNestedBlock =
+                    Set.union shadowedNames nestedLetNames
+            in
+            letBlock.declarations
+                |> List.map (collectReferencedNamesInLetDeclaration targetNames shadowedInNestedBlock)
+                |> (::) (collectReferencedNamesInExpression targetNames shadowedInNestedBlock letBlock.expression)
+                |> List.foldl Set.union Set.empty
+
+        CaseExpression caseBlock ->
+            let
+                caseExpressionRefs =
+                    collectReferencedNamesInExpression targetNames shadowedNames caseBlock.expression
+
+                caseBranchRefs =
+                    caseBlock.cases
+                        |> List.map
+                            (\( pattern, caseExpression ) ->
+                                let
+                                    caseShadowed =
+                                        Set.union shadowedNames (collectPatternBindingNames pattern |> Set.fromList)
+                                in
+                                collectReferencedNamesInExpression targetNames caseShadowed caseExpression
+                            )
+            in
+            caseExpressionRefs
+                :: caseBranchRefs
+                |> List.foldl Set.union Set.empty
+
+        LambdaExpression lambda ->
+            let
+                lambdaShadowed =
+                    Set.union shadowedNames
+                        (lambda.args
+                            |> List.concatMap collectPatternBindingNames
+                            |> Set.fromList
+                        )
+            in
+            collectReferencedNamesInExpression targetNames lambdaShadowed lambda.expression
+
+        RecordExpr setters ->
+            setters
+                |> List.map
+                    (\(Node _ ( _, valueExpression )) ->
+                        collectReferencedNamesInExpression targetNames shadowedNames valueExpression
+                    )
+                |> List.foldl Set.union Set.empty
+
+        ListExpr expressions ->
+            expressions
+                |> List.map (collectReferencedNamesInExpression targetNames shadowedNames)
+                |> List.foldl Set.union Set.empty
+
+        RecordAccess inner _ ->
+            collectReferencedNamesInExpression targetNames shadowedNames inner
+
+        RecordUpdateExpression (Node _ recordName) setters ->
+            let
+                baseRecordRefs =
+                    if Set.member recordName targetNames && not (Set.member recordName shadowedNames) then
+                        Set.singleton recordName
+
+                    else
+                        Set.empty
+            in
+            setters
+                |> List.map
+                    (\(Node _ ( _, valueExpression )) ->
+                        collectReferencedNamesInExpression targetNames shadowedNames valueExpression
+                    )
+                |> List.foldl Set.union baseRecordRefs
+
+        _ ->
+            Set.empty
+
+
+collectReferencedNamesInLetDeclaration :
+    Set.Set String
+    -> Set.Set String
+    -> Node LetDeclaration
+    -> Set.Set String
+collectReferencedNamesInLetDeclaration targetNames shadowedNames (Node _ declaration) =
+    case declaration of
+        LetFunction function ->
+            let
+                implementation =
+                    Node.value function.declaration
+
+                functionShadowed =
+                    Set.union shadowedNames
+                        (Set.fromList
+                            (Node.value implementation.name
+                                :: (implementation.arguments
+                                        |> List.concatMap collectPatternBindingNames
+                                   )
+                            )
+                        )
+            in
+            collectReferencedNamesInExpression targetNames functionShadowed implementation.expression
+
+        LetDestructuring pattern expression ->
+            let
+                localShadowed =
+                    Set.union shadowedNames (collectPatternBindingNames pattern |> Set.fromList)
+            in
+            collectReferencedNamesInExpression targetNames localShadowed expression
 
 
 exactUnshadowedParameterName :
@@ -3063,6 +4202,88 @@ crossModuleDependencyRefsFromDeclaration declarationNode =
                     )
 
         _ ->
+            []
+
+
+crossModuleTypeRefsFromDeclaration : Node Declaration -> List QualifiedRef
+crossModuleTypeRefsFromDeclaration declarationNode =
+    case Node.value declarationNode of
+        FunctionDeclaration function ->
+            case function.signature of
+                Just signature ->
+                    crossModuleTypeRefsFromTypeAnnotation Nothing (Node.value signature).typeAnnotation
+
+                Nothing ->
+                    []
+
+        CustomTypeDeclaration typeDecl ->
+            typeDecl.constructors
+                |> List.concatMap
+                    (\constructorNode ->
+                        let
+                            constructor =
+                                Node.value constructorNode
+                        in
+                        constructor.arguments
+                            |> List.concatMap (crossModuleTypeRefsFromTypeAnnotation (Just (Node.value typeDecl.name)))
+                    )
+
+        AliasDeclaration typeAlias ->
+            crossModuleTypeRefsFromTypeAnnotation Nothing typeAlias.typeAnnotation
+
+        PortDeclaration portDecl ->
+            crossModuleTypeRefsFromTypeAnnotation Nothing portDecl.typeAnnotation
+
+        _ ->
+            []
+
+
+crossModuleTypeRefsFromTypeAnnotation : Maybe String -> Node TypeAnnotation -> List QualifiedRef
+crossModuleTypeRefsFromTypeAnnotation exception annotation =
+    case Node.value annotation of
+        Elm.Syntax.TypeAnnotation.FunctionTypeAnnotation left right ->
+            crossModuleTypeRefsFromTypeAnnotation exception left
+                ++ crossModuleTypeRefsFromTypeAnnotation exception right
+
+        Elm.Syntax.TypeAnnotation.Typed (Node _ ( moduleParts, typeName )) params ->
+            (if Just typeName == exception then
+                []
+
+             else
+                [ { moduleParts = moduleParts, name = typeName } ]
+            )
+                ++ List.concatMap (crossModuleTypeRefsFromTypeAnnotation exception) params
+
+        Elm.Syntax.TypeAnnotation.Record fields ->
+            fields
+                |> List.concatMap
+                    (\field ->
+                        let
+                            (_, fieldAnnotation) =
+                                Node.value field
+                        in
+                        crossModuleTypeRefsFromTypeAnnotation exception fieldAnnotation
+                    )
+
+        Elm.Syntax.TypeAnnotation.GenericRecord _ (Node _ fields) ->
+            fields
+                |> List.concatMap
+                    (\field ->
+                        let
+                            (_, fieldAnnotation) =
+                                Node.value field
+                        in
+                        crossModuleTypeRefsFromTypeAnnotation exception fieldAnnotation
+                    )
+
+        Elm.Syntax.TypeAnnotation.Tupled annotations ->
+            annotations
+                |> List.concatMap (crossModuleTypeRefsFromTypeAnnotation exception)
+
+        Elm.Syntax.TypeAnnotation.GenericType _ ->
+            []
+
+        Elm.Syntax.TypeAnnotation.Unit ->
             []
 
 
@@ -4883,6 +6104,29 @@ stringDictDecoder =
         |> Json.Decode.map Dict.fromList
 
 
+encodeLocalTypeDictJson : Dict String LocalTypeSummary -> Json.Encode.Value
+encodeLocalTypeDictJson values =
+    values
+        |> Dict.toList
+        |> Json.Encode.list
+            (\( name, localType ) ->
+                Json.Encode.object
+                    [ ( "name", Json.Encode.string name )
+                    , ( "summary", encodeLocalTypeSummaryJson localType )
+                    ]
+            )
+
+
+localTypeDictDecoder : Json.Decode.Decoder (Dict String LocalTypeSummary)
+localTypeDictDecoder =
+    Json.Decode.list
+        (Json.Decode.map2 Tuple.pair
+            (Json.Decode.field "name" Json.Decode.string)
+            (Json.Decode.field "summary" localTypeSummaryDecoder)
+        )
+        |> Json.Decode.map Dict.fromList
+
+
 encodeDependencyRefJson : DependencyRef -> Json.Encode.Value
 encodeDependencyRefJson dependencyRef =
     Json.Encode.object
@@ -4904,6 +6148,188 @@ dependencyRefDecoder =
         (Json.Decode.field "owner" Json.Decode.string)
         (Json.Decode.field "moduleParts" (Json.Decode.list Json.Decode.string))
         (Json.Decode.field "name" Json.Decode.string)
+
+
+importedElementKindToString : ImportedElementKind -> String
+importedElementKindToString kind =
+    case kind of
+        ImportedValueKind ->
+            "value"
+
+        ImportedOperatorKind ->
+            "operator"
+
+        ImportedTypeKind ->
+            "type"
+
+        ImportedOpenTypeKind ->
+            "open-type"
+
+
+importedElementKindDecoder : Json.Decode.Decoder ImportedElementKind
+importedElementKindDecoder =
+    Json.Decode.string
+        |> Json.Decode.andThen
+            (\kind ->
+                case kind of
+                    "value" ->
+                        Json.Decode.succeed ImportedValueKind
+
+                    "operator" ->
+                        Json.Decode.succeed ImportedOperatorKind
+
+                    "type" ->
+                        Json.Decode.succeed ImportedTypeKind
+
+                    "open-type" ->
+                        Json.Decode.succeed ImportedOpenTypeKind
+
+                    _ ->
+                        Json.Decode.fail ("Unknown imported element kind: " ++ kind)
+            )
+
+
+localTypeKindToString : LocalTypeKind -> String
+localTypeKindToString kind =
+    case kind of
+        LocalCustomTypeKind ->
+            "custom-type"
+
+        LocalRecordAliasKind ->
+            "record-alias"
+
+        LocalTypeAliasKind ->
+            "type-alias"
+
+
+localTypeKindDecoder : Json.Decode.Decoder LocalTypeKind
+localTypeKindDecoder =
+    Json.Decode.string
+        |> Json.Decode.andThen
+            (\kind ->
+                case kind of
+                    "custom-type" ->
+                        Json.Decode.succeed LocalCustomTypeKind
+
+                    "record-alias" ->
+                        Json.Decode.succeed LocalRecordAliasKind
+
+                    "type-alias" ->
+                        Json.Decode.succeed LocalTypeAliasKind
+
+                    _ ->
+                        Json.Decode.fail ("Unknown local type kind: " ++ kind)
+            )
+
+
+encodeLocalTypeSummaryJson : LocalTypeSummary -> Json.Encode.Value
+encodeLocalTypeSummaryJson localTypeSummary =
+    Json.Encode.object
+        [ ( "range", encodeRangeJson localTypeSummary.range )
+        , ( "kind", Json.Encode.string (localTypeKindToString localTypeSummary.kind) )
+        ]
+
+
+localTypeSummaryDecoder : Json.Decode.Decoder LocalTypeSummary
+localTypeSummaryDecoder =
+    Json.Decode.map2
+        (\range kind ->
+            { range = range
+            , kind = kind
+            }
+        )
+        (Json.Decode.field "range" rangeDecoder)
+        (Json.Decode.field "kind" localTypeKindDecoder)
+
+
+encodeImportAliasSummaryJson : ImportAliasSummary -> Json.Encode.Value
+encodeImportAliasSummaryJson aliasSummary =
+    Json.Encode.object
+        [ ( "name", Json.Encode.string aliasSummary.name )
+        , ( "range", encodeRangeJson aliasSummary.range )
+        ]
+
+
+importAliasSummaryDecoder : Json.Decode.Decoder ImportAliasSummary
+importAliasSummaryDecoder =
+    Json.Decode.map2
+        (\name range ->
+            { name = name
+            , range = range
+            }
+        )
+        (Json.Decode.field "name" Json.Decode.string)
+        (Json.Decode.field "range" rangeDecoder)
+
+
+encodeImportedElementSummaryJson : ImportedElementSummary -> Json.Encode.Value
+encodeImportedElementSummaryJson importedElement =
+    Json.Encode.object
+        [ ( "name", Json.Encode.string importedElement.name )
+        , ( "range", encodeRangeJson importedElement.range )
+        , ( "openRange"
+          , importedElement.openRange
+                |> Maybe.map encodeRangeJson
+                |> Maybe.withDefault Json.Encode.null
+          )
+        , ( "kind", Json.Encode.string (importedElementKindToString importedElement.kind) )
+        ]
+
+
+importedElementSummaryDecoder : Json.Decode.Decoder ImportedElementSummary
+importedElementSummaryDecoder =
+    Json.Decode.map4
+        (\name range openRange kind ->
+            { name = name
+            , range = range
+            , openRange = openRange
+            , kind = kind
+            }
+        )
+        (Json.Decode.field "name" Json.Decode.string)
+        (Json.Decode.field "range" rangeDecoder)
+        (Json.Decode.field "openRange" (Json.Decode.nullable rangeDecoder))
+        (Json.Decode.field "kind" importedElementKindDecoder)
+
+
+encodeImportSummaryJson : ImportSummary -> Json.Encode.Value
+encodeImportSummaryJson importSummary =
+    Json.Encode.object
+        [ ( "moduleName", Json.Encode.string importSummary.moduleName )
+        , ( "moduleNameRange", encodeRangeJson importSummary.moduleNameRange )
+        , ( "importRange", encodeRangeJson importSummary.importRange )
+        , ( "alias"
+          , importSummary.alias
+                |> Maybe.map encodeImportAliasSummaryJson
+                |> Maybe.withDefault Json.Encode.null
+          )
+        , ( "exposingAllRange"
+          , importSummary.exposingAllRange
+                |> Maybe.map encodeRangeJson
+                |> Maybe.withDefault Json.Encode.null
+          )
+        , ( "explicitElements", Json.Encode.list encodeImportedElementSummaryJson importSummary.explicitElements )
+        ]
+
+
+importSummaryDecoder : Json.Decode.Decoder ImportSummary
+importSummaryDecoder =
+    Json.Decode.map6
+        (\moduleName moduleNameRange importRange alias exposingAllRange explicitElements ->
+            { moduleName = moduleName
+            , moduleNameRange = moduleNameRange
+            , importRange = importRange
+            , alias = alias
+            , exposingAllRange = exposingAllRange
+            , explicitElements = explicitElements
+            }
+        )
+        (Json.Decode.field "moduleName" Json.Decode.string)
+        (Json.Decode.field "moduleNameRange" rangeDecoder)
+        (Json.Decode.field "importRange" rangeDecoder)
+        (Json.Decode.field "alias" (Json.Decode.nullable importAliasSummaryDecoder))
+        (Json.Decode.field "exposingAllRange" (Json.Decode.nullable rangeDecoder))
+        (Json.Decode.field "explicitElements" (Json.Decode.list importedElementSummaryDecoder))
 
 
 encodeQualifiedRefJson : QualifiedRef -> Json.Encode.Value
@@ -4947,6 +6373,26 @@ parameterBindingSummaryDecoder =
         (Json.Decode.field "name" Json.Decode.string)
         (Json.Decode.field "range" rangeDecoder)
         (Json.Decode.field "kind" parameterBindingKindDecoder)
+
+
+encodeLetBindingSummaryJson : LetBindingSummary -> Json.Encode.Value
+encodeLetBindingSummaryJson binding =
+    Json.Encode.object
+        [ ( "name", Json.Encode.string binding.name )
+        , ( "range", encodeRangeJson binding.range )
+        ]
+
+
+letBindingSummaryDecoder : Json.Decode.Decoder LetBindingSummary
+letBindingSummaryDecoder =
+    Json.Decode.map2
+        (\name range ->
+            { name = name
+            , range = range
+            }
+        )
+        (Json.Decode.field "name" Json.Decode.string)
+        (Json.Decode.field "range" rangeDecoder)
 
 
 encodeTopLevelFunctionSummaryJson : TopLevelFunctionSummary -> Json.Encode.Value
@@ -5046,7 +6492,9 @@ encodeFileAnalysisCache cache =
                             , ( "moduleName", Json.Encode.string analysis.crossModuleSummary.moduleName )
                             , ( "moduleNameRange", encodeRangeJson analysis.crossModuleSummary.moduleNameRange )
                             , ( "isExposingAll", Json.Encode.bool analysis.crossModuleSummary.isExposingAll )
+                            , ( "valueDeclarationRanges", encodeRangeDictJson analysis.crossModuleSummary.valueDeclarationRanges )
                             , ( "exposedValues", encodeRangeDictJson analysis.crossModuleSummary.exposedValues )
+                            , ( "localTypeDeclarations", encodeLocalTypeDictJson analysis.crossModuleSummary.localTypeDeclarations )
                             , ( "declaredConstructors", encodeNestedRangeDictJson analysis.crossModuleSummary.declaredConstructors )
                             , ( "exposedConstructors", encodeNestedRangeDictJson analysis.crossModuleSummary.exposedConstructors )
                             , ( "constructorArgumentRanges", encodeNestedRangeListDictJson analysis.crossModuleSummary.constructorArgumentRanges )
@@ -5054,15 +6502,18 @@ encodeFileAnalysisCache cache =
                             , ( "importedValueCandidates", encodeStringSetDictJson analysis.crossModuleSummary.importedValueCandidates )
                             , ( "importedOpenTypesByModule", encodeStringSetDictJson analysis.crossModuleSummary.importedOpenTypesByModule )
                             , ( "importAllModules", Json.Encode.list Json.Encode.string analysis.crossModuleSummary.importAllModules )
+                            , ( "importSummaries", Json.Encode.list encodeImportSummaryJson analysis.crossModuleSummary.importSummaries )
                             , ( "moduleAliases", encodeStringDictJson analysis.crossModuleSummary.moduleAliases )
                             , ( "localDeclarations", encodeStringSetJson analysis.crossModuleSummary.localDeclarations )
                             , ( "dependencyRefs", Json.Encode.list encodeDependencyRefJson analysis.crossModuleSummary.dependencyRefs )
+                            , ( "typeRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.typeRefs )
                             , ( "expressionConstructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.expressionConstructorRefs )
                             , ( "patternConstructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.patternConstructorRefs )
                             , ( "constructorPatternUsages", Json.Encode.list encodeConstructorPatternUsageJson analysis.crossModuleSummary.constructorPatternUsages )
                             , ( "comparisonConstructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.comparisonConstructorRefs )
                             , ( "topLevelFunctionSummaries", Json.Encode.list encodeTopLevelFunctionSummaryJson analysis.crossModuleSummary.topLevelFunctionSummaries )
                             , ( "nestedFunctionSummaries", Json.Encode.list encodeTopLevelFunctionSummaryJson analysis.crossModuleSummary.nestedFunctionSummaries )
+                            , ( "letBindingSummaries", Json.Encode.list encodeLetBindingSummaryJson analysis.crossModuleSummary.letBindingSummaries )
                             , ( "containsMainLike", Json.Encode.bool analysis.crossModuleSummary.containsMainLike )
                             ]
                       )
@@ -5147,7 +6598,9 @@ decodeFileAnalysisCache json =
                             , moduleName = headFields.moduleName
                             , moduleNameRange = headFields.moduleNameRange
                             , isExposingAll = headFields.isExposingAll
+                            , valueDeclarationRanges = headFields.valueDeclarationRanges
                             , exposedValues = headFields.exposedValues
+                            , localTypeDeclarations = headFields.localTypeDeclarations
                             , declaredConstructors = headFields.declaredConstructors
                             , exposedConstructors = headFields.exposedConstructors
                             , constructorArgumentRanges = headFields.constructorArgumentRanges
@@ -5155,15 +6608,18 @@ decodeFileAnalysisCache json =
                             , importedValueCandidates = headFields.importedValueCandidates
                             , importedOpenTypesByModule = headFields.importedOpenTypesByModule
                             , importAllModules = headFields.importAllModules
+                            , importSummaries = tailFields.importSummaries
                             , moduleAliases = tailFields.moduleAliases
                             , localDeclarations = tailFields.localDeclarations
                             , dependencyRefs = tailFields.dependencyRefs
+                            , typeRefs = tailFields.typeRefs
                             , expressionConstructorRefs = tailFields.expressionConstructorRefs
                             , patternConstructorRefs = tailFields.patternConstructorRefs
                             , constructorPatternUsages = tailFields.constructorPatternUsages
                             , comparisonConstructorRefs = tailFields.comparisonConstructorRefs
                             , topLevelFunctionSummaries = tailFields.topLevelFunctionSummaries
                             , nestedFunctionSummaries = tailFields.nestedFunctionSummaries
+                            , letBindingSummaries = tailFields.letBindingSummaries
                             , containsMainLike = tailFields.containsMainLike
                             }
                         )
@@ -5173,7 +6629,9 @@ decodeFileAnalysisCache json =
                                 , moduleName = primaryFields.moduleName
                                 , moduleNameRange = primaryFields.moduleNameRange
                                 , isExposingAll = primaryFields.isExposingAll
+                                , valueDeclarationRanges = primaryFields.valueDeclarationRanges
                                 , exposedValues = primaryFields.exposedValues
+                                , localTypeDeclarations = primaryFields.localTypeDeclarations
                                 , declaredConstructors = primaryFields.declaredConstructors
                                 , exposedConstructors = primaryFields.exposedConstructors
                                 , constructorArgumentRanges = primaryFields.constructorArgumentRanges
@@ -5183,25 +6641,56 @@ decodeFileAnalysisCache json =
                                 , importAllModules = importFields.importAllModules
                                 }
                             )
-                            (Json.Decode.map7
-                                (\filePath moduleName moduleNameRange isExposingAll exposedValues declaredConstructors constructorArgumentRanges ->
-                                    { filePath = filePath
-                                    , moduleName = moduleName
-                                    , moduleNameRange = moduleNameRange
-                                    , isExposingAll = isExposingAll
-                                    , exposedValues = exposedValues
-                                    , declaredConstructors = declaredConstructors
+                            (Json.Decode.map2
+                                (\coreFields declarationFields ->
+                                    { filePath = coreFields.filePath
+                                    , moduleName = coreFields.moduleName
+                                    , moduleNameRange = coreFields.moduleNameRange
+                                    , isExposingAll = coreFields.isExposingAll
+                                    , valueDeclarationRanges = declarationFields.valueDeclarationRanges
+                                    , exposedValues = declarationFields.exposedValues
+                                    , localTypeDeclarations = declarationFields.localTypeDeclarations
+                                    , declaredConstructors = declarationFields.declaredConstructors
                                     , exposedConstructors = Dict.empty
-                                    , constructorArgumentRanges = constructorArgumentRanges
+                                    , constructorArgumentRanges = declarationFields.constructorArgumentRanges
                                     }
                                 )
-                                (Json.Decode.field "filePath" Json.Decode.string)
-                                (Json.Decode.field "moduleName" Json.Decode.string)
-                                (Json.Decode.field "moduleNameRange" rangeDecoder)
-                                (Json.Decode.field "isExposingAll" Json.Decode.bool)
-                                (Json.Decode.field "exposedValues" rangeDictDecoder)
-                                (Json.Decode.field "declaredConstructors" nestedRangeDictDecoder)
-                                (Json.Decode.field "constructorArgumentRanges" nestedRangeListDictDecoder)
+                                (Json.Decode.map4
+                                    (\filePath moduleName moduleNameRange isExposingAll ->
+                                        { filePath = filePath
+                                        , moduleName = moduleName
+                                        , moduleNameRange = moduleNameRange
+                                        , isExposingAll = isExposingAll
+                                        }
+                                    )
+                                    (Json.Decode.field "filePath" Json.Decode.string)
+                                    (Json.Decode.field "moduleName" Json.Decode.string)
+                                    (Json.Decode.field "moduleNameRange" rangeDecoder)
+                                    (Json.Decode.field "isExposingAll" Json.Decode.bool)
+                                )
+                                (Json.Decode.map5
+                                    (\valueDeclarationRanges exposedValues localTypeDeclarations declaredConstructors constructorArgumentRanges ->
+                                        { valueDeclarationRanges = valueDeclarationRanges
+                                        , exposedValues = exposedValues
+                                        , localTypeDeclarations = localTypeDeclarations
+                                        , declaredConstructors = declaredConstructors
+                                        , constructorArgumentRanges = constructorArgumentRanges
+                                        }
+                                    )
+                                    (Json.Decode.oneOf
+                                        [ Json.Decode.field "valueDeclarationRanges" rangeDictDecoder
+                                        , Json.Decode.succeed Dict.empty
+                                        ]
+                                    )
+                                    (Json.Decode.field "exposedValues" rangeDictDecoder)
+                                    (Json.Decode.oneOf
+                                        [ Json.Decode.field "localTypeDeclarations" localTypeDictDecoder
+                                        , Json.Decode.succeed Dict.empty
+                                        ]
+                                    )
+                                    (Json.Decode.field "declaredConstructors" nestedRangeDictDecoder)
+                                    (Json.Decode.field "constructorArgumentRanges" nestedRangeListDictDecoder)
+                                )
                             )
                             (Json.Decode.map5
                                 (\exposedConstructors importedModules importedValueCandidates importedOpenTypesByModule importAllModules ->
@@ -5222,49 +6711,108 @@ decodeFileAnalysisCache json =
                         (Json.Decode.map2
                             (\coreFields containsMainLike ->
                                 { moduleAliases = coreFields.moduleAliases
+                                , importSummaries = coreFields.importSummaries
                                 , localDeclarations = coreFields.localDeclarations
                                 , dependencyRefs = coreFields.dependencyRefs
+                                , typeRefs = coreFields.typeRefs
                                 , expressionConstructorRefs = coreFields.expressionConstructorRefs
                                 , patternConstructorRefs = coreFields.patternConstructorRefs
                                 , constructorPatternUsages = coreFields.constructorPatternUsages
                                 , comparisonConstructorRefs = coreFields.comparisonConstructorRefs
                                 , topLevelFunctionSummaries = coreFields.topLevelFunctionSummaries
                                 , nestedFunctionSummaries = coreFields.nestedFunctionSummaries
+                                , letBindingSummaries = coreFields.letBindingSummaries
                                 , containsMainLike = containsMainLike
                                 }
                             )
                             (Json.Decode.map2
                                 (\coreFields nestedFunctionSummaries ->
                                     { moduleAliases = coreFields.moduleAliases
+                                    , importSummaries = coreFields.importSummaries
                                     , localDeclarations = coreFields.localDeclarations
                                     , dependencyRefs = coreFields.dependencyRefs
+                                    , typeRefs = coreFields.typeRefs
                                     , expressionConstructorRefs = coreFields.expressionConstructorRefs
                                     , patternConstructorRefs = coreFields.patternConstructorRefs
                                     , constructorPatternUsages = coreFields.constructorPatternUsages
                                     , comparisonConstructorRefs = coreFields.comparisonConstructorRefs
                                     , topLevelFunctionSummaries = coreFields.topLevelFunctionSummaries
                                     , nestedFunctionSummaries = nestedFunctionSummaries
+                                    , letBindingSummaries = coreFields.letBindingSummaries
                                     }
                                 )
-                                (Json.Decode.map8
-                                    (\moduleAliases localDeclarations dependencyRefs expressionConstructorRefs patternConstructorRefs constructorPatternUsages comparisonConstructorRefs topLevelFunctionSummaries ->
-                                        { moduleAliases = moduleAliases
-                                        , localDeclarations = localDeclarations
-                                        , dependencyRefs = dependencyRefs
-                                        , expressionConstructorRefs = expressionConstructorRefs
-                                        , patternConstructorRefs = patternConstructorRefs
-                                        , constructorPatternUsages = constructorPatternUsages
-                                        , comparisonConstructorRefs = comparisonConstructorRefs
+                                (Json.Decode.map2
+                                    (\coreFields topLevelFunctionSummaries ->
+                                        { moduleAliases = coreFields.moduleAliases
+                                        , importSummaries = coreFields.importSummaries
+                                        , localDeclarations = coreFields.localDeclarations
+                                        , dependencyRefs = coreFields.dependencyRefs
+                                        , typeRefs = coreFields.typeRefs
+                                        , expressionConstructorRefs = coreFields.expressionConstructorRefs
+                                        , patternConstructorRefs = coreFields.patternConstructorRefs
+                                        , constructorPatternUsages = coreFields.constructorPatternUsages
+                                        , comparisonConstructorRefs = coreFields.comparisonConstructorRefs
                                         , topLevelFunctionSummaries = topLevelFunctionSummaries
+                                        , letBindingSummaries = coreFields.letBindingSummaries
                                         }
                                     )
-                                    (Json.Decode.field "moduleAliases" stringDictDecoder)
-                                    (Json.Decode.field "localDeclarations" stringSetDecoder)
-                                    (Json.Decode.field "dependencyRefs" (Json.Decode.list dependencyRefDecoder))
-                                    (Json.Decode.field "expressionConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
-                                    (Json.Decode.field "patternConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
-                                    (Json.Decode.field "constructorPatternUsages" (Json.Decode.list constructorPatternUsageDecoder))
-                                    (Json.Decode.field "comparisonConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                                    (Json.Decode.map2
+                                        (\coreFields refFields ->
+                                            { moduleAliases = coreFields.moduleAliases
+                                            , importSummaries = coreFields.importSummaries
+                                            , localDeclarations = coreFields.localDeclarations
+                                            , dependencyRefs = coreFields.dependencyRefs
+                                            , letBindingSummaries = coreFields.letBindingSummaries
+                                            , typeRefs = refFields.typeRefs
+                                            , expressionConstructorRefs = refFields.expressionConstructorRefs
+                                            , patternConstructorRefs = refFields.patternConstructorRefs
+                                            , constructorPatternUsages = refFields.constructorPatternUsages
+                                            , comparisonConstructorRefs = refFields.comparisonConstructorRefs
+                                            }
+                                        )
+                                        (Json.Decode.map5
+                                            (\moduleAliases importSummaries localDeclarations dependencyRefs letBindingSummaries ->
+                                                { moduleAliases = moduleAliases
+                                                , importSummaries = importSummaries
+                                                , localDeclarations = localDeclarations
+                                                , dependencyRefs = dependencyRefs
+                                                , letBindingSummaries = letBindingSummaries
+                                                }
+                                            )
+                                            (Json.Decode.field "moduleAliases" stringDictDecoder)
+                                            (Json.Decode.oneOf
+                                                [ Json.Decode.field "importSummaries" (Json.Decode.list importSummaryDecoder)
+                                                , Json.Decode.succeed []
+                                                ]
+                                            )
+                                            (Json.Decode.field "localDeclarations" stringSetDecoder)
+                                            (Json.Decode.field "dependencyRefs" (Json.Decode.list dependencyRefDecoder))
+                                            (Json.Decode.oneOf
+                                                [ Json.Decode.field "letBindingSummaries" (Json.Decode.list letBindingSummaryDecoder)
+                                                , Json.Decode.succeed []
+                                                ]
+                                            )
+                                        )
+                                        (Json.Decode.map5
+                                            (\typeRefs expressionConstructorRefs patternConstructorRefs constructorPatternUsages comparisonConstructorRefs ->
+                                                { typeRefs = typeRefs
+                                                , expressionConstructorRefs = expressionConstructorRefs
+                                                , patternConstructorRefs = patternConstructorRefs
+                                                , constructorPatternUsages = constructorPatternUsages
+                                                , comparisonConstructorRefs = comparisonConstructorRefs
+                                                }
+                                            )
+                                            (Json.Decode.oneOf
+                                                [ Json.Decode.field "typeRefs" (Json.Decode.list qualifiedRefDecoder)
+                                                , Json.Decode.succeed []
+                                                ]
+                                            )
+                                            (Json.Decode.field "expressionConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                                            (Json.Decode.field "patternConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                                            (Json.Decode.field "constructorPatternUsages" (Json.Decode.list constructorPatternUsageDecoder))
+                                            (Json.Decode.field "comparisonConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                                        )
+                                    )
                                     (Json.Decode.field "topLevelFunctionSummaries" (Json.Decode.list topLevelFunctionSummaryDecoder))
                                 )
                                 (Json.Decode.oneOf
@@ -6318,6 +7866,7 @@ task config =
                 , ( "experiment.host_no_unused_custom_type_constructors", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorsExperiment )
                 , ( "experiment.host_no_unused_custom_type_constructor_args", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorArgsExperiment )
                 , ( "experiment.host_no_unused_parameters", boolToInt preparedConfig.hostNoUnusedParametersExperiment )
+                , ( "experiment.host_no_unused_variables", boolToInt preparedConfig.hostNoUnusedVariablesExperiment )
                 , ( "analysis_cache.entries", analyzedTargetFiles.cacheEntries )
                 , ( "analysis_cache.loaded_bytes", analyzedTargetFiles.cacheLoadBytes )
                 , ( "analysis_cache.stored_bytes", analyzedTargetFiles.cacheStoreBytes )
@@ -6823,6 +8372,10 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             config.hostNoUnusedParametersExperiment
                 && List.any (\rule -> rule.name == "NoUnused.Parameters") ruleInfo
 
+        hostNoUnusedVariablesEnabled =
+            config.hostNoUnusedVariablesExperiment
+                && List.any (\rule -> rule.name == "NoUnused.Variables") ruleInfo
+
         projectRules =
             ruleInfo
                 |> List.filter (\r -> r.ruleType == ProjectRule)
@@ -6832,6 +8385,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             && (not hostNoUnusedCustomTypeConstructorsEnabled || r.name /= "NoUnused.CustomTypeConstructors")
                             && (not hostNoUnusedCustomTypeConstructorArgsEnabled || r.name /= "NoUnused.CustomTypeConstructorArgs")
                             && (not hostNoUnusedParametersEnabled || r.name /= "NoUnused.Parameters")
+                            && (not hostNoUnusedVariablesEnabled || r.name /= "NoUnused.Variables")
                     )
 
         stalePaths =
@@ -6917,6 +8471,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 , ( "project.host_constructors.enabled", boolToInt hostNoUnusedCustomTypeConstructorsEnabled )
                 , ( "project.host_constructor_args.enabled", boolToInt hostNoUnusedCustomTypeConstructorArgsEnabled )
                 , ( "project.host_parameters.enabled", boolToInt hostNoUnusedParametersEnabled )
+                , ( "project.host_variables.enabled", boolToInt hostNoUnusedVariablesEnabled )
                 ]
     in
     Do.do
@@ -6964,6 +8519,9 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
     let
         packageExposedModules =
             packageExposedModulesFromElmJsonRaw targetProjectSeedTimed.value.elmJsonRaw
+
+        packageOpenTypeConstructors =
+            openTypeConstructorsIndexFromTargetProjectSeed targetProjectSeedTimed.value
     in
     Do.do (withTiming "build_target_project_runtime" (buildTargetProjectRuntime (Path.toString config.buildDirectory) reviewProject targetProjectSeedTimed.value)) <| \targetProjectRuntimeTimed ->
     Do.do
@@ -7036,6 +8594,23 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     )
                 )
             <| \hostNoUnusedParametersTimed ->
+            Do.do
+                (withTiming "project.host_variables_eval"
+                    (if hostNoUnusedVariablesEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoUnusedVariablesForAnalyzedFiles packageOpenTypeConstructors allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "project.host_variables.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoUnusedVariablesTimed ->
             let
                 hostNoUnusedExportsOutput =
                     hostNoUnusedExportsTimed.value.errors
@@ -7084,11 +8659,23 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         , Dict.fromList
                             [ ( "project.host_parameters.ms", hostNoUnusedParametersTimed.stage.ms ) ]
                         ]
+
+                hostNoUnusedVariablesOutput =
+                    hostNoUnusedVariablesTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoUnusedVariablesCounters =
+                    mergeCounterDicts
+                        [ hostNoUnusedVariablesTimed.value.counters
+                        , Dict.fromList
+                            [ ( "project.host_variables.ms", hostNoUnusedVariablesTimed.stage.ms ) ]
+                        ]
             in
             if List.isEmpty projectRules then
                 BackendTask.succeed
                     { output =
-                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, hostNoUnusedConstructorArgsOutput, hostNoUnusedParametersOutput ]
+                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, hostNoUnusedConstructorArgsOutput, hostNoUnusedParametersOutput, hostNoUnusedVariablesOutput ]
                             |> List.filter (not << String.isEmpty)
                             |> String.join "\n"
                     , counters =
@@ -7097,6 +8684,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             , hostNoUnusedConstructorsCounters
                             , hostNoUnusedConstructorArgsCounters
                             , hostNoUnusedParametersCounters
+                            , hostNoUnusedVariablesCounters
                             , Dict.fromList
                                 [ ( "project_rules.skipped", 1 )
                                 , ( "load_target_project_seed_ms", targetProjectSeedTimed.stage.ms )
@@ -7896,7 +9484,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
 
                     combinedProjectOutputs =
-                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, hostNoUnusedConstructorArgsOutput, hostNoUnusedParametersOutput, importersResult, depsOfResult ]
+                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, hostNoUnusedConstructorArgsOutput, hostNoUnusedParametersOutput, hostNoUnusedVariablesOutput, importersResult, depsOfResult ]
                             |> List.filter (not << String.isEmpty)
                             |> String.join "\n"
                 in
@@ -7912,6 +9500,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , hostNoUnusedConstructorsCounters
                                 , hostNoUnusedConstructorArgsCounters
                                 , hostNoUnusedParametersCounters
+                                , hostNoUnusedVariablesCounters
                                 , Dict.fromList
                                     [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
                                     , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
@@ -7954,6 +9543,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , hostNoUnusedConstructorsCounters
                                 , hostNoUnusedConstructorArgsCounters
                                 , hostNoUnusedParametersCounters
+                                , hostNoUnusedVariablesCounters
                                 , Dict.fromList
                                     [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
                                     , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )

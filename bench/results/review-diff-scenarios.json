@@ -1,5 +1,5 @@
 {
-  "date": "2026-04-08T17:33:51.736Z",
+  "date": "2026-04-08T19:05:28.343Z",
   "runner": "dist/review-runner-bench.mjs",
   "cli_runner": "elm-review",
   "importers_cache_mode": "auto",
@@ -17,8 +17,8 @@
           "cache_decision": "cold_miss",
           "diff": {
             "matches": true,
-            "runner_count": 568,
-            "cli_count": 568,
+            "runner_count": 624,
+            "cli_count": 624,
             "only_runner_count": 0,
             "only_cli_count": 0,
             "only_runner_examples": [],
@@ -32,8 +32,8 @@
           "cache_decision": "full_hit",
           "diff": {
             "matches": true,
-            "runner_count": 568,
-            "cli_count": 568,
+            "runner_count": 624,
+            "cli_count": 624,
             "only_runner_count": 0,
             "only_cli_count": 0,
             "only_runner_examples": [],
@@ -47,8 +47,8 @@
           "cache_decision": "partial_miss",
           "diff": {
             "matches": true,
-            "runner_count": 569,
-            "cli_count": 569,
+            "runner_count": 625,
+            "cli_count": 625,
             "only_runner_count": 0,
             "only_cli_count": 0,
             "only_runner_examples": [],
@@ -62,8 +62,8 @@
           "cache_decision": "full_hit",
           "diff": {
             "matches": true,
-            "runner_count": 568,
-            "cli_count": 568,
+            "runner_count": 624,
+            "cli_count": 624,
             "only_runner_count": 0,
             "only_cli_count": 0,
             "only_runner_examples": [],
@@ -77,8 +77,8 @@
           "cache_decision": "partial_miss",
           "diff": {
             "matches": true,
-            "runner_count": 569,
-            "cli_count": 569,
+            "runner_count": 625,
+            "cli_count": 625,
             "only_runner_count": 0,
             "only_cli_count": 0,
             "only_runner_examples": [],

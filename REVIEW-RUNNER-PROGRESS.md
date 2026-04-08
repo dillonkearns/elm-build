@@ -124,6 +124,97 @@ Selected counters from the same run:
 
 ## 2026-04-08
 
+### `DependenciesOf` Host-Fact Upper Bound
+
+I extended the cached fact layer for `NoUnused.Variables` with:
+
+- generic import summaries
+- top-level declaration/use facts
+- local type declarations
+- let-binding summaries
+- constructor-aware open-type usage from dependency `docs.json`
+
+The isolated `DependenciesOf` family benchmark on `small-12` is now:
+
+| Scenario | Interpreted baseline | Host-fact upper bound |
+|---|---:|---:|
+| Cold | 138.38s | 27.12s |
+| Warm | 0.32s | 0.34s |
+| Warm import-graph change | 5.95s | 1.35s |
+
+Correctness on a fresh isolated workspace now matches the real `elm-review` CLI exactly:
+
+| Metric | Count |
+|---|---:|
+| CLI findings | 22 |
+| Host-fact findings | 22 |
+| Missing | 0 |
+| Extra | 0 |
+
+The main bug there was not the fact model itself. It was the dependency docs decoder:
+
+- I was decoding package union constructors from a non-existent `tags` field
+- Elm package `docs.json` uses `cases`
+- that left the dependency open-type constructor index effectively empty
+- fixing that closed the remaining `Imported type ... is not used` mismatches for constructor-only usage
+
+This puts `DependenciesOf` in the same category as the `ImportersOf` family:
+
+- cached host-side facts are a strong seam
+- the interpreted project-context fold is the real hot path
+- the fact/policy split is still the desired end state, but the upper-bound experiment has now proven the size of the opportunity on both expensive `NoUnused` families
+
+### Mixed `small-12` With All Five Host-Backed `NoUnused` Experiments
+
+I then enabled all five host-backed `NoUnused` experiments in the mixed `bench/review` config:
+
+- `NoUnused.Exports`
+- `NoUnused.CustomTypeConstructors`
+- `NoUnused.CustomTypeConstructorArgs`
+- `NoUnused.Parameters`
+- `NoUnused.Variables`
+
+Current mixed `small-12` benchmark:
+
+| Scenario | Runner | elm-review CLI |
+|---|---:|---:|
+| Cold | 111.19s | 2.95s |
+| Warm | 0.37s | 1.05s |
+| Warm 1-file body edit | 1.65s | 1.06s |
+| Warm 1-file comment-only | 0.86s | 1.09s |
+| Warm import-graph change | 1.65s | 1.14s |
+
+Current mixed diff harness is exact in all five scenarios:
+
+| Scenario | Result |
+|---|---|
+| Cold | match |
+| Warm | match |
+| Warm 1-file body edit | match |
+| Warm 1-file comment-only | match |
+| Warm import-graph change | match |
+
+The most important shift is that the previous large project-rule wall is now effectively gone on this fixture:
+
+| Scenario | `load_review_project` | `module_rule_eval` | `project_rule_eval` |
+|---|---:|---:|---:|
+| Warm 1-file body edit | 314ms | 242ms | 10ms |
+| Warm import-graph change | 313ms | 245ms | 12ms |
+
+That changes the optimization target again.
+
+The remaining mixed gap versus the CLI is now mostly:
+
+- fixed warm setup tax in `load_review_project`
+- remaining module-rule execution
+- outer wall-clock overhead outside the traced inner stages
+
+So the broad thesis has held up:
+
+- cached facts plus coarse bypasses are paying off
+- expensive interpreted project-rule folds were the right seam to attack first
+- the next round should focus on setup and module-rule costs rather than more project-rule cache work
+
 ### Benchmarks
 
 After switching `ImportersOf` invalidation to direct reverse dependencies:
@@ -1576,3 +1667,148 @@ This integration confirms two things clearly:
 So the next optimization target should not be more `ImportersOf` work. The next
 target is the other remaining rule families and setup costs that dominate mixed
 partial-miss runs once `ImportersOf` is no longer the wall.
+
+### Current Status Summary
+
+At this point, the main architectural questions are answered.
+
+What has been proven:
+
+- full-hit warm caching is a real advantage over `elm-review` CLI
+- coarse cached facts are a much better optimization seam than generic
+  eval-loop memoization for cheap helper calls
+- the `ImportersOf` family can be collapsed dramatically by working from cached
+  facts and bypassing the interpreted fold
+- that fact-backed path can still match the CLI exactly on the benchmark fixture
+
+What has **not** been achieved yet:
+
+- beating `elm-review` CLI on the common mixed partial-miss paths
+- a general interpreted-policy path over cached facts for these families
+
+Current mixed `small-12` picture:
+
+| Scenario | Runner | elm-review CLI |
+|---|---:|---:|
+| Warm | `0.40s` | `1.00s` |
+| Warm 1-file body edit | `2.41s` | `0.98s` |
+| Warm 1-file comment-only | `0.81s` | `0.98s` |
+| Warm import-graph change | `5.09s` | `0.98s` |
+
+Current bottleneck thesis:
+
+- `ImportersOf` is no longer the dominant mixed-rule wall
+- the next likely expensive family is `DependenciesOf` / `NoUnused.Variables`
+- after that, remaining work is in setup (`load_review_project`) and module-rule cost
+
+### Isolated `DependenciesOf` Baseline
+
+I added a dedicated isolated benchmark harness at
+[bench/dependencies-family-benchmark.mjs](bench/dependencies-family-benchmark.mjs)
+for `NoUnused.Variables`, which is currently the only `DependenciesOf` rule in
+the benchmark config.
+
+Current isolated baseline on `small-12` with `--deps-cache-mode auto`:
+
+| Scenario | `NoUnused.Variables` interpreted |
+|---|---:|
+| Cold | `138.38s` |
+| Warm | `0.32s` |
+| Warm import-graph change | `5.95s` |
+
+Important trace details:
+
+- cold `project_rule_eval`: `111.95s`
+- warm import-change `project_rule_eval`: `4.66s`
+- warm import-change `deps_eval_total_ms`: `1.49s`
+- warm import-change `deps_rule_cache_loaded_bytes`: `87KB`
+
+So the current `DependenciesOf` wall is real, but not as catastrophic as the
+pre-bypass `ImportersOf` family. It also has the same shape:
+
+- cache IO is tiny
+- the remaining cost is dominated by interpreted project-rule work and setup
+
+#### Current error shape on the fixture
+
+The isolated CLI run reports `22` `NoUnused.Variables` findings on the fixture.
+Most of them are simpler categories than the full rule surface might suggest:
+
+- unused imported modules
+- unused imported types
+- unused top-level variables
+- one unused `let in` variable
+- one unnecessary import to implicitly imported `Char`
+- one unused local type
+
+That is useful because it suggests the first fact-backed upper-bound for
+`NoUnused.Variables` can stay focused on:
+
+- generic import facts
+- top-level declaration/use facts
+- local type declarations
+
+before worrying about every corner of the scope machinery.
+
+### Generic Import Fact Layer
+
+I extended `crossModuleSummary` with generic import summaries:
+
+- imported module name + module name range
+- import range
+- alias name + alias range
+- exposing-all range
+- explicit imported elements with per-element ranges and open-type ranges
+
+These are cached facts, not rule-specific outputs. The immediate motivation is
+`NoUnused.Variables`, but this data should also be broadly useful for other
+import-related rules and fixes.
+
+### `DependenciesOf` Host-Fact Upper Bound
+
+I extended the generic cached fact layer again for the `NoUnused.Variables`
+upper-bound:
+
+- top-level declaration ranges
+- local type declarations
+- generic import summaries
+- generic let-binding summaries
+
+The first useful benchmark result is strong. On the isolated
+`NoUnused.Variables` harness:
+
+| Scenario | Interpreted baseline | Host-fact upper bound |
+|---|---:|---:|
+| Cold | `138.38s` | `27.45s` |
+| Warm | `0.32s` | `0.32s` |
+| Warm import-graph change | `5.95s` | `1.36s` |
+
+So this is another clear proof that the right seam is cached facts plus bypass
+of the interpreted project-rule fold.
+
+#### Current correctness status
+
+The conservative host-fact path is now much closer on the isolated fixture:
+
+| Metric | Count |
+|---|---:|
+| CLI findings | `22` |
+| Host-fact findings | `20` |
+| Missing | `2` |
+| Extra | `0` |
+
+The two remaining misses are both the same category:
+
+- `src/ReviewRunner.elm:31:50` `Imported type \`Exposing\` is not used`
+- `src/SemanticHash.elm:21:44` `Imported type \`TypeAnnotation\` is not used`
+
+These are both open-type import cases from package modules where the type name
+is unused but constructor availability still matters. The current generic fact
+layer does not yet carry constructor maps for imported open types, so the host
+path is intentionally conservative there to avoid false positives.
+
+That means the next correctness step for `NoUnused.Variables` is clear:
+
+- add constructor-aware facts for imported open types, likely from local module
+  summaries plus dependency/package metadata
+- then rerun the isolated diff before considering mixed-run integration

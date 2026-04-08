@@ -301,6 +301,85 @@ foo values =
                         |> Expect.equal
                             [ ( "src/A.elm", "Parameter `index` is not used" ) ]
             ]
+        , describe "hostNoUnusedVariablesErrorsForSources"
+            [ test "reports simple unused variable categories" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedVariablesErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (used)
+
+import Char
+import Maybe exposing (Maybe)
+
+type alias LocalRecord =
+    { value : Int }
+
+unusedTopLevel =
+    1
+
+used =
+    2
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> List.sortBy Tuple.first
+                        |> Expect.equal
+                            [ ( 3, "Unnecessary import to implicitly imported `Char`" )
+                            , ( 4, "Unnecessary import to implicitly imported `Maybe`" )
+                            , ( 6, "Type `LocalRecord` is not used" )
+                            , ( 9, "Top-level variable `unusedTopLevel` is not used" )
+                            ]
+            , test "reports implicit prelude imports and let bindings" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedVariablesErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+import Char
+import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
+
+run =
+    let
+        projectSemanticKey =
+            1
+    in
+    Record []
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> List.sortBy Tuple.first
+                        |> Expect.equal
+                            [ ( 3, "Unnecessary import to implicitly imported `Char`" )
+                            , ( 4, "Imported type `TypeAnnotation` is not used" )
+                            , ( 8, "`let in` variable `projectSemanticKey` is not used" )
+                            ]
+            , test "does not report open-type import when constructor is used" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedVariablesErrorsForSources
+                        [ { path = "src/Types.elm"
+                          , source = """module Types exposing (Status(..))
+
+type Status
+    = Ready
+    | Waiting
+"""
+                          }
+                        , { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+import Types exposing (Status(..))
+
+run =
+    Ready
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.filePath, error.message ))
+                        |> Expect.equal
+                            [ ( "src/Types.elm", "Type `Status` is not used" ) ]
+            ]
         , describe "crossModuleSummaryFromSource"
             [ test "captures constructor facts generically" <|
                 \_ ->
@@ -485,6 +564,44 @@ foo values =
                                     )
                                 |> Expect.equal
                                     [ { parameters = [ "index", "value" ], usedNames = [ "value" ], recursiveOnlyNames = [] } ]
+
+                        Nothing ->
+                            Expect.fail "Expected crossModuleSummaryFromSource to parse test module"
+            , test "captures generic import summaries" <|
+                \_ ->
+                    case
+                        ReviewRunner.crossModuleSummaryFromSource
+                            "src/A.elm"
+                            """module A exposing (foo)
+
+import Basics exposing (Char)
+import Maybe as M exposing (Maybe(..), withDefault)
+
+foo value =
+    M.withDefault 'x' value
+"""
+                    of
+                        Just summary ->
+                            summary.importSummaries
+                                |> List.map
+                                    (\importSummary ->
+                                        { moduleName = importSummary.moduleName
+                                        , alias = importSummary.alias |> Maybe.map .name
+                                        , exposesAll = importSummary.exposingAllRange /= Nothing
+                                        , explicitElements =
+                                            importSummary.explicitElements
+                                                |> List.map
+                                                    (\element ->
+                                                        ( element.name
+                                                        , element.openRange /= Nothing
+                                                        )
+                                                    )
+                                        }
+                                    )
+                                |> Expect.equal
+                                    [ { moduleName = "Basics", alias = Nothing, exposesAll = False, explicitElements = [ ( "Char", False ) ] }
+                                    , { moduleName = "Maybe", alias = Just "M", exposesAll = False, explicitElements = [ ( "Maybe", True ), ( "withDefault", False ) ] }
+                                    ]
 
                         Nothing ->
                             Expect.fail "Expected crossModuleSummaryFromSource to parse test module"

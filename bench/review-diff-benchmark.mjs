@@ -34,6 +34,7 @@ function hostExperimentArgs() {
     "--host-no-unused-custom-type-constructors-experiment",
     "--host-no-unused-custom-type-constructor-args-experiment",
     "--host-no-unused-parameters-experiment",
+    "--host-no-unused-variables-experiment",
   ];
 }
 
