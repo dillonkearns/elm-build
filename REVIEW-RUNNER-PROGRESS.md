@@ -1966,3 +1966,42 @@ The overall read is:
   path is now dominated by remaining module-rule cost plus outer overhead.
 - It is still a clear keeper because it halves the package-summary decode cost
   and reduces a fixed tax that affects every warm partial miss.
+
+### Warm-Path Attribution Checkpoint
+
+I added explicit timing for the remaining pure work after evaluation:
+
+- `parse_review_output`
+- `update_decl_cache`
+- `encode_decl_cache`
+
+On the direct mixed warm body-edit probe, the traced stages are now:
+
+| Stage | Time |
+|---|---:|
+| `prepare_config` | `13ms` |
+| `load_decl_cache` | `5ms` |
+| `resolve_target_files` | `2ms` |
+| `read_target_files` | `4ms` |
+| `analyze_target_files` | `45ms` |
+| `load_review_project` | `224ms` |
+| `get_rule_info` | `1ms` |
+| `module_rule_eval` | `318ms` |
+| `project_rule_eval` | `10ms` |
+| `parse_review_output` | `1ms` |
+| `update_decl_cache` | `3ms` |
+| `encode_decl_cache` | `3ms` |
+| `persist_decl_cache` | `96ms` |
+
+Those stages sum to about `725ms`, while the full process wall is about
+`1659ms`. So the remaining missing wall is **not**:
+
+- project-rule work
+- output parsing
+- declaration-cache recomputation
+- declaration-cache encoding
+
+It is partly `persist_decl_cache`, but the larger remaining gap now looks like
+process/bootstrap/runtime overhead outside the traced Elm stages. That makes
+Node/V8 startup or bundle/runtime overhead the next attribution target, not
+another guess inside the existing traced pipeline.

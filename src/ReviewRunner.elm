@@ -7538,6 +7538,23 @@ withTiming name work =
         }
 
 
+withTimingPure : String -> (() -> a) -> BackendTask FatalError (Timed a)
+withTimingPure name thunk =
+    Do.do BackendTask.Time.now <| \start ->
+    let
+        value =
+            thunk ()
+    in
+    Do.do BackendTask.Time.now <| \finish ->
+    BackendTask.succeed
+        { value = value
+        , stage =
+            { name = name
+            , ms = stageMs start finish
+            }
+        }
+
+
 deferTask : (() -> BackendTask FatalError a) -> BackendTask FatalError a
 deferTask thunk =
     BackendTask.succeed ()
@@ -8536,21 +8553,18 @@ task config =
                     ruleInfoTimed.value
             in
             Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents targetFileContents []) <| \runResult ->
+            Do.do (withTimingPure "parse_review_output" (\() -> parseReviewOutput runResult.output)) <| \parseReviewOutputTimed ->
             let
                 errors =
-                    parseReviewOutput runResult.output
-
-                newCache =
-                    updateCacheWithAnalyses Dict.empty targetFileContents errors
-
-                encodedDeclCache =
-                    encodeCacheState newCache
+                    parseReviewOutputTimed.value
             in
+            Do.do (withTimingPure "update_decl_cache" (\() -> updateCacheWithAnalyses Dict.empty targetFileContents errors)) <| \updateDeclCacheTimed ->
+            Do.do (withTimingPure "encode_decl_cache" (\() -> encodeCacheState updateDeclCacheTimed.value)) <| \encodeDeclCacheTimed ->
             Do.do
                 (withTiming "persist_decl_cache"
                     (Script.writeFile
                         { path = declCachePath
-                        , body = encodedDeclCache
+                        , body = encodeDeclCacheTimed.value
                         }
                         |> BackendTask.allowFatal
                     )
@@ -8562,6 +8576,9 @@ task config =
                 , ruleInfoTimed.stage
                 , { name = "module_rule_eval", ms = runResult.perf.moduleRuleEvalMs }
                 , { name = "project_rule_eval", ms = runResult.perf.projectRuleEvalMs }
+                , parseReviewOutputTimed.stage
+                , updateDeclCacheTimed.stage
+                , encodeDeclCacheTimed.stage
                 , persistDeclCacheTimed.stage
                 ]
                 (mergeCounterDicts
@@ -8569,7 +8586,7 @@ task config =
                     , runResult.perf.counters
                     , Dict.fromList
                         [ ( "stale.files", List.length targetFileContents )
-                        , ( "decl_cache.stored_bytes", String.length encodedDeclCache )
+                        , ( "decl_cache.stored_bytes", String.length encodeDeclCacheTimed.value )
                         ]
                     ]
                 )
@@ -8591,21 +8608,18 @@ task config =
                     targetFileContents |> List.filter (\f -> List.member f.path staleFiles)
             in
             Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents staleFileContents cachedErrors) <| \runResult ->
+            Do.do (withTimingPure "parse_review_output" (\() -> parseReviewOutput runResult.output)) <| \parseReviewOutputTimed ->
             let
                 freshErrors =
-                    parseReviewOutput runResult.output
-
-                newCache =
-                    updateCacheWithAnalyses previousCache targetFileContents freshErrors
-
-                encodedDeclCache =
-                    encodeCacheState newCache
+                    parseReviewOutputTimed.value
             in
+            Do.do (withTimingPure "update_decl_cache" (\() -> updateCacheWithAnalyses previousCache targetFileContents freshErrors)) <| \updateDeclCacheTimed ->
+            Do.do (withTimingPure "encode_decl_cache" (\() -> encodeCacheState updateDeclCacheTimed.value)) <| \encodeDeclCacheTimed ->
             Do.do
                 (withTiming "persist_decl_cache"
                     (Script.writeFile
                         { path = declCachePath
-                        , body = encodedDeclCache
+                        , body = encodeDeclCacheTimed.value
                         }
                         |> BackendTask.allowFatal
                     )
@@ -8617,6 +8631,9 @@ task config =
                 , ruleInfoTimed.stage
                 , { name = "module_rule_eval", ms = runResult.perf.moduleRuleEvalMs }
                 , { name = "project_rule_eval", ms = runResult.perf.projectRuleEvalMs }
+                , parseReviewOutputTimed.stage
+                , updateDeclCacheTimed.stage
+                , encodeDeclCacheTimed.stage
                 , persistDeclCacheTimed.stage
                 ]
                 (mergeCounterDicts
@@ -8624,7 +8641,7 @@ task config =
                     , runResult.perf.counters
                     , Dict.fromList
                         [ ( "stale.files", List.length staleFileContents )
-                        , ( "decl_cache.stored_bytes", String.length encodedDeclCache )
+                        , ( "decl_cache.stored_bytes", String.length encodeDeclCacheTimed.value )
                         ]
                     ]
                 )
