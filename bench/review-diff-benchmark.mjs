@@ -22,6 +22,20 @@ const depsCacheMode = process.argv.includes("--deps-cache-mode")
   ? process.argv[process.argv.indexOf("--deps-cache-mode") + 1]
   : "auto";
 const jobs = String(os.cpus().length);
+const hostImportersExperiments = process.argv.includes("--host-importers-experiments");
+
+function hostExperimentArgs() {
+  if (!hostImportersExperiments) {
+    return [];
+  }
+
+  return [
+    "--host-no-unused-exports-experiment",
+    "--host-no-unused-custom-type-constructors-experiment",
+    "--host-no-unused-custom-type-constructor-args-experiment",
+    "--host-no-unused-parameters-experiment",
+  ];
+}
 
 const smallFixtureFiles = [
   "Coverage.elm",
@@ -220,6 +234,7 @@ function runRunner({ workspaceRoot, fixtureSrcDir, buildDir, tracePath }) {
       depsCacheMode,
       "--perf-trace-json",
       tracePath,
+      ...hostExperimentArgs(),
     ],
     {
       cwd: repoRoot,
@@ -369,6 +384,7 @@ const results = {
   cli_runner: "elm-review",
   importers_cache_mode: importersCacheMode,
   deps_cache_mode: depsCacheMode,
+  host_importers_experiments: hostImportersExperiments,
   fixtures: selectedFixtures.map((fixture) => fixtureResult(fixture.name, fixture.fileNames)),
 };
 

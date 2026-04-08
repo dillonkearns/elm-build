@@ -23,6 +23,20 @@ const depsCacheMode = readArg("--deps-cache-mode", "auto");
 const repeatCount = Number.parseInt(readArg("--repeat", "5"), 10);
 const skipBundle = process.argv.includes("--skip-bundle");
 const jobs = String(os.cpus().length);
+const hostImportersExperiments = process.argv.includes("--host-importers-experiments");
+
+function hostExperimentArgs() {
+  if (!hostImportersExperiments) {
+    return [];
+  }
+
+  return [
+    "--host-no-unused-exports-experiment",
+    "--host-no-unused-custom-type-constructors-experiment",
+    "--host-no-unused-custom-type-constructor-args-experiment",
+    "--host-no-unused-parameters-experiment",
+  ];
+}
 
 const smallFixtureFiles = [
   "Coverage.elm",
@@ -168,6 +182,7 @@ function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersC
       depsCacheMode,
       "--perf-trace-json",
       tracePath,
+      ...hostExperimentArgs(),
     ],
     {
       cwd: repoRoot,
@@ -409,6 +424,7 @@ function main() {
     scenario: scenarioName,
     repeat: repeatCount,
     deps_cache_mode: depsCacheMode,
+    host_importers_experiments: hostImportersExperiments,
     modes: [],
   };
 
@@ -416,6 +432,7 @@ function main() {
   console.log(`Scenario: ${scenarioName}`);
   console.log(`Repeats: ${repeatCount}`);
   console.log(`Deps cache mode: ${depsCacheMode}`);
+  console.log(`Host importers experiments: ${hostImportersExperiments}`);
 
   for (const mode of importersModes) {
     const templateWorkspace = prepareTemplateWorkspace(fileNames, mode);

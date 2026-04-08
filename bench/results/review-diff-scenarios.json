@@ -1,9 +1,10 @@
 {
-  "date": "2026-04-07T23:37:20.310Z",
+  "date": "2026-04-08T17:33:51.736Z",
   "runner": "dist/review-runner-bench.mjs",
   "cli_runner": "elm-review",
   "importers_cache_mode": "auto",
   "deps_cache_mode": "auto",
+  "host_importers_experiments": true,
   "fixtures": [
     {
       "fixture": "small-12",
@@ -15,21 +16,13 @@
           "cli_exit_code": 1,
           "cache_decision": "cold_miss",
           "diff": {
-            "matches": false,
-            "runner_count": 444,
-            "cli_count": 445,
+            "matches": true,
+            "runner_count": 568,
+            "cli_count": 568,
             "only_runner_count": 0,
-            "only_cli_count": 1,
+            "only_cli_count": 0,
             "only_runner_examples": [],
-            "only_cli_examples": [
-              {
-                "rule": "NoUnused.Variables",
-                "path": "src/SemanticHash.elm",
-                "line": 21,
-                "column": 44,
-                "message": "Imported type `TypeAnnotation` is not used"
-              }
-            ]
+            "only_cli_examples": []
           }
         },
         {
@@ -38,21 +31,13 @@
           "cli_exit_code": 1,
           "cache_decision": "full_hit",
           "diff": {
-            "matches": false,
-            "runner_count": 444,
-            "cli_count": 445,
+            "matches": true,
+            "runner_count": 568,
+            "cli_count": 568,
             "only_runner_count": 0,
-            "only_cli_count": 1,
+            "only_cli_count": 0,
             "only_runner_examples": [],
-            "only_cli_examples": [
-              {
-                "rule": "NoUnused.Variables",
-                "path": "src/SemanticHash.elm",
-                "line": 21,
-                "column": 44,
-                "message": "Imported type `TypeAnnotation` is not used"
-              }
-            ]
+            "only_cli_examples": []
           }
         },
         {
@@ -61,21 +46,13 @@
           "cli_exit_code": 1,
           "cache_decision": "partial_miss",
           "diff": {
-            "matches": false,
-            "runner_count": 445,
-            "cli_count": 446,
+            "matches": true,
+            "runner_count": 569,
+            "cli_count": 569,
             "only_runner_count": 0,
-            "only_cli_count": 1,
+            "only_cli_count": 0,
             "only_runner_examples": [],
-            "only_cli_examples": [
-              {
-                "rule": "NoUnused.Variables",
-                "path": "src/SemanticHash.elm",
-                "line": 21,
-                "column": 44,
-                "message": "Imported type `TypeAnnotation` is not used"
-              }
-            ]
+            "only_cli_examples": []
           }
         },
         {
@@ -84,21 +61,13 @@
           "cli_exit_code": 1,
           "cache_decision": "full_hit",
           "diff": {
-            "matches": false,
-            "runner_count": 444,
-            "cli_count": 445,
+            "matches": true,
+            "runner_count": 568,
+            "cli_count": 568,
             "only_runner_count": 0,
-            "only_cli_count": 1,
+            "only_cli_count": 0,
             "only_runner_examples": [],
-            "only_cli_examples": [
-              {
-                "rule": "NoUnused.Variables",
-                "path": "src/SemanticHash.elm",
-                "line": 21,
-                "column": 44,
-                "message": "Imported type `TypeAnnotation` is not used"
-              }
-            ]
+            "only_cli_examples": []
           }
         },
         {
@@ -107,21 +76,13 @@
           "cli_exit_code": 1,
           "cache_decision": "partial_miss",
           "diff": {
-            "matches": false,
-            "runner_count": 448,
-            "cli_count": 449,
+            "matches": true,
+            "runner_count": 569,
+            "cli_count": 569,
             "only_runner_count": 0,
-            "only_cli_count": 1,
+            "only_cli_count": 0,
             "only_runner_examples": [],
-            "only_cli_examples": [
-              {
-                "rule": "NoUnused.Variables",
-                "path": "src/SemanticHash.elm",
-                "line": 21,
-                "column": 44,
-                "message": "Imported type `TypeAnnotation` is not used"
-              }
-            ]
+            "only_cli_examples": []
           }
         }
       ]

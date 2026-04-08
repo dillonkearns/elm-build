@@ -23,6 +23,20 @@ const depsCacheMode = process.argv.includes("--deps-cache-mode")
   ? process.argv[process.argv.indexOf("--deps-cache-mode") + 1]
   : "auto";
 const jobs = String(os.cpus().length);
+const hostImportersExperiments = process.argv.includes("--host-importers-experiments");
+
+function hostExperimentArgs() {
+  if (!hostImportersExperiments) {
+    return [];
+  }
+
+  return [
+    "--host-no-unused-exports-experiment",
+    "--host-no-unused-custom-type-constructors-experiment",
+    "--host-no-unused-custom-type-constructor-args-experiment",
+    "--host-no-unused-parameters-experiment",
+  ];
+}
 
 const smallFixtureFiles = [
   "Coverage.elm",
@@ -146,6 +160,7 @@ function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersC
       depsCacheMode,
       "--perf-trace-json",
       tracePath,
+      ...hostExperimentArgs(),
     ],
     {
       cwd: repoRoot,
@@ -184,6 +199,7 @@ function scenarioResult(name, runResult) {
     name,
     importers_cache_mode: importersCacheMode,
     deps_cache_mode: depsCacheMode,
+    host_importers_experiments: hostImportersExperiments,
     wall_ms: Math.round(runResult.wallMs),
     internal_ms: sumStageMs(runResult.trace),
     exit_code: runResult.exitCode,

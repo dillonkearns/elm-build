@@ -1511,3 +1511,68 @@ Final result:
 
 So the combined host-backed `ImportersOf` family matches the CLI exactly on the
 isolated benchmark fixture.
+
+### Full `small-12` Mixed-Rule Integration Checkpoint
+
+I then ran the full mixed `small-12` benchmark with the four host-backed
+`ImportersOf` experiments enabled through the normal runner path, and reran the
+diff harness against the real `elm-review` CLI.
+
+#### Full mixed correctness
+
+The mixed diff harness now matches the CLI for all five benchmark scenarios:
+
+| Scenario | Runner | CLI | Match |
+|---|---:|---:|---|
+| Cold | `568` | `568` | yes |
+| Warm | `568` | `568` | yes |
+| Warm 1-file body edit | `569` | `569` | yes |
+| Warm 1-file comment-only | `568` | `568` | yes |
+| Warm import-graph change | `569` | `569` | yes |
+
+So the mixed-rule path is now correct for this fixture with the host-backed
+`ImportersOf` shortcuts enabled.
+
+#### Full mixed perf
+
+Full mixed runner benchmark on `small-12` with:
+
+- `--importers-cache-mode auto`
+- `--deps-cache-mode auto`
+- `--host-importers-experiments`
+
+Result:
+
+| Scenario | Runner |
+|---|---:|
+| Cold | `224.12s` |
+| Warm | `0.40s` |
+| Warm 1-file body edit | `2.41s` |
+| Warm 1-file comment-only | `0.81s` |
+| Warm import-graph change | `5.09s` |
+
+Fresh CLI benchmark on the same fixture:
+
+| Scenario | elm-review CLI |
+|---|---:|
+| Cold | `2.91s` |
+| Warm | `1.00s` |
+| Warm 1-file body edit | `0.98s` |
+| Warm 1-file comment-only | `0.98s` |
+| Warm import-graph change | `0.98s` |
+
+#### What this means
+
+This integration confirms two things clearly:
+
+1. The `ImportersOf` seam was real.
+   The isolated family win survives the mixed runner path and stays correct.
+
+2. `ImportersOf` is no longer the whole bottleneck in mixed partial-miss runs.
+   Even after collapsing that family, the mixed warm body-edit path is still
+   `2.41s` and the mixed warm import-change path is still `5.09s`, both slower
+   than the CLI.
+
+So the next optimization target should not be more `ImportersOf` work. The next
+target is the other remaining rule families and setup costs that dominate mixed
+partial-miss runs once `ImportersOf` is no longer the wall.
