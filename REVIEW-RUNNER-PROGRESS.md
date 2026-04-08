@@ -1868,3 +1868,66 @@ So the next likely wins are:
 - cheaper `load_review_project`, especially package summary decode / setup
 - tighter measurement of outer wall-clock overhead outside traced inner stages
 - then, if needed, targeted work on the type-annotation module rules
+
+### Fact-Contract Hashing Checkpoint
+
+I added the first explicit fact-contract layer and stable per-family hashes in
+`src/ReviewRunner.elm`, with regression coverage in
+`src/ReviewRunnerTest.elm`.
+
+What is now explicit:
+
+- `FactSet`
+- `RuleFactContract`
+- `FactHashes`
+- `buildFactContractHashKey`
+
+The first important correction from this work was that
+`NoMissingTypeAnnotation` does **not** really depend on `FunctionUsage`. It
+needed a new `DeclarationShape` fact family keyed by:
+
+- function name
+- arity
+- whether a signature exists
+
+That let the contract model capture the real dependency more precisely:
+
+- import-only edits keep the `NoMissingTypeAnnotation` contract key stable
+- body-only edits keep the `NoMissingTypeAnnotation` contract key stable
+- signature edits change the `NoMissingTypeAnnotation` contract key
+
+I then used that contract in the runtime by splitting declaration-shape-only
+module rules into a separate cache batch instead of lumping them into the
+broader expression-sensitive module-rule group.
+
+The isolated `NoMissingTypeAnnotation` benchmark moved slightly:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Cold | `51.15s` | `49.63s` |
+| Warm | `0.35s` | `0.32s` |
+| Warm 1-file body edit | `1.53s` | `1.45s` |
+| `module_rule_eval` | `138ms` | `132ms` |
+
+And the mixed direct probe with all five host-backed `NoUnused` shortcuts stayed
+in the same overall band while shaving a little module-rule time:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Warm 1-file body edit | `1.65s` | `1.647s` |
+| `load_review_project` | `314ms` | `350ms` |
+| `module_rule_eval` | `242ms` | `233ms` |
+| `project_rule_eval` | `10ms` | `10ms` |
+
+That is an important read:
+
+- the visitor/fact/hash coupling is correct and testable
+- it is already paying off strongly on the project-rule families
+- the first module-rule use is valid and slightly positive
+- but it is **not** the next big lever by itself
+
+So the current bottleneck order remains:
+
+1. `load_review_project`
+2. remaining module-rule execution
+3. outer wall-clock overhead outside the traced inner stages

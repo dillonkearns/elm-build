@@ -11,7 +11,11 @@ const srcRoot = path.join(repoRoot, "src");
 const reviewDir = path.join(repoRoot, "bench", "review");
 const distRunnerPath = path.join(repoRoot, "dist", "review-runner-bench.mjs");
 const jobs = String(os.cpus().length);
-const useHostNoUnusedExports = process.argv.includes("--host-no-unused-exports-experiment");
+const scenarios = readArg("--scenarios", "cold,warm,warm_1_file_body_edit,warm_import_graph_change")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const useHostImportersExperiments = process.argv.includes("--host-importers-experiments");
 
 const fixtureFiles = [
   "Coverage.elm",
@@ -30,6 +34,25 @@ const fixtureFiles = [
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function readArg(flag, fallback) {
+  const index = process.argv.indexOf(flag);
+  return index >= 0 ? process.argv[index + 1] : fallback;
+}
+
+function hostExperimentArgs() {
+  if (!useHostImportersExperiments) {
+    return [];
+  }
+
+  return [
+    "--host-no-unused-exports-experiment",
+    "--host-no-unused-custom-type-constructors-experiment",
+    "--host-no-unused-custom-type-constructor-args-experiment",
+    "--host-no-unused-parameters-experiment",
+    "--host-no-unused-variables-experiment",
+  ];
 }
 
 function writeElmJson(workspaceRoot) {
@@ -83,7 +106,7 @@ function runRunner({ fixtureSrcDir, buildDir, root }, name) {
       "quiet",
       "--perf-trace-json",
       tracePath,
-      ...(useHostNoUnusedExports ? ["--host-no-unused-exports-experiment"] : []),
+      ...hostExperimentArgs(),
     ],
     {
       cwd: repoRoot,
@@ -130,26 +153,36 @@ function mutateImportGraphEdit(mathLibPath, originalSource) {
 function main() {
   const workspace = prepareWorkspace();
   const originalMathLib = fs.readFileSync(workspace.mathLibPath, "utf8");
+  const scenarioResults = [];
 
-  const cold = runRunner(workspace, "cold");
-  const warm = runRunner(workspace, "warm");
+  if (scenarios.includes("cold")) {
+    scenarioResults.push(runRunner(workspace, "cold"));
+  }
 
-  mutateBodyEdit(workspace.mathLibPath, originalMathLib);
-  const body = runRunner(workspace, "warm_1_file_body_edit");
+  if (scenarios.includes("warm")) {
+    scenarioResults.push(runRunner(workspace, "warm"));
+  }
 
-  fs.writeFileSync(workspace.mathLibPath, originalMathLib);
-  runRunner(workspace, "restore_after_body");
+  if (scenarios.includes("warm_1_file_body_edit")) {
+    mutateBodyEdit(workspace.mathLibPath, originalMathLib);
+    scenarioResults.push(runRunner(workspace, "warm_1_file_body_edit"));
+    fs.writeFileSync(workspace.mathLibPath, originalMathLib);
+    runRunner(workspace, "restore_after_body");
+  }
 
-  mutateImportGraphEdit(workspace.mathLibPath, originalMathLib);
-  const importGraph = runRunner(workspace, "warm_import_graph_change");
+  if (scenarios.includes("warm_import_graph_change")) {
+    mutateImportGraphEdit(workspace.mathLibPath, originalMathLib);
+    scenarioResults.push(runRunner(workspace, "warm_import_graph_change"));
+  }
 
   console.log(
     JSON.stringify(
       {
         fixture: "small-12",
-        host_no_unused_exports_experiment: useHostNoUnusedExports,
+        host_importers_experiments: useHostImportersExperiments,
+        scenarios_requested: scenarios,
         root: workspace.root,
-        scenarios: [ cold, warm, body, importGraph ],
+        scenarios: scenarioResults,
       },
       null,
       2

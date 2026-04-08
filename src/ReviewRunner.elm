@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, hostNoUnusedVariablesErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, FactHashes, FactSet(..), ReviewError, RuleDependencyProfile, RuleFactContract, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildFactContractHashKey, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, factContractForRule, factHashesForSource, factHashesForSummary, factSetToString, getDeclarationHashes, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, hostNoUnusedVariablesErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -121,6 +121,33 @@ type ReportFormat
     | ReportQuiet
 
 
+type FactSet
+    = ImportShape
+    | ExportShape
+    | ConstructorShape
+    | ConstructorUsage
+    | DeclarationShape
+    | FunctionUsage
+    | TypeUsage
+
+
+type alias RuleFactContract =
+    { ruleName : String
+    , factSets : List FactSet
+    }
+
+
+type alias FactHashes =
+    { importShapeHash : String
+    , exportShapeHash : String
+    , constructorShapeHash : String
+    , constructorUsageHash : String
+    , declarationShapeHash : String
+    , functionUsageHash : String
+    , typeUsageHash : String
+    }
+
+
 type alias InputRevision =
     { key : String
     }
@@ -158,6 +185,7 @@ type alias FileAnalysis =
     , moduleSummary : ModuleSummary
     , bodySummary : BodySummary
     , crossModuleSummary : CrossModuleSummary
+    , factHashes : FactHashes
     }
 
 
@@ -279,6 +307,7 @@ type alias ConstructorPatternUsage =
 type alias TopLevelFunctionSummary =
     { name : String
     , nameRange : Range
+    , hasSignature : Bool
     , parameters : List ParameterBindingSummary
     , usedNames : Set.Set String
     , recursiveOnlyNames : Set.Set String
@@ -295,6 +324,65 @@ type alias ParameterBindingSummary =
 type alias LetBindingSummary =
     { name : String
     , range : Range
+    }
+
+
+type alias ImportShapeFacts =
+    { importedModules : Set.Set String
+    , importedOpenTypesByModule : Dict String (Set.Set String)
+    , importAllModules : List String
+    , importSummaries : List ImportSummary
+    , moduleAliases : Dict String String
+    }
+
+
+type alias ExportShapeFacts =
+    { moduleName : String
+    , isExposingAll : Bool
+    , exposedValues : Dict String Range
+    , exposedConstructors : Dict String (Dict String Range)
+    }
+
+
+type alias ConstructorShapeFacts =
+    { declaredConstructors : Dict String (Dict String Range)
+    , exposedConstructors : Dict String (Dict String Range)
+    , constructorArgumentRanges : Dict String (Dict String (List Range))
+    }
+
+
+type alias ConstructorUsageFacts =
+    { expressionConstructorRefs : List QualifiedRef
+    , patternConstructorRefs : List QualifiedRef
+    , constructorPatternUsages : List ConstructorPatternUsage
+    , comparisonConstructorRefs : List QualifiedRef
+    }
+
+
+type alias DeclarationShapeFacts =
+    { topLevelFunctions : List FunctionDeclarationShape
+    , nestedFunctions : List FunctionDeclarationShape
+    }
+
+
+type alias FunctionDeclarationShape =
+    { name : String
+    , arity : Int
+    , hasSignature : Bool
+    }
+
+
+type alias FunctionUsageFacts =
+    { topLevelFunctionSummaries : List TopLevelFunctionSummary
+    , nestedFunctionSummaries : List TopLevelFunctionSummary
+    , letBindingSummaries : List LetBindingSummary
+    , dependencyRefs : List DependencyRef
+    }
+
+
+type alias TypeUsageFacts =
+    { localTypeDeclarations : Dict String LocalTypeSummary
+    , typeRefs : List QualifiedRef
     }
 
 
@@ -328,6 +416,452 @@ parameterBindingKindDecoder =
                     _ ->
                         Json.Decode.fail ("Unknown parameter binding kind: " ++ kind)
             )
+
+
+factSetToString : FactSet -> String
+factSetToString factSet =
+    case factSet of
+        ImportShape ->
+            "ImportShape"
+
+        ExportShape ->
+            "ExportShape"
+
+        ConstructorShape ->
+            "ConstructorShape"
+
+        ConstructorUsage ->
+            "ConstructorUsage"
+
+        DeclarationShape ->
+            "DeclarationShape"
+
+        FunctionUsage ->
+            "FunctionUsage"
+
+        TypeUsage ->
+            "TypeUsage"
+
+
+factContractForRule : String -> Maybe RuleFactContract
+factContractForRule ruleName =
+    case ruleName of
+        "NoUnused.Exports" ->
+            Just
+                { ruleName = ruleName
+                , factSets = [ ExportShape, FunctionUsage, ImportShape ]
+                }
+
+        "NoUnused.CustomTypeConstructors" ->
+            Just
+                { ruleName = ruleName
+                , factSets = [ ConstructorShape, ConstructorUsage, ImportShape ]
+                }
+
+        "NoUnused.CustomTypeConstructorArgs" ->
+            Just
+                { ruleName = ruleName
+                , factSets = [ ConstructorShape, ConstructorUsage ]
+                }
+
+        "NoUnused.Parameters" ->
+            Just
+                { ruleName = ruleName
+                , factSets = [ FunctionUsage ]
+                }
+
+        "NoUnused.Variables" ->
+            Just
+                { ruleName = ruleName
+                , factSets = [ ImportShape, TypeUsage, FunctionUsage ]
+                }
+
+        "NoMissingTypeAnnotation" ->
+            Just
+                { ruleName = ruleName
+                , factSets = [ DeclarationShape ]
+                }
+
+        _ ->
+            Nothing
+
+
+factHashesForSource : String -> String -> Maybe FactHashes
+factHashesForSource filePath source =
+    crossModuleSummaryFromSource filePath source
+        |> Maybe.map factHashesForSummary
+
+
+factHashesForSummary : CrossModuleSummary -> FactHashes
+factHashesForSummary summary =
+    { importShapeHash =
+        summary
+            |> importShapeFactsFromSummary
+            |> importShapeFingerprint
+            |> hashFingerprint
+    , exportShapeHash =
+        summary
+            |> exportShapeFactsFromSummary
+            |> exportShapeFingerprint
+            |> hashFingerprint
+    , constructorShapeHash =
+        summary
+            |> constructorShapeFactsFromSummary
+            |> constructorShapeFingerprint
+            |> hashFingerprint
+    , constructorUsageHash =
+        summary
+            |> constructorUsageFactsFromSummary
+            |> constructorUsageFingerprint
+            |> hashFingerprint
+    , declarationShapeHash =
+        summary
+            |> declarationShapeFactsFromSummary
+            |> declarationShapeFingerprint
+            |> hashFingerprint
+    , functionUsageHash =
+        summary
+            |> functionUsageFactsFromSummary
+            |> functionUsageFingerprint
+            |> hashFingerprint
+    , typeUsageHash =
+        summary
+            |> typeUsageFactsFromSummary
+            |> typeUsageFingerprint
+            |> hashFingerprint
+    }
+
+
+buildFactContractHashKey : RuleFactContract -> FactHashes -> String
+buildFactContractHashKey contract factHashes =
+    contract.ruleName
+        ++ "|"
+        ++ (contract.factSets
+                |> List.map
+                    (\factSet ->
+                        factSetToString factSet
+                            ++ "="
+                            ++ factHashForFactSet factSet factHashes
+                    )
+                |> String.join "|"
+           )
+
+
+factHashForFactSet : FactSet -> FactHashes -> String
+factHashForFactSet factSet factHashes =
+    case factSet of
+        ImportShape ->
+            factHashes.importShapeHash
+
+        ExportShape ->
+            factHashes.exportShapeHash
+
+        ConstructorShape ->
+            factHashes.constructorShapeHash
+
+        ConstructorUsage ->
+            factHashes.constructorUsageHash
+
+        DeclarationShape ->
+            factHashes.declarationShapeHash
+
+        FunctionUsage ->
+            factHashes.functionUsageHash
+
+        TypeUsage ->
+            factHashes.typeUsageHash
+
+
+importShapeFactsFromSummary : CrossModuleSummary -> ImportShapeFacts
+importShapeFactsFromSummary summary =
+    { importedModules = summary.importedModules
+    , importedOpenTypesByModule = summary.importedOpenTypesByModule
+    , importAllModules = summary.importAllModules
+    , importSummaries = summary.importSummaries
+    , moduleAliases = summary.moduleAliases
+    }
+
+
+exportShapeFactsFromSummary : CrossModuleSummary -> ExportShapeFacts
+exportShapeFactsFromSummary summary =
+    { moduleName = summary.moduleName
+    , isExposingAll = summary.isExposingAll
+    , exposedValues = summary.exposedValues
+    , exposedConstructors = summary.exposedConstructors
+    }
+
+
+constructorShapeFactsFromSummary : CrossModuleSummary -> ConstructorShapeFacts
+constructorShapeFactsFromSummary summary =
+    { declaredConstructors = summary.declaredConstructors
+    , exposedConstructors = summary.exposedConstructors
+    , constructorArgumentRanges = summary.constructorArgumentRanges
+    }
+
+
+constructorUsageFactsFromSummary : CrossModuleSummary -> ConstructorUsageFacts
+constructorUsageFactsFromSummary summary =
+    { expressionConstructorRefs = summary.expressionConstructorRefs
+    , patternConstructorRefs = summary.patternConstructorRefs
+    , constructorPatternUsages = summary.constructorPatternUsages
+    , comparisonConstructorRefs = summary.comparisonConstructorRefs
+    }
+
+
+declarationShapeFactsFromSummary : CrossModuleSummary -> DeclarationShapeFacts
+declarationShapeFactsFromSummary summary =
+    { topLevelFunctions = List.map functionDeclarationShapeFromSummary summary.topLevelFunctionSummaries
+    , nestedFunctions =
+        summary.nestedFunctionSummaries
+            |> List.filter (\functionSummary -> functionSummary.name /= "<lambda>")
+            |> List.map functionDeclarationShapeFromSummary
+    }
+
+
+functionDeclarationShapeFromSummary : TopLevelFunctionSummary -> FunctionDeclarationShape
+functionDeclarationShapeFromSummary summary =
+    { name = summary.name
+    , arity = List.length summary.parameters
+    , hasSignature = summary.hasSignature
+    }
+
+
+functionUsageFactsFromSummary : CrossModuleSummary -> FunctionUsageFacts
+functionUsageFactsFromSummary summary =
+    { topLevelFunctionSummaries = summary.topLevelFunctionSummaries
+    , nestedFunctionSummaries = summary.nestedFunctionSummaries
+    , letBindingSummaries = summary.letBindingSummaries
+    , dependencyRefs = summary.dependencyRefs
+    }
+
+
+typeUsageFactsFromSummary : CrossModuleSummary -> TypeUsageFacts
+typeUsageFactsFromSummary summary =
+    { localTypeDeclarations = summary.localTypeDeclarations
+    , typeRefs = summary.typeRefs
+    }
+
+
+hashFingerprint : String -> String
+hashFingerprint fingerprint =
+    fingerprint
+        |> FNV1a.hash
+        |> String.fromInt
+
+
+importShapeFingerprint : ImportShapeFacts -> String
+importShapeFingerprint facts =
+    String.join "|"
+        [ facts.importedModules |> Set.toList |> List.sort |> String.join ","
+        , facts.importedOpenTypesByModule |> importedOpenTypesFingerprint
+        , facts.importAllModules |> List.sort |> String.join ","
+        , facts.importSummaries |> List.map importSummaryFingerprint |> List.sort |> String.join ";"
+        , facts.moduleAliases |> aliasFingerprint
+        ]
+
+
+exportShapeFingerprint : ExportShapeFacts -> String
+exportShapeFingerprint facts =
+    String.join "|"
+        [ facts.moduleName
+        , boolFingerprint facts.isExposingAll
+        , facts.exposedValues |> Dict.keys |> List.sort |> String.join ","
+        , constructorNamesFingerprint facts.exposedConstructors
+        ]
+
+
+constructorShapeFingerprint : ConstructorShapeFacts -> String
+constructorShapeFingerprint facts =
+    String.join "|"
+        [ constructorNamesFingerprint facts.declaredConstructors
+        , constructorNamesFingerprint facts.exposedConstructors
+        , constructorArgumentCountFingerprint facts.constructorArgumentRanges
+        ]
+
+
+constructorUsageFingerprint : ConstructorUsageFacts -> String
+constructorUsageFingerprint facts =
+    String.join "|"
+        [ facts.expressionConstructorRefs |> List.map qualifiedRefFingerprint |> List.sort |> String.join ","
+        , facts.patternConstructorRefs |> List.map qualifiedRefFingerprint |> List.sort |> String.join ","
+        , facts.constructorPatternUsages |> List.map constructorPatternUsageFingerprint |> List.sort |> String.join ";"
+        , facts.comparisonConstructorRefs |> List.map qualifiedRefFingerprint |> List.sort |> String.join ","
+        ]
+
+
+functionUsageFingerprint : FunctionUsageFacts -> String
+functionUsageFingerprint facts =
+    String.join "|"
+        [ facts.topLevelFunctionSummaries |> List.map functionSummaryFingerprint |> List.sort |> String.join ";"
+        , facts.nestedFunctionSummaries |> List.map functionSummaryFingerprint |> List.sort |> String.join ";"
+        , facts.letBindingSummaries |> List.map .name |> List.sort |> String.join ","
+        , facts.dependencyRefs |> List.map dependencyRefFingerprint |> List.sort |> String.join ";"
+        ]
+
+
+typeUsageFingerprint : TypeUsageFacts -> String
+typeUsageFingerprint facts =
+    String.join "|"
+        [ facts.localTypeDeclarations |> localTypeDeclarationsFingerprint
+        , facts.typeRefs |> List.map qualifiedRefFingerprint |> List.sort |> String.join ";"
+        ]
+
+
+boolFingerprint : Bool -> String
+boolFingerprint value =
+    if value then
+        "1"
+
+    else
+        "0"
+
+
+importedOpenTypesFingerprint : Dict String (Set.Set String) -> String
+importedOpenTypesFingerprint importedOpenTypesByModule =
+    importedOpenTypesByModule
+        |> Dict.toList
+        |> List.sortBy Tuple.first
+        |> List.map (\( moduleName, typeNames ) -> moduleName ++ ":" ++ (typeNames |> Set.toList |> List.sort |> String.join "," ))
+        |> String.join ";"
+
+
+importSummaryFingerprint : ImportSummary -> String
+importSummaryFingerprint importSummary =
+    String.join "|"
+        [ importSummary.moduleName
+        , importSummary.alias |> Maybe.map .name |> Maybe.withDefault "-"
+        , importSummary.exposingAllRange |> Maybe.map (\_ -> "all") |> Maybe.withDefault "explicit"
+        , importSummary.explicitElements |> List.map importedElementFingerprint |> List.sort |> String.join ","
+        ]
+
+
+importedElementFingerprint : ImportedElementSummary -> String
+importedElementFingerprint element =
+    String.join ":"
+        [ importedElementKindToString element.kind
+        , element.name
+        , if element.openRange == Nothing then
+            "closed"
+
+          else
+            "open"
+        ]
+
+
+aliasFingerprint : Dict String String -> String
+aliasFingerprint moduleAliases =
+    moduleAliases
+        |> Dict.toList
+        |> List.sortBy Tuple.first
+        |> List.map (\( aliasName, moduleName ) -> aliasName ++ ":" ++ moduleName)
+        |> String.join ";"
+
+
+constructorNamesFingerprint : Dict String (Dict String a) -> String
+constructorNamesFingerprint constructorsByType =
+    constructorsByType
+        |> Dict.toList
+        |> List.sortBy Tuple.first
+        |> List.map (\( typeName, constructors ) -> typeName ++ ":" ++ (constructors |> Dict.keys |> List.sort |> String.join "," ))
+        |> String.join ";"
+
+
+constructorArgumentCountFingerprint : Dict String (Dict String (List a)) -> String
+constructorArgumentCountFingerprint constructorsByType =
+    constructorsByType
+        |> Dict.toList
+        |> List.sortBy Tuple.first
+        |> List.map
+            (\( typeName, constructors ) ->
+                typeName
+                    ++ ":"
+                    ++ (constructors
+                            |> Dict.toList
+                            |> List.sortBy Tuple.first
+                            |> List.map (\( constructorName, ranges ) -> constructorName ++ ":" ++ String.fromInt (List.length ranges))
+                            |> String.join ","
+                       )
+            )
+        |> String.join ";"
+
+
+qualifiedRefFingerprint : QualifiedRef -> String
+qualifiedRefFingerprint ref =
+    if List.isEmpty ref.moduleParts then
+        ref.name
+
+    else
+        String.join "." ref.moduleParts ++ "." ++ ref.name
+
+
+constructorPatternUsageFingerprint : ConstructorPatternUsage -> String
+constructorPatternUsageFingerprint usage =
+    String.join ":"
+        [ qualifiedRefFingerprint { moduleParts = usage.moduleParts, name = usage.name }
+        , usage.usedPositions |> List.map String.fromInt |> String.join ","
+        ]
+
+
+declarationShapeFingerprint : DeclarationShapeFacts -> String
+declarationShapeFingerprint facts =
+    String.join "|"
+        [ facts.topLevelFunctions
+            |> List.map functionDeclarationShapeFingerprint
+            |> String.join ";"
+        , facts.nestedFunctions
+            |> List.map functionDeclarationShapeFingerprint
+            |> String.join ";"
+        ]
+
+
+functionDeclarationShapeFingerprint : FunctionDeclarationShape -> String
+functionDeclarationShapeFingerprint shape =
+    String.join ":"
+        [ shape.name
+        , String.fromInt shape.arity
+        , if shape.hasSignature then
+            "sig"
+
+          else
+            "nosig"
+        ]
+
+
+functionSummaryFingerprint : TopLevelFunctionSummary -> String
+functionSummaryFingerprint summary =
+    String.join "|"
+        [ summary.name
+        , summary.parameters |> List.map parameterBindingFingerprint |> String.join ","
+        , summary.usedNames |> Set.toList |> List.sort |> String.join ","
+        , summary.recursiveOnlyNames |> Set.toList |> List.sort |> String.join ","
+        ]
+
+
+parameterBindingFingerprint : ParameterBindingSummary -> String
+parameterBindingFingerprint binding =
+    binding.name ++ ":" ++ parameterBindingKindToString binding.kind
+
+
+dependencyRefFingerprint : DependencyRef -> String
+dependencyRefFingerprint dependencyRef =
+    String.join "|"
+        [ dependencyRef.owner
+        , if List.isEmpty dependencyRef.moduleParts then
+            "-"
+
+          else
+            String.join "." dependencyRef.moduleParts
+        , dependencyRef.name
+        ]
+
+
+localTypeDeclarationsFingerprint : Dict String LocalTypeSummary -> String
+localTypeDeclarationsFingerprint localTypeDeclarations =
+    localTypeDeclarations
+        |> Dict.toList
+        |> List.sortBy Tuple.first
+        |> List.map (\( typeName, summary ) -> typeName ++ ":" ++ localTypeKindToString summary.kind)
+        |> String.join ";"
 
 
 type alias HostNoUnusedExportsModule =
@@ -3275,6 +3809,13 @@ collectTopLevelFunctionSummaries declarations =
                         Just
                             { name = Node.value implementation.name
                             , nameRange = Node.range implementation.name
+                            , hasSignature =
+                                case function.signature of
+                                    Just _ ->
+                                        True
+
+                                    Nothing ->
+                                        False
                             , parameters = parameterBindings
                             , usedNames = analysis.usedNames
                             , recursiveOnlyNames =
@@ -3460,6 +4001,7 @@ collectNestedFunctionSummariesFromExpression ((Node range expr) as expressionNod
              else
                 [ { name = "<lambda>"
                   , nameRange = range
+                  , hasSignature = False
                   , parameters = parameterBindings
                   , usedNames = analysis.usedNames
                   , recursiveOnlyNames =
@@ -3554,6 +4096,13 @@ collectNestedFunctionSummariesFromLetDeclaration (Node _ declaration) =
              else
                 [ { name = Node.value implementation.name
                   , nameRange = Node.range implementation.name
+                  , hasSignature =
+                        case function.signature of
+                            Just _ ->
+                                True
+
+                            Nothing ->
+                                False
                   , parameters = parameterBindings
                   , usedNames = analysis.usedNames
                   , recursiveOnlyNames =
@@ -5229,6 +5778,28 @@ importersNeedsImporterContext ruleName =
             True
 
 
+moduleRuleUsesDeclarationShapeOnly : { a | name : String } -> Bool
+moduleRuleUsesDeclarationShapeOnly rule =
+    case factContractForRule rule.name of
+        Just contract ->
+            contract.factSets == [ DeclarationShape ]
+
+        Nothing ->
+            False
+
+
+buildModuleRuleGroupFactHashKey :
+    List { a | name : String }
+    -> FactHashes
+    -> String
+buildModuleRuleGroupFactHashKey rules factHashes =
+    rules
+        |> List.filterMap (\rule -> factContractForRule rule.name)
+        |> List.map (\contract -> buildFactContractHashKey contract factHashes)
+        |> String.join "||"
+        |> hashFingerprint
+
+
 buildPerFileRuleKeys :
     String
     -> String
@@ -6395,11 +6966,47 @@ letBindingSummaryDecoder =
         (Json.Decode.field "range" rangeDecoder)
 
 
+encodeFactHashesJson : FactHashes -> Json.Encode.Value
+encodeFactHashesJson factHashes =
+    Json.Encode.object
+        [ ( "importShapeHash", Json.Encode.string factHashes.importShapeHash )
+        , ( "exportShapeHash", Json.Encode.string factHashes.exportShapeHash )
+        , ( "constructorShapeHash", Json.Encode.string factHashes.constructorShapeHash )
+        , ( "constructorUsageHash", Json.Encode.string factHashes.constructorUsageHash )
+        , ( "declarationShapeHash", Json.Encode.string factHashes.declarationShapeHash )
+        , ( "functionUsageHash", Json.Encode.string factHashes.functionUsageHash )
+        , ( "typeUsageHash", Json.Encode.string factHashes.typeUsageHash )
+        ]
+
+
+factHashesDecoder : Json.Decode.Decoder FactHashes
+factHashesDecoder =
+    Json.Decode.map7
+        (\importShapeHash exportShapeHash constructorShapeHash constructorUsageHash declarationShapeHash functionUsageHash typeUsageHash ->
+            { importShapeHash = importShapeHash
+            , exportShapeHash = exportShapeHash
+            , constructorShapeHash = constructorShapeHash
+            , constructorUsageHash = constructorUsageHash
+            , declarationShapeHash = declarationShapeHash
+            , functionUsageHash = functionUsageHash
+            , typeUsageHash = typeUsageHash
+            }
+        )
+        (Json.Decode.field "importShapeHash" Json.Decode.string)
+        (Json.Decode.field "exportShapeHash" Json.Decode.string)
+        (Json.Decode.field "constructorShapeHash" Json.Decode.string)
+        (Json.Decode.field "constructorUsageHash" Json.Decode.string)
+        (Json.Decode.field "declarationShapeHash" Json.Decode.string)
+        (Json.Decode.field "functionUsageHash" Json.Decode.string)
+        (Json.Decode.field "typeUsageHash" Json.Decode.string)
+
+
 encodeTopLevelFunctionSummaryJson : TopLevelFunctionSummary -> Json.Encode.Value
 encodeTopLevelFunctionSummaryJson summary =
     Json.Encode.object
         [ ( "name", Json.Encode.string summary.name )
         , ( "nameRange", encodeRangeJson summary.nameRange )
+        , ( "hasSignature", Json.Encode.bool summary.hasSignature )
         , ( "parameters", Json.Encode.list encodeParameterBindingSummaryJson summary.parameters )
         , ( "usedNames", encodeStringSetJson summary.usedNames )
         , ( "recursiveOnlyNames", encodeStringSetJson summary.recursiveOnlyNames )
@@ -6408,10 +7015,11 @@ encodeTopLevelFunctionSummaryJson summary =
 
 topLevelFunctionSummaryDecoder : Json.Decode.Decoder TopLevelFunctionSummary
 topLevelFunctionSummaryDecoder =
-    Json.Decode.map5
-        (\name nameRange parameters usedNames recursiveOnlyNames ->
+    Json.Decode.map6
+        (\name nameRange hasSignature parameters usedNames recursiveOnlyNames ->
             { name = name
             , nameRange = nameRange
+            , hasSignature = hasSignature
             , parameters = parameters
             , usedNames = usedNames
             , recursiveOnlyNames = recursiveOnlyNames
@@ -6419,6 +7027,11 @@ topLevelFunctionSummaryDecoder =
         )
         (Json.Decode.field "name" Json.Decode.string)
         (Json.Decode.field "nameRange" rangeDecoder)
+        (Json.Decode.oneOf
+            [ Json.Decode.field "hasSignature" Json.Decode.bool
+            , Json.Decode.succeed False
+            ]
+        )
         (Json.Decode.field "parameters" (Json.Decode.list parameterBindingSummaryDecoder))
         (Json.Decode.field "usedNames" stringSetDecoder)
         (Json.Decode.field "recursiveOnlyNames" stringSetDecoder)
@@ -6517,6 +7130,7 @@ encodeFileAnalysisCache cache =
                             , ( "containsMainLike", Json.Encode.bool analysis.crossModuleSummary.containsMainLike )
                             ]
                       )
+                    , ( "factHashes", encodeFactHashesJson analysis.factHashes )
                     ]
             )
         |> Json.Encode.encode 0
@@ -6540,14 +7154,15 @@ decodeFileAnalysisCache json =
                 (Json.Decode.field "endLine" Json.Decode.int)
 
         analysisDecoder =
-            Json.Decode.map5
-                (\filePath sourceHash parsedAst summaries crossModuleSummary ->
+            Json.Decode.map6
+                (\filePath sourceHash parsedAst summaries crossModuleSummary maybeFactHashes ->
                     ( filePath
                     , { sourceHash = sourceHash
                       , parsedAst = parsedAst
                       , moduleSummary = summaries.moduleSummary
                       , bodySummary = summaries.bodySummary
                       , crossModuleSummary = crossModuleSummary
+                      , factHashes = Maybe.withDefault (factHashesForSummary crossModuleSummary) maybeFactHashes
                       }
                     )
                 )
@@ -6824,6 +7439,11 @@ decodeFileAnalysisCache json =
                             (Json.Decode.field "containsMainLike" Json.Decode.bool)
                         )
                     )
+                )
+                (Json.Decode.oneOf
+                    [ Json.Decode.field "factHashes" factHashesDecoder |> Json.Decode.map Just
+                    , Json.Decode.succeed Nothing
+                    ]
                 )
     in
     Json.Decode.decodeString (Json.Decode.list analysisDecoder |> Json.Decode.map Dict.fromList) json
@@ -7166,6 +7786,7 @@ analyzeSourceFile filePath source =
                     , declarations = declarations
                     }
                 , crossModuleSummary = crossModuleSummary
+                , factHashes = factHashesForSummary crossModuleSummary
                 }
 
         Err _ ->
@@ -8402,14 +9023,23 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 |> List.map formatErrorLine
                 |> String.join "\n"
 
-        moduleRuleIndices =
-            moduleRules |> List.map .index
+        moduleRuleGroups =
+            let
+                declarationShapeRules =
+                    moduleRules
+                        |> List.filter moduleRuleUsesDeclarationShapeOnly
 
-        moduleRuleProfile =
-            mergeProfiles NoCrossModule moduleRules
+                remainingRules =
+                    moduleRules
+                        |> List.filter (not << moduleRuleUsesDeclarationShapeOnly)
+            in
+            [ ( "declaration-shape", declarationShapeRules, True )
+            , ( "default", remainingRules, False )
+            ]
+                |> List.filter (\( _, rules, _ ) -> not (List.isEmpty rules))
 
-        -- Module rules: batch all module rules for each STALE file
-        moduleRuleMonads =
+        -- Module rules: batch stale files by cache-equivalent rule groups
+        moduleRuleJobs =
             if List.isEmpty moduleRules then
                 []
 
@@ -8417,49 +9047,78 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 staleFileContents
                     |> List.indexedMap
                         (\fileIdx file ->
-                            let
-                                fileHashes =
-                                    Dict.get file.path allFileAspectHashes
-                                        |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
+                            moduleRuleGroups
+                                |> List.indexedMap
+                                    (\groupIdx ( groupName, groupRules, useFactHashKey ) ->
+                                        let
+                                            groupRuleIndices =
+                                                groupRules |> List.map .index
 
-                                moduleWithAst =
-                                    { path = file.path
-                                    , source = file.source
-                                    , astJson = file.analysis.parsedAst.astJson
-                                    }
+                                            groupProfile =
+                                                mergeProfiles NoCrossModule groupRules
 
-                                fileNarrowKey =
-                                    narrowCacheKey moduleRuleProfile file.path fileHashes allFileAspectHashes depGraph
+                                            fileHashes =
+                                                Dict.get file.path allFileAspectHashes
+                                                    |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
 
-                                cacheKey =
-                                    "smr|" ++ helperHash ++ "|" ++ (moduleRuleIndices |> List.map String.fromInt |> String.join ",") ++ "|" ++ file.path ++ "|" ++ fileNarrowKey
-                            in
-                            Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
-                            Cache.compute [ "smr", file.path ]
-                                keyHash
-                                (\() ->
-                                    case
-                                        InterpreterProject.prepareAndEval reviewProject
-                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                            , expression = buildExpressionForRules moduleRuleIndices [ moduleWithAst ]
-                                            , sourceOverrides = [ reviewRunnerHelperSource ]
-                                            }
-                                    of
-                                        Ok s ->
-                                            s
+                                            moduleWithAst =
+                                                { path = file.path
+                                                , source = file.source
+                                                , astJson = file.analysis.parsedAst.astJson
+                                                }
 
-                                        Err e ->
-                                            e
-                                )
-                            <| \hash ->
-                            Cache.succeed
-                                { filename = Path.path ("smr-" ++ String.fromInt fileIdx)
-                                , hash = hash
-                                }
+                                            groupNarrowKey =
+                                                if useFactHashKey then
+                                                    buildModuleRuleGroupFactHashKey groupRules file.analysis.factHashes
+
+                                                else
+                                                    narrowCacheKey groupProfile file.path fileHashes allFileAspectHashes depGraph
+
+                                            cacheKey =
+                                                "smr|"
+                                                    ++ helperHash
+                                                    ++ "|"
+                                                    ++ (groupRuleIndices |> List.map String.fromInt |> String.join ",")
+                                                    ++ "|"
+                                                    ++ file.path
+                                                    ++ "|"
+                                                    ++ groupNarrowKey
+
+                                            outputFilename =
+                                                "smr-" ++ String.fromInt fileIdx ++ "-" ++ String.fromInt groupIdx
+                                        in
+                                        { outputFilename = outputFilename
+                                        , monad =
+                                            Cache.do (Cache.writeFile cacheKey Cache.succeed) <| \keyHash ->
+                                            Cache.compute [ "smr", groupName, file.path ]
+                                                keyHash
+                                                (\() ->
+                                                    case
+                                                        InterpreterProject.prepareAndEval reviewProject
+                                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                                                            , expression = buildExpressionForRules groupRuleIndices [ moduleWithAst ]
+                                                            , sourceOverrides = [ reviewRunnerHelperSource ]
+                                                            }
+                                                    of
+                                                        Ok s ->
+                                                            s
+
+                                                        Err e ->
+                                                            e
+                                                )
+                                            <| \hash ->
+                                            Cache.succeed
+                                                { filename = Path.path outputFilename
+                                                , hash = hash
+                                                }
+                                        }
+                                    )
                         )
+                    |> List.concat
 
         allMonads =
-            moduleRuleMonads
+            moduleRuleJobs
+                |> List.map .monad
                 |> Cache.sequence
                 |> Cache.andThen Cache.combine
 
@@ -8481,15 +9140,15 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     (\cacheResult ->
                         let
                             mrFiles =
-                                if List.isEmpty moduleRules then
+                                if List.isEmpty moduleRuleJobs then
                                     []
 
                                 else
-                                    staleModulesWithAst
-                                        |> List.indexedMap
-                                            (\fileIdx _ ->
+                                    moduleRuleJobs
+                                        |> List.map
+                                            (\job ->
                                                 File.rawFile
-                                                    (Path.toString cacheResult.output ++ "/smr-" ++ String.fromInt fileIdx)
+                                                    (Path.toString cacheResult.output ++ "/" ++ job.outputFilename)
                                                     |> BackendTask.allowFatal
                                             )
                         in

@@ -21,6 +21,9 @@ suite : Test
 suite =
     describe "ReviewRunner integration"
         [ pureHelperTests
+        , ruleFactContractTests
+        , factHashTests
+        , contractHashKeyTests
         , semanticCacheKeyTests
         , perDeclarationTests
         , cacheDecisionTests
@@ -607,6 +610,433 @@ foo value =
                             Expect.fail "Expected crossModuleSummaryFromSource to parse test module"
             ]
         ]
+
+
+ruleFactContractTests : Test
+ruleFactContractTests =
+    describe "rule fact contracts"
+        [ test "NoUnused.Exports depends on export, function, and import facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoUnused.Exports"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "ExportShape", "FunctionUsage", "ImportShape" ])
+        , test "NoUnused.CustomTypeConstructors depends on constructor and import facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoUnused.CustomTypeConstructors"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "ConstructorShape", "ConstructorUsage", "ImportShape" ])
+        , test "NoUnused.CustomTypeConstructorArgs depends on constructor facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoUnused.CustomTypeConstructorArgs"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "ConstructorShape", "ConstructorUsage" ])
+        , test "NoUnused.Parameters depends on function usage facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoUnused.Parameters"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "FunctionUsage" ])
+        , test "NoUnused.Variables depends on import, type, and function usage facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoUnused.Variables"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "ImportShape", "TypeUsage", "FunctionUsage" ])
+        , test "NoMissingTypeAnnotation depends on declaration shape facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoMissingTypeAnnotation"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "DeclarationShape" ])
+        ]
+
+
+factHashTests : Test
+factHashTests =
+    describe "fact hashes"
+        [ test "comment-only edit keeps all fact hashes stable" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+type Status
+    = Ready
+    | Waiting
+
+run value =
+    case value of
+        Just _ ->
+            Ready
+
+        Nothing ->
+            Waiting
+"""
+
+                    afterSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+{- comment only -}
+type Status
+    = Ready
+    | Waiting
+
+run value =
+    case value of
+        Just _ ->
+            Ready
+
+        Nothing ->
+            Waiting
+"""
+                in
+                Expect.equal
+                    (factHashTuple "src/A.elm" beforeSource)
+                    (factHashTuple "src/A.elm" afterSource)
+        , test "import edit changes import hash and keeps function hash stable when body is unchanged" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+run value =
+    case value of
+        Just _ ->
+            1
+
+        Nothing ->
+            0
+"""
+
+                    afterSource =
+                        """module A exposing (run)
+
+import Result exposing (Result(..))
+
+run value =
+    case value of
+        Ok _ ->
+            1
+
+        Err _ ->
+            0
+"""
+
+                    beforeHashes =
+                        factHashes "src/A.elm" beforeSource
+
+                    afterHashes =
+                        factHashes "src/A.elm" afterSource
+                in
+                Expect.all
+                    [ \_ -> Expect.notEqual beforeHashes.importShapeHash afterHashes.importShapeHash
+                    , \_ -> Expect.equal beforeHashes.exportShapeHash afterHashes.exportShapeHash
+                    ]
+                    ()
+        , test "body edit changes function usage hash and keeps import hash stable" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+helper =
+    1
+
+other =
+    2
+
+run =
+    helper
+"""
+
+                    afterSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+helper =
+    1
+
+other =
+    2
+
+run =
+    other
+"""
+
+                    beforeHashes =
+                        factHashes "src/A.elm" beforeSource
+
+                    afterHashes =
+                        factHashes "src/A.elm" afterSource
+                in
+                Expect.all
+                    [ \_ -> Expect.equal beforeHashes.importShapeHash afterHashes.importShapeHash
+                    , \_ -> Expect.notEqual beforeHashes.functionUsageHash afterHashes.functionUsageHash
+                    ]
+                    ()
+        , test "constructor shape edit changes constructor shape hash but not import hash" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (Status(..))
+
+type Status
+    = Ready
+    | Waiting
+"""
+
+                    afterSource =
+                        """module A exposing (Status(..))
+
+type Status
+    = Ready
+    | Waiting
+    | Done
+"""
+
+                    beforeHashes =
+                        factHashes "src/A.elm" beforeSource
+
+                    afterHashes =
+                        factHashes "src/A.elm" afterSource
+                in
+                Expect.all
+                    [ \_ -> Expect.notEqual beforeHashes.constructorShapeHash afterHashes.constructorShapeHash
+                    , \_ -> Expect.equal beforeHashes.importShapeHash afterHashes.importShapeHash
+                    ]
+                    ()
+        , test "type signature edit changes declaration shape hash but not function usage hash" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (run)
+
+run value =
+    value + 1
+"""
+
+                    afterSource =
+                        """module A exposing (run)
+
+run : Int -> Int
+run value =
+    value + 1
+"""
+
+                    beforeHashes =
+                        factHashes "src/A.elm" beforeSource
+
+                    afterHashes =
+                        factHashes "src/A.elm" afterSource
+                in
+                Expect.all
+                    [ \_ -> Expect.notEqual beforeHashes.declarationShapeHash afterHashes.declarationShapeHash
+                    , \_ -> Expect.equal beforeHashes.functionUsageHash afterHashes.functionUsageHash
+                    ]
+                    ()
+        ]
+
+
+contractHashKeyTests : Test
+contractHashKeyTests =
+    describe "contract hash keys"
+        [ test "buildFactContractHashKey includes only declared fact hashes in contract order" <|
+            \_ ->
+                ReviewRunner.buildFactContractHashKey
+                    { ruleName = "Demo.Rule"
+                    , factSets = [ ReviewRunner.ExportShape, ReviewRunner.FunctionUsage, ReviewRunner.ImportShape ]
+                    }
+                    { importShapeHash = "imports"
+                    , exportShapeHash = "exports"
+                    , constructorShapeHash = "constructors"
+                    , constructorUsageHash = "usage"
+                    , declarationShapeHash = "declarations"
+                    , functionUsageHash = "functions"
+                    , typeUsageHash = "types"
+                    }
+                    |> Expect.equal "Demo.Rule|ExportShape=exports|FunctionUsage=functions|ImportShape=imports"
+        , test "import-only edit does not change NoMissingTypeAnnotation contract key" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+run value =
+    case value of
+        Just number ->
+            number
+
+        Nothing ->
+            0
+"""
+
+                    afterSource =
+                        """module A exposing (run)
+
+import Result exposing (Result(..))
+
+run value =
+    case value of
+        Ok number ->
+            number
+
+        Err _ ->
+            0
+"""
+                in
+                Expect.equal
+                    (contractHashKey "NoMissingTypeAnnotation" "src/A.elm" beforeSource)
+                    (contractHashKey "NoMissingTypeAnnotation" "src/A.elm" afterSource)
+        , test "import-only edit changes NoUnused.Variables contract key" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+run value =
+    case value of
+        Just number ->
+            number
+
+        Nothing ->
+            0
+"""
+
+                    afterSource =
+                        """module A exposing (run)
+
+import Result exposing (Result(..))
+
+run value =
+    case value of
+        Ok number ->
+            number
+
+        Err _ ->
+            0
+"""
+                in
+                Expect.notEqual
+                    (contractHashKey "NoUnused.Variables" "src/A.elm" beforeSource)
+                    (contractHashKey "NoUnused.Variables" "src/A.elm" afterSource)
+        , test "constructor-shape edit changes constructor contract key but not parameter contract key" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (Status(..), run)
+
+type Status
+    = Ready
+    | Waiting
+
+run value =
+    value
+"""
+
+                    afterSource =
+                        """module A exposing (Status(..), run)
+
+type Status
+    = Ready
+    | Waiting
+    | Done
+
+run value =
+    value
+"""
+                in
+                Expect.all
+                    [ \_ ->
+                        Expect.notEqual
+                            (contractHashKey "NoUnused.CustomTypeConstructors" "src/A.elm" beforeSource)
+                            (contractHashKey "NoUnused.CustomTypeConstructors" "src/A.elm" afterSource)
+                    , \_ ->
+                        Expect.equal
+                            (contractHashKey "NoUnused.Parameters" "src/A.elm" beforeSource)
+                            (contractHashKey "NoUnused.Parameters" "src/A.elm" afterSource)
+                    ]
+                    ()
+        , test "body-only edit does not change NoMissingTypeAnnotation contract key" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (run)
+
+run value =
+    value + 1
+"""
+
+                    afterSource =
+                        """module A exposing (run)
+
+run value =
+    value + 2
+"""
+                in
+                Expect.equal
+                    (contractHashKey "NoMissingTypeAnnotation" "src/A.elm" beforeSource)
+                    (contractHashKey "NoMissingTypeAnnotation" "src/A.elm" afterSource)
+        ]
+
+
+factHashes : String -> String -> ReviewRunner.FactHashes
+factHashes filePath source =
+    case ReviewRunner.factHashesForSource filePath source of
+        Just hashes ->
+            hashes
+
+        Nothing ->
+            Debug.todo "Expected source to parse for fact hash test"
+
+
+contractHashKey : String -> String -> String -> String
+contractHashKey ruleName filePath source =
+    case ( ReviewRunner.factContractForRule ruleName, ReviewRunner.factHashesForSource filePath source ) of
+        ( Just contract, Just hashes ) ->
+            ReviewRunner.buildFactContractHashKey contract hashes
+
+        ( Nothing, _ ) ->
+            Debug.todo ("Expected rule fact contract for " ++ ruleName)
+
+        ( _, Nothing ) ->
+            Debug.todo ("Expected source to parse for contract hash key test: " ++ filePath)
+
+
+factHashTuple :
+    String
+    -> String
+    ->
+        { importShapeHash : String
+        , exportShapeHash : String
+        , constructorShapeHash : String
+        , constructorUsageHash : String
+        , declarationShapeHash : String
+        , functionUsageHash : String
+        , typeUsageHash : String
+        }
+factHashTuple filePath source =
+    let
+        hashes =
+            factHashes filePath source
+    in
+    { importShapeHash = hashes.importShapeHash
+    , exportShapeHash = hashes.exportShapeHash
+    , constructorShapeHash = hashes.constructorShapeHash
+    , constructorUsageHash = hashes.constructorUsageHash
+    , declarationShapeHash = hashes.declarationShapeHash
+    , functionUsageHash = hashes.functionUsageHash
+    , typeUsageHash = hashes.typeUsageHash
+    }
 
 
 
