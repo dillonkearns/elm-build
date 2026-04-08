@@ -1315,3 +1315,58 @@ So the shared fact layer preserved the earlier win. That is the important signal
 
 - richer cached facts did not erase the `NoUnused.Exports` speedup
 - the same cached summary shape is now broad enough to support the next `ImportersOf` experiment without adding another ad hoc parsing path
+
+### Host-Native `NoUnused.CustomTypeConstructors` Experiment
+
+I extended the same generic `crossModuleSummary` fact layer to carry constructor-level facts with an important policy split:
+
+- constructor uses in expressions
+- constructor appearances in patterns
+
+That distinction matters for `NoUnused.CustomTypeConstructors`, because a pattern like:
+
+```elm
+case status of
+    Killed ->
+        ...
+```
+
+does **not** mean the constructor is created anywhere in the project. The first version of the host experiment over-counted those pattern appearances as real usage and incorrectly reported zero errors on the benchmark fixture. After splitting those fact kinds, the host experiment matched the interpreted runner on the isolated fixture’s 10 findings.
+
+#### Direct correctness check
+
+On the isolated `NoUnused.CustomTypeConstructors` fixture:
+
+- interpreted runner: 10 errors
+- host experiment after the pattern/use split: 10 errors
+
+The host path now reports the same unused constructors in:
+
+- `src/MutationReport.elm`
+- `src/UserAccess.elm`
+
+#### Isolated `NoUnused.CustomTypeConstructors` A/B
+
+| Scenario | Interpreted runner | Host via cached facts |
+|---|---:|---:|
+| Cold | `103.39s` | `27.29s` |
+| Warm | `0.32s` | `0.33s` |
+| Warm import-graph change | `74.72s` | `1.28s` |
+
+Important trace details from the host run:
+
+- cold `project_rule_eval`: `3ms`
+- warm import-change `project_rule_eval`: `2ms`
+- host constructor errors on the fixture: `10`
+
+This is the second strong isolated result on the same architectural seam:
+
+- cached host-side facts
+- project-rule fold bypass
+- no daemon
+- no compiled-JS patching
+
+The main remaining caveat is the same as for `NoUnused.Exports`: this is still an upper-bound experiment with policy implemented on the host side. The fact layer itself is the keeper. The long-term direction remains:
+
+- facts cached natively / host-side
+- policy interpreted when possible on top of those facts

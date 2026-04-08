@@ -210,6 +210,32 @@ main =
                         |> Expect.equal
                             [ ( "src/A.elm", "Exposed function or value `bar` is never used in the project" ) ]
             ]
+        , describe "hostNoUnusedCustomTypeConstructorsErrorsForSources"
+            [ test "reports unused constructor and keeps used imported constructor" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedCustomTypeConstructorsErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (Choice(..))
+
+type Choice
+    = Left
+    | Right
+"""
+                          }
+                        , { path = "src/B.elm"
+                          , source = """module B exposing (..)
+
+import A exposing (Choice(..))
+
+value =
+    Left
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.filePath, error.message ))
+                        |> Expect.equal
+                            [ ( "src/A.elm", "Type constructor `Right` is not used." ) ]
+            ]
         , describe "crossModuleSummaryFromSource"
             [ test "captures constructor facts generically" <|
                 \_ ->
@@ -252,8 +278,12 @@ value maybeValue =
                                     |> Maybe.map Set.toList
                                     |> Maybe.withDefault []
                                     |> List.sort
-                            , constructorRefs =
-                                summary.constructorRefs
+                            , expressionConstructorRefs =
+                                summary.expressionConstructorRefs
+                                    |> List.map .name
+                                    |> List.sort
+                            , patternConstructorRefs =
+                                summary.patternConstructorRefs
                                     |> List.map .name
                                     |> List.sort
                             }
@@ -261,7 +291,8 @@ value maybeValue =
                                     { declaredConstructors = [ "Left", "Right" ]
                                     , exposedConstructors = [ "Left", "Right" ]
                                     , importedOpenTypes = [ "Maybe" ]
-                                    , constructorRefs = [ "Just", "Left", "Nothing", "Right" ]
+                                    , expressionConstructorRefs = [ "Left", "Right" ]
+                                    , patternConstructorRefs = [ "Just", "Nothing" ]
                                     }
 
                         Nothing ->

@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, hostNoUnusedExportsErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -101,6 +101,7 @@ type alias Config =
     , reportFormat : ReportFormat
     , perfTraceJson : Maybe String
     , hostNoUnusedExportsExperiment : Bool
+    , hostNoUnusedCustomTypeConstructorsExperiment : Bool
     }
 
 
@@ -192,7 +193,8 @@ type alias CrossModuleSummary =
     , moduleAliases : Dict String String
     , localDeclarations : Set.Set String
     , dependencyRefs : List DependencyRef
-    , constructorRefs : List QualifiedRef
+    , expressionConstructorRefs : List QualifiedRef
+    , patternConstructorRefs : List QualifiedRef
     , containsMainLike : Bool
     }
 
@@ -220,6 +222,14 @@ type alias HostNoUnusedExportsModule =
     , localValueUses : Set.Set String
     , externalValueUses : Set.Set ( String, String )
     , containsMainLike : Bool
+    }
+
+
+type alias HostNoUnusedConstructorsModule =
+    { filePath : String
+    , moduleName : String
+    , declaredConstructors : Dict String Range
+    , externalConstructorUses : Set.Set ( String, String )
     }
 
 
@@ -380,6 +390,10 @@ programConfig =
                     (Option.flag "host-no-unused-exports-experiment"
                         |> Option.withDescription "Handle NoUnused.Exports with a host-native experimental implementation"
                     )
+                |> OptionsParser.with
+                    (Option.flag "host-no-unused-custom-type-constructors-experiment"
+                        |> Option.withDescription "Handle NoUnused.CustomTypeConstructors with a host-native experimental implementation"
+                    )
             )
 
 
@@ -433,6 +447,11 @@ executionModeHash config =
 
       else
         "host-no-unused-exports=0"
+    , if config.hostNoUnusedCustomTypeConstructorsExperiment then
+        "host-no-unused-custom-type-constructors=1"
+
+      else
+        "host-no-unused-custom-type-constructors=0"
     ]
         |> String.join "|"
         |> FNV1a.hash
@@ -730,6 +749,7 @@ benchmarkTargetProjectRuntime options =
             , reportFormat = ReportQuiet
             , perfTraceJson = Nothing
             , hostNoUnusedExportsExperiment = False
+            , hostNoUnusedCustomTypeConstructorsExperiment = False
             }
     in
     Do.do (withTiming "prepare_config" (prepareConfig config)) <| \preparedConfigTimed ->
@@ -907,6 +927,13 @@ hostNoUnusedExportsErrorsForSources sources =
         |> .errors
 
 
+hostNoUnusedCustomTypeConstructorsErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoUnusedCustomTypeConstructorsErrorsForSources sources =
+    sources
+        |> evaluateHostNoUnusedCustomTypeConstructorsForSources
+        |> .errors
+
+
 evaluateHostNoUnusedExportsForAnalyzedFiles :
     List AnalyzedTargetFile
     ->
@@ -927,6 +954,31 @@ evaluateHostNoUnusedExportsForAnalyzedFiles analyzedFiles =
             , Dict.fromList
                 [ ( "project.host_exports.analysis_modules", List.length analyzedFiles )
                 , ( "project.host_exports.analysis_reused", List.length analyzedFiles )
+                ]
+            ]
+    }
+
+
+evaluateHostNoUnusedCustomTypeConstructorsForAnalyzedFiles :
+    List AnalyzedTargetFile
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+evaluateHostNoUnusedCustomTypeConstructorsForAnalyzedFiles analyzedFiles =
+    let
+        evaluation =
+            analyzedFiles
+                |> List.map (.analysis >> .crossModuleSummary)
+                |> hostNoUnusedCustomTypeConstructorsFromSummaries
+    in
+    { errors = evaluation.errors
+    , counters =
+        mergeCounterDicts
+            [ evaluation.counters
+            , Dict.fromList
+                [ ( "project.host_constructors.analysis_modules", List.length analyzedFiles )
+                , ( "project.host_constructors.analysis_reused", List.length analyzedFiles )
                 ]
             ]
     }
@@ -980,6 +1032,59 @@ evaluateHostNoUnusedExportsForSources sources =
                 [ ( "project.host_exports.source_files", List.length sources )
                 , ( "project.host_exports.parsed_modules", List.length rawModules )
                 , ( "project.host_exports.parse_failures", parseFailures )
+                ]
+            ]
+    }
+
+
+evaluateHostNoUnusedCustomTypeConstructorsForSources :
+    List { path : String, source : String }
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+evaluateHostNoUnusedCustomTypeConstructorsForSources sources =
+    let
+        parsedResults =
+            sources
+                |> List.map
+                    (\sourceFile ->
+                        case crossModuleSummaryFromSource sourceFile.path sourceFile.source of
+                            Just summary ->
+                                Ok summary
+
+                            Nothing ->
+                                Err sourceFile.path
+                    )
+
+        summaries =
+            parsedResults
+                |> List.filterMap Result.toMaybe
+
+        parseFailures =
+            parsedResults
+                |> List.filter
+                    (\result ->
+                        case result of
+                            Err _ ->
+                                True
+
+                            Ok _ ->
+                                False
+                    )
+                |> List.length
+
+        evaluation =
+            hostNoUnusedCustomTypeConstructorsFromSummaries summaries
+    in
+    { errors = evaluation.errors
+    , counters =
+        mergeCounterDicts
+            [ evaluation.counters
+            , Dict.fromList
+                [ ( "project.host_constructors.source_files", List.length sources )
+                , ( "project.host_constructors.parsed_modules", List.length summaries )
+                , ( "project.host_constructors.parse_failures", parseFailures )
                 ]
             ]
     }
@@ -1062,6 +1167,94 @@ hostNoUnusedExportsFromRawModules rawModules =
                     |> List.sum
               )
             , ( "project.host_exports.errors", List.length errors )
+            ]
+    }
+
+
+hostNoUnusedCustomTypeConstructorsFromSummaries :
+    List CrossModuleSummary
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+hostNoUnusedCustomTypeConstructorsFromSummaries summaries =
+    let
+        exposedConstructorsByModuleAndType : Dict String (Dict String (Dict String Range))
+        exposedConstructorsByModuleAndType =
+            summaries
+                |> List.map (\summary -> ( summary.moduleName, summary.exposedConstructors ))
+                |> Dict.fromList
+
+        resolvedModules : List HostNoUnusedConstructorsModule
+        resolvedModules =
+            summaries
+                |> List.map (resolveHostNoUnusedConstructorsModule exposedConstructorsByModuleAndType)
+
+        usedConstructorsByModule : Dict String (Set.Set String)
+        usedConstructorsByModule =
+            resolvedModules
+                |> List.foldl
+                    (\moduleInfo acc ->
+                        moduleInfo.externalConstructorUses
+                            |> Set.foldl
+                                (\( moduleName, constructorName ) innerAcc ->
+                                    Dict.update moduleName
+                                        (\maybeConstructors ->
+                                            Just
+                                                (maybeConstructors
+                                                    |> Maybe.withDefault Set.empty
+                                                    |> Set.insert constructorName
+                                                )
+                                        )
+                                        innerAcc
+                                )
+                                acc
+                    )
+                    Dict.empty
+
+        errors : List ReviewError
+        errors =
+            resolvedModules
+                |> List.concatMap
+                    (\moduleInfo ->
+                        let
+                            usedConstructors =
+                                Dict.get moduleInfo.moduleName usedConstructorsByModule
+                                    |> Maybe.withDefault Set.empty
+                        in
+                        moduleInfo.declaredConstructors
+                            |> Dict.toList
+                            |> List.filterMap
+                                (\( constructorName, rangeToReport ) ->
+                                    if Set.member constructorName usedConstructors then
+                                        Nothing
+
+                                    else
+                                        Just
+                                            { ruleName = "NoUnused.CustomTypeConstructors"
+                                            , filePath = moduleInfo.filePath
+                                            , line = rangeToReport.start.row
+                                            , column = rangeToReport.start.column
+                                            , message = "Type constructor `" ++ constructorName ++ "` is not used."
+                                            }
+                                )
+                    )
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "project.host_constructors.modules", List.length resolvedModules )
+            , ( "project.host_constructors.declared"
+              , resolvedModules
+                    |> List.map (\moduleInfo -> Dict.size moduleInfo.declaredConstructors)
+                    |> List.sum
+              )
+            , ( "project.host_constructors.external_uses"
+              , resolvedModules
+                    |> List.map (\moduleInfo -> Set.size moduleInfo.externalConstructorUses)
+                    |> List.sum
+              )
+            , ( "project.host_constructors.errors", List.length errors )
             ]
     }
 
@@ -1159,6 +1352,110 @@ resolveHostNoUnusedExportsModule exportedValuesByModule rawModule =
     , localValueUses = resolvedUses.localValueUses
     , externalValueUses = resolvedUses.externalValueUses
     , containsMainLike = rawModule.containsMainLike
+    }
+
+
+resolveHostNoUnusedConstructorsModule :
+    Dict String (Dict String (Dict String Range))
+    -> CrossModuleSummary
+    -> HostNoUnusedConstructorsModule
+resolveHostNoUnusedConstructorsModule exposedConstructorsByModuleAndType rawModule =
+    let
+        importedConstructorCandidates : Dict String (Set.Set String)
+        importedConstructorCandidates =
+            rawModule.importedOpenTypesByModule
+                |> Dict.foldl
+                    (\moduleName importedTypes acc ->
+                        case Dict.get moduleName exposedConstructorsByModuleAndType of
+                            Just constructorsByType ->
+                                constructorsByType
+                                    |> Dict.foldl
+                                        (\typeName constructors innerAcc ->
+                                            if Set.member typeName importedTypes then
+                                                constructors
+                                                    |> Dict.keys
+                                                    |> List.foldl
+                                                        (\constructorName candidatesAcc ->
+                                                            insertImportCandidate constructorName moduleName candidatesAcc
+                                                        )
+                                                        innerAcc
+
+                                            else
+                                                innerAcc
+                                        )
+                                        acc
+
+                            Nothing ->
+                                acc
+                    )
+                    Dict.empty
+
+        importedConstructorMap : Dict String String
+        importedConstructorMap =
+            importedConstructorCandidates
+                |> Dict.toList
+                |> List.filterMap
+                    (\( constructorName, moduleNames ) ->
+                        case Set.toList moduleNames of
+                            [ singleModuleName ] ->
+                                Just ( constructorName, singleModuleName )
+
+                            _ ->
+                                Nothing
+                    )
+                |> Dict.fromList
+
+        localConstructors : Set.Set String
+        localConstructors =
+            rawModule.declaredConstructors
+                |> Dict.values
+                |> List.foldl
+                    (\constructors acc ->
+                        constructors
+                            |> Dict.keys
+                            |> List.foldl Set.insert acc
+                    )
+                    Set.empty
+
+        externalConstructorUses : Set.Set ( String, String )
+        externalConstructorUses =
+            rawModule.expressionConstructorRefs
+                |> List.foldl
+                    (\constructorRef acc ->
+                        if not (List.isEmpty constructorRef.moduleParts) then
+                            let
+                                qualifiedModuleName =
+                                    String.join "." constructorRef.moduleParts
+
+                                actualModuleName =
+                                    rawModule.moduleAliases
+                                        |> Dict.get qualifiedModuleName
+                                        |> Maybe.withDefault qualifiedModuleName
+                            in
+                            Set.insert ( actualModuleName, constructorRef.name ) acc
+
+                        else if Set.member constructorRef.name localConstructors then
+                            Set.insert ( rawModule.moduleName, constructorRef.name ) acc
+
+                        else
+                            case Dict.get constructorRef.name importedConstructorMap of
+                                Just moduleName ->
+                                    Set.insert ( moduleName, constructorRef.name ) acc
+
+                                Nothing ->
+                                    acc
+                    )
+                    Set.empty
+
+        declaredConstructors =
+            rawModule.declaredConstructors
+                |> Dict.values
+                |> List.foldl Dict.union Dict.empty
+    in
+    { filePath = rawModule.filePath
+    , moduleName = rawModule.moduleName
+    , declaredConstructors = declaredConstructors
+    , externalConstructorUses = externalConstructorUses
     }
 
 
@@ -1290,9 +1587,12 @@ buildCrossModuleSummary filePath file =
     , dependencyRefs =
         file.declarations
             |> List.concatMap crossModuleDependencyRefsFromDeclaration
-    , constructorRefs =
+    , expressionConstructorRefs =
         file.declarations
-            |> List.concatMap crossModuleConstructorRefsFromDeclaration
+            |> List.concatMap crossModuleExpressionConstructorRefsFromDeclaration
+    , patternConstructorRefs =
+        file.declarations
+            |> List.concatMap crossModulePatternConstructorRefsFromDeclaration
     , containsMainLike = containsMainLike
     }
 
@@ -1528,8 +1828,25 @@ crossModuleDependencyRefsFromDeclaration declarationNode =
             []
 
 
-crossModuleConstructorRefsFromDeclaration : Node Declaration -> List QualifiedRef
-crossModuleConstructorRefsFromDeclaration declarationNode =
+crossModuleExpressionConstructorRefsFromDeclaration : Node Declaration -> List QualifiedRef
+crossModuleExpressionConstructorRefsFromDeclaration declarationNode =
+    case Node.value declarationNode of
+        FunctionDeclaration function ->
+            let
+                implementation =
+                    Node.value function.declaration
+            in
+            crossModuleConstructorRefsFromExpression implementation.expression
+
+        Destructuring pattern expression ->
+            crossModuleConstructorRefsFromExpression expression
+
+        _ ->
+            []
+
+
+crossModulePatternConstructorRefsFromDeclaration : Node Declaration -> List QualifiedRef
+crossModulePatternConstructorRefsFromDeclaration declarationNode =
     case Node.value declarationNode of
         FunctionDeclaration function ->
             let
@@ -1537,11 +1854,11 @@ crossModuleConstructorRefsFromDeclaration declarationNode =
                     Node.value function.declaration
             in
             List.concatMap crossModuleConstructorRefsFromPattern implementation.arguments
-                ++ crossModuleConstructorRefsFromExpression implementation.expression
+                ++ crossModulePatternConstructorRefsFromExpression implementation.expression
 
         Destructuring pattern expression ->
             crossModuleConstructorRefsFromPattern pattern
-                ++ crossModuleConstructorRefsFromExpression expression
+                ++ crossModulePatternConstructorRefsFromExpression expression
 
         _ ->
             []
@@ -1579,21 +1896,17 @@ crossModuleConstructorRefsFromExpression (Node _ expr) =
             crossModuleConstructorRefsFromExpression inner
 
         LetExpression letBlock ->
-            List.concatMap crossModuleConstructorRefsFromLetDeclaration letBlock.declarations
+            List.concatMap crossModuleExpressionConstructorRefsFromLetDeclaration letBlock.declarations
                 ++ crossModuleConstructorRefsFromExpression letBlock.expression
 
         CaseExpression caseBlock ->
             crossModuleConstructorRefsFromExpression caseBlock.expression
                 ++ List.concatMap
-                    (\( pattern, caseExpression ) ->
-                        crossModuleConstructorRefsFromPattern pattern
-                            ++ crossModuleConstructorRefsFromExpression caseExpression
-                    )
+                    (\( _, caseExpression ) -> crossModuleConstructorRefsFromExpression caseExpression)
                     caseBlock.cases
 
         LambdaExpression lambda ->
-            List.concatMap crossModuleConstructorRefsFromPattern lambda.args
-                ++ crossModuleConstructorRefsFromExpression lambda.expression
+            crossModuleConstructorRefsFromExpression lambda.expression
 
         RecordExpr setters ->
             setters
@@ -1646,8 +1959,117 @@ crossModuleConstructorRefsFromExpression (Node _ expr) =
             []
 
 
-crossModuleConstructorRefsFromLetDeclaration : Node LetDeclaration -> List QualifiedRef
-crossModuleConstructorRefsFromLetDeclaration (Node _ declaration) =
+crossModulePatternConstructorRefsFromExpression : Node Expression -> List QualifiedRef
+crossModulePatternConstructorRefsFromExpression (Node _ expr) =
+    case expr of
+        Application expressions ->
+            List.concatMap crossModulePatternConstructorRefsFromExpression expressions
+
+        OperatorApplication _ _ left right ->
+            crossModulePatternConstructorRefsFromExpression left
+                ++ crossModulePatternConstructorRefsFromExpression right
+
+        FunctionOrValue _ _ ->
+            []
+
+        IfBlock cond thenExpr elseExpr ->
+            crossModulePatternConstructorRefsFromExpression cond
+                ++ crossModulePatternConstructorRefsFromExpression thenExpr
+                ++ crossModulePatternConstructorRefsFromExpression elseExpr
+
+        Negation inner ->
+            crossModulePatternConstructorRefsFromExpression inner
+
+        TupledExpression expressions ->
+            List.concatMap crossModulePatternConstructorRefsFromExpression expressions
+
+        ParenthesizedExpression inner ->
+            crossModulePatternConstructorRefsFromExpression inner
+
+        LetExpression letBlock ->
+            List.concatMap crossModulePatternConstructorRefsFromLetDeclaration letBlock.declarations
+                ++ crossModulePatternConstructorRefsFromExpression letBlock.expression
+
+        CaseExpression caseBlock ->
+            crossModulePatternConstructorRefsFromExpression caseBlock.expression
+                ++ List.concatMap
+                    (\( pattern, caseExpression ) ->
+                        crossModuleConstructorRefsFromPattern pattern
+                            ++ crossModulePatternConstructorRefsFromExpression caseExpression
+                    )
+                    caseBlock.cases
+
+        LambdaExpression lambda ->
+            List.concatMap crossModuleConstructorRefsFromPattern lambda.args
+                ++ crossModulePatternConstructorRefsFromExpression lambda.expression
+
+        RecordExpr setters ->
+            setters
+                |> List.concatMap
+                    (\(Node _ ( _, valueExpression )) ->
+                        crossModulePatternConstructorRefsFromExpression valueExpression
+                    )
+
+        ListExpr expressions ->
+            List.concatMap crossModulePatternConstructorRefsFromExpression expressions
+
+        RecordAccess inner _ ->
+            crossModulePatternConstructorRefsFromExpression inner
+
+        RecordUpdateExpression _ setters ->
+            setters
+                |> List.concatMap
+                    (\(Node _ ( _, valueExpression )) ->
+                        crossModulePatternConstructorRefsFromExpression valueExpression
+                    )
+
+        UnitExpr ->
+            []
+
+        PrefixOperator _ ->
+            []
+
+        Operator _ ->
+            []
+
+        Integer _ ->
+            []
+
+        Hex _ ->
+            []
+
+        Floatable _ ->
+            []
+
+        Literal _ ->
+            []
+
+        CharLiteral _ ->
+            []
+
+        RecordAccessFunction _ ->
+            []
+
+        GLSLExpression _ ->
+            []
+
+
+crossModuleExpressionConstructorRefsFromLetDeclaration : Node LetDeclaration -> List QualifiedRef
+crossModuleExpressionConstructorRefsFromLetDeclaration (Node _ declaration) =
+    case declaration of
+        LetFunction function ->
+            let
+                implementation =
+                    Node.value function.declaration
+            in
+            crossModuleConstructorRefsFromExpression implementation.expression
+
+        LetDestructuring pattern expression ->
+            crossModuleConstructorRefsFromExpression expression
+
+
+crossModulePatternConstructorRefsFromLetDeclaration : Node LetDeclaration -> List QualifiedRef
+crossModulePatternConstructorRefsFromLetDeclaration (Node _ declaration) =
     case declaration of
         LetFunction function ->
             let
@@ -1655,11 +2077,11 @@ crossModuleConstructorRefsFromLetDeclaration (Node _ declaration) =
                     Node.value function.declaration
             in
             List.concatMap crossModuleConstructorRefsFromPattern implementation.arguments
-                ++ crossModuleConstructorRefsFromExpression implementation.expression
+                ++ crossModulePatternConstructorRefsFromExpression implementation.expression
 
         LetDestructuring pattern expression ->
             crossModuleConstructorRefsFromPattern pattern
-                ++ crossModuleConstructorRefsFromExpression expression
+                ++ crossModulePatternConstructorRefsFromExpression expression
 
 
 crossModuleConstructorRefsFromPattern : Node Pattern -> List QualifiedRef
@@ -2894,7 +3316,8 @@ encodeFileAnalysisCache cache =
                             , ( "moduleAliases", encodeStringDictJson analysis.crossModuleSummary.moduleAliases )
                             , ( "localDeclarations", encodeStringSetJson analysis.crossModuleSummary.localDeclarations )
                             , ( "dependencyRefs", Json.Encode.list encodeDependencyRefJson analysis.crossModuleSummary.dependencyRefs )
-                            , ( "constructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.constructorRefs )
+                            , ( "expressionConstructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.expressionConstructorRefs )
+                            , ( "patternConstructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.patternConstructorRefs )
                             , ( "containsMainLike", Json.Encode.bool analysis.crossModuleSummary.containsMainLike )
                             ]
                       )
@@ -2989,7 +3412,8 @@ decodeFileAnalysisCache json =
                             , moduleAliases = tailFields.moduleAliases
                             , localDeclarations = tailFields.localDeclarations
                             , dependencyRefs = tailFields.dependencyRefs
-                            , constructorRefs = tailFields.constructorRefs
+                            , expressionConstructorRefs = tailFields.expressionConstructorRefs
+                            , patternConstructorRefs = tailFields.patternConstructorRefs
                             , containsMainLike = tailFields.containsMainLike
                             }
                         )
@@ -3042,19 +3466,21 @@ decodeFileAnalysisCache json =
                                 (Json.Decode.field "importAllModules" (Json.Decode.list Json.Decode.string))
                             )
                         )
-                        (Json.Decode.map5
-                            (\moduleAliases localDeclarations dependencyRefs constructorRefs containsMainLike ->
+                        (Json.Decode.map6
+                            (\moduleAliases localDeclarations dependencyRefs expressionConstructorRefs patternConstructorRefs containsMainLike ->
                                 { moduleAliases = moduleAliases
                                 , localDeclarations = localDeclarations
                                 , dependencyRefs = dependencyRefs
-                                , constructorRefs = constructorRefs
+                                , expressionConstructorRefs = expressionConstructorRefs
+                                , patternConstructorRefs = patternConstructorRefs
                                 , containsMainLike = containsMainLike
                                 }
                             )
                             (Json.Decode.field "moduleAliases" stringDictDecoder)
                             (Json.Decode.field "localDeclarations" stringSetDecoder)
                             (Json.Decode.field "dependencyRefs" (Json.Decode.list dependencyRefDecoder))
-                            (Json.Decode.field "constructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                            (Json.Decode.field "expressionConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                            (Json.Decode.field "patternConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
                             (Json.Decode.field "containsMainLike" Json.Decode.bool)
                         )
                     )
@@ -4097,6 +4523,7 @@ task config =
                 , ( "decl_cache.entries", Dict.size previousCache )
                 , ( "decl_cache.loaded_bytes", declCacheTimed.value.bytes )
                 , ( "experiment.host_no_unused_exports", boolToInt preparedConfig.hostNoUnusedExportsExperiment )
+                , ( "experiment.host_no_unused_custom_type_constructors", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorsExperiment )
                 , ( "analysis_cache.entries", analyzedTargetFiles.cacheEntries )
                 , ( "analysis_cache.loaded_bytes", analyzedTargetFiles.cacheLoadBytes )
                 , ( "analysis_cache.stored_bytes", analyzedTargetFiles.cacheStoreBytes )
@@ -4590,14 +5017,18 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             config.hostNoUnusedExportsExperiment
                 && List.any (\rule -> rule.name == "NoUnused.Exports") ruleInfo
 
-        projectRules =
-            if hostNoUnusedExportsEnabled then
-                ruleInfo
-                    |> List.filter (\r -> r.ruleType == ProjectRule)
-                    |> List.filter (\r -> r.name /= "NoUnused.Exports")
+        hostNoUnusedCustomTypeConstructorsEnabled =
+            config.hostNoUnusedCustomTypeConstructorsExperiment
+                && List.any (\rule -> rule.name == "NoUnused.CustomTypeConstructors") ruleInfo
 
-            else
-                ruleInfo |> List.filter (\r -> r.ruleType == ProjectRule)
+        projectRules =
+            ruleInfo
+                |> List.filter (\r -> r.ruleType == ProjectRule)
+                |> List.filter
+                    (\r ->
+                        (not hostNoUnusedExportsEnabled || r.name /= "NoUnused.Exports")
+                            && (not hostNoUnusedCustomTypeConstructorsEnabled || r.name /= "NoUnused.CustomTypeConstructors")
+                    )
 
         stalePaths =
             staleFileContents |> List.map .path |> Set.fromList
@@ -4679,6 +5110,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 [ ( "rules.module.count", List.length moduleRules )
                 , ( "rules.project.count", List.length projectRules )
                 , ( "project.host_exports.enabled", boolToInt hostNoUnusedExportsEnabled )
+                , ( "project.host_constructors.enabled", boolToInt hostNoUnusedCustomTypeConstructorsEnabled )
                 ]
     in
     Do.do
@@ -4743,6 +5175,23 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     )
                 )
             <| \hostNoUnusedExportsTimed ->
+            Do.do
+                (withTiming "project.host_constructors_eval"
+                    (if hostNoUnusedCustomTypeConstructorsEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoUnusedCustomTypeConstructorsForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "project.host_constructors.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoUnusedConstructorsTimed ->
             let
                 hostNoUnusedExportsOutput =
                     hostNoUnusedExportsTimed.value.errors
@@ -4757,16 +5206,31 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             , ( "project.host_exports.enabled", boolToInt hostNoUnusedExportsEnabled )
                             ]
                         ]
+
+                hostNoUnusedConstructorsOutput =
+                    hostNoUnusedConstructorsTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoUnusedConstructorsCounters =
+                    mergeCounterDicts
+                        [ hostNoUnusedConstructorsTimed.value.counters
+                        , Dict.fromList
+                            [ ( "project.host_constructors.ms", hostNoUnusedConstructorsTimed.stage.ms )
+                            , ( "project.host_constructors.enabled", boolToInt hostNoUnusedCustomTypeConstructorsEnabled )
+                            ]
+                        ]
             in
             if List.isEmpty projectRules then
                 BackendTask.succeed
                     { output =
-                        [ moduleRuleOutput, hostNoUnusedExportsOutput ]
+                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput ]
                             |> List.filter (not << String.isEmpty)
                             |> String.join "\n"
                     , counters =
                         mergeCounterDicts
                             [ hostNoUnusedExportsCounters
+                            , hostNoUnusedConstructorsCounters
                             , Dict.fromList
                                 [ ( "project_rules.skipped", 1 )
                                 , ( "load_target_project_seed_ms", targetProjectSeedTimed.stage.ms )
@@ -5566,7 +6030,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
 
                     combinedProjectOutputs =
-                        [ moduleRuleOutput, hostNoUnusedExportsOutput, importersResult, depsOfResult ]
+                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, importersResult, depsOfResult ]
                             |> List.filter (not << String.isEmpty)
                             |> String.join "\n"
                 in
@@ -5579,6 +6043,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , importersRuleCacheCounters
                                 , partialMemoCounters
                                 , hostNoUnusedExportsCounters
+                                , hostNoUnusedConstructorsCounters
                                 , Dict.fromList
                                     [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
                                     , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
@@ -5618,6 +6083,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , importersRuleCacheCounters
                                 , partialMemoCounters
                                 , hostNoUnusedExportsCounters
+                                , hostNoUnusedConstructorsCounters
                                 , Dict.fromList
                                     [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
                                     , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
