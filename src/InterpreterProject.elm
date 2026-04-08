@@ -104,7 +104,7 @@ withTiming work =
 
 packageSummaryCacheVersion : String
 packageSummaryCacheVersion =
-    "v4"
+    "v5"
 
 
 packageSummaryCacheBlobPath : String -> String
@@ -379,6 +379,7 @@ load { projectDir } =
         , skipPackages = Set.empty
         , patchSource = identity
         , extraSourceFiles = []
+        , extraReachableImports = []
         , sourceDirectories = Nothing
         }
 
@@ -396,6 +397,7 @@ loadWith :
     , skipPackages : Set String
     , patchSource : String -> String
     , extraSourceFiles : List String
+    , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
     }
     -> BackendTask FatalError InterpreterProject
@@ -405,6 +407,7 @@ loadWith config =
         , skipPackages = config.skipPackages
         , patchSource = config.patchSource
         , extraSourceFiles = config.extraSourceFiles
+        , extraReachableImports = config.extraReachableImports
         , sourceDirectories = config.sourceDirectories
         , packageParseCacheDir = Nothing
         }
@@ -416,6 +419,7 @@ loadWithProfile :
     , skipPackages : Set String
     , patchSource : String -> String
     , extraSourceFiles : List String
+    , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
     , packageParseCacheDir : Maybe String
     }
@@ -587,9 +591,22 @@ loadWithProfile config =
                 |> List.filterMap DepGraph.parseModuleName
                 |> Set.fromList
 
+        rootModuleNames : Set String
+        rootModuleNames =
+            moduleGraph.moduleToSource
+                |> Dict.keys
+                |> Set.fromList
+                |> Set.diff pkgModuleNames
+                |> Set.union (Set.fromList config.extraReachableImports)
+
+        reachablePackageModuleNames : Set String
+        reachablePackageModuleNames =
+            reachableModules moduleGraph rootModuleNames
+                |> Set.intersect pkgModuleNames
+
         allPackageSources : List String
         allPackageSources =
-            topoSortModules moduleGraph pkgModuleNames
+            topoSortModules moduleGraph reachablePackageModuleNames
     in
     Do.do BackendTask.Time.now <| \graphFinish ->
     let
@@ -2366,3 +2383,29 @@ topoSortModules graph needed =
                 |> List.foldl dfs { visited = Set.empty, order = [] }
     in
     result.order
+
+
+reachableModules : ModuleGraph -> Set String -> Set String
+reachableModules graph roots =
+    let
+        dfs : String -> Set String -> Set String
+        dfs moduleName visited =
+            if Set.member moduleName visited then
+                visited
+
+            else
+                let
+                    nextVisited =
+                        Set.insert moduleName visited
+
+                    deps =
+                        Dict.get moduleName graph.imports
+                            |> Maybe.withDefault Set.empty
+                in
+                deps
+                    |> Set.toList
+                    |> List.foldl dfs nextVisited
+    in
+    roots
+        |> Set.toList
+        |> List.foldl dfs Set.empty

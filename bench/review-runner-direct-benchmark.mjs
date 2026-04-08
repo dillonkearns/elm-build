@@ -110,7 +110,7 @@ function runRunner({ fixtureSrcDir, buildDir, root }, name) {
     ],
     {
       cwd: repoRoot,
-      stdio: ["ignore", "ignore", "ignore"],
+      encoding: "utf8",
     }
   );
   const wallMs = performance.now() - start;

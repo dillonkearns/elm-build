@@ -1931,3 +1931,38 @@ So the current bottleneck order remains:
 1. `load_review_project`
 2. remaining module-rule execution
 3. outer wall-clock overhead outside the traced inner stages
+
+### Package-Closure Reduction Checkpoint
+
+I tightened the review-app package summary cache so it only stores and decodes
+the package-module closure actually reachable from the review app roots,
+instead of every package module discovered in the graph.
+
+Implementation notes:
+
+- `InterpreterProject.loadWithProfile` now computes the reachable package
+  module set from the non-package roots plus explicit extra reachable imports.
+- `ReviewRunner.loadReviewProjectDetailed` passes the helper module imports as
+  `extraReachableImports` so virtual helper dependencies like `Elm.Project`
+  stay in the closure.
+- The package summary cache version was bumped to `v5`.
+
+The direct mixed probe with all five host-backed `NoUnused` shortcuts showed a
+clear setup win:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Warm 1-file body edit | `1.647s` | `1.666s` |
+| Warm import-graph change | `1.65s` | `1.59s` |
+| `load_review_project` | `350ms` | `219-220ms` |
+| `decode_package_summary_cache_ms` | `269ms` | `135-137ms` |
+| `package_summary_cache_bytes` | `2479004` | `1385602` |
+
+The overall read is:
+
+- The closure reduction does exactly what it should: it materially reduces the
+  fixed review-app warm-load tax.
+- It is not, by itself, a large end-to-end body-edit win yet because the mixed
+  path is now dominated by remaining module-rule cost plus outer overhead.
+- It is still a clear keeper because it halves the package-summary decode cost
+  and reduces a fixed tax that affects every warm partial miss.

@@ -12764,6 +12764,7 @@ loadReviewProjectDetailed config =
         , skipPackages = Set.union kernelPackages conflictingPackages
         , patchSource = patchSource
         , extraSourceFiles = []
+        , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
         , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
         , packageParseCacheDir = Just (Path.toString config.buildDirectory)
         }
