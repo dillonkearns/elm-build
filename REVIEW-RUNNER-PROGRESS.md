@@ -1786,29 +1786,85 @@ The first useful benchmark result is strong. On the isolated
 So this is another clear proof that the right seam is cached facts plus bypass
 of the interpreted project-rule fold.
 
-#### Current correctness status
+#### Updated correctness status
 
-The conservative host-fact path is now much closer on the isolated fixture:
+The remaining mismatch turned out to be a dependency-docs decoder bug, not a
+fact-model problem:
+
+- I was decoding union constructor names from a non-existent `tags` field
+- Elm package `docs.json` stores them under `cases`
+- that left the dependency open-type constructor index effectively empty
+
+After fixing that, the isolated `NoUnused.Variables` harness matches the real
+`elm-review` CLI exactly on a fresh workspace:
 
 | Metric | Count |
 |---|---:|
 | CLI findings | `22` |
-| Host-fact findings | `20` |
-| Missing | `2` |
+| Host-fact findings | `22` |
+| Missing | `0` |
 | Extra | `0` |
 
-The two remaining misses are both the same category:
+### Mixed `small-12` With All Five Host-Backed `NoUnused` Experiments
 
-- `src/ReviewRunner.elm:31:50` `Imported type \`Exposing\` is not used`
-- `src/SemanticHash.elm:21:44` `Imported type \`TypeAnnotation\` is not used`
+With the `NoUnused.Variables` shortcut enabled alongside the four
+`ImportersOf` shortcuts, the full mixed `bench/review` config is now exact in
+all five scenarios.
 
-These are both open-type import cases from package modules where the type name
-is unused but constructor availability still matters. The current generic fact
-layer does not yet carry constructor maps for imported open types, so the host
-path is intentionally conservative there to avoid false positives.
+Current mixed `small-12` benchmark:
 
-That means the next correctness step for `NoUnused.Variables` is clear:
+| Scenario | Runner | elm-review CLI |
+|---|---:|---:|
+| Cold | `111.19s` | `2.95s` |
+| Warm | `0.37s` | `1.05s` |
+| Warm 1-file body edit | `1.65s` | `1.06s` |
+| Warm 1-file comment-only | `0.86s` | `1.09s` |
+| Warm import-graph change | `1.65s` | `1.14s` |
 
-- add constructor-aware facts for imported open types, likely from local module
-  summaries plus dependency/package metadata
-- then rerun the isolated diff before considering mixed-run integration
+Diff harness result:
+
+| Scenario | Result |
+|---|---|
+| Cold | `match` |
+| Warm | `match` |
+| Warm 1-file body edit | `match` |
+| Warm 1-file comment-only | `match` |
+| Warm import-graph change | `match` |
+
+The previous project-rule wall is now effectively gone on this fixture:
+
+| Scenario | `load_review_project` | `module_rule_eval` | `project_rule_eval` |
+|---|---:|---:|---:|
+| Warm 1-file body edit | `314ms` | `242ms` | `10ms` |
+| Warm import-graph change | `313ms` | `245ms` | `12ms` |
+
+That changes the next target again.
+
+The remaining mixed gap to the CLI is now mostly:
+
+- fixed warm setup tax in `load_review_project`
+- remaining module-rule execution
+- outer wall-clock overhead outside the traced inner stages
+
+### Module-Rule Ranking Checkpoint
+
+After the mixed run stopped being project-rule bound, I added an isolated
+module-rule harness at `bench/module-rules-benchmark.mjs`.
+
+The first targeted measurements point at the two type-annotation rules:
+
+| Rule | Cold | Warm | Warm 1-file body edit | `load_review_project` | `module_rule_eval` |
+|---|---:|---:|---:|---:|---:|
+| `NoMissingTypeAnnotation` | `51.15s` | `0.35s` | `1.53s` | `317ms` | `138ms` |
+| `NoMissingTypeAnnotationInLetIn` | `55.07s` | `0.33s` | `1.52s` | `332ms` | `139ms` |
+
+Two reads from that:
+
+- these rules are individually expensive enough to matter
+- but the mixed gap is not only inside rule logic
+
+So the next likely wins are:
+
+- cheaper `load_review_project`, especially package summary decode / setup
+- tighter measurement of outer wall-clock overhead outside traced inner stages
+- then, if needed, targeted work on the type-annotation module rules
