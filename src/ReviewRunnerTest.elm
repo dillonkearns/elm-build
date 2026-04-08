@@ -270,6 +270,37 @@ value choice =
                         |> Expect.equal
                             [ ( "src/A.elm", "Argument is never extracted and therefore never used." ) ]
             ]
+        , describe "hostNoUnusedParametersErrorsForSources"
+            [ test "reports unused top-level parameter" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedParametersErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (foo)
+
+foo used unused =
+    used
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.filePath, error.message ))
+                        |> Expect.equal
+                            [ ( "src/A.elm", "Parameter `unused` is not used" ) ]
+            , test "reports unused lambda parameter" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedParametersErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (foo)
+
+foo values =
+    values
+        |> List.indexedMap (\\index value -> value)
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.filePath, error.message ))
+                        |> Expect.equal
+                            [ ( "src/A.elm", "Parameter `index` is not used" ) ]
+            ]
         , describe "crossModuleSummaryFromSource"
             [ test "captures constructor facts generically" <|
                 \_ ->
@@ -398,6 +429,62 @@ use choice =
                                     , constructorPatternUsagePositions = [ ( "Left", [ 0 ] ), ( "Right", [] ) ]
                                     , comparisonConstructorRefs = [ "Left", "Left" ]
                                     }
+
+                        Nothing ->
+                            Expect.fail "Expected crossModuleSummaryFromSource to parse test module"
+            , test "captures top-level function parameter facts" <|
+                \_ ->
+                    case
+                        ReviewRunner.crossModuleSummaryFromSource
+                            "src/A.elm"
+                            """module A exposing (foo)
+
+foo used unused =
+    let
+        helper local =
+            local + used
+    in
+    helper 1
+"""
+                    of
+                        Just summary ->
+                            summary.topLevelFunctionSummaries
+                                |> List.map
+                                    (\functionSummary ->
+                                        { name = functionSummary.name
+                                        , parameters = List.map .name functionSummary.parameters
+                                        , usedNames = functionSummary.usedNames |> Set.toList |> List.sort
+                                        , recursiveOnlyNames = functionSummary.recursiveOnlyNames |> Set.toList |> List.sort
+                                        }
+                                    )
+                                |> Expect.equal
+                                    [ { name = "foo", parameters = [ "used", "unused" ], usedNames = [ "used" ], recursiveOnlyNames = [] } ]
+
+                        Nothing ->
+                            Expect.fail "Expected crossModuleSummaryFromSource to parse test module"
+            , test "captures nested function parameter facts" <|
+                \_ ->
+                    case
+                        ReviewRunner.crossModuleSummaryFromSource
+                            "src/A.elm"
+                            """module A exposing (foo)
+
+foo values =
+    values
+        |> List.indexedMap (\\index value -> value)
+"""
+                    of
+                        Just summary ->
+                            summary.nestedFunctionSummaries
+                                |> List.map
+                                    (\functionSummary ->
+                                        { parameters = List.map .name functionSummary.parameters
+                                        , usedNames = functionSummary.usedNames |> Set.toList |> List.sort
+                                        , recursiveOnlyNames = functionSummary.recursiveOnlyNames |> Set.toList |> List.sort
+                                        }
+                                    )
+                                |> Expect.equal
+                                    [ { parameters = [ "index", "value" ], usedNames = [ "value" ], recursiveOnlyNames = [] } ]
 
                         Nothing ->
                             Expect.fail "Expected crossModuleSummaryFromSource to parse test module"

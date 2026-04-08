@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -104,6 +104,7 @@ type alias Config =
     , hostNoUnusedExportsExperiment : Bool
     , hostNoUnusedCustomTypeConstructorsExperiment : Bool
     , hostNoUnusedCustomTypeConstructorArgsExperiment : Bool
+    , hostNoUnusedParametersExperiment : Bool
     }
 
 
@@ -200,6 +201,8 @@ type alias CrossModuleSummary =
     , patternConstructorRefs : List QualifiedRef
     , constructorPatternUsages : List ConstructorPatternUsage
     , comparisonConstructorRefs : List QualifiedRef
+    , topLevelFunctionSummaries : List TopLevelFunctionSummary
+    , nestedFunctionSummaries : List TopLevelFunctionSummary
     , containsMainLike : Bool
     }
 
@@ -222,6 +225,54 @@ type alias ConstructorPatternUsage =
     , name : String
     , usedPositions : List Int
     }
+
+
+type alias TopLevelFunctionSummary =
+    { name : String
+    , nameRange : Range
+    , parameters : List ParameterBindingSummary
+    , usedNames : Set.Set String
+    , recursiveOnlyNames : Set.Set String
+    }
+
+
+type alias ParameterBindingSummary =
+    { name : String
+    , range : Range
+    , kind : ParameterBindingKind
+    }
+
+
+type ParameterBindingKind
+    = ParameterBinding
+    | PatternAliasBinding
+
+
+parameterBindingKindToString : ParameterBindingKind -> String
+parameterBindingKindToString kind =
+    case kind of
+        ParameterBinding ->
+            "parameter"
+
+        PatternAliasBinding ->
+            "pattern-alias"
+
+
+parameterBindingKindDecoder : Json.Decode.Decoder ParameterBindingKind
+parameterBindingKindDecoder =
+    Json.Decode.string
+        |> Json.Decode.andThen
+            (\kind ->
+                case kind of
+                    "parameter" ->
+                        Json.Decode.succeed ParameterBinding
+
+                    "pattern-alias" ->
+                        Json.Decode.succeed PatternAliasBinding
+
+                    _ ->
+                        Json.Decode.fail ("Unknown parameter binding kind: " ++ kind)
+            )
 
 
 type alias HostNoUnusedExportsModule =
@@ -251,6 +302,13 @@ type alias HostNoUnusedConstructorArgsModule =
     , constructorArgumentRanges : Dict String (List Range)
     , usedArguments : Dict ( String, String ) (Set.Set Int)
     , constructorsNotToReport : Set.Set ( String, String )
+    }
+
+
+type alias HostNoUnusedParametersModule =
+    { filePath : String
+    , moduleName : String
+    , topLevelFunctionSummaries : List TopLevelFunctionSummary
     }
 
 
@@ -342,7 +400,7 @@ type alias Timed a =
 
 cacheSchemaVersion : String
 cacheSchemaVersion =
-    "review-runner-v7"
+    "review-runner-v8"
 
 
 programConfig : Program.Config Config
@@ -419,6 +477,10 @@ programConfig =
                     (Option.flag "host-no-unused-custom-type-constructor-args-experiment"
                         |> Option.withDescription "Handle NoUnused.CustomTypeConstructorArgs with a host-native experimental implementation"
                     )
+                |> OptionsParser.with
+                    (Option.flag "host-no-unused-parameters-experiment"
+                        |> Option.withDescription "Handle NoUnused.Parameters with a host-native experimental implementation"
+                    )
             )
 
 
@@ -482,6 +544,11 @@ executionModeHash config =
 
       else
         "host-no-unused-custom-type-constructor-args=0"
+    , if config.hostNoUnusedParametersExperiment then
+        "host-no-unused-parameters=1"
+
+      else
+        "host-no-unused-parameters=0"
     ]
         |> String.join "|"
         |> FNV1a.hash
@@ -813,6 +880,7 @@ benchmarkTargetProjectRuntime options =
             , hostNoUnusedExportsExperiment = False
             , hostNoUnusedCustomTypeConstructorsExperiment = False
             , hostNoUnusedCustomTypeConstructorArgsExperiment = False
+            , hostNoUnusedParametersExperiment = False
             }
     in
     Do.do (withTiming "prepare_config" (prepareConfig config)) <| \preparedConfigTimed ->
@@ -1004,6 +1072,13 @@ hostNoUnusedCustomTypeConstructorArgsErrorsForSources sources =
         |> .errors
 
 
+hostNoUnusedParametersErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoUnusedParametersErrorsForSources sources =
+    sources
+        |> evaluateHostNoUnusedParametersForSources
+        |> .errors
+
+
 evaluateHostNoUnusedExportsForAnalyzedFiles :
     List AnalyzedTargetFile
     ->
@@ -1075,6 +1150,31 @@ evaluateHostNoUnusedCustomTypeConstructorArgsForAnalyzedFiles packageExposedModu
             , Dict.fromList
                 [ ( "project.host_constructor_args.analysis_modules", List.length analyzedFiles )
                 , ( "project.host_constructor_args.analysis_reused", List.length analyzedFiles )
+                ]
+            ]
+    }
+
+
+evaluateHostNoUnusedParametersForAnalyzedFiles :
+    List AnalyzedTargetFile
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+evaluateHostNoUnusedParametersForAnalyzedFiles analyzedFiles =
+    let
+        evaluation =
+            analyzedFiles
+                |> List.map (.analysis >> .crossModuleSummary)
+                |> hostNoUnusedParametersFromSummaries
+    in
+    { errors = evaluation.errors
+    , counters =
+        mergeCounterDicts
+            [ evaluation.counters
+            , Dict.fromList
+                [ ( "project.host_parameters.analysis_modules", List.length analyzedFiles )
+                , ( "project.host_parameters.analysis_reused", List.length analyzedFiles )
                 ]
             ]
     }
@@ -1234,6 +1334,59 @@ evaluateHostNoUnusedCustomTypeConstructorArgsForSources sources =
                 [ ( "project.host_constructor_args.source_files", List.length sources )
                 , ( "project.host_constructor_args.parsed_modules", List.length summaries )
                 , ( "project.host_constructor_args.parse_failures", parseFailures )
+                ]
+            ]
+    }
+
+
+evaluateHostNoUnusedParametersForSources :
+    List { path : String, source : String }
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+evaluateHostNoUnusedParametersForSources sources =
+    let
+        parsedResults =
+            sources
+                |> List.map
+                    (\sourceFile ->
+                        case crossModuleSummaryFromSource sourceFile.path sourceFile.source of
+                            Just summary ->
+                                Ok summary
+
+                            Nothing ->
+                                Err sourceFile.path
+                    )
+
+        summaries =
+            parsedResults
+                |> List.filterMap Result.toMaybe
+
+        parseFailures =
+            parsedResults
+                |> List.filter
+                    (\result ->
+                        case result of
+                            Err _ ->
+                                True
+
+                            Ok _ ->
+                                False
+                    )
+                |> List.length
+
+        evaluation =
+            hostNoUnusedParametersFromSummaries summaries
+    in
+    { errors = evaluation.errors
+    , counters =
+        mergeCounterDicts
+            [ evaluation.counters
+            , Dict.fromList
+                [ ( "project.host_parameters.source_files", List.length sources )
+                , ( "project.host_parameters.parsed_modules", List.length summaries )
+                , ( "project.host_parameters.parse_failures", parseFailures )
                 ]
             ]
     }
@@ -1519,6 +1672,75 @@ hostNoUnusedCustomTypeConstructorArgsFromSummaries packageExposedModules summari
               , Set.size constructorsNotToReport
               )
             , ( "project.host_constructor_args.errors", List.length errors )
+            ]
+    }
+
+
+hostNoUnusedParametersFromSummaries :
+    List CrossModuleSummary
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+hostNoUnusedParametersFromSummaries summaries =
+    let
+        allFunctionSummaries summary =
+            summary.topLevelFunctionSummaries ++ summary.nestedFunctionSummaries
+
+        errors : List ReviewError
+        errors =
+            summaries
+                |> List.concatMap
+                    (\summary ->
+                        allFunctionSummaries summary
+                            |> List.concatMap
+                                (\functionSummary ->
+                                    functionSummary.parameters
+                                        |> List.filterMap
+                                            (\parameter ->
+                                                let
+                                                    unusedMessage =
+                                                        case parameter.kind of
+                                                            ParameterBinding ->
+                                                                "Parameter `" ++ parameter.name ++ "` is not used"
+
+                                                            PatternAliasBinding ->
+                                                                "Pattern alias `" ++ parameter.name ++ "` is not used"
+                                                in
+                                                if Set.member parameter.name functionSummary.recursiveOnlyNames then
+                                                    Just
+                                                        { ruleName = "NoUnused.Parameters"
+                                                        , filePath = summary.filePath
+                                                        , line = parameter.range.start.row
+                                                        , column = parameter.range.start.column
+                                                        , message = "Parameter `" ++ parameter.name ++ "` is only used in recursion"
+                                                        }
+
+                                                else if Set.member parameter.name functionSummary.usedNames then
+                                                    Nothing
+
+                                                else
+                                                    Just
+                                                        { ruleName = "NoUnused.Parameters"
+                                                        , filePath = summary.filePath
+                                                        , line = parameter.range.start.row
+                                                        , column = parameter.range.start.column
+                                                        , message = unusedMessage
+                                                        }
+                                            )
+                                )
+                    )
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "project.host_parameters.modules", List.length summaries )
+            , ( "project.host_parameters.functions"
+              , summaries
+                    |> List.map (\summary -> List.length (allFunctionSummaries summary))
+                    |> List.sum
+              )
+            , ( "project.host_parameters.errors", List.length errors )
             ]
     }
 
@@ -1928,6 +2150,12 @@ buildCrossModuleSummary filePath file =
         constructorArgumentRanges =
             collectCustomTypeConstructorArguments file.declarations
 
+        topLevelFunctionSummaries =
+            collectTopLevelFunctionSummaries file.declarations
+
+        nestedFunctionSummaries =
+            collectNestedFunctionSummariesFromDeclarations file.declarations
+
         exposingList =
             Elm.Syntax.Module.exposingList (Node.value file.moduleDefinition)
 
@@ -1996,6 +2224,8 @@ buildCrossModuleSummary filePath file =
     , comparisonConstructorRefs =
         file.declarations
             |> List.concatMap crossModuleComparisonConstructorRefsFromDeclaration
+    , topLevelFunctionSummaries = topLevelFunctionSummaries
+    , nestedFunctionSummaries = nestedFunctionSummaries
     , containsMainLike = containsMainLike
     }
 
@@ -2184,6 +2414,568 @@ nonNeverConstructorArgumentRange argument =
 
         _ ->
             Just (Node.range argument)
+
+
+collectTopLevelFunctionSummaries : List (Node Declaration) -> List TopLevelFunctionSummary
+collectTopLevelFunctionSummaries declarations =
+    declarations
+        |> List.filterMap
+            (\(Node _ declaration) ->
+                case declaration of
+                    FunctionDeclaration function ->
+                        let
+                            implementation =
+                                Node.value function.declaration
+
+                            parameterBindings =
+                                implementation.arguments
+                                    |> List.concatMap collectParameterBindingsFromPattern
+
+                            analysis =
+                                collectFunctionUsageSummary
+                                    (Node.value implementation.name)
+                                    (parameterBindings |> List.map .name |> Set.fromList)
+                                    implementation.expression
+                        in
+                        Just
+                            { name = Node.value implementation.name
+                            , nameRange = Node.range implementation.name
+                            , parameters = parameterBindings
+                            , usedNames = analysis.usedNames
+                            , recursiveOnlyNames =
+                                Set.diff analysis.recursiveOnlyNames analysis.usedNames
+                            }
+
+                    _ ->
+                        Nothing
+            )
+
+
+collectNestedFunctionSummariesFromDeclarations : List (Node Declaration) -> List TopLevelFunctionSummary
+collectNestedFunctionSummariesFromDeclarations declarations =
+    declarations
+        |> List.concatMap
+            (\(Node _ declaration) ->
+                case declaration of
+                    FunctionDeclaration function ->
+                        collectNestedFunctionSummariesFromExpression (Node.value function.declaration).expression
+
+                    _ ->
+                        []
+            )
+
+
+collectNestedFunctionSummariesFromExpression : Node Expression -> List TopLevelFunctionSummary
+collectNestedFunctionSummariesFromExpression ((Node range expr) as expressionNode) =
+    case expr of
+        LambdaExpression lambda ->
+            let
+                parameterBindings =
+                    lambda.args
+                        |> List.concatMap collectParameterBindingsFromPattern
+
+                analysis =
+                    collectFunctionUsageSummary
+                        "<lambda>"
+                        (parameterBindings |> List.map .name |> Set.fromList)
+                        lambda.expression
+            in
+            (if List.isEmpty parameterBindings then
+                []
+
+             else
+                [ { name = "<lambda>"
+                  , nameRange = range
+                  , parameters = parameterBindings
+                  , usedNames = analysis.usedNames
+                  , recursiveOnlyNames =
+                        Set.diff analysis.recursiveOnlyNames analysis.usedNames
+                  }
+                ]
+            )
+                ++ collectNestedFunctionSummariesFromExpression lambda.expression
+
+        LetExpression letBlock ->
+            let
+                declarationSummaries =
+                    letBlock.declarations
+                        |> List.concatMap collectNestedFunctionSummariesFromLetDeclaration
+            in
+            declarationSummaries ++ collectNestedFunctionSummariesFromExpression letBlock.expression
+
+        Application expressions ->
+            expressions
+                |> List.concatMap collectNestedFunctionSummariesFromExpression
+
+        OperatorApplication _ _ left right ->
+            collectNestedFunctionSummariesFromExpression left
+                ++ collectNestedFunctionSummariesFromExpression right
+
+        IfBlock cond thenExpr elseExpr ->
+            [ cond, thenExpr, elseExpr ]
+                |> List.concatMap collectNestedFunctionSummariesFromExpression
+
+        Negation inner ->
+            collectNestedFunctionSummariesFromExpression inner
+
+        TupledExpression expressions ->
+            expressions
+                |> List.concatMap collectNestedFunctionSummariesFromExpression
+
+        ParenthesizedExpression inner ->
+            collectNestedFunctionSummariesFromExpression inner
+
+        CaseExpression caseBlock ->
+            collectNestedFunctionSummariesFromExpression caseBlock.expression
+                ++ (caseBlock.cases
+                        |> List.concatMap (\( _, caseExpression ) -> collectNestedFunctionSummariesFromExpression caseExpression)
+                   )
+
+        RecordExpr setters ->
+            setters
+                |> List.concatMap
+                    (\(Node _ ( _, valueExpression )) ->
+                        collectNestedFunctionSummariesFromExpression valueExpression
+                    )
+
+        ListExpr expressions ->
+            expressions
+                |> List.concatMap collectNestedFunctionSummariesFromExpression
+
+        RecordAccess inner _ ->
+            collectNestedFunctionSummariesFromExpression inner
+
+        RecordUpdateExpression _ setters ->
+            setters
+                |> List.concatMap
+                    (\(Node _ ( _, valueExpression )) ->
+                        collectNestedFunctionSummariesFromExpression valueExpression
+                    )
+
+        _ ->
+            []
+
+
+collectNestedFunctionSummariesFromLetDeclaration : Node LetDeclaration -> List TopLevelFunctionSummary
+collectNestedFunctionSummariesFromLetDeclaration (Node _ declaration) =
+    case declaration of
+        LetFunction function ->
+            let
+                implementation =
+                    Node.value function.declaration
+
+                parameterBindings =
+                    implementation.arguments
+                        |> List.concatMap collectParameterBindingsFromPattern
+
+                analysis =
+                    collectFunctionUsageSummary
+                        (Node.value implementation.name)
+                        (parameterBindings |> List.map .name |> Set.fromList)
+                        implementation.expression
+            in
+            (if List.isEmpty parameterBindings then
+                []
+
+             else
+                [ { name = Node.value implementation.name
+                  , nameRange = Node.range implementation.name
+                  , parameters = parameterBindings
+                  , usedNames = analysis.usedNames
+                  , recursiveOnlyNames =
+                        Set.diff analysis.recursiveOnlyNames analysis.usedNames
+                  }
+                ]
+            )
+                ++ collectNestedFunctionSummariesFromExpression implementation.expression
+
+        LetDestructuring _ expression ->
+            collectNestedFunctionSummariesFromExpression expression
+
+
+collectParameterBindingsFromPattern : Node Pattern -> List ParameterBindingSummary
+collectParameterBindingsFromPattern (Node range pattern) =
+    case pattern of
+        ParenthesizedPattern inner ->
+            collectParameterBindingsFromPattern inner
+
+        VarPattern name ->
+            if name == "_" then
+                []
+
+            else
+                [ { name = name, range = range, kind = ParameterBinding } ]
+
+        AsPattern inner asName ->
+            { name = Node.value asName, range = Node.range asName, kind = PatternAliasBinding }
+                :: collectParameterBindingsFromPattern inner
+
+        RecordPattern fields ->
+            fields
+                |> List.filterMap
+                    (\field ->
+                        let
+                            fieldName =
+                                Node.value field
+                        in
+                        if fieldName == "_" then
+                            Nothing
+
+                        else
+                            Just { name = fieldName, range = Node.range field, kind = ParameterBinding }
+                    )
+
+        TuplePattern patterns ->
+            List.concatMap collectParameterBindingsFromPattern patterns
+
+        ListPattern patterns ->
+            List.concatMap collectParameterBindingsFromPattern patterns
+
+        UnConsPattern left right ->
+            collectParameterBindingsFromPattern left ++ collectParameterBindingsFromPattern right
+
+        NamedPattern _ patterns ->
+            List.concatMap collectParameterBindingsFromPattern patterns
+
+        AllPattern ->
+            []
+
+        UnitPattern ->
+            []
+
+        CharPattern _ ->
+            []
+
+        StringPattern _ ->
+            []
+
+        IntPattern _ ->
+            []
+
+        HexPattern _ ->
+            []
+
+        FloatPattern _ ->
+            []
+
+
+type alias FunctionUsageSummary =
+    { usedNames : Set.Set String
+    , recursiveOnlyNames : Set.Set String
+    }
+
+
+collectFunctionUsageSummary : String -> Set.Set String -> Node Expression -> FunctionUsageSummary
+collectFunctionUsageSummary functionName parameterNames expression =
+    collectUsedNamesInExpression functionName parameterNames Set.empty expression
+
+
+collectUsedNamesInExpression :
+    String
+    -> Set.Set String
+    -> Set.Set String
+    -> Node Expression
+    -> FunctionUsageSummary
+collectUsedNamesInExpression functionName parameterNames shadowedNames (Node _ expr) =
+    case expr of
+        FunctionOrValue [] name ->
+            if Set.member name shadowedNames then
+                { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+            else if Set.member name parameterNames then
+                { usedNames = Set.singleton name, recursiveOnlyNames = Set.empty }
+
+            else
+                { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        FunctionOrValue _ _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        Application ((Node _ (FunctionOrValue [] calledName)) :: arguments) ->
+            if calledName == functionName then
+                arguments
+                    |> List.indexedMap Tuple.pair
+                    |> List.foldl
+                        (\( index, argument ) acc ->
+                            case exactUnshadowedParameterName parameterNames shadowedNames argument of
+                                Just parameterName ->
+                                    { usedNames = acc.usedNames
+                                    , recursiveOnlyNames = Set.insert parameterName acc.recursiveOnlyNames
+                                    }
+
+                                Nothing ->
+                                    mergeFunctionUsageSummary acc (collectUsedNamesInExpression functionName parameterNames shadowedNames argument)
+                        )
+                        { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+            else
+                let
+                    calleeSummary =
+                        if Set.member calledName parameterNames && not (Set.member calledName shadowedNames) then
+                            { usedNames = Set.singleton calledName, recursiveOnlyNames = Set.empty }
+
+                        else
+                            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+                in
+                arguments
+                    |> List.map (collectUsedNamesInExpression functionName parameterNames shadowedNames)
+                    |> List.foldl mergeFunctionUsageSummary calleeSummary
+
+        Application expressions ->
+            expressions
+                |> List.map (collectUsedNamesInExpression functionName parameterNames shadowedNames)
+                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        OperatorApplication _ _ left right ->
+            mergeFunctionUsageSummary
+                (collectUsedNamesInExpression functionName parameterNames shadowedNames left)
+                (collectUsedNamesInExpression functionName parameterNames shadowedNames right)
+
+        IfBlock cond thenExpr elseExpr ->
+            [ cond, thenExpr, elseExpr ]
+                |> List.map (collectUsedNamesInExpression functionName parameterNames shadowedNames)
+                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        Negation inner ->
+            collectUsedNamesInExpression functionName parameterNames shadowedNames inner
+
+        TupledExpression expressions ->
+            expressions
+                |> List.map (collectUsedNamesInExpression functionName parameterNames shadowedNames)
+                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        ParenthesizedExpression inner ->
+            collectUsedNamesInExpression functionName parameterNames shadowedNames inner
+
+        LetExpression letBlock ->
+            let
+                letBoundNames =
+                    letBlock.declarations
+                        |> List.concatMap letDeclarationBoundNames
+                        |> Set.fromList
+
+                shadowedWithLets =
+                    Set.union shadowedNames letBoundNames
+
+                declarationSummaries =
+                    letBlock.declarations
+                        |> List.map
+                            (collectUsedNamesInLetDeclaration functionName parameterNames shadowedWithLets)
+            in
+            declarationSummaries
+                ++ [ collectUsedNamesInExpression functionName parameterNames shadowedWithLets letBlock.expression ]
+                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        CaseExpression caseBlock ->
+            let
+                expressionSummary =
+                    collectUsedNamesInExpression functionName parameterNames shadowedNames caseBlock.expression
+
+                caseSummaries =
+                    caseBlock.cases
+                        |> List.map
+                            (\( pattern, caseExpression ) ->
+                                let
+                                    caseShadowed =
+                                        Set.union shadowedNames (collectPatternBindingNames pattern |> Set.fromList)
+                                in
+                                collectUsedNamesInExpression functionName parameterNames caseShadowed caseExpression
+                            )
+            in
+            expressionSummary
+                :: caseSummaries
+                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        LambdaExpression lambda ->
+            let
+                lambdaShadowed =
+                    Set.union shadowedNames
+                        (lambda.args
+                            |> List.concatMap collectPatternBindingNames
+                            |> Set.fromList
+                        )
+            in
+            collectUsedNamesInExpression functionName parameterNames lambdaShadowed lambda.expression
+
+        RecordExpr setters ->
+            setters
+                |> List.map
+                    (\(Node _ ( _, valueExpression )) ->
+                        collectUsedNamesInExpression functionName parameterNames shadowedNames valueExpression
+                    )
+                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        ListExpr expressions ->
+            expressions
+                |> List.map (collectUsedNamesInExpression functionName parameterNames shadowedNames)
+                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        RecordAccess inner _ ->
+            collectUsedNamesInExpression functionName parameterNames shadowedNames inner
+
+        RecordUpdateExpression _ setters ->
+            setters
+                |> List.map
+                    (\(Node _ ( _, valueExpression )) ->
+                        collectUsedNamesInExpression functionName parameterNames shadowedNames valueExpression
+                    )
+                |> List.foldl mergeFunctionUsageSummary { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        UnitExpr ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        PrefixOperator _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        Operator _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        Integer _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        Hex _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        Floatable _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        Literal _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        CharLiteral _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        RecordAccessFunction _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+        GLSLExpression _ ->
+            { usedNames = Set.empty, recursiveOnlyNames = Set.empty }
+
+
+mergeFunctionUsageSummary : FunctionUsageSummary -> FunctionUsageSummary -> FunctionUsageSummary
+mergeFunctionUsageSummary left right =
+    { usedNames = Set.union left.usedNames right.usedNames
+    , recursiveOnlyNames = Set.union left.recursiveOnlyNames right.recursiveOnlyNames
+    }
+
+
+exactUnshadowedParameterName :
+    Set.Set String
+    -> Set.Set String
+    -> Node Expression
+    -> Maybe String
+exactUnshadowedParameterName parameterNames shadowedNames (Node _ expression) =
+    case expression of
+        FunctionOrValue [] name ->
+            if Set.member name parameterNames && not (Set.member name shadowedNames) then
+                Just name
+
+            else
+                Nothing
+
+        ParenthesizedExpression inner ->
+            exactUnshadowedParameterName parameterNames shadowedNames inner
+
+        _ ->
+            Nothing
+
+
+collectUsedNamesInLetDeclaration :
+    String
+    -> Set.Set String
+    -> Set.Set String
+    -> Node LetDeclaration
+    -> FunctionUsageSummary
+collectUsedNamesInLetDeclaration functionName parameterNames shadowedNames (Node _ declaration) =
+    case declaration of
+        LetFunction function ->
+            let
+                implementation =
+                    Node.value function.declaration
+
+                functionShadowed =
+                    Set.union shadowedNames
+                        (Set.fromList
+                            (Node.value implementation.name
+                                :: (implementation.arguments
+                                        |> List.concatMap collectPatternBindingNames
+                                   )
+                            )
+                        )
+            in
+            collectUsedNamesInExpression functionName parameterNames functionShadowed implementation.expression
+
+        LetDestructuring pattern expression ->
+            let
+                localShadowed =
+                    Set.union shadowedNames (collectPatternBindingNames pattern |> Set.fromList)
+            in
+            collectUsedNamesInExpression functionName parameterNames localShadowed expression
+
+
+letDeclarationBoundNames : Node LetDeclaration -> List String
+letDeclarationBoundNames (Node _ declaration) =
+    case declaration of
+        LetFunction function ->
+            [ Node.value (Node.value function.declaration).name ]
+
+        LetDestructuring pattern _ ->
+            collectPatternBindingNames pattern
+
+
+collectPatternBindingNames : Node Pattern -> List String
+collectPatternBindingNames (Node _ pattern) =
+    case pattern of
+        ParenthesizedPattern inner ->
+            collectPatternBindingNames inner
+
+        VarPattern name ->
+            if name == "_" then
+                []
+
+            else
+                [ name ]
+
+        AsPattern inner asName ->
+            Node.value asName :: collectPatternBindingNames inner
+
+        RecordPattern fields ->
+            fields
+                |> List.map Node.value
+                |> List.filter (\name -> name /= "_")
+
+        TuplePattern patterns ->
+            List.concatMap collectPatternBindingNames patterns
+
+        ListPattern patterns ->
+            List.concatMap collectPatternBindingNames patterns
+
+        UnConsPattern left right ->
+            collectPatternBindingNames left ++ collectPatternBindingNames right
+
+        NamedPattern _ patterns ->
+            List.concatMap collectPatternBindingNames patterns
+
+        AllPattern ->
+            []
+
+        UnitPattern ->
+            []
+
+        CharPattern _ ->
+            []
+
+        StringPattern _ ->
+            []
+
+        IntPattern _ ->
+            []
+
+        HexPattern _ ->
+            []
+
+        FloatPattern _ ->
+            []
 
 
 collectExplicitExposedValueRanges :
@@ -4134,6 +4926,58 @@ qualifiedRefDecoder =
         (Json.Decode.field "name" Json.Decode.string)
 
 
+encodeParameterBindingSummaryJson : ParameterBindingSummary -> Json.Encode.Value
+encodeParameterBindingSummaryJson binding =
+    Json.Encode.object
+        [ ( "name", Json.Encode.string binding.name )
+        , ( "range", encodeRangeJson binding.range )
+        , ( "kind", Json.Encode.string (parameterBindingKindToString binding.kind) )
+        ]
+
+
+parameterBindingSummaryDecoder : Json.Decode.Decoder ParameterBindingSummary
+parameterBindingSummaryDecoder =
+    Json.Decode.map3
+        (\name range kind ->
+            { name = name
+            , range = range
+            , kind = kind
+            }
+        )
+        (Json.Decode.field "name" Json.Decode.string)
+        (Json.Decode.field "range" rangeDecoder)
+        (Json.Decode.field "kind" parameterBindingKindDecoder)
+
+
+encodeTopLevelFunctionSummaryJson : TopLevelFunctionSummary -> Json.Encode.Value
+encodeTopLevelFunctionSummaryJson summary =
+    Json.Encode.object
+        [ ( "name", Json.Encode.string summary.name )
+        , ( "nameRange", encodeRangeJson summary.nameRange )
+        , ( "parameters", Json.Encode.list encodeParameterBindingSummaryJson summary.parameters )
+        , ( "usedNames", encodeStringSetJson summary.usedNames )
+        , ( "recursiveOnlyNames", encodeStringSetJson summary.recursiveOnlyNames )
+        ]
+
+
+topLevelFunctionSummaryDecoder : Json.Decode.Decoder TopLevelFunctionSummary
+topLevelFunctionSummaryDecoder =
+    Json.Decode.map5
+        (\name nameRange parameters usedNames recursiveOnlyNames ->
+            { name = name
+            , nameRange = nameRange
+            , parameters = parameters
+            , usedNames = usedNames
+            , recursiveOnlyNames = recursiveOnlyNames
+            }
+        )
+        (Json.Decode.field "name" Json.Decode.string)
+        (Json.Decode.field "nameRange" rangeDecoder)
+        (Json.Decode.field "parameters" (Json.Decode.list parameterBindingSummaryDecoder))
+        (Json.Decode.field "usedNames" stringSetDecoder)
+        (Json.Decode.field "recursiveOnlyNames" stringSetDecoder)
+
+
 encodeConstructorPatternUsageJson : ConstructorPatternUsage -> Json.Encode.Value
 encodeConstructorPatternUsageJson usage =
     Json.Encode.object
@@ -4217,6 +5061,8 @@ encodeFileAnalysisCache cache =
                             , ( "patternConstructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.patternConstructorRefs )
                             , ( "constructorPatternUsages", Json.Encode.list encodeConstructorPatternUsageJson analysis.crossModuleSummary.constructorPatternUsages )
                             , ( "comparisonConstructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.comparisonConstructorRefs )
+                            , ( "topLevelFunctionSummaries", Json.Encode.list encodeTopLevelFunctionSummaryJson analysis.crossModuleSummary.topLevelFunctionSummaries )
+                            , ( "nestedFunctionSummaries", Json.Encode.list encodeTopLevelFunctionSummaryJson analysis.crossModuleSummary.nestedFunctionSummaries )
                             , ( "containsMainLike", Json.Encode.bool analysis.crossModuleSummary.containsMainLike )
                             ]
                       )
@@ -4316,6 +5162,8 @@ decodeFileAnalysisCache json =
                             , patternConstructorRefs = tailFields.patternConstructorRefs
                             , constructorPatternUsages = tailFields.constructorPatternUsages
                             , comparisonConstructorRefs = tailFields.comparisonConstructorRefs
+                            , topLevelFunctionSummaries = tailFields.topLevelFunctionSummaries
+                            , nestedFunctionSummaries = tailFields.nestedFunctionSummaries
                             , containsMainLike = tailFields.containsMainLike
                             }
                         )
@@ -4371,25 +5219,60 @@ decodeFileAnalysisCache json =
                                 (Json.Decode.field "importAllModules" (Json.Decode.list Json.Decode.string))
                             )
                         )
-                        (Json.Decode.map8
-                            (\moduleAliases localDeclarations dependencyRefs expressionConstructorRefs patternConstructorRefs constructorPatternUsages comparisonConstructorRefs containsMainLike ->
-                                { moduleAliases = moduleAliases
-                                , localDeclarations = localDeclarations
-                                , dependencyRefs = dependencyRefs
-                                , expressionConstructorRefs = expressionConstructorRefs
-                                , patternConstructorRefs = patternConstructorRefs
-                                , constructorPatternUsages = constructorPatternUsages
-                                , comparisonConstructorRefs = comparisonConstructorRefs
+                        (Json.Decode.map2
+                            (\coreFields containsMainLike ->
+                                { moduleAliases = coreFields.moduleAliases
+                                , localDeclarations = coreFields.localDeclarations
+                                , dependencyRefs = coreFields.dependencyRefs
+                                , expressionConstructorRefs = coreFields.expressionConstructorRefs
+                                , patternConstructorRefs = coreFields.patternConstructorRefs
+                                , constructorPatternUsages = coreFields.constructorPatternUsages
+                                , comparisonConstructorRefs = coreFields.comparisonConstructorRefs
+                                , topLevelFunctionSummaries = coreFields.topLevelFunctionSummaries
+                                , nestedFunctionSummaries = coreFields.nestedFunctionSummaries
                                 , containsMainLike = containsMainLike
                                 }
                             )
-                            (Json.Decode.field "moduleAliases" stringDictDecoder)
-                            (Json.Decode.field "localDeclarations" stringSetDecoder)
-                            (Json.Decode.field "dependencyRefs" (Json.Decode.list dependencyRefDecoder))
-                            (Json.Decode.field "expressionConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
-                            (Json.Decode.field "patternConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
-                            (Json.Decode.field "constructorPatternUsages" (Json.Decode.list constructorPatternUsageDecoder))
-                            (Json.Decode.field "comparisonConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                            (Json.Decode.map2
+                                (\coreFields nestedFunctionSummaries ->
+                                    { moduleAliases = coreFields.moduleAliases
+                                    , localDeclarations = coreFields.localDeclarations
+                                    , dependencyRefs = coreFields.dependencyRefs
+                                    , expressionConstructorRefs = coreFields.expressionConstructorRefs
+                                    , patternConstructorRefs = coreFields.patternConstructorRefs
+                                    , constructorPatternUsages = coreFields.constructorPatternUsages
+                                    , comparisonConstructorRefs = coreFields.comparisonConstructorRefs
+                                    , topLevelFunctionSummaries = coreFields.topLevelFunctionSummaries
+                                    , nestedFunctionSummaries = nestedFunctionSummaries
+                                    }
+                                )
+                                (Json.Decode.map8
+                                    (\moduleAliases localDeclarations dependencyRefs expressionConstructorRefs patternConstructorRefs constructorPatternUsages comparisonConstructorRefs topLevelFunctionSummaries ->
+                                        { moduleAliases = moduleAliases
+                                        , localDeclarations = localDeclarations
+                                        , dependencyRefs = dependencyRefs
+                                        , expressionConstructorRefs = expressionConstructorRefs
+                                        , patternConstructorRefs = patternConstructorRefs
+                                        , constructorPatternUsages = constructorPatternUsages
+                                        , comparisonConstructorRefs = comparisonConstructorRefs
+                                        , topLevelFunctionSummaries = topLevelFunctionSummaries
+                                        }
+                                    )
+                                    (Json.Decode.field "moduleAliases" stringDictDecoder)
+                                    (Json.Decode.field "localDeclarations" stringSetDecoder)
+                                    (Json.Decode.field "dependencyRefs" (Json.Decode.list dependencyRefDecoder))
+                                    (Json.Decode.field "expressionConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                                    (Json.Decode.field "patternConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                                    (Json.Decode.field "constructorPatternUsages" (Json.Decode.list constructorPatternUsageDecoder))
+                                    (Json.Decode.field "comparisonConstructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                                    (Json.Decode.field "topLevelFunctionSummaries" (Json.Decode.list topLevelFunctionSummaryDecoder))
+                                )
+                                (Json.Decode.oneOf
+                                    [ Json.Decode.field "nestedFunctionSummaries" (Json.Decode.list topLevelFunctionSummaryDecoder)
+                                    , Json.Decode.succeed []
+                                    ]
+                                )
+                            )
                             (Json.Decode.field "containsMainLike" Json.Decode.bool)
                         )
                     )
@@ -5434,6 +6317,7 @@ task config =
                 , ( "experiment.host_no_unused_exports", boolToInt preparedConfig.hostNoUnusedExportsExperiment )
                 , ( "experiment.host_no_unused_custom_type_constructors", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorsExperiment )
                 , ( "experiment.host_no_unused_custom_type_constructor_args", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorArgsExperiment )
+                , ( "experiment.host_no_unused_parameters", boolToInt preparedConfig.hostNoUnusedParametersExperiment )
                 , ( "analysis_cache.entries", analyzedTargetFiles.cacheEntries )
                 , ( "analysis_cache.loaded_bytes", analyzedTargetFiles.cacheLoadBytes )
                 , ( "analysis_cache.stored_bytes", analyzedTargetFiles.cacheStoreBytes )
@@ -5935,6 +6819,10 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             config.hostNoUnusedCustomTypeConstructorArgsExperiment
                 && List.any (\rule -> rule.name == "NoUnused.CustomTypeConstructorArgs") ruleInfo
 
+        hostNoUnusedParametersEnabled =
+            config.hostNoUnusedParametersExperiment
+                && List.any (\rule -> rule.name == "NoUnused.Parameters") ruleInfo
+
         projectRules =
             ruleInfo
                 |> List.filter (\r -> r.ruleType == ProjectRule)
@@ -5943,6 +6831,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         (not hostNoUnusedExportsEnabled || r.name /= "NoUnused.Exports")
                             && (not hostNoUnusedCustomTypeConstructorsEnabled || r.name /= "NoUnused.CustomTypeConstructors")
                             && (not hostNoUnusedCustomTypeConstructorArgsEnabled || r.name /= "NoUnused.CustomTypeConstructorArgs")
+                            && (not hostNoUnusedParametersEnabled || r.name /= "NoUnused.Parameters")
                     )
 
         stalePaths =
@@ -6027,6 +6916,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 , ( "project.host_exports.enabled", boolToInt hostNoUnusedExportsEnabled )
                 , ( "project.host_constructors.enabled", boolToInt hostNoUnusedCustomTypeConstructorsEnabled )
                 , ( "project.host_constructor_args.enabled", boolToInt hostNoUnusedCustomTypeConstructorArgsEnabled )
+                , ( "project.host_parameters.enabled", boolToInt hostNoUnusedParametersEnabled )
                 ]
     in
     Do.do
@@ -6129,6 +7019,23 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     )
                 )
             <| \hostNoUnusedConstructorArgsTimed ->
+            Do.do
+                (withTiming "project.host_parameters_eval"
+                    (if hostNoUnusedParametersEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoUnusedParametersForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "project.host_parameters.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoUnusedParametersTimed ->
             let
                 hostNoUnusedExportsOutput =
                     hostNoUnusedExportsTimed.value.errors
@@ -6165,11 +7072,23 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         , Dict.fromList
                             [ ( "project.host_constructor_args.ms", hostNoUnusedConstructorArgsTimed.stage.ms ) ]
                         ]
+
+                hostNoUnusedParametersOutput =
+                    hostNoUnusedParametersTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoUnusedParametersCounters =
+                    mergeCounterDicts
+                        [ hostNoUnusedParametersTimed.value.counters
+                        , Dict.fromList
+                            [ ( "project.host_parameters.ms", hostNoUnusedParametersTimed.stage.ms ) ]
+                        ]
             in
             if List.isEmpty projectRules then
                 BackendTask.succeed
                     { output =
-                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, hostNoUnusedConstructorArgsOutput ]
+                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, hostNoUnusedConstructorArgsOutput, hostNoUnusedParametersOutput ]
                             |> List.filter (not << String.isEmpty)
                             |> String.join "\n"
                     , counters =
@@ -6177,6 +7096,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             [ hostNoUnusedExportsCounters
                             , hostNoUnusedConstructorsCounters
                             , hostNoUnusedConstructorArgsCounters
+                            , hostNoUnusedParametersCounters
                             , Dict.fromList
                                 [ ( "project_rules.skipped", 1 )
                                 , ( "load_target_project_seed_ms", targetProjectSeedTimed.stage.ms )
@@ -6976,7 +7896,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
 
                     combinedProjectOutputs =
-                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, hostNoUnusedConstructorArgsOutput, importersResult, depsOfResult ]
+                        [ moduleRuleOutput, hostNoUnusedExportsOutput, hostNoUnusedConstructorsOutput, hostNoUnusedConstructorArgsOutput, hostNoUnusedParametersOutput, importersResult, depsOfResult ]
                             |> List.filter (not << String.isEmpty)
                             |> String.join "\n"
                 in
@@ -6991,6 +7911,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , hostNoUnusedExportsCounters
                                 , hostNoUnusedConstructorsCounters
                                 , hostNoUnusedConstructorArgsCounters
+                                , hostNoUnusedParametersCounters
                                 , Dict.fromList
                                     [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
                                     , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
@@ -7032,6 +7953,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 , hostNoUnusedExportsCounters
                                 , hostNoUnusedConstructorsCounters
                                 , hostNoUnusedConstructorArgsCounters
+                                , hostNoUnusedParametersCounters
                                 , Dict.fromList
                                     [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
                                     , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )

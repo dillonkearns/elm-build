@@ -1450,3 +1450,64 @@ That is useful, because it narrows the next target cleanly:
 - the generic cached fact layer is broad enough to support three rules already
 - the next high-value rule in this family is `NoUnused.Parameters`
 - after that, the `ImportersOf` family should be much closer to the CLI-relevant warm partial-miss target
+
+### Host-Native `NoUnused.Parameters` Experiment
+
+I extended the same cached fact layer to `NoUnused.Parameters`.
+
+This first version is still an upper-bound experiment, but it now works from
+cached generic per-file parameter facts rather than reparsing source:
+
+- top-level function parameter summaries
+- nested `let` function parameter summaries
+- nested lambda parameter summaries
+- binding-kind metadata so `as`-pattern aliases report the same message shape as the CLI
+
+The important point is that the cached data is still generic fact data. The
+host path uses it directly today, but this is the same fact/policy split we want
+for a longer-term interpreted solution.
+
+#### Isolated `NoUnused.Parameters` A/B
+
+| Scenario | Interpreted runner | Host via cached facts |
+|---|---:|---:|
+| Cold | `143.93s` | `27.50s` |
+| Warm | `0.32s` | `0.34s` |
+| Warm import-graph change | `171.64s` | `1.35s` |
+
+That is the strongest isolated win in this series so far. It confirms that the
+remaining `ImportersOf` wall was not semantic complexity in the rule itself. It
+was the interpreted project-rule machinery and the `Dict`/`Set` churn around it.
+
+#### Combined `ImportersOf` Family A/B
+
+After adding the `NoUnused.Parameters` host experiment, I reran the full
+isolated `ImportersOf` family:
+
+| Scenario | Interpreted family | Four fact-backed host experiments |
+|---|---:|---:|
+| Cold | `260.43s` | `26.14s` |
+| Warm | `0.33s` | `0.33s` |
+| Warm import-graph change | `188.70s` | `1.32s` |
+
+That is the clearest result so far that the high-value optimization seam is:
+
+- host-cached generic facts
+- bypass of the interpreted `ImportersOf` fold
+- no daemon
+- no compiled-JS patching
+
+#### Combined Family Correctness
+
+I then ran a direct JSON diff for the combined host-backed family against the
+real `elm-review` CLI on the same fixture workspace and review config.
+
+Final result:
+
+- host count: `47`
+- CLI count: `47`
+- missing: `[]`
+- extra: `[]`
+
+So the combined host-backed `ImportersOf` family matches the CLI exactly on the
+isolated benchmark fixture.
