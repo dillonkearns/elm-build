@@ -935,3 +935,383 @@ Current read:
 - The persistent `NoUnused.Variables` miss suggests there is still one baseline project-rule correctness gap, independent of warm caching.
 - The extra `NoUnused.Exports` misses on import-graph change strongly suggest our narrowed `ImportersOf` invalidation/reuse is still too aggressive in at least one path.
 - That means the next perf work should stay coupled to this harness; correctness should be treated as a gate, not a secondary check.
+
+### Target Project Runtime Cache
+
+I added a focused benchmark for just the fixed setup path that had become suspicious:
+
+- [src/TargetProjectRuntimeBenchmark.elm](/Users/dillonkearns/src/github.com/dillonkearns/elm-build2/src/TargetProjectRuntimeBenchmark.elm)
+- [src/ReviewRunner.elm](/Users/dillonkearns/src/github.com/dillonkearns/elm-build2/src/ReviewRunner.elm)
+
+The benchmark exercises:
+
+1. `prepareConfig`
+2. `loadReviewProjectDetailed`
+3. `loadTargetProjectSeed`
+4. `buildTargetProjectRuntime`
+
+with repeated iterations on the same build dir.
+
+The important change was caching the fully built target-project `baseProject : Types.Value` with `ValueCodec`, instead of rebuilding it from raw target `elm.json` plus dependency `docs.json` on every partial miss.
+
+Measured on the current repo as target project:
+
+| Step | Cold / first iteration | Warm / repeated iteration |
+|---|---:|---:|
+| `prepare_config` | `136ms` | `14ms` |
+| `load_review_project` | `1846ms` | `384ms` |
+| `load_target_project_seed` | `7ms` | `8ms` |
+| `build_target_project_runtime` | `20235ms` | `89ms` |
+
+Repeated benchmark output:
+
+| Iteration | `build_target_project_runtime` | Cache hit |
+|---|---:|---:|
+| 1 | `20384ms` | `false` |
+| 2 | `78ms` | `true` |
+| 3 | `84ms` | `true` |
+
+Current read:
+
+- This is the clearest isolated perf win in a while.
+- The new cache removes an enormous fixed partial-miss setup tax.
+- The previous hypothesis was correct: rebuilding the full target-project base project was pathological on this branch.
+- Even on repeated iterations, `load_review_project` is still a meaningful fixed cost, but it is no longer the dominant wall inside this setup slice.
+
+### Node CPU Profile: Cold vs Warm Runtime Build
+
+I also profiled the same focused benchmark with Node `--cpu-prof`.
+
+Cold benchmark result:
+
+| Metric | Value |
+|---|---:|
+| `prepare_config` | `136ms` |
+| `load_review_project` | `1846ms` |
+| `build_target_project_runtime` | `20235ms` |
+
+Warm benchmark result:
+
+| Metric | Value |
+|---|---:|
+| `prepare_config` | `14ms` |
+| `load_review_project` | `384ms` |
+| `build_target_project_runtime` | `89ms` |
+
+Profile summary:
+
+- Cold runtime build is dominated by **garbage collection**.
+- Warm runtime build still shows some GC, but at a dramatically lower level.
+- That matches the architectural story: the uncached path was allocating/rebuilding a very large `Types.Value` graph, while the cached path mostly pays for loading and decoding it.
+
+Top sampled cold frames included:
+
+- `(garbage collector)`
+- bundled helper frames in `target-project-runtime-benchmark.mjs`
+- buffer allocation / string / module-loader frames
+
+Top sampled warm frames included:
+
+- much smaller `(garbage collector)` presence
+- bundled helper frames
+- modest buffer/string work
+
+Current read:
+
+- The Node profile reinforces the benchmark result rather than contradicting it.
+- The big cold-path cost here is not “a mysterious CLI wrapper issue”; it is allocation-heavy rebuild work inside the JS/runtime execution of the uncached setup path.
+- Caching the built `baseProject` is therefore the right direction, and the next thing to measure is how much of the end-to-end warm partial-miss regression this isolated win removes.
+
+### Focused Warm Partial-Miss Probes With Explicit `--jobs`
+
+The next debugging issue turned out to be environmental rather than architectural: in this sandbox, `Cache.run { jobs = Nothing }` could not resolve CPU count via `nproc` / `sysctl`. Falling back implicitly to one worker distorted the benchmark signal, so I added an explicit `--jobs` option to the runner and updated benchmark scripts to pass `os.cpus().length`.
+
+That let me run direct warmed probes on preserved `small-12` workspaces.
+
+Body-edit probe, one stale file (`MathLib.elm` body-only change):
+
+| Metric | Value |
+|---|---:|
+| wall time | `2.41s` |
+| `load_review_project` | `332ms` |
+| `module_rule_eval` | `236ms` |
+| `project_rule_eval` | `940ms` |
+| `persist_decl_cache` | `179ms` |
+| stale files | `1` |
+
+Import-graph probe, one stale file (`ProjectSources.elm` import change on warmed workspace):
+
+| Metric | Value |
+|---|---:|
+| wall time | `26.51s` |
+| `load_review_project` | `346ms` |
+| `module_rule_eval` | `2475ms` |
+| `project_rule_eval` | `21164ms` |
+| stale files | `1` |
+
+The key counters on that warm import-change run were:
+
+| Counter | Value |
+|---|---:|
+| `project.importers.affected_modules` | `4` |
+| `project.importers.cache_hits` | `9` |
+| `project.importers.cache_misses` | `3` |
+| `project.importers.eval_total_ms` | `18081ms` |
+| `project.importers_fold.eval_total_ms` | `971ms` |
+| `project.deps.eval_total_ms` | `891ms` |
+
+Current read:
+
+- The common warm body-edit path is now in a much healthier range once the target-project runtime cache is warm and cache workers are not artificially serialized.
+- The dominant remaining bottleneck is now sharply localized: **warm import-graph changes are dominated by the `ImportersOf` project-rule path**, not review-app loading, not file parsing, and not cache file I/O.
+- On the measured warm import-change run, the cache system was mostly hitting already. The expensive part is what happens after those hits, inside `project.importers.eval_total_ms`.
+
+### Node CPU Profile: Warm Import Change
+
+I also profiled the warm import-change partial miss with Node `--cpu-prof`.
+
+Top sampled frames:
+
+| Samples | Frame |
+|---|---:|
+| `605` | `(garbage collector)` |
+| `177`, `165`, `163`, `144`, ... | `gr` in bundled output |
+| `108`, `36` | bundled frame near line `216` |
+| `79`, `72`, `70`, `68`, ... | bundled frame near line `242` |
+
+The useful part here is that `gr` is the bundled Elm generic comparison function, so the hot path is spending a lot of time in:
+
+- generic compare / ordering
+- GC / allocation churn
+- data-structure heavy work in the bundled Elm runtime
+
+Current read:
+
+- This reinforces the import-change thesis: the remaining wall is not shelling out, not JSON formatting, and not review-app setup.
+- The remaining wall looks like **allocation-heavy, comparison-heavy project-rule work**, especially in `ImportersOf`.
+- The next optimization target should therefore be reducing comparison/allocation pressure in the `ImportersOf` path, likely by using a more compact direct contribution representation instead of repeatedly traversing large generic Elm values.
+
+### Split Cache Seeding: Forced Extraction, Then Narrowed
+
+I tested one specific hypothesis after the Node profile: perhaps the split `ImportersOf` cache path was still underperforming because we were not actually forcing `finalCachePartsMarker` / `extractRuleCaches` on the helper paths that are supposed to seed those artifacts.
+
+What I validated:
+
+- Forcing `extractRuleCaches updatedRules` in the helper layer **does** cause split rule-cache files to be written for the current workspace path.
+- After doing that on a warmed body-edit workspace, the active `review-app-*` namespace gained current-path files such as:
+  - `NoUnused.Exports-0.base.json`
+  - `NoUnused.Parameters-0--..._workspace_src_MathLib.elm.module.json`
+  - `NoUnused.CustomTypeConstructors-0--..._workspace_src_ProjectSources.elm.module.json`
+
+That confirmed the mechanism, but the first implementation was too broad:
+
+- forcing extraction directly inside generic helper functions made even ordinary warm runs much more expensive
+- it was therefore not safe to leave enabled on every `runRulesByIndices*` / `runReviewCaching*` path
+
+The code is now narrowed so forced extraction is only used on the explicit project cache-writing paths:
+
+- `runProjectRulesWithCacheWrite`
+- `runProjectRulesWithCacheWriteModules`
+
+and ordinary helper calls have been restored to their cheaper behavior.
+
+What I do **not** have yet from this narrowed version is a clean end-to-end benchmark number. The temp workspace sequencing got confounded by long-running benchmark processes and by cold-vs-warm setup when switching helper hashes. So the current stable conclusion is:
+
+- the helper-level extraction mechanism is real
+- broad helper-level extraction is too expensive
+- targeted extraction on explicit project cache-write paths is the right shape
+- the next measurement should use a clean dedicated per-family harness or a fresh same-path warm sequence
+
+### Isolated `ImportersOf` Harness And Single-Rule Probes
+
+I added a dedicated harness at [bench/importers-family-benchmark.mjs](bench/importers-family-benchmark.mjs) to isolate the `ImportersOf` family with its own temporary `ReviewConfig`.
+
+The first important result is that `ImportersOf` alone reproduces the wall:
+
+- isolated family cold run stayed active for multiple minutes
+- the child runner process reached roughly `1.0GB` RSS while still in the cold run
+
+That means the mixed-config import-change wall is not coming from the rest of the ruleset. The `ImportersOf` family alone is enough to produce the allocation-heavy behavior.
+
+I then narrowed further to single rules inside that family using the same harness:
+
+| Rule | Observation |
+|---|---|
+| `NoUnused.Exports` | child runner reached about `807MB` RSS after `~45s` in isolated cold mode |
+| `NoUnused.Parameters` | child runner reached about `778MB` RSS after `~27s` in isolated cold mode |
+
+These were not full completed timings; they were live-process observations taken with `ps` while the isolated cold run was still executing. That is enough to establish a ranking signal:
+
+- this is not a single outlier hidden in the four-rule bundle
+- at least `NoUnused.Exports` and `NoUnused.Parameters` individually hit the same memory-heavy wall
+
+### Upstream Rule Shape: Why `ImportersOf` Is Expensive
+
+I inspected the upstream `elm-review-unused` sources for the two representative rules:
+
+- `NoUnused.Exports`
+- `NoUnused.Parameters`
+
+The shared pattern matches the Node CPU profile (`gr` + GC):
+
+- both rules build large project contexts out of `Dict` and `Set`
+- both rules merge those contexts through `foldProjectContexts`
+- `NoUnused.Parameters` also accumulates per-function call-site lists across modules
+
+Representative upstream structures:
+
+- `NoUnused.Exports.ProjectContext`
+  - `modules : Dict ModuleNameStr {...}`
+  - `usedModules : Set ModuleNameStr`
+  - `used : Set ElementIdentifier`
+  - `usedInIgnoredModules : Set ElementIdentifier`
+  - `constructors : Dict (ModuleNameStr, String) String`
+  - `typesImportedWithConstructors : Set (ModuleNameStr, String)`
+
+- `NoUnused.Parameters.ProjectContext`
+  - `toReport : Dict ModuleName { key : ModuleKey, args : List ArgumentToReport }`
+  - `functionCallsWithArguments : Dict ( ModuleName, FunctionName ) (List { key : ModuleKey, isFileFixable : Bool, callSites : List CallSite })`
+
+And their folds are straightforward `Dict.union`, `Set.union`, or `Dict.foldl` merges. In the interpreter, that means a lot of:
+
+- generic compare
+- persistent structure allocation
+- GC churn
+
+### Current Read
+
+The next optimization target should not be “more generic cache plumbing” around these rules. The new data points toward a deeper seam:
+
+- either direct contribution artifacts for `ImportersOf`
+- or a host-native implementation for the hottest `ImportersOf` summaries / folds
+
+The important updated thesis is:
+
+- `ImportersOf` itself is the wall
+- the wall is shared `Dict` / `Set` project-context churn
+- the likely winning move is to bypass that interpreted fold entirely, not just cache around it
+
+### Host-Native `NoUnused.Exports` Experiment
+
+I implemented a guarded host-native `NoUnused.Exports` path in [src/ReviewRunner.elm](src/ReviewRunner.elm), enabled with:
+
+```bash
+--host-no-unused-exports-experiment
+```
+
+Scope of the first slice:
+
+- application-style `NoUnused.Exports`
+- unused module detection
+- value/function exports
+- explicit exposing and `exposing (..)` value checks
+- module alias resolution
+- `exposing (..)` imported-value resolution from host summaries
+
+This path intentionally bypasses interpreted `ImportersOf` evaluation for `NoUnused.Exports` entirely when enabled. The current implementation reparses source on the host for this experiment; it does **not** yet reuse a dedicated cached summary artifact.
+
+#### Isolated `NoUnused.Exports` A/B
+
+Using the isolated family harness with a temporary `ReviewConfig` that only includes `NoUnused.Exports`:
+
+| Scenario | Interpreted runner | Host-native experiment |
+|---|---:|---:|
+| Cold | `89.76s` | `26.24s` |
+| Warm | `0.29s` | `0.32s` |
+| Warm import-graph change | `4.31s` | `1.27s` |
+
+Important details from the trace:
+
+- interpreted cold `project_rule_eval`: `63.60s`
+- host-native cold `project_rule_eval`: `2ms`
+- interpreted warm import-change `project_rule_eval`: `3.13s`
+- host-native warm import-change `project_rule_eval`: `2ms`
+
+The host-native run fully bypassed the interpreted `ImportersOf` machinery:
+
+- `project.importers.eval_total_ms = 0`
+- `project.importers.cache_hits = 0`
+- `project.importers.cache_misses = 0`
+
+That is the clearest result so far that bypassing the interpreted project-context folds is the right direction.
+
+#### Correctness Read For The Experiment
+
+I compared three things on the isolated `NoUnused.Exports` fixture:
+
+1. current interpreted runner
+2. host-native experiment
+3. real `elm-review` CLI
+
+The host-native experiment was initially different by one finding:
+
+- current interpreted runner reported `ProjectSources.resolvePackageVersions` as unused
+- host-native experiment did **not**
+
+I then checked the real `elm-review` CLI on the same isolated config. The CLI also **did not** report `ProjectSources.resolvePackageVersions` as unused.
+
+So on this point:
+
+- host-native experiment matches the CLI
+- current interpreted runner appears to have an extra incorrect finding
+
+That means the host-native experiment is not just faster on this isolated rule; it is also at least competitive on correctness for the specific mismatch we found.
+
+#### Current Read
+
+This is the strongest architectural signal so far:
+
+- bypassing interpreted `ImportersOf` folds for one hot rule produced a large win
+- the win showed up on both cold and warm import-change paths
+- the experiment did not depend on daemonization or JS patching
+
+The next obvious expansion paths are:
+
+- reuse host-side cached summaries instead of reparsing source for the experiment
+- extend the same host-native / direct-contribution approach to the other `ImportersOf` rules
+- use the same method on `DependenciesOf` if isolated profiling shows a comparable payoff
+
+### Generic Cross-Module Fact Layer
+
+I moved the `NoUnused.Exports` experiment onto a more general cached fact layer in
+[src/ReviewRunner.elm](src/ReviewRunner.elm) instead of treating it as a one-off source parser.
+
+`FileAnalysis.crossModuleSummary` now stores reusable cross-module facts such as:
+
+- value exposure facts
+- constructor declaration and exposure facts
+- open-type import facts
+- value dependency refs
+- constructor refs collected from expressions and patterns
+
+This keeps the architecture aligned with the intended split:
+
+- host side owns reusable facts and caches
+- rules can stay interpreted, or use the same facts for upper-bound experiments
+
+I added a unit test for the new constructor-level facts in
+[src/ReviewRunnerTest.elm](src/ReviewRunnerTest.elm), and the full test suite passed:
+
+```bash
+npx elm-pages run src/RunTests.elm
+```
+
+Result:
+
+- `213 passed, 0 failed`
+
+#### Re-check: isolated `NoUnused.Exports` after fact-layer reuse
+
+I reran the same isolated benchmark after switching the host path to consume
+`crossModuleSummary` instead of reparsing sources.
+
+| Scenario | Interpreted runner | Host via cached facts |
+|---|---:|---:|
+| Cold | `94.72s` | `26.70s` |
+| Warm | `0.30s` | `0.31s` |
+| Warm import-graph change | `4.27s` | `1.22s` |
+
+So the shared fact layer preserved the earlier win. That is the important signal:
+
+- richer cached facts did not erase the `NoUnused.Exports` speedup
+- the same cached summary shape is now broad enough to support the next `ImportersOf` experiment without adding another ad hoc parsing path

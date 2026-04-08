@@ -765,12 +765,7 @@ jobs_ =
                         Nothing ->
                             tryRunningOrElse "nproc" [ "--all" ] <| \_ ->
                             tryRunningOrElse "sysctl" [ "-n", "hw.logicalcpu" ] <| \_ ->
-                            let
-                                message : String
-                                message =
-                                    "Failed to run either `nproc --all` or `sysctl -n hw.logicalcpu`. You can work around this by specifying an explicit number of jobs to run in parallel"
-                            in
-                            BackendTask.fail (FatalError.fromString message)
+                            BackendTask.succeed 1
             in
             task |> BackendTask.map (\j -> ( j, deps ))
         )

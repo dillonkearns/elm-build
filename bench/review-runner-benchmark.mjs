@@ -22,6 +22,7 @@ const importersCacheMode = process.argv.includes("--importers-cache-mode")
 const depsCacheMode = process.argv.includes("--deps-cache-mode")
   ? process.argv[process.argv.indexOf("--deps-cache-mode") + 1]
   : "auto";
+const jobs = String(os.cpus().length);
 
 const smallFixtureFiles = [
   "Coverage.elm",
@@ -83,6 +84,12 @@ function copyFixture(fileNames, fixtureSrcDir) {
   }
 }
 
+function writeElmJson(workspaceRoot) {
+  const rootElmJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "elm.json"), "utf8"));
+  rootElmJson["source-directories"] = ["src"];
+  fs.writeFileSync(path.join(workspaceRoot, "elm.json"), JSON.stringify(rootElmJson, null, 4));
+}
+
 function mutateBodyEdit(fixtureSrcDir) {
   const filePath = path.join(fixtureSrcDir, "MathLib.elm");
   const source = fs.readFileSync(filePath, "utf8");
@@ -131,6 +138,8 @@ function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersC
       fixtureSrcDir,
       "--build",
       buildDir,
+      "--jobs",
+      jobs,
       "--importers-cache-mode",
       importersCacheMode,
       "--deps-cache-mode",
@@ -199,6 +208,7 @@ function prepareScenarioWorkspace(fixtureName, scenarioName, fileNames) {
   const tracePath = path.join(root, "trace.json");
 
   copyFixture(fileNames, fixtureSrcDir);
+  writeElmJson(root);
   ensureDir(buildDir);
 
   return { root, fixtureSrcDir, buildDir, tracePath };

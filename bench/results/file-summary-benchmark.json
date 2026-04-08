@@ -1,0 +1,48 @@
+{
+  "date": "2026-04-08T01:31:55.704Z",
+  "fixture": "small-12",
+  "iterations": 200,
+  "runner_source": "bench/results/review-runner-scenarios.json",
+  "importers_cache_mode": "auto",
+  "deps_cache_mode": "auto",
+  "scenarios": [
+    {
+      "scenario": "warm_1_file_body_edit",
+      "wall_ms": 1571,
+      "analyze_target_files_ms": 20,
+      "read_target_files_ms": 3,
+      "load_review_project_ms": 325,
+      "module_rule_eval_ms": 240,
+      "project_rule_eval_ms": 402,
+      "analysis_cache_hits": 11,
+      "analysis_cache_misses": 1,
+      "changed_file_count": 1,
+      "lightweight_summary_ms": 0.014,
+      "lightweight_summary_per_file_ms": 0.014,
+      "upper_bound_wall_if_analysis_free_ms": 1551
+    },
+    {
+      "scenario": "warm_import_graph_change",
+      "wall_ms": 4123,
+      "analyze_target_files_ms": 21,
+      "read_target_files_ms": 6,
+      "load_review_project_ms": 332,
+      "module_rule_eval_ms": 225,
+      "project_rule_eval_ms": 2920,
+      "analysis_cache_hits": 11,
+      "analysis_cache_misses": 1,
+      "changed_file_count": 1,
+      "lightweight_summary_ms": 0.009,
+      "lightweight_summary_per_file_ms": 0.009,
+      "upper_bound_wall_if_analysis_free_ms": 4102
+    }
+  ],
+  "all_files_lightweight_summary": {
+    "iterations": 200,
+    "fileCount": 12,
+    "totalMs": 208.649,
+    "avgPerIterationMs": 1.043,
+    "avgPerFileMs": 0.087,
+    "checksum": 2285800
+  }
+}

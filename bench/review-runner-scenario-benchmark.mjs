@@ -22,6 +22,7 @@ const importersModes = readArg("--importers-cache-modes", "fresh,split,auto")
 const depsCacheMode = readArg("--deps-cache-mode", "auto");
 const repeatCount = Number.parseInt(readArg("--repeat", "5"), 10);
 const skipBundle = process.argv.includes("--skip-bundle");
+const jobs = String(os.cpus().length);
 
 const smallFixtureFiles = [
   "Coverage.elm",
@@ -105,6 +106,12 @@ function copyFixture(fileNames, fixtureSrcDir) {
   }
 }
 
+function writeElmJson(workspaceRoot) {
+  const rootElmJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "elm.json"), "utf8"));
+  rootElmJson["source-directories"] = ["src"];
+  fs.writeFileSync(path.join(workspaceRoot, "elm.json"), JSON.stringify(rootElmJson, null, 4));
+}
+
 function mutateBodyEdit(fixtureSrcDir) {
   const filePath = path.join(fixtureSrcDir, "MathLib.elm");
   const source = fs.readFileSync(filePath, "utf8");
@@ -153,6 +160,8 @@ function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersC
       fixtureSrcDir,
       "--build",
       buildDir,
+      "--jobs",
+      jobs,
       "--importers-cache-mode",
       importersCacheMode,
       "--deps-cache-mode",
@@ -207,6 +216,7 @@ function prepareTemplateWorkspace(fileNames, mode) {
   const buildDir = path.join(workspaceRoot, ".elm-review-build");
   ensureDir(buildDir);
   copyFixture(fileNames, fixtureSrcDir);
+  writeElmJson(workspaceRoot);
 
   const mathLibPath = path.join(fixtureSrcDir, "MathLib.elm");
 

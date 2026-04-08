@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, ReviewError, RuleDependencyProfile, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, getDeclarationHashes, hostNoUnusedExportsErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -13,6 +13,7 @@ import AstWireCodec
 import BackendTask exposing (BackendTask)
 import Lamdera.Wire3
 import BackendTask.Do as Do
+import BackendTask.Env
 import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
@@ -22,12 +23,17 @@ import DepGraph
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
+import Char
 import Dict exposing (Dict)
 import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
+import Elm.Syntax.Expression exposing (Expression(..), LetDeclaration(..))
+import Elm.Syntax.Exposing as Exposing exposing (Exposing(..), TopLevelExpose(..))
 import Elm.Syntax.File
+import Elm.Syntax.Import exposing (Import)
 import Elm.Syntax.Module
 import Elm.Syntax.Node as Node exposing (Node(..))
+import Elm.Syntax.Pattern exposing (Pattern(..))
 import Elm.Syntax.Range exposing (Range)
 import FastDict
 import FatalError exposing (FatalError)
@@ -40,6 +46,7 @@ import InterpreterProject exposing (InterpreterProject)
 import MemoRuntime
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
+import ProjectSources
 import Set
 import Time
 import Eval.Expression
@@ -56,16 +63,44 @@ type alias ReviewError =
     }
 
 
+type alias TargetProjectSeed =
+    { elmJsonRaw : String
+    , directDependencies : List DependencySeed
+    }
+
+
+type alias DependencySeed =
+    { name : String
+    , elmJsonRaw : String
+    , docsJsonRaw : String
+    }
+
+
+type alias TargetProjectSeedPayloads =
+    { projectElmJsonRaw : Types.Value
+    , dependencySeeds : Types.Value
+    }
+
+
+type alias TargetProjectRuntime =
+    { seedPayloads : TargetProjectSeedPayloads
+    , baseProject : Types.Value
+    , cacheHit : Bool
+    }
+
+
 type alias Config =
     { reviewDir : String
     , sourceDirs : List String
     , buildDirectory : Path
+    , jobs : Maybe Int
     , memoizedFunctions : Set.Set String
     , memoProfile : Bool
     , importersCacheMode : ImportersCacheMode
     , depsCacheMode : ImportersCacheMode
     , reportFormat : ReportFormat
     , perfTraceJson : Maybe String
+    , hostNoUnusedExportsExperiment : Bool
     }
 
 
@@ -78,6 +113,7 @@ type ImportersCacheMode
 type ReportFormat
     = ReportHuman
     | ReportJson
+    | ReportQuiet
 
 
 type alias InputRevision =
@@ -116,6 +152,7 @@ type alias FileAnalysis =
     , parsedAst : ParsedAst
     , moduleSummary : ModuleSummary
     , bodySummary : BodySummary
+    , crossModuleSummary : CrossModuleSummary
     }
 
 
@@ -137,6 +174,52 @@ type alias AnalyzedTargetFilesResult =
     , cacheStoreBytes : Int
     , readMs : Int
     , analysisMs : Int
+    }
+
+
+type alias CrossModuleSummary =
+    { filePath : String
+    , moduleName : String
+    , moduleNameRange : Range
+    , isExposingAll : Bool
+    , exposedValues : Dict String Range
+    , declaredConstructors : Dict String (Dict String Range)
+    , exposedConstructors : Dict String (Dict String Range)
+    , importedModules : Set.Set String
+    , importedValueCandidates : Dict String (Set.Set String)
+    , importedOpenTypesByModule : Dict String (Set.Set String)
+    , importAllModules : List String
+    , moduleAliases : Dict String String
+    , localDeclarations : Set.Set String
+    , dependencyRefs : List DependencyRef
+    , constructorRefs : List QualifiedRef
+    , containsMainLike : Bool
+    }
+
+
+type alias DependencyRef =
+    { owner : String
+    , moduleParts : List String
+    , name : String
+    }
+
+
+type alias QualifiedRef =
+    { moduleParts : List String
+    , name : String
+    }
+
+
+type alias HostNoUnusedExportsModule =
+    { filePath : String
+    , moduleName : String
+    , moduleNameRange : Range
+    , isExposingAll : Bool
+    , exposedValues : Dict String Range
+    , importedModules : Set.Set String
+    , localValueUses : Set.Set String
+    , externalValueUses : Set.Set ( String, String )
+    , containsMainLike : Bool
     }
 
 
@@ -252,6 +335,11 @@ programConfig =
                         |> Option.withDescription "Build/cache directory (default: .elm-review-build)"
                     )
                 |> OptionsParser.with
+                    (Option.optionalKeywordArg "jobs"
+                        |> Option.map (Maybe.andThen String.toInt)
+                        |> Option.withDescription "Parallel worker count for cache evaluation"
+                    )
+                |> OptionsParser.with
                     (Option.optionalKeywordArg "memoize-functions"
                         |> Option.map (Maybe.map parseMemoizedFunctions >> Maybe.withDefault Set.empty)
                         |> Option.withDescription "Comma-separated qualified Elm function names to memoize inside the interpreter"
@@ -282,11 +370,15 @@ programConfig =
                             (Maybe.map parseReportFormat
                                 >> Maybe.withDefault ReportHuman
                             )
-                        |> Option.withDescription "Output format: human or json (default: human)"
+                        |> Option.withDescription "Output format: human, json, or quiet (default: human)"
                     )
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "perf-trace-json"
                         |> Option.withDescription "Write structured review-runner perf trace JSON to the given path"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "host-no-unused-exports-experiment"
+                        |> Option.withDescription "Handle NoUnused.Exports with a host-native experimental implementation"
                     )
             )
 
@@ -327,8 +419,24 @@ parseReportFormat rawValue =
         "json" ->
             ReportJson
 
+        "quiet" ->
+            ReportQuiet
+
         _ ->
             ReportHuman
+
+
+executionModeHash : Config -> String
+executionModeHash config =
+    [ if config.hostNoUnusedExportsExperiment then
+        "host-no-unused-exports=1"
+
+      else
+        "host-no-unused-exports=0"
+    ]
+        |> String.join "|"
+        |> FNV1a.hash
+        |> String.fromInt
 
 
 run : Script
@@ -350,6 +458,360 @@ escapeElmString str =
         |> String.replace "\"" "\\\""
         |> String.replace "\n" "\\n"
         |> String.replace "\u{000D}" "\\r"
+
+
+targetProjectRoot : Config -> String
+targetProjectRoot config =
+    case List.head config.sourceDirs of
+        Just firstSourceDir ->
+            if String.startsWith "/" firstSourceDir then
+                case
+                    firstSourceDir
+                        |> String.split "/"
+                        |> List.filter (\segment -> segment /= "")
+                        |> List.reverse
+                of
+                    _ :: reversedParents ->
+                        case List.reverse reversedParents of
+                            [] ->
+                                "/"
+
+                            parents ->
+                                "/" ++ String.join "/" parents
+
+                    [] ->
+                        "/"
+
+            else
+                "."
+
+        Nothing ->
+            "."
+
+
+resolveElmHome : BackendTask FatalError String
+resolveElmHome =
+    BackendTask.map2
+        (\maybeElmHome maybeHome ->
+            case maybeElmHome of
+                Just elmHome ->
+                    elmHome
+
+                Nothing ->
+                    case maybeHome of
+                        Just home ->
+                            home ++ "/.elm"
+
+                        Nothing ->
+                            "~/.elm"
+        )
+        (BackendTask.Env.get "ELM_HOME")
+        (BackendTask.Env.get "HOME")
+
+
+directDependenciesDecoder : Json.Decode.Decoder (Dict String String)
+directDependenciesDecoder =
+    Json.Decode.field "type" Json.Decode.string
+        |> Json.Decode.andThen
+            (\elmJsonType ->
+                if elmJsonType == "package" then
+                    Json.Decode.map2 Dict.union
+                        (Json.Decode.field "dependencies" (Json.Decode.dict Json.Decode.string))
+                        (Json.Decode.oneOf
+                            [ Json.Decode.field "test-dependencies" (Json.Decode.dict Json.Decode.string)
+                            , Json.Decode.succeed Dict.empty
+                            ]
+                        )
+
+                else
+                    Json.Decode.map2 Dict.union
+                        (Json.Decode.at [ "dependencies", "direct" ] (Json.Decode.dict Json.Decode.string))
+                        (Json.Decode.oneOf
+                            [ Json.Decode.at [ "test-dependencies", "direct" ] (Json.Decode.dict Json.Decode.string)
+                            , Json.Decode.succeed Dict.empty
+                            ]
+                        )
+            )
+
+
+loadTargetProjectSeed : Config -> BackendTask FatalError TargetProjectSeed
+loadTargetProjectSeed config =
+    let
+        projectRoot =
+            targetProjectRoot config
+    in
+    Do.allowFatal (File.rawFile (projectRoot ++ "/elm.json")) <| \elmJsonRaw ->
+    let
+        directDependenciesResult =
+            Json.Decode.decodeString directDependenciesDecoder elmJsonRaw
+    in
+    case directDependenciesResult of
+        Err err ->
+            BackendTask.fail
+                (FatalError.fromString ("Failed to decode target project elm.json: " ++ Json.Decode.errorToString err))
+
+        Ok directDependencies ->
+            Do.do resolveElmHome <| \elmHome ->
+            Do.do (ProjectSources.resolvePackageVersions elmHome directDependencies) <| \resolvedDirectDependencies ->
+            Do.do
+                (resolvedDirectDependencies
+                    |> Dict.toList
+                    |> List.sortBy Tuple.first
+                    |> List.map
+                        (\( packageName, version ) ->
+                            let
+                                packageBasePath =
+                                    elmHome ++ "/0.19.1/packages/" ++ packageName ++ "/" ++ version
+                            in
+                            Do.allowFatal (File.rawFile (packageBasePath ++ "/elm.json")) <| \dependencyElmJsonRaw ->
+                            Do.allowFatal (File.rawFile (packageBasePath ++ "/docs.json")) <| \docsJsonRaw ->
+                            BackendTask.succeed
+                                { name = packageName
+                                , elmJsonRaw = dependencyElmJsonRaw
+                                , docsJsonRaw = docsJsonRaw
+                                }
+                        )
+                    |> BackendTask.Extra.combine
+                )
+            <| \dependencySeeds ->
+            BackendTask.succeed
+                { elmJsonRaw = elmJsonRaw
+                , directDependencies = dependencySeeds
+                }
+
+dependencySeedValue : DependencySeed -> Types.Value
+dependencySeedValue dependencySeed =
+    Types.Record
+        (FastDict.fromList
+            [ ( "name", Types.String dependencySeed.name )
+            , ( "elmJsonRaw", Types.String dependencySeed.elmJsonRaw )
+            , ( "docsJsonRaw", Types.String dependencySeed.docsJsonRaw )
+            ]
+        )
+
+
+targetProjectSeedPayloads : TargetProjectSeed -> TargetProjectSeedPayloads
+targetProjectSeedPayloads seed =
+    { projectElmJsonRaw = Types.String seed.elmJsonRaw
+    , dependencySeeds =
+        seed.directDependencies
+            |> List.map dependencySeedValue
+            |> Types.List
+    }
+
+
+buildTargetProjectRuntime : String -> InterpreterProject -> TargetProjectSeed -> BackendTask FatalError TargetProjectRuntime
+buildTargetProjectRuntime buildDir reviewProject targetProjectSeed =
+    let
+        seedPayloads =
+            targetProjectSeedPayloads targetProjectSeed
+
+        intercepts =
+            FastDict.fromList
+                [ ( "ReviewRunnerHelper.projectElmJsonRawMarker"
+                  , Types.Intercept
+                        (\_ _ _ _ ->
+                            Types.EvOk seedPayloads.projectElmJsonRaw
+                        )
+                  )
+                , ( "ReviewRunnerHelper.dependencySeedsMarker"
+                  , Types.Intercept
+                        (\_ _ _ _ ->
+                            Types.EvOk seedPayloads.dependencySeeds
+                        )
+                  )
+                ]
+
+        finish baseProject =
+            BackendTask.succeed
+                { seedPayloads = seedPayloads
+                , baseProject = baseProject
+                , cacheHit = False
+                }
+    in
+    Do.do (loadTargetProjectRuntimeCache buildDir targetProjectSeed) <| \maybeCachedBaseProject ->
+    case maybeCachedBaseProject of
+        Just cachedBaseProject ->
+            BackendTask.succeed
+                { seedPayloads = seedPayloads
+                , baseProject = cachedBaseProject
+                , cacheHit = True
+                }
+
+        Nothing ->
+            case
+                InterpreterProject.prepareAndEvalWithIntercepts reviewProject
+                    { imports = [ "ReviewRunnerHelper" ]
+                    , expression = "ReviewRunnerHelper.buildBaseProjectFromSeed"
+                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                    , intercepts = intercepts
+                    }
+            of
+                Ok baseProject ->
+                    Do.do (persistTargetProjectRuntimeCache buildDir targetProjectSeed baseProject) <| \_ ->
+                    finish baseProject
+
+                Err err ->
+                    BackendTask.fail
+                        (FatalError.fromString ("Failed to build target project runtime: " ++ err))
+
+
+targetProjectRuntimeCacheKey : TargetProjectSeed -> String
+targetProjectRuntimeCacheKey targetProjectSeed =
+    let
+        serializedSeed =
+            targetProjectSeed.elmJsonRaw
+                ++ "\n--deps--\n"
+                ++ (targetProjectSeed.directDependencies
+                        |> List.sortBy .name
+                        |> List.map
+                            (\dependency ->
+                                dependency.name
+                                    ++ "\n--elm-json--\n"
+                                    ++ dependency.elmJsonRaw
+                                    ++ "\n--docs--\n"
+                                    ++ dependency.docsJsonRaw
+                            )
+                        |> String.join "\n==dep==\n"
+                   )
+    in
+    String.fromInt (FNV1a.hash serializedSeed)
+
+
+targetProjectRuntimeCachePath : String -> TargetProjectSeed -> String
+targetProjectRuntimeCachePath buildDir targetProjectSeed =
+    buildDir ++ "/target-project-runtime/" ++ targetProjectRuntimeCacheKey targetProjectSeed ++ ".json"
+
+
+loadTargetProjectRuntimeCache : String -> TargetProjectSeed -> BackendTask FatalError (Maybe Types.Value)
+loadTargetProjectRuntimeCache buildDir targetProjectSeed =
+    File.rawFile (targetProjectRuntimeCachePath buildDir targetProjectSeed)
+        |> BackendTask.toResult
+        |> BackendTask.map
+            (\result ->
+                case result of
+                    Ok encodedValue ->
+                        ValueCodec.decodeValue encodedValue
+
+                    Err _ ->
+                        Nothing
+            )
+
+
+persistTargetProjectRuntimeCache : String -> TargetProjectSeed -> Types.Value -> BackendTask FatalError ()
+persistTargetProjectRuntimeCache buildDir targetProjectSeed baseProject =
+    Do.do (Script.exec "mkdir" [ "-p", buildDir ++ "/target-project-runtime" ]) <| \_ ->
+    Script.writeFile
+        { path = targetProjectRuntimeCachePath buildDir targetProjectSeed
+        , body = ValueCodec.encodeValue baseProject
+        }
+        |> BackendTask.allowFatal
+
+
+benchmarkTargetProjectRuntime :
+    { reviewDir : String
+    , sourceDirs : List String
+    , buildDirectory : String
+    , iterations : Int
+    }
+    -> BackendTask FatalError String
+benchmarkTargetProjectRuntime options =
+    let
+        config : Config
+        config =
+            { reviewDir = options.reviewDir
+            , sourceDirs = options.sourceDirs
+            , buildDirectory = Path.path options.buildDirectory
+            , jobs = Just 1
+            , memoizedFunctions = Set.empty
+            , memoProfile = False
+            , importersCacheMode = ImportersAuto
+            , depsCacheMode = ImportersAuto
+            , reportFormat = ReportQuiet
+            , perfTraceJson = Nothing
+            , hostNoUnusedExportsExperiment = False
+            }
+    in
+    Do.do (withTiming "prepare_config" (prepareConfig config)) <| \preparedConfigTimed ->
+    let
+        preparedConfig =
+            preparedConfigTimed.value
+    in
+    Do.do (withTiming "load_review_project" (loadReviewProjectDetailed preparedConfig)) <| \reviewProjectTimed ->
+    Do.do
+        (runTargetProjectRuntimeBenchmarkIterations
+            (max 1 options.iterations)
+            preparedConfig
+            reviewProjectTimed.value.project
+            []
+        )
+    <| \iterations ->
+    BackendTask.succeed <|
+        Json.Encode.encode 2 <|
+            Json.Encode.object
+                [ ( "prepare_config_ms", Json.Encode.int preparedConfigTimed.stage.ms )
+                , ( "load_review_project_ms", Json.Encode.int reviewProjectTimed.stage.ms )
+                , ( "iterations"
+                  , iterations
+                        |> List.reverse
+                        |> Json.Encode.list
+                            (\iteration ->
+                                Json.Encode.object
+                                    [ ( "iteration", Json.Encode.int iteration.iteration )
+                                    , ( "load_target_project_seed_ms", Json.Encode.int iteration.loadTargetProjectSeedMs )
+                                    , ( "build_target_project_runtime_ms", Json.Encode.int iteration.buildTargetProjectRuntimeMs )
+                                    , ( "cache_hit", Json.Encode.bool iteration.cacheHit )
+                                    ]
+                            )
+                  )
+                ]
+
+
+runTargetProjectRuntimeBenchmarkIterations :
+    Int
+    -> Config
+    -> InterpreterProject
+    -> List
+        { iteration : Int
+        , loadTargetProjectSeedMs : Int
+        , buildTargetProjectRuntimeMs : Int
+        , cacheHit : Bool
+        }
+    -> BackendTask FatalError
+        (List
+            { iteration : Int
+            , loadTargetProjectSeedMs : Int
+            , buildTargetProjectRuntimeMs : Int
+            , cacheHit : Bool
+            }
+        )
+runTargetProjectRuntimeBenchmarkIterations remaining config reviewProject acc =
+    if remaining <= 0 then
+        BackendTask.succeed acc
+
+    else
+        let
+            iterationNumber =
+                List.length acc + 1
+        in
+        Do.do (withTiming "load_target_project_seed" (loadTargetProjectSeed config)) <| \targetProjectSeedTimed ->
+        Do.do
+            (withTiming
+                "build_target_project_runtime"
+                (buildTargetProjectRuntime (Path.toString config.buildDirectory) reviewProject targetProjectSeedTimed.value)
+            )
+        <| \targetProjectRuntimeTimed ->
+        runTargetProjectRuntimeBenchmarkIterations
+            (remaining - 1)
+            config
+            reviewProject
+            ({ iteration = iterationNumber
+             , loadTargetProjectSeedMs = targetProjectSeedTimed.stage.ms
+             , buildTargetProjectRuntimeMs = targetProjectRuntimeTimed.stage.ms
+             , cacheHit = targetProjectRuntimeTimed.value.cacheHit
+             }
+                :: acc
+            )
 
 
 {-| Build an Elm record literal for a module: { path = "...", source = "..." }
@@ -436,6 +898,840 @@ parseSingleError line =
 
         _ ->
             Nothing
+
+
+hostNoUnusedExportsErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoUnusedExportsErrorsForSources sources =
+    sources
+        |> evaluateHostNoUnusedExportsForSources
+        |> .errors
+
+
+evaluateHostNoUnusedExportsForAnalyzedFiles :
+    List AnalyzedTargetFile
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+evaluateHostNoUnusedExportsForAnalyzedFiles analyzedFiles =
+    let
+        evaluation =
+            analyzedFiles
+                |> List.map (.analysis >> .crossModuleSummary)
+                |> hostNoUnusedExportsFromRawModules
+    in
+    { errors = evaluation.errors
+    , counters =
+        mergeCounterDicts
+            [ evaluation.counters
+            , Dict.fromList
+                [ ( "project.host_exports.analysis_modules", List.length analyzedFiles )
+                , ( "project.host_exports.analysis_reused", List.length analyzedFiles )
+                ]
+            ]
+    }
+
+
+evaluateHostNoUnusedExportsForSources :
+    List { path : String, source : String }
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+evaluateHostNoUnusedExportsForSources sources =
+    let
+        parsedResults =
+            sources
+                |> List.map
+                    (\sourceFile ->
+                        case crossModuleSummaryFromSource sourceFile.path sourceFile.source of
+                            Just rawModule ->
+                                Ok rawModule
+
+                            Nothing ->
+                                Err sourceFile.path
+                    )
+
+        rawModules =
+            parsedResults
+                |> List.filterMap Result.toMaybe
+
+        parseFailures =
+            parsedResults
+                |> List.filter
+                    (\result ->
+                        case result of
+                            Err _ ->
+                                True
+
+                            Ok _ ->
+                                False
+                    )
+                |> List.length
+
+        evaluation =
+            hostNoUnusedExportsFromRawModules rawModules
+    in
+    { errors = evaluation.errors
+    , counters =
+        mergeCounterDicts
+            [ evaluation.counters
+            , Dict.fromList
+                [ ( "project.host_exports.source_files", List.length sources )
+                , ( "project.host_exports.parsed_modules", List.length rawModules )
+                , ( "project.host_exports.parse_failures", parseFailures )
+                ]
+            ]
+    }
+
+
+hostNoUnusedExportsFromRawModules :
+    List CrossModuleSummary
+    ->
+        { errors : List ReviewError
+        , counters : Dict String Int
+        }
+hostNoUnusedExportsFromRawModules rawModules =
+    let
+        exportedValuesByModule : Dict String (Set.Set String)
+        exportedValuesByModule =
+            rawModules
+                |> List.map
+                    (\rawModule ->
+                        ( rawModule.moduleName
+                        , rawModule.exposedValues
+                            |> Dict.keys
+                            |> Set.fromList
+                        )
+                    )
+                |> Dict.fromList
+
+        resolvedModules : List HostNoUnusedExportsModule
+        resolvedModules =
+            rawModules
+                |> List.map (resolveHostNoUnusedExportsModule exportedValuesByModule)
+
+        usedModules : Set.Set String
+        usedModules =
+            resolvedModules
+                |> List.foldl
+                    (\moduleInfo acc ->
+                        let
+                            withImports =
+                                Set.union acc moduleInfo.importedModules
+                        in
+                        if Set.member "Test" moduleInfo.importedModules || moduleInfo.containsMainLike then
+                            Set.insert moduleInfo.moduleName withImports
+
+                        else
+                            withImports
+                    )
+                    Set.empty
+
+        externalValueUses : Set.Set ( String, String )
+        externalValueUses =
+            resolvedModules
+                |> List.foldl
+                    (\moduleInfo acc ->
+                        Set.union acc moduleInfo.externalValueUses
+                    )
+                    Set.empty
+
+        errors : List ReviewError
+        errors =
+            resolvedModules
+                |> List.concatMap (hostNoUnusedExportsErrorsForModule usedModules externalValueUses)
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "project.host_exports.modules", List.length resolvedModules )
+            , ( "project.host_exports.exported_values"
+              , resolvedModules
+                    |> List.map (\moduleInfo -> Dict.size moduleInfo.exposedValues)
+                    |> List.sum
+              )
+            , ( "project.host_exports.local_value_uses"
+              , resolvedModules
+                    |> List.map (\moduleInfo -> Set.size moduleInfo.localValueUses)
+                    |> List.sum
+              )
+            , ( "project.host_exports.external_value_uses"
+              , resolvedModules
+                    |> List.map (\moduleInfo -> Set.size moduleInfo.externalValueUses)
+                    |> List.sum
+              )
+            , ( "project.host_exports.errors", List.length errors )
+            ]
+    }
+
+
+resolveHostNoUnusedExportsModule :
+    Dict String (Set.Set String)
+    -> CrossModuleSummary
+    -> HostNoUnusedExportsModule
+resolveHostNoUnusedExportsModule exportedValuesByModule rawModule =
+    let
+        importedValueMap : Dict String String
+        importedValueMap =
+            rawModule.importAllModules
+                |> List.foldl
+                    (\moduleName acc ->
+                        exportedValuesByModule
+                            |> Dict.get moduleName
+                            |> Maybe.withDefault Set.empty
+                            |> Set.foldl
+                                (\valueName innerAcc ->
+                                    insertImportCandidate valueName moduleName innerAcc
+                                )
+                                acc
+                    )
+                    rawModule.importedValueCandidates
+                |> Dict.toList
+                |> List.filterMap
+                    (\( valueName, moduleNames ) ->
+                        case Set.toList moduleNames of
+                            [ singleModuleName ] ->
+                                Just ( valueName, singleModuleName )
+
+                            _ ->
+                                Nothing
+                    )
+                |> Dict.fromList
+
+        resolvedUses =
+            rawModule.dependencyRefs
+                |> List.foldl
+                    (\dependency acc ->
+                        if startsWithUppercase dependency.name then
+                            acc
+
+                        else if not (List.isEmpty dependency.moduleParts) then
+                            let
+                                qualifiedModuleName =
+                                    String.join "." dependency.moduleParts
+
+                                actualModuleName =
+                                    rawModule.moduleAliases
+                                        |> Dict.get qualifiedModuleName
+                                        |> Maybe.withDefault qualifiedModuleName
+                            in
+                            { acc
+                                | externalValueUses =
+                                    Set.insert
+                                        ( actualModuleName, dependency.name )
+                                        acc.externalValueUses
+                            }
+
+                        else if Set.member dependency.name rawModule.localDeclarations then
+                            if dependency.name == dependency.owner then
+                                acc
+
+                            else
+                                { acc
+                                    | localValueUses =
+                                        Set.insert dependency.name acc.localValueUses
+                                }
+
+                        else
+                            case Dict.get dependency.name importedValueMap of
+                                Just moduleName ->
+                                    { acc
+                                        | externalValueUses =
+                                            Set.insert
+                                                ( moduleName, dependency.name )
+                                                acc.externalValueUses
+                                    }
+
+                                Nothing ->
+                                    acc
+                    )
+                    { localValueUses = Set.empty
+                    , externalValueUses = Set.empty
+                    }
+    in
+    { filePath = rawModule.filePath
+    , moduleName = rawModule.moduleName
+    , moduleNameRange = rawModule.moduleNameRange
+    , isExposingAll = rawModule.isExposingAll
+    , exposedValues = rawModule.exposedValues
+    , importedModules = rawModule.importedModules
+    , localValueUses = resolvedUses.localValueUses
+    , externalValueUses = resolvedUses.externalValueUses
+    , containsMainLike = rawModule.containsMainLike
+    }
+
+
+hostNoUnusedExportsErrorsForModule :
+    Set.Set String
+    -> Set.Set ( String, String )
+    -> HostNoUnusedExportsModule
+    -> List ReviewError
+hostNoUnusedExportsErrorsForModule usedModules externalValueUses moduleInfo =
+    if moduleInfo.moduleName == "ReviewConfig" then
+        []
+
+    else if Set.member moduleInfo.moduleName usedModules then
+        moduleInfo.exposedValues
+            |> Dict.toList
+            |> List.filterMap
+                (\( valueName, range ) ->
+                    if valueName == "main" || valueName == "app" then
+                        Nothing
+
+                    else if
+                        Set.member ( moduleInfo.moduleName, valueName ) externalValueUses
+                            || (moduleInfo.isExposingAll && Set.member valueName moduleInfo.localValueUses)
+                    then
+                        Nothing
+
+                    else
+                        Just
+                            { ruleName = "NoUnused.Exports"
+                            , filePath = moduleInfo.filePath
+                            , line = range.start.row
+                            , column = range.start.column
+                            , message =
+                                if moduleInfo.isExposingAll then
+                                    "Exposed function or value `" ++ valueName ++ "` is never used in the project"
+
+                                else
+                                    "Exposed function or value `" ++ valueName ++ "` is never used outside this module"
+                            }
+                )
+
+    else
+        [ { ruleName = "NoUnused.Exports"
+          , filePath = moduleInfo.filePath
+          , line = moduleInfo.moduleNameRange.start.row
+          , column = moduleInfo.moduleNameRange.start.column
+          , message = "Module `" ++ moduleInfo.moduleName ++ "` is never used"
+          }
+        ]
+
+
+crossModuleSummaryFromSource : String -> String -> Maybe CrossModuleSummary
+crossModuleSummaryFromSource filePath source =
+    case Elm.Parser.parseToFile source of
+        Ok file ->
+            Just (buildCrossModuleSummary filePath file)
+
+        Err _ ->
+            Nothing
+
+
+buildCrossModuleSummary : String -> Elm.Syntax.File.File -> CrossModuleSummary
+buildCrossModuleSummary filePath file =
+    let
+        moduleName =
+            moduleNameFromFile file
+
+        moduleNameRange =
+            moduleNameRangeFromFile file
+
+        valueDeclarations =
+            collectValueDeclarations file.declarations
+
+        declaredConstructors =
+            collectCustomTypeConstructors file.declarations
+
+        exposingList =
+            Elm.Syntax.Module.exposingList (Node.value file.moduleDefinition)
+
+        isExposingAll =
+            case exposingList of
+                Exposing.All _ ->
+                    True
+
+                Exposing.Explicit _ ->
+                    False
+
+        exposedValues =
+            case exposingList of
+                Exposing.All _ ->
+                    valueDeclarations
+
+                Exposing.Explicit explicitlyExposed ->
+                    collectExplicitExposedValueRanges valueDeclarations explicitlyExposed
+
+        exposedConstructors =
+            case exposingList of
+                Exposing.All _ ->
+                    declaredConstructors
+
+                Exposing.Explicit explicitlyExposed ->
+                    collectExplicitExposedConstructors declaredConstructors explicitlyExposed
+
+        importInfo =
+            file.imports
+                |> List.foldl collectCrossModuleImportInfo initialCrossModuleImportInfo
+
+        localDeclarations =
+            valueDeclarations
+                |> Dict.keys
+                |> Set.fromList
+
+        containsMainLike =
+            Set.member "main" localDeclarations || Set.member "app" localDeclarations
+    in
+    { filePath = filePath
+    , moduleName = moduleName
+    , moduleNameRange = moduleNameRange
+    , isExposingAll = isExposingAll
+    , exposedValues = exposedValues
+    , declaredConstructors = declaredConstructors
+    , exposedConstructors = exposedConstructors
+    , importedModules = importInfo.importedModules
+    , importedValueCandidates = importInfo.importedValueCandidates
+    , importedOpenTypesByModule = importInfo.importedOpenTypesByModule
+    , importAllModules = importInfo.importAllModules
+    , moduleAliases = importInfo.moduleAliases
+    , localDeclarations = localDeclarations
+    , dependencyRefs =
+        file.declarations
+            |> List.concatMap crossModuleDependencyRefsFromDeclaration
+    , constructorRefs =
+        file.declarations
+            |> List.concatMap crossModuleConstructorRefsFromDeclaration
+    , containsMainLike = containsMainLike
+    }
+
+
+type alias CrossModuleImportInfo =
+    { importedModules : Set.Set String
+    , importedValueCandidates : Dict String (Set.Set String)
+    , importedOpenTypesByModule : Dict String (Set.Set String)
+    , importAllModules : List String
+    , moduleAliases : Dict String String
+    }
+
+
+initialCrossModuleImportInfo : CrossModuleImportInfo
+initialCrossModuleImportInfo =
+    { importedModules = Set.empty
+    , importedValueCandidates = Dict.empty
+    , importedOpenTypesByModule = Dict.empty
+    , importAllModules = []
+    , moduleAliases = Dict.empty
+    }
+
+
+collectCrossModuleImportInfo :
+    Node Import
+    -> CrossModuleImportInfo
+    -> CrossModuleImportInfo
+collectCrossModuleImportInfo (Node _ import_) importInfo =
+    let
+        moduleName =
+            import_.moduleName
+                |> Node.value
+                |> String.join "."
+
+        withImportedModule =
+            { importInfo
+                | importedModules = Set.insert moduleName importInfo.importedModules
+            }
+
+        withAlias =
+            case import_.moduleAlias of
+                Just aliasNode ->
+                    { withImportedModule
+                        | moduleAliases =
+                            Dict.insert
+                                (aliasNode |> Node.value |> String.join ".")
+                                moduleName
+                                withImportedModule.moduleAliases
+                    }
+
+                Nothing ->
+                    withImportedModule
+    in
+    case import_.exposingList |> Maybe.map Node.value of
+        Just (Exposing.All _) ->
+            { withAlias
+                | importAllModules = moduleName :: withAlias.importAllModules
+            }
+
+        Just (Exposing.Explicit exposedItems) ->
+            exposedItems
+                |> List.foldl
+                    (\(Node _ exposedItem) acc ->
+                        case exposedItem of
+                            FunctionExpose valueName ->
+                                { acc
+                                    | importedValueCandidates =
+                                        insertImportCandidate valueName moduleName acc.importedValueCandidates
+                                }
+
+                            TypeExpose { name, open } ->
+                                case open of
+                                    Just _ ->
+                                        { acc
+                                            | importedOpenTypesByModule =
+                                                Dict.update moduleName
+                                                    (\maybeTypeNames ->
+                                                        Just
+                                                            (maybeTypeNames
+                                                                |> Maybe.withDefault Set.empty
+                                                                |> Set.insert name
+                                                            )
+                                                    )
+                                                    acc.importedOpenTypesByModule
+                                        }
+
+                                    Nothing ->
+                                        acc
+
+                            _ ->
+                                acc
+                    )
+                    withAlias
+
+        Nothing ->
+            withAlias
+
+
+collectValueDeclarations : List (Node Declaration) -> Dict String Range
+collectValueDeclarations declarations =
+    declarations
+        |> List.foldl
+            (\(Node _ declaration) acc ->
+                case declaration of
+                    FunctionDeclaration function ->
+                        let
+                            nameNode =
+                                Node.value function.declaration |> .name
+                        in
+                        Dict.insert (Node.value nameNode) (Node.range nameNode) acc
+
+                    PortDeclaration signature ->
+                        Dict.insert (Node.value signature.name) (Node.range signature.name) acc
+
+                    _ ->
+                        acc
+            )
+            Dict.empty
+
+
+collectCustomTypeConstructors : List (Node Declaration) -> Dict String (Dict String Range)
+collectCustomTypeConstructors declarations =
+    declarations
+        |> List.foldl
+            (\(Node _ declaration) acc ->
+                case declaration of
+                    CustomTypeDeclaration typeDecl ->
+                        Dict.insert
+                            (Node.value typeDecl.name)
+                            (typeDecl.constructors
+                                |> List.foldl
+                                    (\(Node _ constructor) constructorsAcc ->
+                                        Dict.insert
+                                            (Node.value constructor.name)
+                                            (Node.range constructor.name)
+                                            constructorsAcc
+                                    )
+                                    Dict.empty
+                            )
+                            acc
+
+                    _ ->
+                        acc
+            )
+            Dict.empty
+
+
+collectExplicitExposedValueRanges :
+    Dict String Range
+    -> List (Node TopLevelExpose)
+    -> Dict String Range
+collectExplicitExposedValueRanges valueDeclarations exposingNodes =
+    exposingNodes
+        |> List.foldl
+            (\(Node range exposedItem) acc ->
+                case exposedItem of
+                    FunctionExpose valueName ->
+                        if Dict.member valueName valueDeclarations then
+                            Dict.insert valueName range acc
+
+                        else
+                            acc
+
+                    _ ->
+                        acc
+            )
+            Dict.empty
+
+
+collectExplicitExposedConstructors :
+    Dict String (Dict String Range)
+    -> List (Node TopLevelExpose)
+    -> Dict String (Dict String Range)
+collectExplicitExposedConstructors declaredConstructors exposingNodes =
+    exposingNodes
+        |> List.foldl
+            (\(Node _ exposedItem) acc ->
+                case exposedItem of
+                    TypeExpose { name, open } ->
+                        case open of
+                            Just _ ->
+                                case Dict.get name declaredConstructors of
+                                    Just constructors ->
+                                        Dict.insert name constructors acc
+
+                                    Nothing ->
+                                        acc
+
+                            Nothing ->
+                                acc
+
+                    _ ->
+                        acc
+            )
+            Dict.empty
+
+
+moduleNameRangeFromFile : Elm.Syntax.File.File -> Range
+moduleNameRangeFromFile file =
+    case Node.value file.moduleDefinition of
+        Elm.Syntax.Module.NormalModule { moduleName } ->
+            Node.range moduleName
+
+        Elm.Syntax.Module.PortModule { moduleName } ->
+            Node.range moduleName
+
+        Elm.Syntax.Module.EffectModule { moduleName } ->
+            Node.range moduleName
+
+
+crossModuleDependencyRefsFromDeclaration : Node Declaration -> List DependencyRef
+crossModuleDependencyRefsFromDeclaration declarationNode =
+    case Node.value declarationNode of
+        FunctionDeclaration function ->
+            let
+                implementation =
+                    Node.value function.declaration
+
+                ownerName =
+                    Node.value implementation.name
+            in
+            implementation.expression
+                |> SemanticHash.extractDependencies
+                |> List.map
+                    (\( moduleParts, name ) ->
+                        { owner = ownerName
+                        , moduleParts = moduleParts
+                        , name = name
+                        }
+                    )
+
+        _ ->
+            []
+
+
+crossModuleConstructorRefsFromDeclaration : Node Declaration -> List QualifiedRef
+crossModuleConstructorRefsFromDeclaration declarationNode =
+    case Node.value declarationNode of
+        FunctionDeclaration function ->
+            let
+                implementation =
+                    Node.value function.declaration
+            in
+            List.concatMap crossModuleConstructorRefsFromPattern implementation.arguments
+                ++ crossModuleConstructorRefsFromExpression implementation.expression
+
+        Destructuring pattern expression ->
+            crossModuleConstructorRefsFromPattern pattern
+                ++ crossModuleConstructorRefsFromExpression expression
+
+        _ ->
+            []
+
+
+crossModuleConstructorRefsFromExpression : Node Expression -> List QualifiedRef
+crossModuleConstructorRefsFromExpression (Node _ expr) =
+    case expr of
+        Application expressions ->
+            List.concatMap crossModuleConstructorRefsFromExpression expressions
+
+        OperatorApplication _ _ left right ->
+            crossModuleConstructorRefsFromExpression left
+                ++ crossModuleConstructorRefsFromExpression right
+
+        FunctionOrValue moduleParts name ->
+            if startsWithUppercase name then
+                [ { moduleParts = moduleParts, name = name } ]
+
+            else
+                []
+
+        IfBlock cond thenExpr elseExpr ->
+            crossModuleConstructorRefsFromExpression cond
+                ++ crossModuleConstructorRefsFromExpression thenExpr
+                ++ crossModuleConstructorRefsFromExpression elseExpr
+
+        Negation inner ->
+            crossModuleConstructorRefsFromExpression inner
+
+        TupledExpression expressions ->
+            List.concatMap crossModuleConstructorRefsFromExpression expressions
+
+        ParenthesizedExpression inner ->
+            crossModuleConstructorRefsFromExpression inner
+
+        LetExpression letBlock ->
+            List.concatMap crossModuleConstructorRefsFromLetDeclaration letBlock.declarations
+                ++ crossModuleConstructorRefsFromExpression letBlock.expression
+
+        CaseExpression caseBlock ->
+            crossModuleConstructorRefsFromExpression caseBlock.expression
+                ++ List.concatMap
+                    (\( pattern, caseExpression ) ->
+                        crossModuleConstructorRefsFromPattern pattern
+                            ++ crossModuleConstructorRefsFromExpression caseExpression
+                    )
+                    caseBlock.cases
+
+        LambdaExpression lambda ->
+            List.concatMap crossModuleConstructorRefsFromPattern lambda.args
+                ++ crossModuleConstructorRefsFromExpression lambda.expression
+
+        RecordExpr setters ->
+            setters
+                |> List.concatMap
+                    (\(Node _ ( _, valueExpression )) ->
+                        crossModuleConstructorRefsFromExpression valueExpression
+                    )
+
+        ListExpr expressions ->
+            List.concatMap crossModuleConstructorRefsFromExpression expressions
+
+        RecordAccess inner _ ->
+            crossModuleConstructorRefsFromExpression inner
+
+        RecordUpdateExpression _ setters ->
+            setters
+                |> List.concatMap
+                    (\(Node _ ( _, valueExpression )) ->
+                        crossModuleConstructorRefsFromExpression valueExpression
+                    )
+
+        UnitExpr ->
+            []
+
+        PrefixOperator _ ->
+            []
+
+        Operator _ ->
+            []
+
+        Integer _ ->
+            []
+
+        Hex _ ->
+            []
+
+        Floatable _ ->
+            []
+
+        Literal _ ->
+            []
+
+        CharLiteral _ ->
+            []
+
+        RecordAccessFunction _ ->
+            []
+
+        GLSLExpression _ ->
+            []
+
+
+crossModuleConstructorRefsFromLetDeclaration : Node LetDeclaration -> List QualifiedRef
+crossModuleConstructorRefsFromLetDeclaration (Node _ declaration) =
+    case declaration of
+        LetFunction function ->
+            let
+                implementation =
+                    Node.value function.declaration
+            in
+            List.concatMap crossModuleConstructorRefsFromPattern implementation.arguments
+                ++ crossModuleConstructorRefsFromExpression implementation.expression
+
+        LetDestructuring pattern expression ->
+            crossModuleConstructorRefsFromPattern pattern
+                ++ crossModuleConstructorRefsFromExpression expression
+
+
+crossModuleConstructorRefsFromPattern : Node Pattern -> List QualifiedRef
+crossModuleConstructorRefsFromPattern (Node _ pattern) =
+    case pattern of
+        TuplePattern patterns ->
+            List.concatMap crossModuleConstructorRefsFromPattern patterns
+
+        UnConsPattern left right ->
+            crossModuleConstructorRefsFromPattern left
+                ++ crossModuleConstructorRefsFromPattern right
+
+        ListPattern patterns ->
+            List.concatMap crossModuleConstructorRefsFromPattern patterns
+
+        NamedPattern qualifiedNameRef patterns ->
+            { moduleParts = qualifiedNameRef.moduleName, name = qualifiedNameRef.name }
+                :: List.concatMap crossModuleConstructorRefsFromPattern patterns
+
+        AsPattern inner _ ->
+            crossModuleConstructorRefsFromPattern inner
+
+        ParenthesizedPattern inner ->
+            crossModuleConstructorRefsFromPattern inner
+
+        AllPattern ->
+            []
+
+        UnitPattern ->
+            []
+
+        CharPattern _ ->
+            []
+
+        StringPattern _ ->
+            []
+
+        IntPattern _ ->
+            []
+
+        HexPattern _ ->
+            []
+
+        FloatPattern _ ->
+            []
+
+        RecordPattern _ ->
+            []
+
+        VarPattern _ ->
+            []
+
+
+insertImportCandidate : String -> String -> Dict String (Set.Set String) -> Dict String (Set.Set String)
+insertImportCandidate valueName moduleName candidates =
+    Dict.update valueName
+        (\maybeModules ->
+            Just
+                (maybeModules
+                    |> Maybe.withDefault Set.empty
+                    |> Set.insert moduleName
+                )
+        )
+        candidates
+
+
+startsWithUppercase : String -> Bool
+startsWithUppercase value =
+    value
+        |> String.uncons
+        |> Maybe.map (\( firstChar, _ ) -> Char.isUpper firstChar)
+        |> Maybe.withDefault False
 
 
 {-| Classification of an elm-review rule as module-scoped or project-scoped.
@@ -1355,6 +2651,194 @@ durabilityDecoder =
             )
 
 
+encodePositionJson : { row : Int, column : Int } -> Json.Encode.Value
+encodePositionJson position =
+    Json.Encode.object
+        [ ( "row", Json.Encode.int position.row )
+        , ( "column", Json.Encode.int position.column )
+        ]
+
+
+positionDecoder : Json.Decode.Decoder { row : Int, column : Int }
+positionDecoder =
+    Json.Decode.map2
+        (\row column ->
+            { row = row
+            , column = column
+            }
+        )
+        (Json.Decode.field "row" Json.Decode.int)
+        (Json.Decode.field "column" Json.Decode.int)
+
+
+encodeRangeJson : Range -> Json.Encode.Value
+encodeRangeJson range =
+    Json.Encode.object
+        [ ( "start", encodePositionJson range.start )
+        , ( "end", encodePositionJson range.end )
+        ]
+
+
+rangeDecoder : Json.Decode.Decoder Range
+rangeDecoder =
+    Json.Decode.map2
+        (\start end ->
+            { start = start
+            , end = end
+            }
+        )
+        (Json.Decode.field "start" positionDecoder)
+        (Json.Decode.field "end" positionDecoder)
+
+
+encodeStringSetJson : Set.Set String -> Json.Encode.Value
+encodeStringSetJson values =
+    values
+        |> Set.toList
+        |> Json.Encode.list Json.Encode.string
+
+
+stringSetDecoder : Json.Decode.Decoder (Set.Set String)
+stringSetDecoder =
+    Json.Decode.list Json.Decode.string
+        |> Json.Decode.map Set.fromList
+
+
+encodeRangeDictJson : Dict String Range -> Json.Encode.Value
+encodeRangeDictJson ranges =
+    ranges
+        |> Dict.toList
+        |> Json.Encode.list
+            (\( name, range ) ->
+                Json.Encode.object
+                    [ ( "name", Json.Encode.string name )
+                    , ( "range", encodeRangeJson range )
+                    ]
+            )
+
+
+rangeDictDecoder : Json.Decode.Decoder (Dict String Range)
+rangeDictDecoder =
+    Json.Decode.list
+        (Json.Decode.map2 Tuple.pair
+            (Json.Decode.field "name" Json.Decode.string)
+            (Json.Decode.field "range" rangeDecoder)
+        )
+        |> Json.Decode.map Dict.fromList
+
+
+encodeNestedRangeDictJson : Dict String (Dict String Range) -> Json.Encode.Value
+encodeNestedRangeDictJson values =
+    values
+        |> Dict.toList
+        |> Json.Encode.list
+            (\( typeName, constructors ) ->
+                Json.Encode.object
+                    [ ( "type", Json.Encode.string typeName )
+                    , ( "constructors", encodeRangeDictJson constructors )
+                    ]
+            )
+
+
+nestedRangeDictDecoder : Json.Decode.Decoder (Dict String (Dict String Range))
+nestedRangeDictDecoder =
+    Json.Decode.list
+        (Json.Decode.map2 Tuple.pair
+            (Json.Decode.field "type" Json.Decode.string)
+            (Json.Decode.field "constructors" rangeDictDecoder)
+        )
+        |> Json.Decode.map Dict.fromList
+
+
+encodeStringSetDictJson : Dict String (Set.Set String) -> Json.Encode.Value
+encodeStringSetDictJson values =
+    values
+        |> Dict.toList
+        |> Json.Encode.list
+            (\( name, modules ) ->
+                Json.Encode.object
+                    [ ( "name", Json.Encode.string name )
+                    , ( "modules", encodeStringSetJson modules )
+                    ]
+            )
+
+
+stringSetDictDecoder : Json.Decode.Decoder (Dict String (Set.Set String))
+stringSetDictDecoder =
+    Json.Decode.list
+        (Json.Decode.map2 Tuple.pair
+            (Json.Decode.field "name" Json.Decode.string)
+            (Json.Decode.field "modules" stringSetDecoder)
+        )
+        |> Json.Decode.map Dict.fromList
+
+
+encodeStringDictJson : Dict String String -> Json.Encode.Value
+encodeStringDictJson values =
+    values
+        |> Dict.toList
+        |> Json.Encode.list
+            (\( key, value ) ->
+                Json.Encode.object
+                    [ ( "key", Json.Encode.string key )
+                    , ( "value", Json.Encode.string value )
+                    ]
+            )
+
+
+stringDictDecoder : Json.Decode.Decoder (Dict String String)
+stringDictDecoder =
+    Json.Decode.list
+        (Json.Decode.map2 Tuple.pair
+            (Json.Decode.field "key" Json.Decode.string)
+            (Json.Decode.field "value" Json.Decode.string)
+        )
+        |> Json.Decode.map Dict.fromList
+
+
+encodeDependencyRefJson : DependencyRef -> Json.Encode.Value
+encodeDependencyRefJson dependencyRef =
+    Json.Encode.object
+        [ ( "owner", Json.Encode.string dependencyRef.owner )
+        , ( "moduleParts", Json.Encode.list Json.Encode.string dependencyRef.moduleParts )
+        , ( "name", Json.Encode.string dependencyRef.name )
+        ]
+
+
+dependencyRefDecoder : Json.Decode.Decoder DependencyRef
+dependencyRefDecoder =
+    Json.Decode.map3
+        (\owner moduleParts name ->
+            { owner = owner
+            , moduleParts = moduleParts
+            , name = name
+            }
+        )
+        (Json.Decode.field "owner" Json.Decode.string)
+        (Json.Decode.field "moduleParts" (Json.Decode.list Json.Decode.string))
+        (Json.Decode.field "name" Json.Decode.string)
+
+
+encodeQualifiedRefJson : QualifiedRef -> Json.Encode.Value
+encodeQualifiedRefJson qualifiedRef =
+    Json.Encode.object
+        [ ( "moduleParts", Json.Encode.list Json.Encode.string qualifiedRef.moduleParts )
+        , ( "name", Json.Encode.string qualifiedRef.name )
+        ]
+
+
+qualifiedRefDecoder : Json.Decode.Decoder QualifiedRef
+qualifiedRefDecoder =
+    Json.Decode.map2
+        (\moduleParts name ->
+            { moduleParts = moduleParts
+            , name = name
+            }
+        )
+        (Json.Decode.field "moduleParts" (Json.Decode.list Json.Decode.string))
+        (Json.Decode.field "name" Json.Decode.string)
+
+
 encodeFileAnalysisCache : Dict String FileAnalysis -> String
 encodeFileAnalysisCache cache =
     cache
@@ -1394,6 +2878,26 @@ encodeFileAnalysisCache cache =
                               )
                             ]
                       )
+                    , ( "crossModuleSummary"
+                      , Json.Encode.object
+                            [ ( "filePath", Json.Encode.string analysis.crossModuleSummary.filePath )
+                            , ( "moduleName", Json.Encode.string analysis.crossModuleSummary.moduleName )
+                            , ( "moduleNameRange", encodeRangeJson analysis.crossModuleSummary.moduleNameRange )
+                            , ( "isExposingAll", Json.Encode.bool analysis.crossModuleSummary.isExposingAll )
+                            , ( "exposedValues", encodeRangeDictJson analysis.crossModuleSummary.exposedValues )
+                            , ( "declaredConstructors", encodeNestedRangeDictJson analysis.crossModuleSummary.declaredConstructors )
+                            , ( "exposedConstructors", encodeNestedRangeDictJson analysis.crossModuleSummary.exposedConstructors )
+                            , ( "importedModules", encodeStringSetJson analysis.crossModuleSummary.importedModules )
+                            , ( "importedValueCandidates", encodeStringSetDictJson analysis.crossModuleSummary.importedValueCandidates )
+                            , ( "importedOpenTypesByModule", encodeStringSetDictJson analysis.crossModuleSummary.importedOpenTypesByModule )
+                            , ( "importAllModules", Json.Encode.list Json.Encode.string analysis.crossModuleSummary.importAllModules )
+                            , ( "moduleAliases", encodeStringDictJson analysis.crossModuleSummary.moduleAliases )
+                            , ( "localDeclarations", encodeStringSetJson analysis.crossModuleSummary.localDeclarations )
+                            , ( "dependencyRefs", Json.Encode.list encodeDependencyRefJson analysis.crossModuleSummary.dependencyRefs )
+                            , ( "constructorRefs", Json.Encode.list encodeQualifiedRefJson analysis.crossModuleSummary.constructorRefs )
+                            , ( "containsMainLike", Json.Encode.bool analysis.crossModuleSummary.containsMainLike )
+                            ]
+                      )
                     ]
             )
         |> Json.Encode.encode 0
@@ -1417,13 +2921,14 @@ decodeFileAnalysisCache json =
                 (Json.Decode.field "endLine" Json.Decode.int)
 
         analysisDecoder =
-            Json.Decode.map4
-                (\filePath sourceHash parsedAst summaries ->
+            Json.Decode.map5
+                (\filePath sourceHash parsedAst summaries crossModuleSummary ->
                     ( filePath
                     , { sourceHash = sourceHash
                       , parsedAst = parsedAst
                       , moduleSummary = summaries.moduleSummary
                       , bodySummary = summaries.bodySummary
+                      , crossModuleSummary = crossModuleSummary
                       }
                     )
                 )
@@ -1464,6 +2969,93 @@ decodeFileAnalysisCache json =
                             )
                             (Json.Decode.field "revision" (Json.Decode.map InputRevision (Json.Decode.field "key" Json.Decode.string)))
                             (Json.Decode.field "declarations" (Json.Decode.list declarationDecoder))
+                        )
+                    )
+                )
+                (Json.Decode.field "crossModuleSummary"
+                    (Json.Decode.map2
+                        (\headFields tailFields ->
+                            { filePath = headFields.filePath
+                            , moduleName = headFields.moduleName
+                            , moduleNameRange = headFields.moduleNameRange
+                            , isExposingAll = headFields.isExposingAll
+                            , exposedValues = headFields.exposedValues
+                            , declaredConstructors = headFields.declaredConstructors
+                            , exposedConstructors = headFields.exposedConstructors
+                            , importedModules = headFields.importedModules
+                            , importedValueCandidates = headFields.importedValueCandidates
+                            , importedOpenTypesByModule = headFields.importedOpenTypesByModule
+                            , importAllModules = headFields.importAllModules
+                            , moduleAliases = tailFields.moduleAliases
+                            , localDeclarations = tailFields.localDeclarations
+                            , dependencyRefs = tailFields.dependencyRefs
+                            , constructorRefs = tailFields.constructorRefs
+                            , containsMainLike = tailFields.containsMainLike
+                            }
+                        )
+                        (Json.Decode.map2
+                            (\primaryFields importFields ->
+                                { filePath = primaryFields.filePath
+                                , moduleName = primaryFields.moduleName
+                                , moduleNameRange = primaryFields.moduleNameRange
+                                , isExposingAll = primaryFields.isExposingAll
+                                , exposedValues = primaryFields.exposedValues
+                                , declaredConstructors = primaryFields.declaredConstructors
+                                , exposedConstructors = primaryFields.exposedConstructors
+                                , importedModules = importFields.importedModules
+                                , importedValueCandidates = importFields.importedValueCandidates
+                                , importedOpenTypesByModule = importFields.importedOpenTypesByModule
+                                , importAllModules = importFields.importAllModules
+                                }
+                            )
+                            (Json.Decode.map6
+                                (\filePath moduleName moduleNameRange isExposingAll exposedValues declaredConstructors ->
+                                    { filePath = filePath
+                                    , moduleName = moduleName
+                                    , moduleNameRange = moduleNameRange
+                                    , isExposingAll = isExposingAll
+                                    , exposedValues = exposedValues
+                                    , declaredConstructors = declaredConstructors
+                                    , exposedConstructors = Dict.empty
+                                    }
+                                )
+                                (Json.Decode.field "filePath" Json.Decode.string)
+                                (Json.Decode.field "moduleName" Json.Decode.string)
+                                (Json.Decode.field "moduleNameRange" rangeDecoder)
+                                (Json.Decode.field "isExposingAll" Json.Decode.bool)
+                                (Json.Decode.field "exposedValues" rangeDictDecoder)
+                                (Json.Decode.field "declaredConstructors" nestedRangeDictDecoder)
+                            )
+                            (Json.Decode.map5
+                                (\exposedConstructors importedModules importedValueCandidates importedOpenTypesByModule importAllModules ->
+                                    { exposedConstructors = exposedConstructors
+                                    , importedModules = importedModules
+                                    , importedValueCandidates = importedValueCandidates
+                                    , importedOpenTypesByModule = importedOpenTypesByModule
+                                    , importAllModules = importAllModules
+                                    }
+                                )
+                                (Json.Decode.field "exposedConstructors" nestedRangeDictDecoder)
+                                (Json.Decode.field "importedModules" stringSetDecoder)
+                                (Json.Decode.field "importedValueCandidates" stringSetDictDecoder)
+                                (Json.Decode.field "importedOpenTypesByModule" stringSetDictDecoder)
+                                (Json.Decode.field "importAllModules" (Json.Decode.list Json.Decode.string))
+                            )
+                        )
+                        (Json.Decode.map5
+                            (\moduleAliases localDeclarations dependencyRefs constructorRefs containsMainLike ->
+                                { moduleAliases = moduleAliases
+                                , localDeclarations = localDeclarations
+                                , dependencyRefs = dependencyRefs
+                                , constructorRefs = constructorRefs
+                                , containsMainLike = containsMainLike
+                                }
+                            )
+                            (Json.Decode.field "moduleAliases" stringDictDecoder)
+                            (Json.Decode.field "localDeclarations" stringSetDecoder)
+                            (Json.Decode.field "dependencyRefs" (Json.Decode.list dependencyRefDecoder))
+                            (Json.Decode.field "constructorRefs" (Json.Decode.list qualifiedRefDecoder))
+                            (Json.Decode.field "containsMainLike" Json.Decode.bool)
                         )
                     )
                 )
@@ -1769,8 +3361,8 @@ loadProjectCache buildDir expectedMetadata =
             )
 
 
-analyzeSourceFile : String -> Maybe FileAnalysis
-analyzeSourceFile source =
+analyzeSourceFile : String -> String -> Maybe FileAnalysis
+analyzeSourceFile filePath source =
     case Elm.Parser.parseToFile source of
         Ok file ->
             let
@@ -1785,6 +3377,9 @@ analyzeSourceFile source =
 
                 declarations =
                     getDeclarationHashesFromFile file
+
+                crossModuleSummary =
+                    buildCrossModuleSummary filePath file
             in
             Just
                 { sourceHash = hashSourceContents source
@@ -1804,6 +3399,7 @@ analyzeSourceFile source =
                     { revision = { key = bodySummaryRevisionKey declarations }
                     , declarations = declarations
                     }
+                , crossModuleSummary = crossModuleSummary
                 }
 
         Err _ ->
@@ -1878,7 +3474,7 @@ loadAnalyzedTargetFiles config files =
                                 else
                                     { wasMiss = True
                                     , analyzed =
-                                        analyzeSourceFile file.source
+                                        analyzeSourceFile file.path file.source
                                             |> Maybe.map
                                                 (\analysis ->
                                                     { path = file.path
@@ -1891,7 +3487,7 @@ loadAnalyzedTargetFiles config files =
                             Nothing ->
                                 { wasMiss = True
                                 , analyzed =
-                                    analyzeSourceFile file.source
+                                    analyzeSourceFile file.path file.source
                                         |> Maybe.map
                                             (\analysis ->
                                                 { path = file.path
@@ -2039,6 +3635,15 @@ buildExpressionForRulesWithModuleVar ruleIndices moduleVarName =
     "ReviewRunnerHelper.runRulesByIndices " ++ indexList ++ " " ++ moduleVarName
 
 
+buildExpressionForRulesWithModuleVarAndCacheExtract : List Int -> String -> String
+buildExpressionForRulesWithModuleVarAndCacheExtract ruleIndices moduleVarName =
+    let
+        indexList =
+            "[ " ++ (ruleIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+    in
+    "ReviewRunnerHelper.runRulesByIndicesAndExtractCaches " ++ indexList ++ " " ++ moduleVarName
+
+
 moduleInputValue : { path : String, source : String, astJson : String } -> Types.Value
 moduleInputValue moduleInput =
     Types.Record
@@ -2093,6 +3698,15 @@ buildExpressionForRulesWithHandleVar ruleIndices moduleHandlesVarName =
             "[ " ++ (ruleIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
     in
     "ReviewRunnerHelper.runRulesByIndicesFromHandles " ++ indexList ++ " " ++ moduleHandlesVarName
+
+
+buildExpressionForRulesWithHandleVarAndCacheExtract : List Int -> String -> String
+buildExpressionForRulesWithHandleVarAndCacheExtract ruleIndices moduleHandlesVarName =
+    let
+        indexList =
+            "[ " ++ (ruleIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+    in
+    "ReviewRunnerHelper.runRulesByIndicesFromHandlesAndExtractCaches " ++ indexList ++ " " ++ moduleHandlesVarName
 
 
 buildExpressionForRule : Int -> List { path : String, source : String, astJson : String } -> String
@@ -2194,12 +3808,57 @@ buildExpressionWithWire modules =
 reviewRunnerHelperSource : String
 reviewRunnerHelperSource =
     String.join "\n"
-        [ "module ReviewRunnerHelper exposing (buildProject, buildProjectFromHandles, extractRuleCaches, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedProject, runReviewWithCachedRules, runRulesByIndices, runRulesByIndicesFromHandles, runSingleRule, runTwoRuleGroups)"
+        [ "module ReviewRunnerHelper exposing (buildBaseProjectFromSeed, buildProject, buildProjectFromHandles, extractRuleCaches, ruleCount, ruleNames, runReview, runReviewCaching, runReviewCachingByIndices, runReviewCachingWithProject, runReviewWithCachedProject, runReviewWithCachedRules, runRulesByIndices, runRulesByIndicesAndExtractCaches, runRulesByIndicesFromHandles, runRulesByIndicesFromHandlesAndExtractCaches, runSingleRule, runTwoRuleGroups)"
+        , "import Elm.Docs"
+        , "import Elm.Project"
         , "import Json.Decode"
         , "import Elm.Syntax.File"
         , "import Review.Project as Project"
+        , "import Review.Project.Dependency as Dependency"
         , "import Review.Rule as Rule"
         , "import ReviewConfig"
+        , ""
+        , "projectElmJsonRawMarker _ ="
+        , "    \"\""
+        , ""
+        , "dependencySeedsMarker _ ="
+        , "    []"
+        , ""
+        , "buildBaseProjectFromSeed ="
+        , "    let"
+        , "        projectElmJsonRaw ="
+        , "            projectElmJsonRawMarker ()"
+        , ""
+        , "        dependencySeeds ="
+        , "            dependencySeedsMarker ()"
+        , ""
+        , "        baseProject ="
+        , "            case Json.Decode.decodeString Elm.Project.decoder projectElmJsonRaw of"
+        , "                Ok elmJson ->"
+        , "                    Project.addElmJson { path = \"elm.json\", raw = projectElmJsonRaw, project = elmJson } Project.new"
+        , ""
+        , "                Err _ ->"
+        , "                    Project.new"
+        , ""
+        , "        addDependency dependencySeed project ="
+        , "            case"
+        , "                ( Json.Decode.decodeString Elm.Project.decoder dependencySeed.elmJsonRaw"
+        , "                , Json.Decode.decodeString (Json.Decode.list Elm.Docs.decoder) dependencySeed.docsJsonRaw"
+        , "                )"
+        , "            of"
+        , "                ( Ok elmJson, Ok docs ) ->"
+        , "                    Project.addDependency (Dependency.create dependencySeed.name elmJson docs) project"
+        , ""
+        , "                _ ->"
+        , "                    project"
+        , "    in"
+        , "    List.foldl addDependency baseProject dependencySeeds"
+        , ""
+        , "buildBaseProjectMarker _ ="
+        , "    Project.new"
+        , ""
+        , "buildBaseProject ="
+        , "    buildBaseProjectMarker ()"
         , ""
         , "buildProject modules ="
         , "    let"
@@ -2208,7 +3867,7 @@ reviewRunnerHelperSource =
         , "                Ok ast -> Project.addParsedModule { path = mod.path, source = mod.source, ast = ast } proj"
         , "                Err _ -> Project.addModule { path = mod.path, source = mod.source } proj"
         , "    in"
-        , "    List.foldl addParsed Project.new modules"
+        , "    List.foldl addParsed buildBaseProject modules"
         , ""
         , "buildProjectFromHandles moduleHandles ="
         , "    let"
@@ -2222,7 +3881,7 @@ reviewRunnerHelperSource =
         , "                Ok ast -> Project.addParsedModule { path = path, source = source, ast = ast } proj"
         , "                Err _ -> Project.addModule { path = path, source = source } proj"
         , "    in"
-        , "    List.foldl addParsed Project.new moduleHandles"
+        , "    List.foldl addParsed buildBaseProject moduleHandles"
         , ""
         , "moduleHandlePathMarker handle ="
         , "    \"\""
@@ -2310,11 +3969,29 @@ reviewRunnerHelperSource =
         , "    in"
         , "    errors |> List.map formatError |> String.join \"\\n\""
         , ""
+        , "runRulesByIndicesAndExtractCaches indices modules ="
+        , "    let"
+        , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
+        , "        project = buildProject modules"
+        , "        ( errors, updatedRules ) = Rule.review selectedRules project"
+        , "        _ = extractRuleCaches updatedRules"
+        , "    in"
+        , "    errors |> List.map formatError |> String.join \"\\n\""
+        , ""
         , "runRulesByIndicesFromHandles indices moduleHandles ="
         , "    let"
         , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
         , "        project = buildProjectFromHandles moduleHandles"
         , "        ( errors, _ ) = Rule.review selectedRules project"
+        , "    in"
+        , "    errors |> List.map formatError |> String.join \"\\n\""
+        , ""
+        , "runRulesByIndicesFromHandlesAndExtractCaches indices moduleHandles ="
+        , "    let"
+        , "        selectedRules = indices |> List.filterMap (\\i -> List.head (List.drop i ReviewConfig.config))"
+        , "        project = buildProjectFromHandles moduleHandles"
+        , "        ( errors, updatedRules ) = Rule.review selectedRules project"
+        , "        _ = extractRuleCaches updatedRules"
         , "    in"
         , "    errors |> List.map formatError |> String.join \"\\n\""
         , ""
@@ -2363,7 +4040,7 @@ task config =
             preparedConfigTimed.value
 
         declCachePath =
-            Path.toString preparedConfig.buildDirectory ++ "/review-decl-cache.json"
+            Path.toString preparedConfig.buildDirectory ++ "/review-decl-cache-" ++ executionModeHash preparedConfig ++ ".json"
 
         reviewAppHashValue =
             reviewAppHashFromPreparedConfig preparedConfig
@@ -2419,6 +4096,7 @@ task config =
                 [ ( "target.files", List.length targetFileContents )
                 , ( "decl_cache.entries", Dict.size previousCache )
                 , ( "decl_cache.loaded_bytes", declCacheTimed.value.bytes )
+                , ( "experiment.host_no_unused_exports", boolToInt preparedConfig.hostNoUnusedExportsExperiment )
                 , ( "analysis_cache.entries", analyzedTargetFiles.cacheEntries )
                 , ( "analysis_cache.loaded_bytes", analyzedTargetFiles.cacheLoadBytes )
                 , ( "analysis_cache.stored_bytes", analyzedTargetFiles.cacheStoreBytes )
@@ -2676,7 +4354,7 @@ loadAndEval config targetFileContents =
         expression =
             buildExpressionWithAst modulesWithAst
     in
-    Cache.run { jobs = Nothing } config.buildDirectory
+    Cache.run { jobs = config.jobs } config.buildDirectory
         (InterpreterProject.evalWithSourceOverrides reviewProject
             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
             , expression = expression
@@ -2908,8 +4586,18 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
         moduleRules =
             ruleInfo |> List.filter (\r -> r.ruleType == ModuleRule)
 
+        hostNoUnusedExportsEnabled =
+            config.hostNoUnusedExportsExperiment
+                && List.any (\rule -> rule.name == "NoUnused.Exports") ruleInfo
+
         projectRules =
-            ruleInfo |> List.filter (\r -> r.ruleType == ProjectRule)
+            if hostNoUnusedExportsEnabled then
+                ruleInfo
+                    |> List.filter (\r -> r.ruleType == ProjectRule)
+                    |> List.filter (\r -> r.name /= "NoUnused.Exports")
+
+            else
+                ruleInfo |> List.filter (\r -> r.ruleType == ProjectRule)
 
         stalePaths =
             staleFileContents |> List.map .path |> Set.fromList
@@ -2990,11 +4678,12 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             Dict.fromList
                 [ ( "rules.module.count", List.length moduleRules )
                 , ( "rules.project.count", List.length projectRules )
+                , ( "project.host_exports.enabled", boolToInt hostNoUnusedExportsEnabled )
                 ]
     in
     Do.do
         (withTiming "module_rule_eval"
-            (Cache.run { jobs = Nothing } config.buildDirectory allMonads
+            (Cache.run { jobs = config.jobs } config.buildDirectory allMonads
                 |> BackendTask.andThen
                     (\cacheResult ->
                         let
@@ -3033,15 +4722,60 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
         moduleRuleOutput =
             modulePhaseTimed.value
     in
+    Do.do (withTiming "load_target_project_seed" (loadTargetProjectSeed config)) <| \targetProjectSeedTimed ->
+    Do.do (withTiming "build_target_project_runtime" (buildTargetProjectRuntime (Path.toString config.buildDirectory) reviewProject targetProjectSeedTimed.value)) <| \targetProjectRuntimeTimed ->
     Do.do
         (withTiming "project_rule_eval"
-            (if List.isEmpty projectRules then
+            (Do.do
+                (withTiming "project.host_exports_eval"
+                    (if hostNoUnusedExportsEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoUnusedExportsForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "project.host_exports.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoUnusedExportsTimed ->
+            let
+                hostNoUnusedExportsOutput =
+                    hostNoUnusedExportsTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoUnusedExportsCounters =
+                    mergeCounterDicts
+                        [ hostNoUnusedExportsTimed.value.counters
+                        , Dict.fromList
+                            [ ( "project.host_exports.ms", hostNoUnusedExportsTimed.stage.ms )
+                            , ( "project.host_exports.enabled", boolToInt hostNoUnusedExportsEnabled )
+                            ]
+                        ]
+            in
+            if List.isEmpty projectRules then
                 BackendTask.succeed
-                    { output = moduleRuleOutput
-                    , counters = Dict.fromList [ ( "project_rules.skipped", 1 ) ]
+                    { output =
+                        [ moduleRuleOutput, hostNoUnusedExportsOutput ]
+                            |> List.filter (not << String.isEmpty)
+                            |> String.join "\n"
+                    , counters =
+                        mergeCounterDicts
+                            [ hostNoUnusedExportsCounters
+                            , Dict.fromList
+                                [ ( "project_rules.skipped", 1 )
+                                , ( "load_target_project_seed_ms", targetProjectSeedTimed.stage.ms )
+                                , ( "build_target_project_runtime_ms", targetProjectRuntimeTimed.stage.ms )
+                                ]
+                            ]
                     }
 
-             else
+            else
                 let
                     importersAllRules =
                         projectRules
@@ -3212,17 +4946,17 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             |> List.map .path
 
                     importersFoldAffectedModules =
+                        let
+                            affectedPaths =
+                                importersFoldMissedPaths |> Set.fromList
+                        in
                         allModulesWithAst
-                            |> List.filter
-                                (\file ->
-                                    staleFileContents
-                                        |> List.any (\stale -> stale.path == file.path)
-                                )
+                            |> List.filter (\file -> Set.member file.path affectedPaths)
 
                     importersFoldSupportingPaths =
                         let
-                            stalePathSet =
-                                staleFileContents
+                            affectedPathSet =
+                                importersFoldAffectedModules
                                     |> List.map .path
                                     |> Set.fromList
 
@@ -3236,7 +4970,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                         Set.empty
                         in
                         requiredPaths
-                            |> Set.diff stalePathSet
+                            |> Set.diff affectedPathSet
                             |> Set.toList
 
                     importersAffectedModules =
@@ -3406,6 +5140,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             runProjectRulesWithWarmRuleCaches
                                 "project.importers_fold"
                                 (Path.toString config.buildDirectory)
+                                targetProjectRuntimeTimed.value.baseProject
                                 reviewProject
                                 importersFoldIndices
                                 importersFoldSupportingPaths
@@ -3420,6 +5155,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                     (withTiming "project.importers_fold.fresh_eval"
                                     (runProjectRulesWithCacheWrite
                                         (Path.toString config.buildDirectory)
+                                        targetProjectRuntimeTimed.value.baseProject
                                         reviewProject
                                         importersFoldIndices
                                         importersFoldAffectedModules
@@ -3473,6 +5209,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             runProjectRulesWithWarmRuleCaches
                                 "project.importers"
                                 (Path.toString config.buildDirectory)
+                                targetProjectRuntimeTimed.value.baseProject
                                 reviewProject
                                 ioIndices
                                 (importersAffectedModules
@@ -3495,6 +5232,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                     (withTiming "project.importers.fresh_eval"
                                     (runProjectRulesWithCacheWrite
                                         (Path.toString config.buildDirectory)
+                                        targetProjectRuntimeTimed.value.baseProject
                                         reviewProject
                                         ioIndices
                                         importersAffectedModules
@@ -3545,9 +5283,10 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
                          else
                             if useSplitDepsCache then
-                            runProjectRulesWithWarmRuleCaches
+                            runProjectRulesWithWarmRuleCachesModules
                                 "project.deps"
                                 (Path.toString config.buildDirectory)
+                                targetProjectRuntimeTimed.value.baseProject
                                 reviewProject
                                 doIndices
                                 (depsAffectedModules
@@ -3583,8 +5322,9 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             else
                                 Do.do
                                     (withTiming "project.deps.fresh_eval"
-                                    (runProjectRulesWithCacheWrite
+                                    (runProjectRulesWithCacheWriteModules
                                         (Path.toString config.buildDirectory)
+                                        targetProjectRuntimeTimed.value.baseProject
                                         reviewProject
                                         doIndices
                                         depsAffectedModules
@@ -3826,7 +5566,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         Path.toString config.buildDirectory ++ "/pr-fp-cache.txt"
 
                     combinedProjectOutputs =
-                        [ moduleRuleOutput, importersResult, depsOfResult ]
+                        [ moduleRuleOutput, hostNoUnusedExportsOutput, importersResult, depsOfResult ]
                             |> List.filter (not << String.isEmpty)
                             |> String.join "\n"
                 in
@@ -3838,6 +5578,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 [ sliceCounters
                                 , importersRuleCacheCounters
                                 , partialMemoCounters
+                                , hostNoUnusedExportsCounters
                                 , Dict.fromList
                                     [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
                                     , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
@@ -3850,6 +5591,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     Do.do
                         (evalProjectRulesWithWarmState
                             config
+                            targetProjectRuntimeTimed.value.baseProject
                             reviewProject
                             helperHash
                             fpIndices
@@ -3875,6 +5617,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 [ sliceCounters
                                 , importersRuleCacheCounters
                                 , partialMemoCounters
+                                , hostNoUnusedExportsCounters
                                 , Dict.fromList
                                     [ ( "project.importers_fold.cache_write_ms", importersFoldWriteTimed.stage.ms )
                                     , ( "project.importers.cache_write_ms", importersWriteTimed.stage.ms )
@@ -4021,7 +5764,7 @@ loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents =
                 |> Cache.andThen Cache.combine
     in
     -- Step 1: Run module rules via Cache.compute (per-file, disk-cached)
-    Cache.run { jobs = Nothing } config.buildDirectory allMonads
+    Cache.run { jobs = config.jobs } config.buildDirectory allMonads
         |> BackendTask.andThen
             (\cacheResult ->
                 let
@@ -4053,6 +5796,8 @@ loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents =
             )
         |> BackendTask.andThen
             (\moduleRuleOutput ->
+                Do.do (loadTargetProjectSeed config) <| \targetProjectSeed ->
+                Do.do (buildTargetProjectRuntime (Path.toString config.buildDirectory) reviewProject targetProjectSeed) <| \targetProjectRuntime ->
                 -- Step 2: Project rules — two-pass with Value injection
                 if List.isEmpty projectRules then
                     BackendTask.succeed moduleRuleOutput
@@ -4112,14 +5857,14 @@ loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents =
                                                                 BackendTask.succeed cachedPrErrors
 
                                                             Err _ ->
-                                                                evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                                                evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile targetProjectRuntime.baseProject reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
                                                     )
 
                                         else
-                                            evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                            evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile targetProjectRuntime.baseProject reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
 
                                     Err _ ->
-                                        evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
+                                        evalProjectRulesSingle (Path.toString config.buildDirectory) config.memoizedFunctions config.memoProfile targetProjectRuntime.baseProject reviewProject prIndices modulesWithAst prCacheKeyPath prCacheDataPath prCacheKey
                             )
                         |> BackendTask.map
                             (\prOutput ->
@@ -4382,8 +6127,9 @@ buildReviewIntercepts :
     List String
     -> SharedModulePayloads
     -> LoadedRuleCaches
+    -> Types.Value
     -> FastDict.Dict String Types.Intercept
-buildReviewIntercepts finalCacheAllowedPaths sharedModulePayloads loadedRuleCaches =
+buildReviewIntercepts finalCacheAllowedPaths sharedModulePayloads loadedRuleCaches baseProjectValue =
     FastDict.fromList
         [ ( "Review.Rule.initialCachePartsMarker"
           , Types.Intercept
@@ -4481,6 +6227,12 @@ buildReviewIntercepts finalCacheAllowedPaths sharedModulePayloads loadedRuleCach
 
                         _ ->
                             Types.EvOk (Types.String "")
+                )
+          )
+        , ( "ReviewRunnerHelper.buildBaseProjectMarker"
+          , Types.Intercept
+                (\_ _ _ _ ->
+                    Types.EvOk baseProjectValue
                 )
           )
         , ( "Review.Rule.finalCachePartsMarker"
@@ -4802,35 +6554,46 @@ appendMemoProfileLog enabled buildDir label memoEntryCount memoStats =
 
 
 runProjectRulesFresh :
+    Types.Value
+    ->
     InterpreterProject
     -> List Int
     -> List { path : String, source : String, astJson : String }
-    -> String
-runProjectRulesFresh reviewProject prIndices modulesWithAst =
+    -> BackendTask FatalError String
+runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst =
     let
         modulesVarName =
             "reviewModules__"
+
+        intercepts =
+            buildReviewIntercepts [] emptySharedModulePayloads emptyLoadedRuleCaches baseProjectValue
     in
-    case
-        InterpreterProject.prepareAndEvalWithValues reviewProject
+    Do.do
+        (InterpreterProject.prepareAndEvalWithYield reviewProject
             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
             , expression = buildExpressionForRulesWithModuleVar prIndices modulesVarName
             , sourceOverrides = [ reviewRunnerHelperSource ]
+            , intercepts = intercepts
             , injectedValues =
                 FastDict.singleton modulesVarName (moduleInputsValue modulesWithAst)
             }
-    of
+            ignoreProjectRuleYield
+        )
+    <| \evalResult ->
+    case evalResult of
         Ok (Types.String output) ->
-            output
+            BackendTask.succeed output
 
         Ok _ ->
-            ""
+            BackendTask.succeed ""
 
         Err err ->
-            err
+            BackendTask.succeed err
 
 
 runProjectRulesFreshWithMemo :
+    Types.Value
+    ->
     InterpreterProject
     -> List Int
     -> List { path : String, source : String, astJson : String }
@@ -4842,51 +6605,55 @@ runProjectRulesFreshWithMemo :
         , memoCache : MemoRuntime.MemoCache
         , memoStats : MemoRuntime.MemoStats
         }
-runProjectRulesFreshWithMemo reviewProject prIndices modulesWithAst memoizedFunctions memoProfile memoCache =
+runProjectRulesFreshWithMemo baseProjectValue reviewProject prIndices modulesWithAst memoizedFunctions memoProfile memoCache =
     let
         modulesVarName =
             "reviewModules__"
 
         injectedValues =
             FastDict.singleton modulesVarName (moduleInputsValue modulesWithAst)
+
+        intercepts =
+            buildReviewIntercepts [] emptySharedModulePayloads emptyLoadedRuleCaches baseProjectValue
     in
     if Set.isEmpty memoizedFunctions then
-        BackendTask.succeed ()
-            |> BackendTask.map
-                (\_ ->
-                    { output = runProjectRulesFresh reviewProject prIndices modulesWithAst
-                    , memoCache = memoCache
-                    , memoStats = MemoRuntime.emptyMemoStats
-                    }
-                )
+        Do.do (runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst) <| \output ->
+        BackendTask.succeed
+            { output = output
+            , memoCache = memoCache
+            , memoStats = MemoRuntime.emptyMemoStats
+            }
 
     else
-        case
-            InterpreterProject.prepareAndEvalWithValuesAndMemoizedFunctions reviewProject
+        Do.do
+            (InterpreterProject.prepareAndEvalWithYieldAndMemoizedFunctions reviewProject
                 { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
                 , expression = buildExpressionForRulesWithModuleVar prIndices modulesVarName
                 , sourceOverrides = [ reviewRunnerHelperSource ]
+                , intercepts = intercepts
                 , injectedValues = injectedValues
                 , memoizedFunctions = memoizedFunctions
                 , memoCache = memoCache
                 , collectMemoStats = memoProfile
                 }
-        of
-            Ok evalResult ->
-                case evalResult.value of
-                    Types.String output ->
-                        BackendTask.succeed
-                            { output = output
-                            , memoCache = evalResult.memoCache
-                            , memoStats = evalResult.memoStats
-                            }
+                ignoreProjectRuleYield
+            )
+        <| \evalResult ->
+        case evalResult.result of
+            Ok (Types.String output) ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = evalResult.memoCache
+                    , memoStats = evalResult.memoStats
+                    }
 
-                    _ ->
-                        BackendTask.succeed
-                            { output = runProjectRulesFresh reviewProject prIndices modulesWithAst
-                            , memoCache = memoCache
-                            , memoStats = MemoRuntime.emptyMemoStats
-                            }
+            Ok _ ->
+                Do.do (runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst) <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    }
 
             Err err ->
                 BackendTask.succeed
@@ -4896,8 +6663,9 @@ runProjectRulesFreshWithMemo reviewProject prIndices modulesWithAst memoizedFunc
                     }
 
 
-runProjectRulesWithCacheWrite :
+runProjectRulesWithCacheWriteModules :
     String
+    -> Types.Value
     -> InterpreterProject
     -> List Int
     -> List { path : String, source : String, astJson : String }
@@ -4906,22 +6674,19 @@ runProjectRulesWithCacheWrite :
     -> Bool
     -> MemoRuntime.MemoCache
     -> BackendTask FatalError ProjectRuleEvalResult
-runProjectRulesWithCacheWrite buildDir reviewProject prIndices modulesWithAst finalCachePathsToWrite memoizedFunctions memoProfile memoCache =
+runProjectRulesWithCacheWriteModules buildDir baseProjectValue reviewProject prIndices modulesWithAst finalCachePathsToWrite memoizedFunctions memoProfile memoCache =
     let
-        moduleHandlesVarName =
-            "reviewModuleHandles__"
+        modulesVarName =
+            "reviewModules__"
 
         expression =
-            buildExpressionForRulesWithHandleVar prIndices moduleHandlesVarName
-
-        sharedModuleHandlePayloads =
-            moduleHandlePayloads modulesWithAst
+            buildExpressionForRulesWithModuleVarAndCacheExtract prIndices modulesVarName
 
         injectedValues =
-            FastDict.singleton moduleHandlesVarName sharedModuleHandlePayloads.handlesValue
+            FastDict.singleton modulesVarName (moduleInputsValue modulesWithAst)
 
-        fallbackOutput () =
-            runProjectRulesFresh reviewProject prIndices modulesWithAst
+        fallbackOutput =
+            runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst
 
         loadedRuleCaches =
             { baseCaches = Dict.empty
@@ -4931,7 +6696,7 @@ runProjectRulesWithCacheWrite buildDir reviewProject prIndices modulesWithAst fi
             }
 
         intercepts =
-            buildReviewIntercepts finalCachePathsToWrite sharedModuleHandlePayloads.payloads loadedRuleCaches
+            buildReviewIntercepts finalCachePathsToWrite emptySharedModulePayloads loadedRuleCaches baseProjectValue
     in
     if Set.isEmpty memoizedFunctions then
         Do.do
@@ -4959,8 +6724,9 @@ runProjectRulesWithCacheWrite buildDir reviewProject prIndices modulesWithAst fi
                     }
 
             Ok _ ->
+                Do.do fallbackOutput <| \output ->
                 BackendTask.succeed
-                    { output = fallbackOutput ()
+                    { output = output
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
                     , loadedRuleCaches = loadedRuleCaches
@@ -4968,8 +6734,9 @@ runProjectRulesWithCacheWrite buildDir reviewProject prIndices modulesWithAst fi
                     }
 
             Err _ ->
+                Do.do fallbackOutput <| \output ->
                 BackendTask.succeed
-                    { output = fallbackOutput ()
+                    { output = output
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
                     , loadedRuleCaches = loadedRuleCaches
@@ -5005,8 +6772,9 @@ runProjectRulesWithCacheWrite buildDir reviewProject prIndices modulesWithAst fi
                     }
 
             Ok _ ->
+                Do.do fallbackOutput <| \output ->
                 BackendTask.succeed
-                    { output = fallbackOutput ()
+                    { output = output
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
                     , loadedRuleCaches = loadedRuleCaches
@@ -5014,8 +6782,9 @@ runProjectRulesWithCacheWrite buildDir reviewProject prIndices modulesWithAst fi
                     }
 
             Err _ ->
+                Do.do fallbackOutput <| \output ->
                 BackendTask.succeed
-                    { output = fallbackOutput ()
+                    { output = output
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
                     , loadedRuleCaches = loadedRuleCaches
@@ -5023,9 +6792,142 @@ runProjectRulesWithCacheWrite buildDir reviewProject prIndices modulesWithAst fi
                     }
 
 
-runProjectRulesWithWarmRuleCaches :
+runProjectRulesWithCacheWrite :
+    String
+    -> Types.Value
+    -> InterpreterProject
+    -> List Int
+    -> List { path : String, source : String, astJson : String }
+    -> List String
+    -> Set.Set String
+    -> Bool
+    -> MemoRuntime.MemoCache
+    -> BackendTask FatalError ProjectRuleEvalResult
+runProjectRulesWithCacheWrite buildDir baseProjectValue reviewProject prIndices modulesWithAst finalCachePathsToWrite memoizedFunctions memoProfile memoCache =
+    let
+        moduleHandlesVarName =
+            "reviewModuleHandles__"
+
+        expression =
+            buildExpressionForRulesWithHandleVarAndCacheExtract prIndices moduleHandlesVarName
+
+        sharedModuleHandlePayloads =
+            moduleHandlePayloads modulesWithAst
+
+        injectedValues =
+            FastDict.singleton moduleHandlesVarName sharedModuleHandlePayloads.handlesValue
+
+        fallbackOutput =
+            runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst
+
+        loadedRuleCaches =
+            { baseCaches = Dict.empty
+            , moduleEntries = Dict.empty
+            , entryCount = 0
+            , bytes = 0
+            }
+
+        intercepts =
+            buildReviewIntercepts finalCachePathsToWrite sharedModuleHandlePayloads.payloads loadedRuleCaches baseProjectValue
+    in
+    if Set.isEmpty memoizedFunctions then
+        Do.do
+            (deferTask
+                (\() ->
+                    InterpreterProject.prepareAndEvalWithYield reviewProject
+                        { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                        , expression = expression
+                        , sourceOverrides = [ reviewRunnerHelperSource ]
+                        , intercepts = intercepts
+                        , injectedValues = injectedValues
+                        }
+                        (projectRuleYieldHandler buildDir)
+                )
+            )
+        <| \result ->
+        case result of
+            Ok (Types.String output) ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters = Dict.empty
+                    }
+
+            Ok _ ->
+                Do.do fallbackOutput <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters = Dict.empty
+                    }
+
+            Err _ ->
+                Do.do fallbackOutput <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters = Dict.empty
+                    }
+
+    else
+        Do.do
+            (deferTask
+                (\() ->
+                    InterpreterProject.prepareAndEvalWithYieldAndMemoizedFunctions reviewProject
+                        { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                        , expression = expression
+                        , sourceOverrides = [ reviewRunnerHelperSource ]
+                        , intercepts = intercepts
+                        , injectedValues = injectedValues
+                        , memoizedFunctions = memoizedFunctions
+                        , memoCache = memoCache
+                        , collectMemoStats = memoProfile
+                        }
+                        (projectRuleYieldHandler buildDir)
+                )
+            )
+        <| \result ->
+        case result.result of
+            Ok (Types.String output) ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = result.memoCache
+                    , memoStats = result.memoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters = Dict.empty
+                    }
+
+            Ok _ ->
+                Do.do fallbackOutput <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters = Dict.empty
+                    }
+
+            Err _ ->
+                Do.do fallbackOutput <| \output ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters = Dict.empty
+                    }
+
+
+runProjectRulesWithWarmRuleCachesModules :
     String
     -> String
+    -> Types.Value
     -> InterpreterProject
     -> List Int
     -> List String
@@ -5035,40 +6937,48 @@ runProjectRulesWithWarmRuleCaches :
     -> Bool
     -> MemoRuntime.MemoCache
     -> BackendTask FatalError ProjectRuleEvalResult
-runProjectRulesWithWarmRuleCaches counterPrefix buildDir reviewProject prIndices moduleCachePathsToLoad modulesWithAst finalCachePathsToWrite memoizedFunctions memoProfile memoCache =
+runProjectRulesWithWarmRuleCachesModules counterPrefix buildDir baseProjectValue reviewProject prIndices moduleCachePathsToLoad modulesWithAst finalCachePathsToWrite memoizedFunctions memoProfile memoCache =
     let
-        moduleHandlesVarName =
-            "reviewModuleHandles__"
+        modulesVarName =
+            "reviewModules__"
 
         expression =
-            buildExpressionForRulesWithHandleVar prIndices moduleHandlesVarName
-
-        sharedModuleHandlePayloads =
-            moduleHandlePayloads modulesWithAst
+            buildExpressionForRulesWithModuleVar prIndices modulesVarName
 
         injectedValues =
-            FastDict.singleton moduleHandlesVarName sharedModuleHandlePayloads.handlesValue
+            FastDict.singleton modulesVarName (moduleInputsValue modulesWithAst)
 
-        fallbackOutput () =
-            runProjectRulesFresh reviewProject prIndices modulesWithAst
+        fallbackOutput =
+            runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst
     in
     Do.do
         (withTiming (counterPrefix ++ ".rule_cache.load")
             (loadRuleCachesWithStats buildDir moduleCachePathsToLoad)
         )
     <| \loadTimed ->
+    Do.do
+        (withTiming (counterPrefix ++ ".prepare_intercepts")
+            (deferTask
+                (\() ->
+                    BackendTask.succeed
+                        (buildReviewIntercepts finalCachePathsToWrite emptySharedModulePayloads loadTimed.value baseProjectValue)
+                )
+            )
+        )
+    <| \interceptsTimed ->
     let
         loadedRuleCaches =
             loadTimed.value
 
         intercepts =
-            buildReviewIntercepts finalCachePathsToWrite sharedModuleHandlePayloads.payloads loadedRuleCaches
+            interceptsTimed.value
 
         baseCounters =
             Dict.fromList
                 [ ( counterPrefix ++ ".mode.fresh", 0 )
                 , ( counterPrefix ++ ".mode.split", 1 )
                 , ( counterPrefix ++ ".rule_cache.load_ms", loadTimed.stage.ms )
+                , ( counterPrefix ++ ".prepare_intercepts_ms", interceptsTimed.stage.ms )
                 ]
     in
     if Set.isEmpty memoizedFunctions then
@@ -5100,23 +7010,39 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir reviewProject prIndices
                     }
 
             Ok _ ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
                 BackendTask.succeed
-                    { output = fallbackOutput ()
+                    { output = fallbackTimed.value
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
                     , loadedRuleCaches = loadedRuleCaches
                     , counters =
-                        Dict.insert (counterPrefix ++ ".warm_eval_ms") evalTimed.stage.ms baseCounters
+                        mergeCounterDicts
+                            [ baseCounters
+                            , Dict.fromList
+                                [ ( counterPrefix ++ ".warm_eval_ms", evalTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback_eval_ms", fallbackTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback.non_string", 1 )
+                                ]
+                            ]
                     }
 
             Err _ ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
                 BackendTask.succeed
-                    { output = fallbackOutput ()
+                    { output = fallbackTimed.value
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
                     , loadedRuleCaches = loadedRuleCaches
                     , counters =
-                        Dict.insert (counterPrefix ++ ".warm_eval_ms") evalTimed.stage.ms baseCounters
+                        mergeCounterDicts
+                            [ baseCounters
+                            , Dict.fromList
+                                [ ( counterPrefix ++ ".warm_eval_ms", evalTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback_eval_ms", fallbackTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback.err", 1 )
+                                ]
+                            ]
                     }
 
     else
@@ -5151,8 +7077,134 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir reviewProject prIndices
                     }
 
             Ok _ ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
                 BackendTask.succeed
-                    { output = fallbackOutput ()
+                    { output = fallbackTimed.value
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        mergeCounterDicts
+                            [ baseCounters
+                            , Dict.fromList
+                                [ ( counterPrefix ++ ".warm_eval_ms", evalTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback_eval_ms", fallbackTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback.non_string", 1 )
+                                ]
+                            ]
+                    }
+
+            Err _ ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                BackendTask.succeed
+                    { output = fallbackTimed.value
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        mergeCounterDicts
+                            [ baseCounters
+                            , Dict.fromList
+                                [ ( counterPrefix ++ ".warm_eval_ms", evalTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback_eval_ms", fallbackTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback.err", 1 )
+                                ]
+                            ]
+                    }
+
+
+runProjectRulesWithWarmRuleCaches :
+    String
+    -> String
+    -> Types.Value
+    -> InterpreterProject
+    -> List Int
+    -> List String
+    -> List { path : String, source : String, astJson : String }
+    -> List String
+    -> Set.Set String
+    -> Bool
+    -> MemoRuntime.MemoCache
+    -> BackendTask FatalError ProjectRuleEvalResult
+runProjectRulesWithWarmRuleCaches counterPrefix buildDir baseProjectValue reviewProject prIndices moduleCachePathsToLoad modulesWithAst finalCachePathsToWrite memoizedFunctions memoProfile memoCache =
+    let
+        moduleHandlesVarName =
+            "reviewModuleHandles__"
+
+        expression =
+            buildExpressionForRulesWithHandleVar prIndices moduleHandlesVarName
+
+        fallbackOutput =
+            runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst
+    in
+    Do.do
+        (withTiming (counterPrefix ++ ".prepare_module_handles")
+            (deferTask
+                (\() ->
+                    BackendTask.succeed (moduleHandlePayloads modulesWithAst)
+                )
+            )
+        )
+    <| \handlePayloadsTimed ->
+    let
+        sharedModuleHandlePayloads =
+            handlePayloadsTimed.value
+
+        injectedValues =
+            FastDict.singleton moduleHandlesVarName sharedModuleHandlePayloads.handlesValue
+    in
+    Do.do
+        (withTiming (counterPrefix ++ ".rule_cache.load")
+            (loadRuleCachesWithStats buildDir moduleCachePathsToLoad)
+        )
+    <| \loadTimed ->
+    Do.do
+        (withTiming (counterPrefix ++ ".prepare_intercepts")
+            (deferTask
+                (\() ->
+                    BackendTask.succeed
+                        (buildReviewIntercepts finalCachePathsToWrite sharedModuleHandlePayloads.payloads loadTimed.value baseProjectValue)
+                )
+            )
+        )
+    <| \interceptsTimed ->
+    let
+        loadedRuleCaches =
+            loadTimed.value
+
+        intercepts =
+            interceptsTimed.value
+
+        baseCounters =
+            Dict.fromList
+                [ ( counterPrefix ++ ".mode.fresh", 0 )
+                , ( counterPrefix ++ ".mode.split", 1 )
+                , ( counterPrefix ++ ".prepare_module_handles_ms", handlePayloadsTimed.stage.ms )
+                , ( counterPrefix ++ ".rule_cache.load_ms", loadTimed.stage.ms )
+                , ( counterPrefix ++ ".prepare_intercepts_ms", interceptsTimed.stage.ms )
+                ]
+    in
+    if Set.isEmpty memoizedFunctions then
+        Do.do
+            (withTiming (counterPrefix ++ ".warm_eval")
+                (deferTask
+                    (\() ->
+                        InterpreterProject.prepareAndEvalWithYield reviewProject
+                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                            , expression = expression
+                            , sourceOverrides = [ reviewRunnerHelperSource ]
+                            , intercepts = intercepts
+                            , injectedValues = injectedValues
+                            }
+                            (projectRuleYieldHandler buildDir)
+                    )
+                )
+            )
+        <| \evalTimed ->
+        case evalTimed.value of
+            Ok (Types.String output) ->
+                BackendTask.succeed
+                    { output = output
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
                     , loadedRuleCaches = loadedRuleCaches
@@ -5160,25 +7212,120 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir reviewProject prIndices
                         Dict.insert (counterPrefix ++ ".warm_eval_ms") evalTimed.stage.ms baseCounters
                     }
 
-            Err _ ->
+            Ok _ ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
                 BackendTask.succeed
-                    { output = fallbackOutput ()
+                    { output = fallbackTimed.value
                     , memoCache = memoCache
                     , memoStats = MemoRuntime.emptyMemoStats
                     , loadedRuleCaches = loadedRuleCaches
                     , counters =
+                        mergeCounterDicts
+                            [ baseCounters
+                            , Dict.fromList
+                                [ ( counterPrefix ++ ".warm_eval_ms", evalTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback_eval_ms", fallbackTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback.non_string", 1 )
+                                ]
+                            ]
+                    }
+
+            Err _ ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                BackendTask.succeed
+                    { output = fallbackTimed.value
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        mergeCounterDicts
+                            [ baseCounters
+                            , Dict.fromList
+                                [ ( counterPrefix ++ ".warm_eval_ms", evalTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback_eval_ms", fallbackTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback.err", 1 )
+                                ]
+                            ]
+                    }
+
+    else
+        Do.do
+            (withTiming (counterPrefix ++ ".warm_eval")
+                (deferTask
+                    (\() ->
+                        InterpreterProject.prepareAndEvalWithYieldAndMemoizedFunctions reviewProject
+                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                            , expression = expression
+                            , sourceOverrides = [ reviewRunnerHelperSource ]
+                            , intercepts = intercepts
+                            , injectedValues = injectedValues
+                            , memoizedFunctions = memoizedFunctions
+                            , memoCache = memoCache
+                            , collectMemoStats = memoProfile
+                            }
+                            (projectRuleYieldHandler buildDir)
+                    )
+                )
+            )
+        <| \evalTimed ->
+        case evalTimed.value.result of
+            Ok (Types.String output) ->
+                BackendTask.succeed
+                    { output = output
+                    , memoCache = evalTimed.value.memoCache
+                    , memoStats = evalTimed.value.memoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
                         Dict.insert (counterPrefix ++ ".warm_eval_ms") evalTimed.stage.ms baseCounters
+                    }
+
+            Ok _ ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                BackendTask.succeed
+                    { output = fallbackTimed.value
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        mergeCounterDicts
+                            [ baseCounters
+                            , Dict.fromList
+                                [ ( counterPrefix ++ ".warm_eval_ms", evalTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback_eval_ms", fallbackTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback.non_string", 1 )
+                                ]
+                            ]
+                    }
+
+            Err _ ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                BackendTask.succeed
+                    { output = fallbackTimed.value
+                    , memoCache = memoCache
+                    , memoStats = MemoRuntime.emptyMemoStats
+                    , loadedRuleCaches = loadedRuleCaches
+                    , counters =
+                        mergeCounterDicts
+                            [ baseCounters
+                            , Dict.fromList
+                                [ ( counterPrefix ++ ".warm_eval_ms", evalTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback_eval_ms", fallbackTimed.stage.ms )
+                                , ( counterPrefix ++ ".fallback.err", 1 )
+                                ]
+                            ]
                     }
 
 
 evalTwoProjectRuleSlices :
+    Types.Value
+    ->
     InterpreterProject
     -> List Int
     -> List { path : String, source : String, astJson : String }
     -> List Int
     -> List { path : String, source : String, astJson : String }
-    -> { firstOutput : String, secondOutput : String }
-evalTwoProjectRuleSlices reviewProject firstIndices firstModules secondIndices secondModules =
+    -> BackendTask FatalError { firstOutput : String, secondOutput : String }
+evalTwoProjectRuleSlices baseProjectValue reviewProject firstIndices firstModules secondIndices secondModules =
     let
         indexList indices =
             "[ " ++ (indices |> List.map String.fromInt |> String.join ", ") ++ " ]"
@@ -5198,29 +7345,41 @@ evalTwoProjectRuleSlices reviewProject firstIndices firstModules secondIndices s
                 ++ indexList secondIndices
                 ++ " "
                 ++ secondModulesVar
+
+        intercepts =
+            buildReviewIntercepts [] emptySharedModulePayloads emptyLoadedRuleCaches baseProjectValue
     in
-    case
-        InterpreterProject.prepareAndEvalWithValues reviewProject
+    Do.do
+        (InterpreterProject.prepareAndEvalWithYield reviewProject
             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
             , expression = expression
             , sourceOverrides = [ reviewRunnerHelperSource ]
+            , intercepts = intercepts
             , injectedValues =
                 FastDict.fromList
                     [ ( firstModulesVar, moduleInputsValue firstModules )
                     , ( secondModulesVar, moduleInputsValue secondModules )
                     ]
             }
-    of
+            ignoreProjectRuleYield
+        )
+    <| \evalResult ->
+    case evalResult of
         Ok (Types.Tuple (Types.String firstOutput) (Types.String secondOutput)) ->
-            { firstOutput = firstOutput, secondOutput = secondOutput }
+            BackendTask.succeed { firstOutput = firstOutput, secondOutput = secondOutput }
 
         _ ->
-            { firstOutput = runProjectRulesFresh reviewProject firstIndices firstModules
-            , secondOutput = runProjectRulesFresh reviewProject secondIndices secondModules
-            }
+            Do.do (runProjectRulesFresh baseProjectValue reviewProject firstIndices firstModules) <| \firstOutput ->
+            Do.do (runProjectRulesFresh baseProjectValue reviewProject secondIndices secondModules) <| \secondOutput ->
+            BackendTask.succeed
+                { firstOutput = firstOutput
+                , secondOutput = secondOutput
+                }
 
 
 evalTwoProjectRuleSlicesWithMemo :
+    Types.Value
+    ->
     InterpreterProject
     -> List Int
     -> List { path : String, source : String, astJson : String }
@@ -5235,7 +7394,7 @@ evalTwoProjectRuleSlicesWithMemo :
         , memoCache : MemoRuntime.MemoCache
         , memoStats : MemoRuntime.MemoStats
         }
-evalTwoProjectRuleSlicesWithMemo reviewProject firstIndices firstModules secondIndices secondModules memoizedFunctions memoProfile memoCache =
+evalTwoProjectRuleSlicesWithMemo baseProjectValue reviewProject firstIndices firstModules secondIndices secondModules memoizedFunctions memoProfile memoCache =
     let
         indexList indices =
             "[ " ++ (indices |> List.map String.fromInt |> String.join ", ") ++ " ]"
@@ -5261,12 +7420,12 @@ evalTwoProjectRuleSlicesWithMemo reviewProject firstIndices firstModules secondI
                 [ ( firstModulesVar, moduleInputsValue firstModules )
                 , ( secondModulesVar, moduleInputsValue secondModules )
                 ]
+
+        intercepts =
+            buildReviewIntercepts [] emptySharedModulePayloads emptyLoadedRuleCaches baseProjectValue
     in
     if Set.isEmpty memoizedFunctions then
-        let
-            result =
-                evalTwoProjectRuleSlices reviewProject firstIndices firstModules secondIndices secondModules
-        in
+        Do.do (evalTwoProjectRuleSlices baseProjectValue reviewProject firstIndices firstModules secondIndices secondModules) <| \result ->
         BackendTask.succeed
             { firstOutput = result.firstOutput
             , secondOutput = result.secondOutput
@@ -5275,40 +7434,32 @@ evalTwoProjectRuleSlicesWithMemo reviewProject firstIndices firstModules secondI
             }
 
     else
-        case
-            InterpreterProject.prepareAndEvalWithValuesAndMemoizedFunctions reviewProject
+        Do.do
+            (InterpreterProject.prepareAndEvalWithYieldAndMemoizedFunctions reviewProject
                 { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
                 , expression = expression
                 , sourceOverrides = [ reviewRunnerHelperSource ]
+                , intercepts = intercepts
                 , injectedValues = injectedValues
                 , memoizedFunctions = memoizedFunctions
                 , memoCache = memoCache
                 , collectMemoStats = memoProfile
                 }
-        of
-            Ok evalResult ->
-                case evalResult.value of
-                    Types.Tuple (Types.String firstOutput) (Types.String secondOutput) ->
-                        BackendTask.succeed
-                            { firstOutput = firstOutput
-                            , secondOutput = secondOutput
-                            , memoCache = evalResult.memoCache
-                            , memoStats = evalResult.memoStats
-                            }
+                ignoreProjectRuleYield
+            )
+        <| \evalResult ->
+        case evalResult.result of
+            Ok (Types.Tuple (Types.String firstOutput) (Types.String secondOutput)) ->
+                BackendTask.succeed
+                    { firstOutput = firstOutput
+                    , secondOutput = secondOutput
+                    , memoCache = evalResult.memoCache
+                    , memoStats = evalResult.memoStats
+                    }
 
-                    _ ->
-                        Do.do (runProjectRulesFreshWithMemo reviewProject firstIndices firstModules memoizedFunctions memoProfile memoCache) <| \firstResult ->
-                        Do.do (runProjectRulesFreshWithMemo reviewProject secondIndices secondModules memoizedFunctions memoProfile firstResult.memoCache) <| \secondResult ->
-                        BackendTask.succeed
-                            { firstOutput = firstResult.output
-                            , secondOutput = secondResult.output
-                            , memoCache = secondResult.memoCache
-                            , memoStats = secondResult.memoStats
-                            }
-
-            Err _ ->
-                Do.do (runProjectRulesFreshWithMemo reviewProject firstIndices firstModules memoizedFunctions memoProfile memoCache) <| \firstResult ->
-                Do.do (runProjectRulesFreshWithMemo reviewProject secondIndices secondModules memoizedFunctions memoProfile firstResult.memoCache) <| \secondResult ->
+            _ ->
+                Do.do (runProjectRulesFreshWithMemo baseProjectValue reviewProject firstIndices firstModules memoizedFunctions memoProfile memoCache) <| \firstResult ->
+                Do.do (runProjectRulesFreshWithMemo baseProjectValue reviewProject secondIndices secondModules memoizedFunctions memoProfile firstResult.memoCache) <| \secondResult ->
                 BackendTask.succeed
                     { firstOutput = firstResult.output
                     , secondOutput = secondResult.output
@@ -5440,8 +7591,14 @@ projectRuleYieldHandler buildDir tag payload =
             BackendTask.succeed Types.Unit
 
 
+ignoreProjectRuleYield : String -> Types.Value -> BackendTask FatalError Types.Value
+ignoreProjectRuleYield _ _ =
+    BackendTask.succeed Types.Unit
+
+
 evalProjectRulesWithWarmState :
     Config
+    -> Types.Value
     -> InterpreterProject
     -> String
     -> List Int
@@ -5456,7 +7613,7 @@ evalProjectRulesWithWarmState :
             , memoStats : MemoRuntime.MemoStats
             , usedCachedProject : Bool
             }
-evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileContents staleFileContents maybeOutputCache memoCache =
+evalProjectRulesWithWarmState config baseProjectValue reviewProject helperHash prIndices allFileContents staleFileContents maybeOutputCache memoCache =
     let
         buildDir =
             Path.toString config.buildDirectory
@@ -5498,6 +7655,7 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                 (allFileContents |> List.map .path)
                 emptySharedModulePayloads
                 preloadedCaches
+                baseProjectValue
 
         expression =
             case maybeCachedProject of
@@ -5528,8 +7686,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
             Do.do (persistProjectCacheMetadata buildDir projectMetadata) <| \_ ->
             persistProjectEvalOutput maybeOutputCache output
 
-        fallbackOutput () =
-            runProjectRulesFresh reviewProject prIndices allModulesWithAst
+        fallbackOutput =
+            runProjectRulesFresh baseProjectValue reviewProject prIndices allModulesWithAst
 
         usedCachedProject =
             case maybeCachedProject of
@@ -5571,7 +7729,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     }
 
             Ok _ ->
-                Do.do (persistProjectEvalOutput maybeOutputCache (fallbackOutput ())) <| \output ->
+                Do.do fallbackOutput <| \fallback ->
+                Do.do (persistProjectEvalOutput maybeOutputCache fallback) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -5580,7 +7739,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     }
 
             Err _ ->
-                Do.do (persistProjectEvalOutput maybeOutputCache (fallbackOutput ())) <| \output ->
+                Do.do fallbackOutput <| \fallback ->
+                Do.do (persistProjectEvalOutput maybeOutputCache fallback) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -5625,7 +7785,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     }
 
             Ok _ ->
-                Do.do (persistProjectEvalOutput maybeOutputCache (fallbackOutput ())) <| \output ->
+                Do.do fallbackOutput <| \fallback ->
+                Do.do (persistProjectEvalOutput maybeOutputCache fallback) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -5634,7 +7795,8 @@ evalProjectRulesWithWarmState config reviewProject helperHash prIndices allFileC
                     }
 
             Err _ ->
-                Do.do (persistProjectEvalOutput maybeOutputCache (fallbackOutput ())) <| \output ->
+                Do.do fallbackOutput <| \fallback ->
+                Do.do (persistProjectEvalOutput maybeOutputCache fallback) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -5647,6 +7809,7 @@ evalProjectRulesSingle :
     String
     -> Set.Set String
     -> Bool
+    -> Types.Value
     -> InterpreterProject
     -> List Int
     -> List { path : String, source : String, astJson : String }
@@ -5654,8 +7817,8 @@ evalProjectRulesSingle :
     -> String
     -> String
     -> BackendTask FatalError String
-evalProjectRulesSingle buildDir memoizedFunctions memoProfile reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
-    Do.do (runProjectRulesFreshWithMemo reviewProject prIndices modulesWithAst memoizedFunctions memoProfile MemoRuntime.emptyMemoCache) <| \evalResult ->
+evalProjectRulesSingle buildDir memoizedFunctions memoProfile baseProjectValue reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
+    Do.do (runProjectRulesFreshWithMemo baseProjectValue reviewProject prIndices modulesWithAst memoizedFunctions memoProfile MemoRuntime.emptyMemoCache) <| \evalResult ->
     Do.do (appendMemoProfileLog memoProfile buildDir "project-rules-cold" (MemoRuntime.entryCount evalResult.memoCache) evalResult.memoStats) <| \_ ->
     persistProjectEvalOutput
         (Just
@@ -5678,6 +7841,7 @@ Both passes store errors to disk cache.
 -}
 evalProjectRulesTwoPass :
     Config
+    -> Types.Value
     -> InterpreterProject
     -> List Int
     -> List { path : String, source : String, astJson : String }
@@ -5685,7 +7849,7 @@ evalProjectRulesTwoPass :
     -> String
     -> String
     -> BackendTask FatalError String
-evalProjectRulesTwoPass config reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
+evalProjectRulesTwoPass config baseProjectValue reviewProject prIndices modulesWithAst cacheKeyPath cacheDataPath cacheKey =
     let
         moduleList =
             buildModuleListWithAst modulesWithAst
@@ -5701,13 +7865,20 @@ evalProjectRulesTwoPass config reviewProject prIndices modulesWithAst cacheKeyPa
     in
     Do.do BackendTask.Time.now <| \t1 ->
     let
-        pass1Result =
-            InterpreterProject.prepareAndEvalRaw reviewProject
-                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                , expression = cachingExpr
-                , sourceOverrides = [ reviewRunnerHelperSource ]
-                }
+        intercepts =
+            buildReviewIntercepts [] emptySharedModulePayloads emptyLoadedRuleCaches baseProjectValue
     in
+    Do.do
+        (InterpreterProject.prepareAndEvalWithYield reviewProject
+            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+            , expression = cachingExpr
+            , sourceOverrides = [ reviewRunnerHelperSource ]
+            , intercepts = intercepts
+            , injectedValues = FastDict.empty
+            }
+            ignoreProjectRuleYield
+        )
+    <| \pass1Result ->
     case pass1Result of
         Ok (Types.Tuple (Types.String errorStr) rulesValue) ->
             Do.do BackendTask.Time.now <| \t2 ->
@@ -5717,14 +7888,17 @@ evalProjectRulesTwoPass config reviewProject prIndices modulesWithAst cacheKeyPa
                 cachedExpr =
                     "ReviewRunnerHelper.runReviewWithCachedRules cachedRules__ " ++ moduleList
 
-                pass2Result =
-                    InterpreterProject.prepareAndEvalWithValues reviewProject
-                        { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                        , expression = cachedExpr
-                        , sourceOverrides = [ reviewRunnerHelperSource ]
-                        , injectedValues = FastDict.singleton "cachedRules__" rulesValue
-                        }
+                pass2Config =
+                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                    , expression = cachedExpr
+                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                    , intercepts = intercepts
+                    , injectedValues = FastDict.singleton "cachedRules__" rulesValue
+                    }
             in
+            Do.do
+                (InterpreterProject.prepareAndEvalWithYield reviewProject pass2Config ignoreProjectRuleYield)
+            <| \pass2Result ->
             case pass2Result of
                 Ok (Types.Tuple (Types.String errorStr2) _) ->
                     Do.do BackendTask.Time.now <| \t3 ->
@@ -5795,7 +7969,7 @@ encodeReviewErrors errors =
 getRuleCount : Config -> BackendTask FatalError Int
 getRuleCount config =
     Do.do (loadReviewProject config) <| \reviewProject ->
-    Cache.run { jobs = Nothing } config.buildDirectory
+    Cache.run { jobs = config.jobs } config.buildDirectory
         (InterpreterProject.evalWithSourceOverrides reviewProject
             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
             , expression = "String.fromInt ReviewRunnerHelper.ruleCount"
@@ -5855,7 +8029,7 @@ computeAndPersistRuleInfo :
     -> InterpreterProject
     -> BackendTask FatalError (List RuleInfo)
 computeAndPersistRuleInfo config reviewProject =
-    Cache.run { jobs = Nothing } config.buildDirectory
+    Cache.run { jobs = config.jobs } config.buildDirectory
         (InterpreterProject.evalWithSourceOverrides reviewProject
             { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
             , expression = "ReviewRunnerHelper.ruleNames"
@@ -6054,6 +8228,18 @@ persistCache path cache =
 reportErrors : ReportFormat -> List ReviewError -> BackendTask FatalError ()
 reportErrors reportFormat errors =
     case reportFormat of
+        ReportQuiet ->
+            if List.isEmpty errors then
+                BackendTask.succeed ()
+
+            else
+                BackendTask.fail
+                    (FatalError.build
+                        { title = ""
+                        , body = ""
+                        }
+                    )
+
         ReportJson ->
             Do.do (Script.log (encodeReviewErrors errors)) <| \_ ->
             if List.isEmpty errors then

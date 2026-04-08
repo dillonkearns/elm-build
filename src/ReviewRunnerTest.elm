@@ -12,6 +12,7 @@ import Dict
 import Expect
 import ReviewRunner
 import SemanticHash
+import Set
 import Test exposing (Test, describe, test)
 import Test.BackendTask as BackendTaskTest
 
@@ -154,6 +155,117 @@ pureHelperTests =
                         |> List.head
                         |> Maybe.map .message
                         |> Expect.equal (Just "use a |> b instead")
+            ]
+        , describe "hostNoUnusedExportsErrorsForSources"
+            [ test "reports unused explicitly exposed value" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedExportsErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (foo, bar)
+
+foo =
+    1
+
+bar =
+    2
+"""
+                          }
+                        , { path = "src/B.elm"
+                          , source = """module B exposing (..)
+
+import A exposing (foo)
+
+main =
+    foo
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.filePath, error.message ))
+                        |> Expect.equal
+                            [ ( "src/A.elm", "Exposed function or value `bar` is never used outside this module" ) ]
+            , test "keeps locally used exposing-all value" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedExportsErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (..)
+
+foo =
+    1
+
+bar =
+    foo
+"""
+                          }
+                        , { path = "src/B.elm"
+                          , source = """module B exposing (..)
+
+import A
+
+main =
+    1
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.filePath, error.message ))
+                        |> Expect.equal
+                            [ ( "src/A.elm", "Exposed function or value `bar` is never used in the project" ) ]
+            ]
+        , describe "crossModuleSummaryFromSource"
+            [ test "captures constructor facts generically" <|
+                \_ ->
+                    case
+                        ReviewRunner.crossModuleSummaryFromSource
+                            "src/A.elm"
+                            """module A exposing (Choice(..), value)
+
+import Maybe exposing (Maybe(..))
+
+type Choice
+    = Left
+    | Right
+
+value maybeValue =
+    case maybeValue of
+        Just _ ->
+            Left
+
+        Nothing ->
+            Right
+"""
+                    of
+                        Just summary ->
+                            { declaredConstructors =
+                                summary.declaredConstructors
+                                    |> Dict.get "Choice"
+                                    |> Maybe.map Dict.keys
+                                    |> Maybe.withDefault []
+                                    |> List.sort
+                            , exposedConstructors =
+                                summary.exposedConstructors
+                                    |> Dict.get "Choice"
+                                    |> Maybe.map Dict.keys
+                                    |> Maybe.withDefault []
+                                    |> List.sort
+                            , importedOpenTypes =
+                                summary.importedOpenTypesByModule
+                                    |> Dict.get "Maybe"
+                                    |> Maybe.map Set.toList
+                                    |> Maybe.withDefault []
+                                    |> List.sort
+                            , constructorRefs =
+                                summary.constructorRefs
+                                    |> List.map .name
+                                    |> List.sort
+                            }
+                                |> Expect.equal
+                                    { declaredConstructors = [ "Left", "Right" ]
+                                    , exposedConstructors = [ "Left", "Right" ]
+                                    , importedOpenTypes = [ "Maybe" ]
+                                    , constructorRefs = [ "Just", "Left", "Nothing", "Right" ]
+                                    }
+
+                        Nothing ->
+                            Expect.fail "Expected crossModuleSummaryFromSource to parse test module"
             ]
         ]
 

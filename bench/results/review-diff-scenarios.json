@@ -1,5 +1,5 @@
 {
-  "date": "2026-04-07T22:52:41.564Z",
+  "date": "2026-04-07T23:37:20.310Z",
   "runner": "dist/review-runner-bench.mjs",
   "cli_runner": "elm-review",
   "importers_cache_mode": "auto",
@@ -16,8 +16,8 @@
           "cache_decision": "cold_miss",
           "diff": {
             "matches": false,
-            "runner_count": 430,
-            "cli_count": 431,
+            "runner_count": 444,
+            "cli_count": 445,
             "only_runner_count": 0,
             "only_cli_count": 1,
             "only_runner_examples": [],
@@ -39,8 +39,8 @@
           "cache_decision": "full_hit",
           "diff": {
             "matches": false,
-            "runner_count": 430,
-            "cli_count": 431,
+            "runner_count": 444,
+            "cli_count": 445,
             "only_runner_count": 0,
             "only_cli_count": 1,
             "only_runner_examples": [],
@@ -62,8 +62,8 @@
           "cache_decision": "partial_miss",
           "diff": {
             "matches": false,
-            "runner_count": 431,
-            "cli_count": 432,
+            "runner_count": 445,
+            "cli_count": 446,
             "only_runner_count": 0,
             "only_cli_count": 1,
             "only_runner_examples": [],
@@ -85,8 +85,8 @@
           "cache_decision": "full_hit",
           "diff": {
             "matches": false,
-            "runner_count": 430,
-            "cli_count": 431,
+            "runner_count": 444,
+            "cli_count": 445,
             "only_runner_count": 0,
             "only_cli_count": 1,
             "only_runner_examples": [],
@@ -108,40 +108,12 @@
           "cache_decision": "partial_miss",
           "diff": {
             "matches": false,
-            "runner_count": 430,
-            "cli_count": 435,
+            "runner_count": 448,
+            "cli_count": 449,
             "only_runner_count": 0,
-            "only_cli_count": 5,
+            "only_cli_count": 1,
             "only_runner_examples": [],
             "only_cli_examples": [
-              {
-                "rule": "NoUnused.Exports",
-                "path": "src/ProjectSources.elm",
-                "line": 1,
-                "column": 33,
-                "message": "Exposed function or value `loadPackageDeps` is never used outside this module"
-              },
-              {
-                "rule": "NoUnused.Exports",
-                "path": "src/ProjectSources.elm",
-                "line": 1,
-                "column": 50,
-                "message": "Exposed function or value `loadPackageDepsCached` is never used outside this module"
-              },
-              {
-                "rule": "NoUnused.Exports",
-                "path": "src/ProjectSources.elm",
-                "line": 1,
-                "column": 73,
-                "message": "Exposed function or value `loadProjectSources` is never used outside this module"
-              },
-              {
-                "rule": "NoUnused.Exports",
-                "path": "src/ProjectSources.elm",
-                "line": 1,
-                "column": 93,
-                "message": "Exposed function or value `resolvePackageVersions` is never used outside this module"
-              },
               {
                 "rule": "NoUnused.Variables",
                 "path": "src/SemanticHash.elm",

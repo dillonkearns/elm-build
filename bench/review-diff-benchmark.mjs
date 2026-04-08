@@ -21,6 +21,7 @@ const importersCacheMode = process.argv.includes("--importers-cache-mode")
 const depsCacheMode = process.argv.includes("--deps-cache-mode")
   ? process.argv[process.argv.indexOf("--deps-cache-mode") + 1]
   : "auto";
+const jobs = String(os.cpus().length);
 
 const smallFixtureFiles = [
   "Coverage.elm",
@@ -209,6 +210,8 @@ function runRunner({ workspaceRoot, fixtureSrcDir, buildDir, tracePath }) {
       fixtureSrcDir,
       "--build",
       buildDir,
+      "--jobs",
+      jobs,
       "--report",
       "json",
       "--importers-cache-mode",
