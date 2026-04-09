@@ -3028,3 +3028,142 @@ cycle check is amortized.
 - The iteration loop — profile, pick a targeted change, run the
   standalone benchmark plus the review runner A/B in ~10 minutes —
   is now well exercised and cheap to repeat.
+
+### Profile-Driven Round 3: Cheap Cycle-Check Probes, TCO'd Kernel
+### Helpers, And First-Order `["List"]` Shortcuts
+
+Another profile-driven round after round 2. The fresh CPU profile of
+`review_rule_mock_large` showed that `List.length` was still a top
+hot frame, called from:
+
+- `sizeOfValue` / `fingerprintValue` inside the sampled TCO cycle
+  check, for `Custom _ args` and `List items`
+- The Elm stdlib's `List.foldl func acc list = Elm.Kernel.List.foldl
+  func acc list` thin wrappers on every call
+
+Both `sizeOfValue` and `fingerprintValue` were calling `List.length
+args` on a `Custom` value — which always equals the fixed constructor
+arity and gives no meaningful growth signal. Elm's compiled
+`List.length` allocates an `F2` wrapper per call and runs a fold.
+
+Changes landed on the interpreter (`elm-interpreter` commit
+`8e9dc4c`):
+
+1. **Cheap `sizeOfValue`**. `Custom _ _` returns a constant `1`,
+   `List items` uses a `shallowListBucket` pattern-match capped at
+   4, and `String _` / `Record _` / `JsArray _` return `1`. The
+   cycle check only needs a crude growth bucket; the fingerprint
+   already distinguishes shape changes.
+
+2. **Cheap `fingerprintValue`**. Same `List.length` → bucket fix
+   for `Custom`, `List`, and `PartiallyApplied` args.
+
+3. **Lifted `innerCfg` out of `tcoLoopHelp`**. The per-iteration
+   `{ cfg | maxSteps = Nothing, ... }` record update built a fresh
+   7-field Config every step. Build it once outside the loop and
+   thread it through.
+
+4. **TCO'd `foldlHelp` and `mapHelp`** in `Kernel/List.elm`. Moved
+   the recursive calls into direct tail position so Elm's compiler
+   turns them into `while (true)` loops. Previously the recursive
+   call was nested inside an `applyStep` local helper which Elm's
+   TCO analyzer couldn't see through.
+
+5. **Inlined kernel tuple evaluation**. `userModuleKernelFastPath`
+   was finding `(argCount, f)` in `kernelFunctions` and then calling
+   `evalKernelFunctionWithKey`, which re-looked up the same entry.
+   The new `runKernelTuple` takes the resolved tuple directly.
+
+6. **Removed redundant `letFunctions` lookup** via a new
+   `evalUnqualifiedAfterLocalMiss` branch that goes straight to
+   `currentModuleFunctions`.
+
+7. **Targeted `["List"]` kernel shortcut** for `List.range` and
+   `List.append` only. The thin stdlib wrappers for these bounce
+   through an extra interpreted step on every call; wiring them
+   directly to the kernel entries skips that.
+
+   The higher-order `["List"]` helpers (`foldl`, `map`, `filter`,
+   ...) were also tried here and gave the biggest standalone wins,
+   but they broke `elm-review`'s `Review.Rule` machinery — either
+   silently returning zero errors or tripping a stack overflow
+   depending on the mix — so they're deferred pending a root-cause
+   investigation.
+
+### Standalone benchmark
+
+Measured on `DictSetBenchmark.elm` (~120ms Node startup floor):
+
+| Benchmark                | Round 2   | Round 3  | Speedup |
+|--------------------------|----------:|---------:|--------:|
+| `dict_insert_string_1k`  | `115.3ms` | `102.5ms`| `1.12x` |
+| `dict_insert_string_5k`  | `218.0ms` | `156.5ms`| `1.39x` |
+| `dict_insert_tuple_1k`   | `123.4ms` | `110.9ms`| `1.11x` |
+| `dict_union_string_1k`   | `143.0ms` | `125.6ms`| `1.14x` |
+| `dict_member_string_1k`  | `178.9ms` | `125.6ms`| `1.42x` |
+| `set_insert_string_1k`   | `149.4ms` | `99.2ms` | `1.51x` |
+| `set_union_string_1k`    | `202.3ms` | `124.3ms`| `1.63x` |
+| `set_member_string_1k`   | `192.8ms` | `117.3ms`| `1.64x` |
+| `review_rule_mock`       | `143.9ms` | `141.3ms`| `1.02x` |
+| `review_rule_mock_large` | `~722ms`  | `~591ms` | `1.22x` |
+
+The Set operations move the most (`1.5x`-`1.6x`) because they pair
+the earlier Dict kernel win with per-iteration cycle-check savings
+on the `Set.insert` loop.
+
+`elm-test-rs` stayed at the same `1123` passed / `10` pre-existing
+failures; the suite itself now runs in `~15s`, down from `45s` after
+round 2 (and `287s` before round 2 thanks to the TCO cycle check
+amortization).
+
+### Review runner A/B: `NoUnused.Parameters` interpreted
+
+Same `bench/importers-kernel-ab.mjs` harness on the `small-12`
+fixture, comparing the round 2 interpreter build against round 3:
+
+| Scenario                | Round 2   | Round 3  | Delta   | Speedup |
+|-------------------------|----------:|---------:|--------:|--------:|
+| Cold wall               | `149.5s`  | `144.4s` | `-5.1s` | `1.04x` |
+| Warm wall               | `363ms`   | `375ms`  | flat    | `0.97x` |
+| Warm import-graph wall  | `117.1s`  | `112.0s` | `-5.1s` | `1.05x` |
+
+Error counts identical (`7 / 7 / 7`). The real-rule delta is small
+because the hottest interpreted path in `elm-review` rules runs
+through `List.foldl` / `List.map`, which are still going through
+the interpreted wrapper until the `Review.Rule` bug is tracked down.
+The cold interpreted `project_rule_eval` for `NoUnused.Parameters`
+is now `1.93x` → `2.00x` faster than the pre-kernel-Dict/Set
+baseline (`287.7s` → `144.4s`).
+
+### Current read
+
+- Round 3 is a clear win on the *standalone* Dict/Set workload,
+  where there are no `Review.Rule` intercepts in play. The 1.5x+
+  speedups on Set operations plus the 1.22x on the shaped
+  workload benchmark match the profile's diagnosis.
+- The `Review.Rule` / higher-order-`List` correctness bug is the
+  clearest open thread. When the test it enabled, `NoUnused.Parameters`
+  silently drops to zero reported errors, which tells us the kernel
+  shortcut for `List.foldl` / `List.map` is interacting with
+  `Review.Rule`'s visitor state in a way the AST-wrapper path
+  doesn't. Whatever it is, tracking it down would unlock another
+  big step on the interpreter's review-runner path — the
+  `review_rule_mock_large` with all List shortcuts was landing at
+  `~465ms` vs the current safe `~591ms`, and the review runner
+  A/B with the full shortcut dropped `NoUnused.Parameters` warm
+  import-graph from `117s` to `55s` (a further `2.1x` on top of
+  round 3 safe).
+- The remaining TCO'd `foldlHelp` / `mapHelp` kernels are kept
+  even though the user-level `["List"]` shortcut is restricted,
+  because they still help anywhere those kernels are reached
+  via `Elm.Kernel.List.*` calls from generated AST.
+- Next logical step: diagnose the `List.foldl` / `Review.Rule`
+  interaction. The most likely suspects are intercept routing
+  (only AstImpl triggers the intercepts check in
+  `evalFullyAppliedWithEnv`, not KernelImpl) and how the
+  `PartiallyApplied` closure env for the `List.foldl` value
+  interacts with `Review.Rule`'s own closure values as it threads
+  visitor state. If it's intercept-related, the fix is to route
+  kernel calls through the same intercepts hook; if it's closure
+  identity, we may need to preserve the wrapper as a thin AstImpl
+  that still goes through the kernel directly.
