@@ -2695,3 +2695,54 @@ Conclusion:
 - The remaining opportunity inside `load_review_project` is not just “use a
   slightly different binary payload”; it likely needs a more structural change
   or a different source of overhead reduction.
+
+### Package function payload concentration
+
+I extended the package-summary codec benchmark to compare the full payload
+against a metadata-only variant with `functions = []`, and to rank package
+modules by function-payload size.
+
+Current benchmark result on the review app cache:
+
+| Metric | Full binary | Metadata-only binary |
+| --- | ---: | ---: |
+| bytes | `1,313,565` | `159,492` |
+| encode (`5` iters) | `779ms` | `73ms` |
+| decode (`5` iters) | `760ms` | `75ms` |
+
+That makes the main point clear:
+
+- package function bodies dominate the package-summary cache
+- interfaces/import metadata are comparatively cheap
+
+Top modules by encoded function payload:
+
+| Module | Functions | Bytes |
+| --- | ---: | ---: |
+| `Review.Rule` | `266` | `166,499` |
+| `ParserFast` | `116` | `100,768` |
+| `Char.Extra` | `8` | `84,639` |
+| `NoUnused.Variables` | `83` | `66,677` |
+| `NoUnused.Exports` | `75` | `58,647` |
+| `Review.ModuleNameLookupTable.Compute` | `54` | `55,553` |
+| `NoUnused.CustomTypeConstructors` | `48` | `51,370` |
+| `Elm.Parser.Expression` | `82` | `50,654` |
+| `NoUnused.Parameters` | `62` | `47,791` |
+| `Elm.Parser.Declarations` | `23` | `30,118` |
+| `Parser.Advanced` | `86` | `28,978` |
+| `NoUnused.Patterns` | `48` | `27,336` |
+
+Interpretation:
+
+- The remaining `load_review_project` cost is now clearly a function-payload
+  problem, not a metadata problem.
+- Several top payload modules are `NoUnused.*` rules that we already shortcut
+  on the host side. Those five visible `NoUnused.*` modules alone account for
+  about `252KB`, roughly `19%` of the full package-summary payload.
+- This suggests the next worthwhile structural experiment is not another cache
+  blob tweak. It is one of:
+  1. exclude or stub host-backed rule modules from the interpreted review-app
+     package closure
+  2. prune package function payloads more aggressively
+  3. introduce true lazy package-function loading, if the interpreter churn is
+     justified

@@ -119,7 +119,9 @@ task config =
                 { projectDir = Path.path "."
                 , skipPackages = skipPackages
                 , patchSource = patchSource
+                , patchUserSource = \_ source -> source
                 , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
+                , extraReachableImports = []
                 , sourceDirectories = Just [ coreExtraDir ++ "/src", coreExtraDir ++ "/tests" ]
                 }
             )

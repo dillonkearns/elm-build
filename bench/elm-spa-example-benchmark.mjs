@@ -13,6 +13,8 @@ const sourceRepo =
     : "/Users/dillonkearns/src/github.com/rtfeldman/elm-spa-example";
 const reviewDir = path.join(repoRoot, "bench", "review");
 const fastRunnerPath = path.join(repoRoot, "dist", "review-runner-fast-bench.mjs");
+const useElmPagesRunner = process.argv.includes("--via-elm-pages");
+const elmPagesBin = path.join(repoRoot, "node_modules", ".bin", "elm-pages");
 const buildDirName = ".elm-review-build";
 
 function ensureDir(dirPath) {
@@ -110,7 +112,7 @@ function runRunner(workspace, scenarioName) {
   };
 
   const start = performance.now();
-  const result = spawnSync("node", [fastRunnerPath], {
+  const result = spawnSync(useElmPagesRunner ? elmPagesBin : "node", useElmPagesRunner ? ["run", "src/ReviewRunnerFast.elm"] : [fastRunnerPath], {
     cwd: repoRoot,
     encoding: "utf8",
     env: {
@@ -182,6 +184,7 @@ function main() {
     JSON.stringify(
       {
         source_repo: sourceRepo,
+        via_elm_pages: useElmPagesRunner,
         workspace_root: workspace.workspaceRoot,
         edited_file: path.relative(workspace.workspaceRoot, workspace.editFile),
         source_dirs: workspace.sourceDirs.map((dir) => path.relative(workspace.workspaceRoot, dir)),

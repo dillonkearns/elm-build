@@ -2059,6 +2059,7 @@ benchmarkPackageSummaryCodecs options =
         { projectDir = Path.path options.reviewDir
         , skipPackages = Set.union kernelPackages conflictingPackages
         , patchSource = patchSource
+        , patchUserSource = \_ source -> source
         , extraSourceFiles = []
         , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
         , sourceDirectories = Just [ options.reviewDir ++ "/src" ]
@@ -2071,6 +2072,18 @@ benchmarkPackageSummaryCodecs options =
                     [ ( "iterations", Json.Encode.int result.iterations )
                     , ( "summaryCount", Json.Encode.int result.summaryCount )
                     , ( "binaryBytes", Json.Encode.int result.binaryBytes )
+                    , ( "metadataOnlyBinaryBytes", Json.Encode.int result.metadataOnlyBinaryBytes )
+                    , ( "topFunctionPayloadModules"
+                      , result.topFunctionPayloadModules
+                            |> Json.Encode.list
+                                (\item ->
+                                    Json.Encode.object
+                                        [ ( "moduleKey", Json.Encode.string item.moduleKey )
+                                        , ( "functionCount", Json.Encode.int item.functionCount )
+                                        , ( "functionBytes", Json.Encode.int item.functionBytes )
+                                        ]
+                                )
+                      )
                     , ( "envSeedBinaryBytes", Json.Encode.int result.envSeedBinaryBytes )
                     , ( "shardedBinaryBytes", Json.Encode.int result.shardedBinaryBytes )
                     , ( "jsonChars", Json.Encode.int result.jsonChars )
@@ -2080,6 +2093,8 @@ benchmarkPackageSummaryCodecs options =
                     , ( "seedDecodePackageSummaryCacheMs", Json.Encode.int result.seedDecodePackageSummaryCacheMs )
                     , ( "binaryEncodeMs", Json.Encode.int result.binaryEncodeMs )
                     , ( "binaryDecodeMs", Json.Encode.int result.binaryDecodeMs )
+                    , ( "metadataOnlyBinaryEncodeMs", Json.Encode.int result.metadataOnlyBinaryEncodeMs )
+                    , ( "metadataOnlyBinaryDecodeMs", Json.Encode.int result.metadataOnlyBinaryDecodeMs )
                     , ( "envSeedBinaryEncodeMs", Json.Encode.int result.envSeedBinaryEncodeMs )
                     , ( "envSeedBinaryDecodeMs", Json.Encode.int result.envSeedBinaryDecodeMs )
                     , ( "shardedBinaryEncodeMs", Json.Encode.int result.shardedBinaryEncodeMs )
@@ -15232,7 +15247,12 @@ getRuleInfoWithProject config reviewProject =
                 computeAndPersistRuleInfo config reviewProject
 
     else
-        computeAndPersistRuleInfo config reviewProject
+        if shouldPruneHostBackedRulesFromReviewConfig config then
+            Do.do (loadReviewProjectForRuleInfo config) <| \unprunedReviewProject ->
+            computeAndPersistRuleInfo config unprunedReviewProject
+
+        else
+            computeAndPersistRuleInfo config reviewProject
 
 
 computeAndPersistRuleInfo :
@@ -15279,6 +15299,21 @@ computeAndPersistRuleInfo config reviewProject =
 ruleInfoCachePath : Config -> String
 ruleInfoCachePath config =
     Path.toString config.buildDirectory ++ "/rule-info.json"
+
+
+loadReviewProjectForRuleInfo : Config -> BackendTask FatalError InterpreterProject
+loadReviewProjectForRuleInfo config =
+    InterpreterProject.loadWithProfile
+        { projectDir = Path.path config.reviewDir
+        , skipPackages = Set.union kernelPackages conflictingPackages
+        , patchSource = patchSource
+        , patchUserSource = \_ source -> source
+        , extraSourceFiles = []
+        , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
+        , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
+        , packageParseCacheDir = Just (Path.toString config.buildDirectory)
+        }
+        |> BackendTask.map .project
 
 
 encodeRuleInfo : List RuleInfo -> String
@@ -15385,10 +15420,16 @@ loadReviewProject config =
 
 loadReviewProjectDetailed : Config -> BackendTask FatalError LoadedReviewProject
 loadReviewProjectDetailed config =
+    Do.do (fileExists (ruleInfoCachePath config)) <| \ruleInfoCacheExists ->
+    let
+        pruneHostBackedRules =
+            shouldPruneHostBackedRulesFromReviewConfig config
+    in
     InterpreterProject.loadWithProfile
         { projectDir = Path.path config.reviewDir
         , skipPackages = Set.union kernelPackages conflictingPackages
         , patchSource = patchSource
+        , patchUserSource = patchReviewUserSource config pruneHostBackedRules
         , extraSourceFiles = []
         , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
         , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
@@ -15419,6 +15460,8 @@ loadReviewProjectDetailed config =
                         , ( "load_review_project.build_base_user_env_ms", loaded.profile.buildBaseUserEnvMs )
                         , ( "load_review_project.build_semantic_index_ms", loaded.profile.buildSemanticIndexMs )
                         , ( "load_review_project.cache_inputs_ms", loaded.profile.cacheInputsMs )
+                        , ( "load_review_project.rule_info_cache_exists", boolToInt ruleInfoCacheExists )
+                        , ( "load_review_project.pruned_host_backed_rules", boolToInt pruneHostBackedRules )
                         ]
                 }
             )
@@ -15623,6 +15666,341 @@ conflictingPackages =
         , "vkfisher/elm-review-no-unsafe-division"
         , "lue-bird/elm-review-documentation-code-snippet"
         ]
+
+
+type alias ReviewConfigRulePrune =
+    { importLine : String
+    , itemPrefixes : List String
+    }
+
+
+shouldPruneHostBackedRulesFromReviewConfig : Config -> Bool
+shouldPruneHostBackedRulesFromReviewConfig config =
+    not (List.isEmpty (hostBackedReviewConfigRulesToPrune config))
+
+
+hostBackedReviewConfigRulesToPrune : Config -> List ReviewConfigRulePrune
+hostBackedReviewConfigRulesToPrune config =
+    List.concat
+        [ if config.hostNoUnusedExportsExperiment then
+            [ { importLine = "import NoUnused.Exports"
+              , itemPrefixes =
+                    [ "NoUnused.Exports.rule"
+                    , "NoUnused.Exports.defaults"
+                    , "NoUnused.Exports.toRule"
+                    ]
+              }
+            ]
+
+          else
+            []
+        , if config.hostNoUnusedCustomTypeConstructorsExperiment then
+            [ { importLine = "import NoUnused.CustomTypeConstructors"
+              , itemPrefixes = [ "NoUnused.CustomTypeConstructors.rule" ]
+              }
+            ]
+
+          else
+            []
+        , if config.hostNoUnusedCustomTypeConstructorArgsExperiment then
+            [ { importLine = "import NoUnused.CustomTypeConstructorArgs"
+              , itemPrefixes = [ "NoUnused.CustomTypeConstructorArgs.rule" ]
+              }
+            ]
+
+          else
+            []
+        , if config.hostNoUnusedParametersExperiment then
+            [ { importLine = "import NoUnused.Parameters"
+              , itemPrefixes = [ "NoUnused.Parameters.rule" ]
+              }
+            ]
+
+          else
+            []
+        , if config.hostNoUnusedVariablesExperiment then
+            [ { importLine = "import NoUnused.Variables"
+              , itemPrefixes = [ "NoUnused.Variables.rule" ]
+              }
+            ]
+
+          else
+            []
+        , if config.hostNoUnusedPatternsExperiment then
+            [ { importLine = "import NoUnused.Patterns"
+              , itemPrefixes = [ "NoUnused.Patterns.rule" ]
+              }
+            ]
+
+          else
+            []
+        ]
+
+
+patchReviewUserSource : Config -> Bool -> String -> String -> String
+patchReviewUserSource config pruneHostBackedRules filePath source =
+    if pruneHostBackedRules && String.endsWith "/ReviewConfig.elm" filePath then
+        pruneReviewConfigSource (hostBackedReviewConfigRulesToPrune config) source
+            |> Maybe.withDefault source
+
+    else
+        source
+
+
+pruneReviewConfigSource : List ReviewConfigRulePrune -> String -> Maybe String
+pruneReviewConfigSource rules source =
+    let
+        lines =
+            String.lines source
+    in
+    pruneReviewConfigListBlock rules lines
+        |> Maybe.map
+            (\updatedLines ->
+                updatedLines
+                    |> List.filter
+                        (\line ->
+                            let
+                                trimmed =
+                                    String.trim line
+                            in
+                            not (List.any (\rule -> trimmed == rule.importLine) rules)
+                        )
+                    |> String.join "\n"
+            )
+
+
+type alias ReviewConfigItemBlock =
+    { head : String
+    , tail : List String
+    }
+
+
+pruneReviewConfigListBlock : List ReviewConfigRulePrune -> List String -> Maybe (List String)
+pruneReviewConfigListBlock rules lines =
+    let
+        indexedLines =
+            List.indexedMap Tuple.pair lines
+
+        maybeConfigIndex =
+            indexedLines
+                |> List.filter (\( _, line ) -> String.startsWith "config =" (String.trim line))
+                |> List.head
+                |> Maybe.map Tuple.first
+    in
+    case maybeConfigIndex of
+        Nothing ->
+            Nothing
+
+        Just configIndex ->
+            let
+                maybeStartIndex =
+                    indexedLines
+                        |> List.filter (\( index, line ) -> index > configIndex && String.startsWith "[" (String.trim line))
+                        |> List.head
+                        |> Maybe.map Tuple.first
+            in
+            case maybeStartIndex of
+                Nothing ->
+                    Nothing
+
+                Just startIndex ->
+                    let
+                        maybeEndIndex =
+                            indexedLines
+                                |> List.filter (\( index, line ) -> index >= startIndex && String.trim line == "]")
+                                |> List.head
+                                |> Maybe.map Tuple.first
+                    in
+                    case maybeEndIndex of
+                        Nothing ->
+                            Nothing
+
+                        Just endIndex ->
+                            let
+                                prefix =
+                                    lines
+                                        |> List.take startIndex
+
+                                blockLines =
+                                    lines
+                                        |> List.drop startIndex
+                                        |> List.take (endIndex - startIndex + 1)
+
+                                suffix =
+                                    lines
+                                        |> List.drop (endIndex + 1)
+                            in
+                            case parseReviewConfigItemBlocks blockLines of
+                                Nothing ->
+                                    Nothing
+
+                                Just ( listIndent, items ) ->
+                                    let
+                                        keptItems =
+                                            items
+                                                |> List.filter
+                                                    (\item ->
+                                                        let
+                                                            trimmedHead =
+                                                                String.trim item.head
+                                                        in
+                                                        not
+                                                            (List.any
+                                                                (\rule ->
+                                                                    rule.itemPrefixes
+                                                                        |> List.any (\prefixToRemove -> String.startsWith prefixToRemove trimmedHead)
+                                                                )
+                                                                rules
+                                                            )
+                                                    )
+                                    in
+                                    Just (prefix ++ renderReviewConfigItemBlocks listIndent keptItems ++ suffix)
+
+
+parseReviewConfigItemBlocks : List String -> Maybe ( String, List ReviewConfigItemBlock )
+parseReviewConfigItemBlocks blockLines =
+    case blockLines of
+        [] ->
+            Nothing
+
+        startLine :: remainingLines ->
+            let
+                trimmedStart =
+                    String.trim startLine
+
+                listIndent =
+                    leadingWhitespace startLine
+
+                initialHead =
+                    trimmedStart
+                        |> String.dropLeft 1
+                        |> String.trim
+
+                middleLines =
+                    remainingLines
+                        |> List.reverse
+                        |> List.drop 1
+                        |> List.reverse
+            in
+            if not (String.startsWith "[" trimmedStart) then
+                Nothing
+
+            else
+                parseReviewConfigItemsHelp middleLines
+                    { current =
+                        if initialHead == "" then
+                            Nothing
+
+                        else
+                            Just { head = initialHead, tail = [] }
+                    , items = []
+                    }
+                    |> Maybe.map
+                        (\state ->
+                            let
+                                finalItems =
+                                    case state.current of
+                                        Just current ->
+                                            state.items ++ [ current ]
+
+                                        Nothing ->
+                                            state.items
+                            in
+                            ( listIndent, finalItems )
+                        )
+
+
+parseReviewConfigItemsHelp :
+    List String
+    -> { current : Maybe ReviewConfigItemBlock, items : List ReviewConfigItemBlock }
+    -> Maybe { current : Maybe ReviewConfigItemBlock, items : List ReviewConfigItemBlock }
+parseReviewConfigItemsHelp remaining state =
+    case remaining of
+        [] ->
+            Just state
+
+        line :: rest ->
+            let
+                trimmed =
+                    String.trim line
+            in
+            if trimmed == "" then
+                case state.current of
+                    Just current ->
+                        parseReviewConfigItemsHelp rest
+                            { state | current = Just { current | tail = current.tail ++ [ line ] } }
+
+                    Nothing ->
+                        parseReviewConfigItemsHelp rest state
+
+            else if String.startsWith "," trimmed then
+                let
+                    nextHead =
+                        trimmed
+                            |> String.dropLeft 1
+                            |> String.trim
+                in
+                case state.current of
+                    Just current ->
+                        parseReviewConfigItemsHelp rest
+                            { current =
+                                if nextHead == "" then
+                                    Nothing
+
+                                else
+                                    Just { head = nextHead, tail = [] }
+                            , items = state.items ++ [ current ]
+                            }
+
+                    Nothing ->
+                        Nothing
+
+            else
+                case state.current of
+                    Just current ->
+                        parseReviewConfigItemsHelp rest
+                            { state | current = Just { current | tail = current.tail ++ [ line ] } }
+
+                    Nothing ->
+                        Nothing
+
+
+renderReviewConfigItemBlocks : String -> List ReviewConfigItemBlock -> List String
+renderReviewConfigItemBlocks listIndent items =
+    case items of
+        [] ->
+            [ listIndent ++ "[]" ]
+
+        first :: rest ->
+            (listIndent ++ "[ " ++ first.head)
+                :: first.tail
+                ++ List.concatMap
+                    (\item -> (listIndent ++ "    , " ++ item.head) :: item.tail)
+                    rest
+                ++ [ listIndent ++ "]" ]
+
+
+leadingWhitespace : String -> String
+leadingWhitespace line =
+    leadingWhitespaceHelp [] (String.toList line)
+
+
+leadingWhitespaceHelp : List Char -> List Char -> String
+leadingWhitespaceHelp reversedPrefix remainingChars =
+    case remainingChars of
+        char :: rest ->
+            if char == ' ' || char == '\t' then
+                leadingWhitespaceHelp (char :: reversedPrefix) rest
+
+            else
+                reversedPrefix
+                    |> List.reverse
+                    |> String.fromList
+
+        [] ->
+            reversedPrefix
+                |> List.reverse
+                |> String.fromList
 
 
 patchSource : String -> String

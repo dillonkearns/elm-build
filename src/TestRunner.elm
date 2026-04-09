@@ -83,7 +83,9 @@ task config =
                 { projectDir = Path.path "."
                 , skipPackages = kernelPackages
                 , patchSource = patchSource
+                , patchUserSource = \_ source -> source
                 , extraSourceFiles = []
+                , extraReachableImports = []
                 , sourceDirectories = Just allDirectories
                 }
             )

@@ -123,7 +123,9 @@ task config =
         { projectDir = Path.path "."
         , skipPackages = Set.empty
         , patchSource = identity
+        , patchUserSource = \_ source -> source
         , extraSourceFiles = []
+        , extraReachableImports = []
         , sourceDirectories = Just []
         }
         |> BackendTask.andThen

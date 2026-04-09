@@ -10,12 +10,14 @@ const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "
 const srcRoot = path.join(repoRoot, "src");
 const reviewDir = path.join(repoRoot, "bench", "review");
 const useFastEntrypoint = process.argv.includes("--fast-entrypoint");
+const useElmPagesRunner = process.argv.includes("--via-elm-pages");
 const moduleRuleTransportMode = readArg("--transport-mode", "handles");
 const distRunnerPath = path.join(
   repoRoot,
   "dist",
   useFastEntrypoint ? "review-runner-fast-bench.mjs" : "review-runner-bench.mjs"
 );
+const elmPagesBin = path.join(repoRoot, "node_modules", ".bin", "elm-pages");
 const jobs = String(os.cpus().length);
 const scenarios = readArg("--scenarios", "cold,warm,warm_1_file_body_edit,warm_import_graph_change")
   .split(",")
@@ -150,7 +152,7 @@ function runRunner({ fixtureSrcDir, buildDir, root }, name) {
   };
 
   const result = useFastEntrypoint
-    ? spawnSync("node", [distRunnerPath], {
+    ? spawnSync(useElmPagesRunner ? elmPagesBin : "node", useElmPagesRunner ? ["run", "src/ReviewRunnerFast.elm"] : [distRunnerPath], {
         cwd: repoRoot,
         encoding: "utf8",
         env: {
@@ -252,6 +254,7 @@ function main() {
       {
         fixture: "small-12",
         fast_entrypoint: useFastEntrypoint,
+        via_elm_pages: useElmPagesRunner,
         module_rule_transport_mode: moduleRuleTransportMode,
         host_importers_experiments: useHostImportersExperiments,
         host_type_annotation_experiments: useHostTypeAnnotationExperiments,

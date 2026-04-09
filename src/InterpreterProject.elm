@@ -34,6 +34,7 @@ import Eval.Module
 import Environment
 import FastDict
 import FatalError exposing (FatalError)
+import FNV1a
 import Json.Decode as Decode
 import Json.Encode
 import Lamdera.Wire3
@@ -251,18 +252,28 @@ repeatJsonDecode iterations jsonString acc =
 
 packageSummaryCacheVersion : String
 packageSummaryCacheVersion =
-    "v6"
+    "v7"
 
 
-packageSummaryCacheBlobPath : String -> String
-packageSummaryCacheBlobPath cacheDir =
-    cacheDir ++ "/package-module-summaries-" ++ packageSummaryCacheVersion ++ ".blob"
+packageSummaryCacheBlobPath : String -> String -> String
+packageSummaryCacheBlobPath cacheDir cacheKey =
+    cacheDir ++ "/package-module-summaries-" ++ packageSummaryCacheVersion ++ "-" ++ cacheKey ++ ".blob"
+
+
+packageSummaryCacheKey : List String -> String
+packageSummaryCacheKey allPackageSources =
+    allPackageSources
+        |> List.map (FNV1a.hash >> String.fromInt)
+        |> String.join "|"
+        |> FNV1a.hash
+        |> String.fromInt
 
 
 benchmarkPackageSummaryCacheCodecs :
     { projectDir : Path
     , skipPackages : Set String
     , patchSource : String -> String
+    , patchUserSource : String -> String -> String
     , extraSourceFiles : List String
     , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
@@ -273,6 +284,8 @@ benchmarkPackageSummaryCacheCodecs :
         { iterations : Int
         , summaryCount : Int
         , binaryBytes : Int
+        , metadataOnlyBinaryBytes : Int
+        , topFunctionPayloadModules : List { moduleKey : String, functionCount : Int, functionBytes : Int }
         , envSeedBinaryBytes : Int
         , shardedBinaryBytes : Int
         , jsonChars : Int
@@ -282,6 +295,8 @@ benchmarkPackageSummaryCacheCodecs :
         , seedDecodePackageSummaryCacheMs : Int
         , binaryEncodeMs : Int
         , binaryDecodeMs : Int
+        , metadataOnlyBinaryEncodeMs : Int
+        , metadataOnlyBinaryDecodeMs : Int
         , envSeedBinaryEncodeMs : Int
         , envSeedBinaryDecodeMs : Int
         , shardedBinaryEncodeMs : Int
@@ -295,6 +310,7 @@ benchmarkPackageSummaryCacheCodecs config =
             { projectDir = config.projectDir
             , skipPackages = config.skipPackages
             , patchSource = config.patchSource
+            , patchUserSource = \_ source -> source
             , extraSourceFiles = config.extraSourceFiles
             , extraReachableImports = config.extraReachableImports
             , sourceDirectories = config.sourceDirectories
@@ -302,53 +318,99 @@ benchmarkPackageSummaryCacheCodecs config =
             }
         )
     <| \seedLoad ->
-    Do.do (File.binaryFile (packageSummaryCacheBlobPath config.packageParseCacheDir) |> BackendTask.allowFatal) <| \cacheBytes ->
-    case decodePackageSummaryCache cacheBytes of
+    Do.do
+        (Glob.fromStringWithOptions
+            (let
+                options : Glob.Options
+                options =
+                    Glob.defaultOptions
+             in
+             { options | include = Glob.OnlyFiles }
+            )
+            (config.packageParseCacheDir ++ "/package-module-summaries-" ++ packageSummaryCacheVersion ++ "-*.blob")
+        )
+    <| \cacheCandidates ->
+    case List.head (List.sort cacheCandidates) of
         Nothing ->
-            BackendTask.fail (FatalError.fromString "Failed to decode package summary cache blob for codec benchmark")
+            BackendTask.fail (FatalError.fromString "Failed to find package summary cache blob for codec benchmark")
 
-        Just summaries ->
-            let
-                envSeed =
-                    packageEnvSeedFromSummaries summaries
+        Just cachePath ->
+            Do.do (File.binaryFile cachePath |> BackendTask.allowFatal) <| \cacheBytes ->
+                case decodePackageSummaryCache cacheBytes of
+                    Nothing ->
+                        BackendTask.fail (FatalError.fromString "Failed to decode package summary cache blob for codec benchmark")
 
-                envSeedBytes =
-                    encodePackageEnvSeed envSeed
+                    Just summaries ->
+                        let
+                            metadataOnlySummaries =
+                                summaries
+                                    |> List.map (\summary -> { summary | functions = [] })
 
-                jsonString =
-                    encodePackageSummaryCacheJson summaries
+                            envSeed =
+                                packageEnvSeedFromSummaries summaries
 
-                shardedBytes =
-                    encodePackageSummaryCacheSharded summaries
-            in
-            Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations summaries 0)) <| \binaryEncodeTimed ->
-            Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations cacheBytes 0)) <| \binaryDecodeTimed ->
-            Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryEncode config.iterations envSeed 0)) <| \envSeedBinaryEncodeTimed ->
-            Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryDecode config.iterations envSeedBytes 0)) <| \envSeedBinaryDecodeTimed ->
-            Do.do (benchmarkThunk (\_ -> repeatShardedBinaryEncode config.iterations summaries 0)) <| \shardedBinaryEncodeTimed ->
-            Do.do (benchmarkThunk (\_ -> repeatShardedBinaryDecode config.iterations shardedBytes 0)) <| \shardedBinaryDecodeTimed ->
-            Do.do (benchmarkThunk (\_ -> repeatJsonEncode config.iterations summaries 0)) <| \jsonEncodeTimed ->
-            Do.do (benchmarkThunk (\_ -> repeatJsonDecode config.iterations jsonString 0)) <| \jsonDecodeTimed ->
-            BackendTask.succeed
-                { iterations = config.iterations
-                , summaryCount = List.length summaries
-                , binaryBytes = Bytes.width cacheBytes
-                , envSeedBinaryBytes = Bytes.width envSeedBytes
-                , shardedBinaryBytes = List.foldl (\bytes total -> total + Bytes.width bytes) 0 shardedBytes
-                , jsonChars = String.length jsonString
-                , seedCacheHit = seedLoad.profile.packageSummaryCacheHit
-                , seedParsePackageSourcesMs = seedLoad.profile.parsePackageSourcesMs
-                , seedBuildPackageSummariesFromParsedMs = seedLoad.profile.buildPackageSummariesFromParsedMs
-                , seedDecodePackageSummaryCacheMs = seedLoad.profile.decodePackageSummaryCacheMs
-                , binaryEncodeMs = binaryEncodeTimed.ms
-                , binaryDecodeMs = binaryDecodeTimed.ms
-                , envSeedBinaryEncodeMs = envSeedBinaryEncodeTimed.ms
-                , envSeedBinaryDecodeMs = envSeedBinaryDecodeTimed.ms
-                , shardedBinaryEncodeMs = shardedBinaryEncodeTimed.ms
-                , shardedBinaryDecodeMs = shardedBinaryDecodeTimed.ms
-                , jsonEncodeMs = jsonEncodeTimed.ms
-                , jsonDecodeMs = jsonDecodeTimed.ms
-                }
+                            envSeedBytes =
+                                encodePackageEnvSeed envSeed
+
+                            metadataOnlyBytes =
+                                encodePackageSummaryCache metadataOnlySummaries
+
+                            topFunctionPayloadModules =
+                                summaries
+                                    |> List.map
+                                    (\summary ->
+                                        { moduleKey = Environment.moduleKey summary.moduleName
+                                        , functionCount = List.length summary.functions
+                                        , functionBytes =
+                                            summary.functions
+                                                |> Lamdera.Wire3.encodeList encodeFunctionImplementationNoRanges
+                                                |> Lamdera.Wire3.bytesEncode
+                                                |> Bytes.width
+                                        }
+                                    )
+                                |> List.sortBy (.functionBytes >> negate)
+                                |> List.take 12
+
+                            jsonString =
+                                encodePackageSummaryCacheJson summaries
+
+                            shardedBytes =
+                                encodePackageSummaryCacheSharded summaries
+                        in
+                        Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations summaries 0)) <| \binaryEncodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations cacheBytes 0)) <| \binaryDecodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations metadataOnlySummaries 0)) <| \metadataOnlyBinaryEncodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations metadataOnlyBytes 0)) <| \metadataOnlyBinaryDecodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryEncode config.iterations envSeed 0)) <| \envSeedBinaryEncodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryDecode config.iterations envSeedBytes 0)) <| \envSeedBinaryDecodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatShardedBinaryEncode config.iterations summaries 0)) <| \shardedBinaryEncodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatShardedBinaryDecode config.iterations shardedBytes 0)) <| \shardedBinaryDecodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatJsonEncode config.iterations summaries 0)) <| \jsonEncodeTimed ->
+                        Do.do (benchmarkThunk (\_ -> repeatJsonDecode config.iterations jsonString 0)) <| \jsonDecodeTimed ->
+                        BackendTask.succeed
+                            { iterations = config.iterations
+                            , summaryCount = List.length summaries
+                            , binaryBytes = Bytes.width cacheBytes
+                            , metadataOnlyBinaryBytes = Bytes.width metadataOnlyBytes
+                            , topFunctionPayloadModules = topFunctionPayloadModules
+                        , envSeedBinaryBytes = Bytes.width envSeedBytes
+                        , shardedBinaryBytes = List.foldl (\bytes total -> total + Bytes.width bytes) 0 shardedBytes
+                        , jsonChars = String.length jsonString
+                        , seedCacheHit = seedLoad.profile.packageSummaryCacheHit
+                        , seedParsePackageSourcesMs = seedLoad.profile.parsePackageSourcesMs
+                        , seedBuildPackageSummariesFromParsedMs = seedLoad.profile.buildPackageSummariesFromParsedMs
+                        , seedDecodePackageSummaryCacheMs = seedLoad.profile.decodePackageSummaryCacheMs
+                        , binaryEncodeMs = binaryEncodeTimed.ms
+                        , binaryDecodeMs = binaryDecodeTimed.ms
+                        , metadataOnlyBinaryEncodeMs = metadataOnlyBinaryEncodeTimed.ms
+                        , metadataOnlyBinaryDecodeMs = metadataOnlyBinaryDecodeTimed.ms
+                        , envSeedBinaryEncodeMs = envSeedBinaryEncodeTimed.ms
+                        , envSeedBinaryDecodeMs = envSeedBinaryDecodeTimed.ms
+                        , shardedBinaryEncodeMs = shardedBinaryEncodeTimed.ms
+                        , shardedBinaryDecodeMs = shardedBinaryDecodeTimed.ms
+                        , jsonEncodeMs = jsonEncodeTimed.ms
+                        , jsonDecodeMs = jsonDecodeTimed.ms
+                        }
 
 
 encodePackageSummaryCache : List CachedPackageModuleSummary -> Bytes.Bytes
@@ -897,6 +959,7 @@ load { projectDir } =
         { projectDir = projectDir
         , skipPackages = Set.empty
         , patchSource = identity
+        , patchUserSource = \_ source -> source
         , extraSourceFiles = []
         , extraReachableImports = []
         , sourceDirectories = Nothing
@@ -915,6 +978,7 @@ loadWith :
     { projectDir : Path
     , skipPackages : Set String
     , patchSource : String -> String
+    , patchUserSource : String -> String -> String
     , extraSourceFiles : List String
     , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
@@ -925,6 +989,7 @@ loadWith config =
         { projectDir = config.projectDir
         , skipPackages = config.skipPackages
         , patchSource = config.patchSource
+        , patchUserSource = config.patchUserSource
         , extraSourceFiles = config.extraSourceFiles
         , extraReachableImports = config.extraReachableImports
         , sourceDirectories = config.sourceDirectories
@@ -937,6 +1002,7 @@ loadWithProfile :
     { projectDir : Path
     , skipPackages : Set String
     , patchSource : String -> String
+    , patchUserSource : String -> String -> String
     , extraSourceFiles : List String
     , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
@@ -1012,6 +1078,12 @@ loadWithProfile config =
     let
         userFileContents =
             userFileContentsTimed.value
+                |> List.map
+                    (\( filePath, content ) ->
+                        ( filePath
+                        , config.patchUserSource filePath content
+                        )
+                    )
     in
     Do.do
         (withTiming
@@ -1123,7 +1195,7 @@ loadWithProfile config =
         packageSummaryCachePath : Maybe String
         packageSummaryCachePath =
             config.packageParseCacheDir
-                |> Maybe.map packageSummaryCacheBlobPath
+                |> Maybe.map (\cacheDir -> packageSummaryCacheBlobPath cacheDir (packageSummaryCacheKey allPackageSources))
 
         parseAndSeedPackageSummaries :
             { packageSummaryCacheHit : Int
