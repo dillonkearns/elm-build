@@ -3167,3 +3167,123 @@ baseline (`287.7s` → `144.4s`).
   kernel calls through the same intercepts hook; if it's closure
   identity, we may need to preserve the wrapper as a thin AstImpl
   that still goes through the kernel directly.
+
+### Round 4: Yield-Aware TCO Kernel Fold/Map And Most Higher-Order
+### List Shortcuts
+
+Followed the round 3 thread on the `List.foldl` / `List.map` /
+`Review.Rule` correctness bug. Two findings:
+
+1. **The TCO refactor in round 2/3 silently dropped yield
+   propagation**. `foldlHelp` and `mapHelp` had been rewritten to
+   pipe results through `EvalResult.toResult`, which converts
+   `EvYield` / `EvMemoLookup` / `EvMemoStore` into
+   `"Unhandled EvYield in toResult"` errors. For a standalone
+   fold that's fine — nothing yields — but elm-review's
+   `Review.Rule.initialCachePartsMarker` and the module payload
+   intercepts are synchronous `Types.EvOk` overrides, not
+   yields, so those didn't directly fire the bug... but *other*
+   paths in the interpreter do yield (e.g. resumed memoized
+   evaluations), and the drop silently turned them into errors
+   that the rule's visitor state then failed to recover from.
+   
+2. **`List.map` specifically still breaks elm-review even after
+   the yield fix**. Binary-searched every higher-order List
+   helper through the kernel shortcut: `foldl`, `foldr`, `filter`,
+   `filterMap`, `concatMap`, `indexedMap`, `any`, `all`, `sortBy`,
+   `sortWith` all produce the correct error count. Only `map`
+   silently drops the rule errors. Both the yield-aware and the
+   `toResult`-based `mapHelp` implementations fail the same way,
+   so the bug isn't in `Kernel.List.map`'s body — it's in how
+   the `PartiallyApplied (KernelImpl ["List"] "map" ...)` value
+   interacts with `Review.Rule`'s rule-construction state. Root
+   cause still unknown.
+
+### Changes landed
+
+On `elm-interpreter` (`df767a8`):
+
+1. **`foldlHelp` + `mapHelp` yield-aware TCO**. Kept the fast
+   `EvOk -> EvOk` path in direct tail-call position so Elm
+   compiles it to a `while (true)` loop, but peeled the
+   yield/trace/memo cases out to helper functions
+   (`foldlResumeAfterFx`, `foldlResumeAfterAcc`, `mapResumeAfterFx`)
+   that propagate the effect correctly and re-enter the TCO'd
+   main loop on resume. Traces merge via `attachTrace` /
+   `attachTraceList`.
+
+2. **Most higher-order `["List"]` kernel shortcuts enabled**:
+   `foldl`, `foldr`, `filter`, `filterMap`, `concatMap`,
+   `indexedMap`, `any`, `all`, `sortBy`, `sortWith`. Only
+   `List.map` stays routed through the interpreted wrapper,
+   with an inline comment explaining the open bug.
+
+### Standalone benchmark
+
+Measured on `DictSetBenchmark.elm` (round 2 baseline vs round 4):
+
+| Benchmark                | Round 2   | Round 4  | Speedup |
+|--------------------------|----------:|---------:|--------:|
+| `dict_insert_string_1k`  | `115ms`   | `92ms`   | `1.26x` |
+| `dict_insert_string_5k`  | `218ms`   | `130ms`  | `1.67x` |
+| `dict_insert_tuple_1k`   | `123ms`   | `101ms`  | `1.22x` |
+| `dict_union_string_1k`   | `143ms`   | `111ms`  | `1.29x` |
+| `dict_member_string_1k`  | `179ms`   | `102ms`  | `1.75x` |
+| `dict_get_string_1k`     | `187ms`   | `104ms`  | `1.80x` |
+| `dict_foldl_string_1k`   | `163ms`   | `115ms`  | `1.42x` |
+| `set_insert_string_1k`   | `149ms`   | `101ms`  | `1.48x` |
+| `set_union_string_1k`    | `202ms`   | `111ms`  | `1.82x` |
+| `set_member_string_1k`   | `193ms`   | `105ms`  | `1.84x` |
+| `review_rule_mock`       | `144ms`   | `129ms`  | `1.12x` |
+| `review_rule_mock_large` | `~722ms`  | `~456ms` | `1.58x` |
+
+Compared to round 3 (which had the round 2 numbers plus the
+safe-only shortcut), dict/set member and union operations improve
+another `1.2-1.3x` from the higher-order shortcuts now kicking in
+for `Set.union` / `Dict.union`'s internal work.
+
+### Review runner A/B
+
+`bench/importers-kernel-ab.mjs` on `NoUnused.Parameters` interpreted,
+small-12, round 3 safe baseline vs round 4:
+
+| Scenario                | Round 3   | Round 4  | Speedup |
+|-------------------------|----------:|---------:|--------:|
+| Cold wall               | `149.5s`  | `125.9s` | `1.19x` |
+| Warm import-graph wall  | `117.1s`  | `96.1s`  | `1.22x` |
+
+Error counts identical (`7 / 7 / 7`), so the correctness invariant
+held across all scenarios.
+
+Stacked against the pre-kernel baseline:
+
+| Scenario                | Pre-kernel | Round 4  | Speedup |
+|-------------------------|-----------:|---------:|--------:|
+| Cold wall               | `287.7s`   | `125.9s` | `2.29x` |
+| Warm import-graph wall  | `277.0s`   | `96.1s`  | `2.88x` |
+
+### Test suite
+
+`elm-test-rs` now passes `1124` / fails `9` — one more passing
+than the pre-round-3 baseline. The newly passing test is
+`List.foldr 50000 within 500 steps`, which relies on the TCO'd
+`foldlHelp` (via `foldr` → reverse → `foldlHelp`). The remaining
+9 failures are all pre-existing and unrelated to the interpreter
+hot path.
+
+### Current read
+
+- Round 4 closes most of the round 3 gap. The two fixes
+  (yield-aware TCO and the broader `["List"]` shortcut set) are
+  independent wins that compose cleanly.
+- `List.map` is the only remaining item. Having it excluded
+  costs about `1.3-1.4x` on the standalone workload
+  (`review_rule_mock_large` `~456ms` vs `~465ms` with full
+  shortcut earlier), and about another `1.5-2x` on the review
+  runner's warm import-graph (earlier experiments with full
+  shortcut hit `~55s` vs the current `~96s`). That's still the
+  biggest single lever waiting to be unlocked.
+- The iteration loop continues to pay off: each round produces
+  a ~1.15-1.55x improvement on the real workload, and the
+  standalone benchmark now runs the whole `review_rule_mock_large`
+  Dict/Set workload in under half a second.
