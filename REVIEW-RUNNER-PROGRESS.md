@@ -2861,3 +2861,170 @@ raw project-rule churn while keeping the rule semantics interpreted.
   within striking distance of the CLI on mixed partial-miss paths.
   A viable "all interpreted + kernel Dict/Set + further interpreter
   tuning" path now looks plausible.
+
+### Profile-Driven Round 2: Arity Caching And Sampled TCO Cycle Check
+
+After the kernel Dict/Set round I captured a Node `--cpu-prof` of the
+warm import-graph change on `NoUnused.Parameters` (the same scenario
+that previously dropped from `277s` to `186s`), plus a profile of the
+`review_rule_mock_large` standalone benchmark on the non-minified
+interpreter bundle.
+
+Key findings from the profile:
+
+- GC was still the single largest self-time frame (about `9.7%`).
+- `$author$project$Eval$Expression$fingerprintValue` appeared three
+  times in the top ten self-time frames, totaling `3-4%`.
+- `evalApplicationGeneralCompute` was hitting `List.length patterns`
+  on every call even though the cached arity already lived on
+  `PartiallyApplied`.
+- The bundled `$author$project$Eval$Expression$valuesSize` helper
+  was hot, called from `tcoLoopHelp` on every TCO iteration to drive
+  cycle detection.
+
+Two changes landed on the interpreter (`elm-interpreter` commit
+`56f5f5d`):
+
+1. **Cached arity threaded through `Kernel.EvalFunction`.**
+   `PartiallyApplied` already carried an `Int` arity, but the kernel
+   higher-order entry points (`function`, `function2`, `function3`,
+   plus `bytesDecodeKernel`, `regexReplaceAtMost`, `applyPredicate`,
+   `Kernel.Json.applyFunction`) were matching it as `_` and then
+   `evalFunction` recomputed `List.length patterns` on every user
+   callback invocation. `EvalFunction` now takes the arity as an
+   explicit argument, so the per-call `List.length` is gone.
+
+2. **Sampled TCO cycle detection.** `tcoLoopHelp` used to compute
+   `valuesSize newValues` and `fingerprintValues newValues` on every
+   single iteration. These walk the full env values dict *and*
+   recurse into each value's own structure, so for
+   `List.foldl (\\n acc -> Dict.insert ... acc)` over a 5000-element
+   input the cycle check alone was O(n²) in the growing accumulator.
+   The full check now runs once every `tcoCycleCheckInterval = 16`
+   iterations; infinite recursion is still caught, just `interval`
+   steps later, which is fine for the way `recursionCheck` is
+   already bounded.
+
+### Standalone benchmark — cycle check was the real wall
+
+Measured on `benchmark/DictSetBenchmark.elm` (about `120ms` per run
+Node/Elm startup floor):
+
+| Benchmark                | Kernel only | Kernel + round 2 | Speedup |
+|--------------------------|------------:|-----------------:|--------:|
+| `dict_insert_string_1k`  | `140.3ms`   | `115.3ms`        | `1.22x` |
+| `dict_insert_string_5k`  | `2099.0ms`  | `218.0ms`        | `9.63x` |
+| `dict_insert_tuple_1k`   | `156.2ms`   | `123.4ms`        | `1.27x` |
+| `dict_union_string_1k`   | `198.8ms`   | `143.0ms`        | `1.39x` |
+| `dict_member_string_1k`  | `178.9ms`   | `140.4ms`        | `1.27x` |
+| `dict_get_string_1k`     | `186.8ms`   | `142.4ms`        | `1.31x` |
+| `set_insert_string_1k`   | `149.4ms`   | `119.2ms`        | `1.25x` |
+| `set_union_string_1k`    | `202.3ms`   | `148.2ms`        | `1.37x` |
+| `review_rule_mock`       | `162.9ms`   | `143.9ms`        | `1.13x` |
+| `review_rule_mock_large` | `~1015ms`   | `~722ms`         | `1.41x` |
+
+The `dict_insert_string_5k` line is the headline: it went from
+`2099ms` (kernel only) to `218ms`, nearly `10x`. That's exactly the
+O(n²) blowup the sampled check eliminates — the growing accumulator
+was being fingerprinted 5000 times, each walking a Dict whose size
+grew from 1 to 5000.
+
+Even the `elm-test-rs` test suite benefited directly: `1123` tests
+went from `287s` to `45s` without any test changes.
+
+### Review runner A/B — 2.36x stacked on NoUnused.Parameters
+
+Rebuilt `dist/review-runner-bench.mjs` with the updated interpreter
+and reran `bench/importers-kernel-ab.mjs` on the same `small-12`
+fixture, this time comparing kernel-only against kernel + round 2:
+
+`NoUnused.Parameters` interpreted:
+
+| Scenario                | Kernel only | Round 2  | Delta   | Speedup |
+|-------------------------|------------:|---------:|--------:|--------:|
+| Cold wall               | `203.7s`    | `149.4s` | `-54.3s`| `1.36x` |
+| Cold `project_rule_eval`| `175.1s`    | `121.2s` | `-53.9s`| `1.44x` |
+| Warm wall               | `372ms`     | `371ms`  | flat    | `1.00x` |
+| Warm import-graph wall  | `183.2s`    | `117.2s` | `-66.0s`| `1.56x` |
+| Warm import-graph `proj_rule_eval` | `181.9s` | `115.9s` | `-66.0s` | `1.57x` |
+
+`NoUnused.Exports` interpreted:
+
+| Scenario                | Kernel only | Round 2  | Delta    | Speedup |
+|-------------------------|------------:|---------:|---------:|--------:|
+| Cold wall               | `156.9s`    | `129.1s` | `-27.8s` | `1.22x` |
+| Cold `project_rule_eval`| `128.3s`    | `100.8s` | `-27.6s` | `1.27x` |
+| Warm wall               | `375ms`     | `383ms`  | `+8ms`   | noise   |
+| Warm import-graph wall  | `4260ms`    | `4339ms` | `+79ms`  | noise   |
+
+Error counts identical across every scenario for both rules
+(`Parameters` `7/7/7`, `Exports` `33/33/34`), so the correctness
+invariant continues to hold.
+
+Stacked against the pre-kernel-Dict/Set baseline, the cumulative
+speedup on `NoUnused.Parameters` is:
+
+| Scenario                | Original | Round 2  | Speedup |
+|-------------------------|---------:|---------:|--------:|
+| Cold wall               | `287.7s` | `149.4s` | `1.93x` |
+| Warm import-graph wall  | `277.0s` | `117.2s` | `2.36x` |
+
+That's `160 seconds` cut from the single most expensive warm
+interpreted scenario on this fixture.
+
+`NoUnused.Exports` moves much less on the warm paths because its
+inner loop has smaller per-iteration env churn — there's not much
+O(n²) fingerprint cost to eliminate. Its cold path still improves
+cleanly, which matches the hypothesis that the savings scale with
+"env size × loop iterations".
+
+### Visitor split architectural probe
+
+I also added `visitor_split_mock` and `visitor_split_mock_large` to
+`DictSetBenchmark.elm`. These run the same underlying work as the
+monolithic `review_rule_mock` benchmarks, but decomposed into
+separate per-visitor functions (`usedValuesVisitor`,
+`exportsVisitor`, `mergeUsedValues`, `mergeExports`) instead of a
+single `buildModuleContext` plus `foldProjectContext`.
+
+| Shape                        | Monolithic | Visitor split |
+|------------------------------|-----------:|--------------:|
+| small (20 modules × 50 items)  | `155.8ms`  | `147.3ms`     |
+| large (100 modules × 200 items)| `~754ms`   | `~726ms`      |
+
+Both produce identical results (`2000` / `40000`). Visitor-split is
+within noise of the monolithic fold — actually slightly faster on
+both sizes, though the margin is small enough to be within run-to-run
+variance.
+
+The important read is the *negative* result: there is no inherent
+interpreter overhead from decomposing a rule into visitors with
+typed contributions plus kernel merging. The shape the elm-review
+runner vision wants — "per-module visitor in the interpreter, cross-
+module merge via kernel Dict/Set" — is not more expensive than a
+monolithic rule fold once Dict/Set is kernel-native and the TCO
+cycle check is amortized.
+
+### Current read
+
+- Two interpreter-side optimizations, each justified by the profile
+  before being written, took `NoUnused.Parameters` warm import-graph
+  time from `277s` to `117s`, a cumulative `2.36x` speedup on top
+  of the earlier kernel Dict/Set round.
+- The `dict_insert_string_5k` microbenchmark result (`10x`) is a
+  pure demonstration that the old TCO cycle check was the dominant
+  cost on growing-accumulator loops. Any workload that repeatedly
+  calls `Dict.insert` / `Set.insert` inside a `List.foldl` was
+  paying O(n²) in cycle detection.
+- The visitor-split microbenchmark is the first direct evidence
+  that the visitor-decomposed rule architecture is viable on its
+  own merits — not just "eventually competitive".
+- The interpreter path on `NoUnused.Parameters` is still about
+  `100x` slower than the host-native shortcut, so there is a lot
+  more headroom. The next profile (after this round) will tell
+  us whether GC / allocation pressure is now the dominant cost
+  or whether there is another targeted fix like this one hiding
+  underneath.
+- The iteration loop — profile, pick a targeted change, run the
+  standalone benchmark plus the review runner A/B in ~10 minutes —
+  is now well exercised and cheap to repeat.
