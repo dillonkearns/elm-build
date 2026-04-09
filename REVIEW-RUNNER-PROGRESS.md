@@ -2746,3 +2746,118 @@ Interpretation:
   2. prune package function payloads more aggressively
   3. introduce true lazy package-function loading, if the interpreter churn is
      justified
+
+## 2026-04-09
+
+### Kernel Native Dict / Set In The Interpreter
+
+I added host-Elm kernel implementations for the hot `Dict.*` and
+`Set.*` operations in `elm-interpreter/src/Kernel/Dict.elm` and
+`elm-interpreter/src/Kernel/Set.elm`, with registration in
+`elm-interpreter/src/Kernel.elm` and a new `userModuleKernelFastPath`
+check inside `Eval.Expression.evalNonVariant` that short-circuits
+user-level `Dict.*` / `Set.*` calls to the kernel before the
+interpreted AST lookup.
+
+Operations kernelized:
+
+- `Dict.empty`, `isEmpty`, `size`
+- `Dict.get`, `member`
+- `Dict.insert`, `remove`
+- `Dict.union`
+- `Dict.fromList`, `toList`
+- `Set.*` equivalents, which unwrap `Set_elm_builtin` and delegate
+  to the Dict kernel
+
+Key comparison reuses `Kernel.Utils.innerCompare`, which already has
+native fast paths for String, Int, Tuple, etc. The RBTree balance
+logic is ported into host Elm directly.
+
+### Standalone interpreter benchmark
+
+A focused `benchmark/DictSetBenchmark.elm` in the interpreter repo
+runs each Dict / Set scenario in a fresh Node worker (~120ms startup
+floor baked in). Baseline numbers are before the kernel change; kernel
+numbers are after.
+
+| Benchmark                | Baseline | Kernel   | Speedup |
+|--------------------------|---------:|---------:|--------:|
+| `dict_insert_string_1k`  | `358ms`  | `140ms`  | `2.55x` |
+| `dict_insert_string_5k`  | `2099ms` | `949ms`  | `2.21x` |
+| `dict_insert_tuple_1k`   | `348ms`  | `156ms`  | `2.23x` |
+| `dict_union_string_1k`   | `778ms`  | `198ms`  | `3.92x` |
+| `dict_member_string_1k`  | `435ms`  | `178ms`  | `2.43x` |
+| `dict_get_string_1k`     | `428ms`  | `186ms`  | `2.29x` |
+| `set_insert_string_1k`   | `357ms`  | `134ms`  | `2.66x` |
+| `set_union_string_1k`    | `785ms`  | `202ms`  | `3.88x` |
+| `review_rule_mock`       | `801ms`  | `162ms`  | `4.94x` |
+
+The `review_rule_mock` scenario is deliberately shaped like a
+`foldProjectContexts` merge (20 module contexts, each a small
+`Dict ( ModuleName, String ) Int` plus a `Set`, folded together).
+Subtracting the ~120ms per-run Node/Elm startup floor, the actual
+interpreted work on that benchmark went from about `680ms` to about
+`43ms`, roughly a `16x` speedup on the raw hot loop.
+
+### Review runner A/B: `NoUnused.Exports` interpreted
+
+Added `bench/importers-kernel-ab.mjs` that builds two review-runner
+bundles — one from the baseline `elm-interpreter` commit (pre-kernel
+Dict/Set) and one from the kernel commit — and runs the interpreted
+`NoUnused.Exports` ruleset over the `small-12` fixture for each.
+
+| Scenario                | Baseline | Kernel   | Delta   | Speedup |
+|-------------------------|---------:|---------:|--------:|--------:|
+| Cold wall               | `234.4s` | `159.8s` | `-74.6s`| `1.47x` |
+| Cold `project_rule_eval`| `205.1s` | `131.4s` | `-73.7s`| `1.56x` |
+| Warm wall               | `372ms`  | `370ms`  | noise   | `1.01x` |
+| Warm import-graph wall  | `4913ms` | `4314ms` | `-599ms`| `1.14x` |
+| Warm import-graph `project_rule_eval` | `3629ms` | `3001ms` | `-628ms`| `1.21x` |
+
+Error counts identical across all scenarios (`33 / 33 / 34`), so the
+correctness invariant held.
+
+### Review runner A/B: `NoUnused.Parameters` interpreted
+
+The same harness on `NoUnused.Parameters`, which the progress log
+already flagged as the most `Dict`/`Set`-heavy interpreted rule.
+
+| Scenario                | Baseline | Kernel   | Delta   | Speedup |
+|-------------------------|---------:|---------:|--------:|--------:|
+| Cold wall               | `287.7s` | `204.9s` | `-82.8s`| `1.40x` |
+| Cold `project_rule_eval`| `257.0s` | `174.5s` | `-82.5s`| `1.47x` |
+| Warm wall               | `374ms`  | `374ms`  | flat    | `1.00x` |
+| Warm import-graph wall  | `277.0s` | `185.9s` | `-91.1s`| `1.49x` |
+| Warm import-graph `project_rule_eval` | `275.7s` | `184.6s` | `-91.1s`| `1.49x` |
+
+Error counts identical (`7 / 7 / 7`). This is the clearest read of
+the experiment: on the single worst interpreted scenario in the
+`ImportersOf` family, kernel `Dict` / `Set` removes `91` seconds of
+raw project-rule churn while keeping the rule semantics interpreted.
+
+### Current read
+
+- Kernel `Dict.*` / `Set.*` is a real, measurable win on the exact
+  hot path that the earlier Node CPU profiles identified as dominated
+  by `gr` and GC. Cold interpreted `project_rule_eval` drops by about
+  `1.4-1.6x` across the two rules tested, and the hardest warm
+  import-graph case on `NoUnused.Parameters` drops by `91s`.
+- The microbenchmark win (about `5x` end-to-end, about `16x` on pure
+  work) does not translate 1:1 to the real workload because real
+  rules also pay closure-dispatch, AST-walking, and per-module
+  visitor setup costs that are not addressed by kernelizing Dict/Set.
+- That still validates the architectural thesis from the
+  `elm-interpreter-opportunities.md` note: the hottest data structure
+  operations *can* be native without giving up the interpreter's
+  flexibility, and doing so materially moves the needle on the
+  interpreted rule workload.
+- The next compounding moves should be the remaining interpreter
+  optimizations from the research notes — arity caching, flat
+  closures, fewer `Config` allocations per trampoline step — because
+  once Dict/Set is no longer the dominant frame, closure / env /
+  dispatch overhead becomes the next highest-leverage target.
+- Host-native rule shortcuts remain strictly faster on a per-rule
+  basis, but they are no longer the only way to get the interpreter
+  within striking distance of the CLI on mixed partial-miss paths.
+  A viable "all interpreted + kernel Dict/Set + further interpreter
+  tuning" path now looks plausible.
