@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, LoadProfile, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -25,11 +25,13 @@ import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation)
 import Elm.Syntax.File exposing (File)
+import Elm.Syntax.Infix as Infix
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
 import Elm.Syntax.Infix exposing (InfixDirection(..))
 import Eval.Module
+import Environment
 import FastDict
 import FatalError exposing (FatalError)
 import Json.Decode as Decode
@@ -102,14 +104,189 @@ withTiming work =
         }
 
 
+benchmarkThunk : (() -> a) -> BackendTask FatalError (Timed a)
+benchmarkThunk thunk =
+    Do.do BackendTask.Time.now <| \start ->
+    let
+        value =
+            thunk ()
+    in
+    Do.do BackendTask.Time.now <| \finish ->
+    BackendTask.succeed
+        { value = value
+        , ms = stageMs start finish
+        }
+
+
+repeatBinaryEncode : Int -> List CachedPackageModuleSummary -> Int -> Int
+repeatBinaryEncode iterations summaries acc =
+    if iterations <= 0 then
+        acc
+
+    else
+        repeatBinaryEncode
+            (iterations - 1)
+            summaries
+            (acc + Bytes.width (encodePackageSummaryCache summaries))
+
+
+repeatBinaryDecode : Int -> Bytes.Bytes -> Int -> Int
+repeatBinaryDecode iterations bytes acc =
+    if iterations <= 0 then
+        acc
+
+    else
+        case decodePackageSummaryCache bytes of
+            Just summaries ->
+                repeatBinaryDecode (iterations - 1) bytes (acc + List.length summaries)
+
+            Nothing ->
+                -1
+
+
+repeatShardedBinaryEncode : Int -> List CachedPackageModuleSummary -> Int -> Int
+repeatShardedBinaryEncode iterations summaries acc =
+    if iterations <= 0 then
+        acc
+
+    else
+        let
+            shardBytes =
+                encodePackageSummaryCacheSharded summaries
+        in
+        repeatShardedBinaryEncode
+            (iterations - 1)
+            summaries
+            (acc + List.foldl (\bytes total -> total + Bytes.width bytes) 0 shardBytes)
+
+
+repeatShardedBinaryDecode : Int -> List Bytes.Bytes -> Int -> Int
+repeatShardedBinaryDecode iterations shardBytes acc =
+    if iterations <= 0 then
+        acc
+
+    else
+        case decodePackageSummaryCacheSharded shardBytes of
+            Just summaries ->
+                repeatShardedBinaryDecode (iterations - 1) shardBytes (acc + List.length summaries)
+
+            Nothing ->
+                -1
+
+
+repeatJsonEncode : Int -> List CachedPackageModuleSummary -> Int -> Int
+repeatJsonEncode iterations summaries acc =
+    if iterations <= 0 then
+        acc
+
+    else
+        let
+            jsonString =
+                encodePackageSummaryCacheJson summaries
+        in
+        repeatJsonEncode (iterations - 1) summaries (acc + String.length jsonString)
+
+
+repeatJsonDecode : Int -> String -> Int -> Int
+repeatJsonDecode iterations jsonString acc =
+    if iterations <= 0 then
+        acc
+
+    else
+        case decodePackageSummaryCacheJson jsonString of
+            Just summaries ->
+                repeatJsonDecode (iterations - 1) jsonString (acc + List.length summaries)
+
+            Nothing ->
+                -1
+
+
 packageSummaryCacheVersion : String
 packageSummaryCacheVersion =
-    "v5"
+    "v6"
 
 
 packageSummaryCacheBlobPath : String -> String
 packageSummaryCacheBlobPath cacheDir =
     cacheDir ++ "/package-module-summaries-" ++ packageSummaryCacheVersion ++ ".blob"
+
+
+benchmarkPackageSummaryCacheCodecs :
+    { projectDir : Path
+    , skipPackages : Set String
+    , patchSource : String -> String
+    , extraSourceFiles : List String
+    , extraReachableImports : List String
+    , sourceDirectories : Maybe (List String)
+    , packageParseCacheDir : String
+    , iterations : Int
+    }
+    -> BackendTask FatalError
+        { iterations : Int
+        , summaryCount : Int
+        , binaryBytes : Int
+        , shardedBinaryBytes : Int
+        , jsonChars : Int
+        , seedCacheHit : Int
+        , seedParsePackageSourcesMs : Int
+        , seedBuildPackageSummariesFromParsedMs : Int
+        , seedDecodePackageSummaryCacheMs : Int
+        , binaryEncodeMs : Int
+        , binaryDecodeMs : Int
+        , shardedBinaryEncodeMs : Int
+        , shardedBinaryDecodeMs : Int
+        , jsonEncodeMs : Int
+        , jsonDecodeMs : Int
+        }
+benchmarkPackageSummaryCacheCodecs config =
+    Do.do
+        (loadWithProfile
+            { projectDir = config.projectDir
+            , skipPackages = config.skipPackages
+            , patchSource = config.patchSource
+            , extraSourceFiles = config.extraSourceFiles
+            , extraReachableImports = config.extraReachableImports
+            , sourceDirectories = config.sourceDirectories
+            , packageParseCacheDir = Just config.packageParseCacheDir
+            }
+        )
+    <| \seedLoad ->
+    Do.do (File.binaryFile (packageSummaryCacheBlobPath config.packageParseCacheDir) |> BackendTask.allowFatal) <| \cacheBytes ->
+    case decodePackageSummaryCache cacheBytes of
+        Nothing ->
+            BackendTask.fail (FatalError.fromString "Failed to decode package summary cache blob for codec benchmark")
+
+        Just summaries ->
+            let
+                jsonString =
+                    encodePackageSummaryCacheJson summaries
+
+                shardedBytes =
+                    encodePackageSummaryCacheSharded summaries
+            in
+            Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations summaries 0)) <| \binaryEncodeTimed ->
+            Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations cacheBytes 0)) <| \binaryDecodeTimed ->
+            Do.do (benchmarkThunk (\_ -> repeatShardedBinaryEncode config.iterations summaries 0)) <| \shardedBinaryEncodeTimed ->
+            Do.do (benchmarkThunk (\_ -> repeatShardedBinaryDecode config.iterations shardedBytes 0)) <| \shardedBinaryDecodeTimed ->
+            Do.do (benchmarkThunk (\_ -> repeatJsonEncode config.iterations summaries 0)) <| \jsonEncodeTimed ->
+            Do.do (benchmarkThunk (\_ -> repeatJsonDecode config.iterations jsonString 0)) <| \jsonDecodeTimed ->
+            BackendTask.succeed
+                { iterations = config.iterations
+                , summaryCount = List.length summaries
+                , binaryBytes = Bytes.width cacheBytes
+                , shardedBinaryBytes = List.foldl (\bytes total -> total + Bytes.width bytes) 0 shardedBytes
+                , jsonChars = String.length jsonString
+                , seedCacheHit = seedLoad.profile.packageSummaryCacheHit
+                , seedParsePackageSourcesMs = seedLoad.profile.parsePackageSourcesMs
+                , seedBuildPackageSummariesFromParsedMs = seedLoad.profile.buildPackageSummariesFromParsedMs
+                , seedDecodePackageSummaryCacheMs = seedLoad.profile.decodePackageSummaryCacheMs
+                , binaryEncodeMs = binaryEncodeTimed.ms
+                , binaryDecodeMs = binaryDecodeTimed.ms
+                , shardedBinaryEncodeMs = shardedBinaryEncodeTimed.ms
+                , shardedBinaryDecodeMs = shardedBinaryDecodeTimed.ms
+                , jsonEncodeMs = jsonEncodeTimed.ms
+                , jsonDecodeMs = jsonDecodeTimed.ms
+                }
 
 
 encodePackageSummaryCache : List CachedPackageModuleSummary -> Bytes.Bytes
@@ -123,6 +300,47 @@ decodePackageSummaryCache : Bytes.Bytes -> Maybe (List CachedPackageModuleSummar
 decodePackageSummaryCache bytes =
     bytes
         |> Lamdera.Wire3.bytesDecode (Lamdera.Wire3.decodeList decodeCachedPackageModuleSummary)
+
+
+encodePackageSummaryCacheSharded : List CachedPackageModuleSummary -> List Bytes.Bytes
+encodePackageSummaryCacheSharded summaries =
+    List.map
+        (\summary ->
+            summary
+                |> encodeCachedPackageModuleSummary
+                |> Lamdera.Wire3.bytesEncode
+        )
+        summaries
+
+
+decodePackageSummaryCacheSharded : List Bytes.Bytes -> Maybe (List CachedPackageModuleSummary)
+decodePackageSummaryCacheSharded shardBytes =
+    shardBytes
+        |> List.foldr
+            (\bytes maybeSummaries ->
+                case ( Lamdera.Wire3.bytesDecode decodeCachedPackageModuleSummary bytes, maybeSummaries ) of
+                    ( Just summary, Just summaries ) ->
+                        Just (summary :: summaries)
+
+                    _ ->
+                        Nothing
+            )
+            (Just [])
+
+
+encodePackageSummaryCacheJson : List CachedPackageModuleSummary -> String
+encodePackageSummaryCacheJson summaries =
+    summaries
+        |> Json.Encode.list encodeCachedPackageModuleSummaryJson
+        |> Json.Encode.encode 0
+
+
+decodePackageSummaryCacheJson : String -> Maybe (List CachedPackageModuleSummary)
+decodePackageSummaryCacheJson jsonString =
+    Decode.decodeString
+        (Decode.list decodeCachedPackageModuleSummaryJson)
+        jsonString
+        |> Result.toMaybe
 
 
 writeBinaryFile : { path : String, bytes : Bytes.Bytes } -> BackendTask FatalError ()
@@ -165,6 +383,32 @@ decodeCachedPackageModuleSummary =
         |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeExposed)
         |> Lamdera.Wire3.andMapDecode decodeImportedNames
         |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeFunctionImplementationNoRanges)
+
+
+encodeCachedPackageModuleSummaryJson : CachedPackageModuleSummary -> Json.Encode.Value
+encodeCachedPackageModuleSummaryJson summary =
+    Json.Encode.object
+        [ ( "moduleName", Json.Encode.list Json.Encode.string summary.moduleName )
+        , ( "interface", Json.Encode.list encodeExposedJson summary.interface )
+        , ( "importedNames", encodeImportedNamesJson summary.importedNames )
+        , ( "functions", Json.Encode.list encodeFunctionImplementationNoRangesJson summary.functions )
+        ]
+
+
+decodeCachedPackageModuleSummaryJson : Decode.Decoder CachedPackageModuleSummary
+decodeCachedPackageModuleSummaryJson =
+    Decode.map4
+        (\moduleName interface importedNames functions ->
+            { moduleName = moduleName
+            , interface = interface
+            , importedNames = importedNames
+            , functions = functions
+            }
+        )
+        (Decode.field "moduleName" (Decode.list Decode.string))
+        (Decode.field "interface" (Decode.list decodeExposedJson))
+        (Decode.field "importedNames" decodeImportedNamesJson)
+        (Decode.field "functions" (Decode.list decodeFunctionImplementationNoRangesJson))
 
 
 encodeModuleName : ModuleName -> Lamdera.Wire3.Encoder
@@ -245,6 +489,63 @@ decodeExposed =
             )
 
 
+encodeExposedJson : Exposed -> Json.Encode.Value
+encodeExposedJson exposed =
+    case exposed of
+        Elm.Interface.Function name ->
+            Json.Encode.object
+                [ ( "tag", Json.Encode.string "function" )
+                , ( "name", Json.Encode.string name )
+                ]
+
+        Elm.Interface.CustomType ( name, constructors ) ->
+            Json.Encode.object
+                [ ( "tag", Json.Encode.string "custom-type" )
+                , ( "name", Json.Encode.string name )
+                , ( "constructors", Json.Encode.list Json.Encode.string constructors )
+                ]
+
+        Elm.Interface.Alias name ->
+            Json.Encode.object
+                [ ( "tag", Json.Encode.string "alias" )
+                , ( "name", Json.Encode.string name )
+                ]
+
+        Elm.Interface.Operator infix_ ->
+            Json.Encode.object
+                [ ( "tag", Json.Encode.string "operator" )
+                , ( "infix", Infix.encode infix_ )
+                ]
+
+
+decodeExposedJson : Decode.Decoder Exposed
+decodeExposedJson =
+    Decode.field "tag" Decode.string
+        |> Decode.andThen
+            (\tag ->
+                case tag of
+                    "function" ->
+                        Decode.map Elm.Interface.Function
+                            (Decode.field "name" Decode.string)
+
+                    "custom-type" ->
+                        Decode.map2 (\name constructors -> Elm.Interface.CustomType ( name, constructors ))
+                            (Decode.field "name" Decode.string)
+                            (Decode.field "constructors" (Decode.list Decode.string))
+
+                    "alias" ->
+                        Decode.map Elm.Interface.Alias
+                            (Decode.field "name" Decode.string)
+
+                    "operator" ->
+                        Decode.map Elm.Interface.Operator
+                            (Decode.field "infix" Infix.decoder)
+
+                    _ ->
+                        Decode.fail ("Unknown exposed tag: " ++ tag)
+            )
+
+
 encodeImportedNames : Types.ImportedNames -> Lamdera.Wire3.Encoder
 encodeImportedNames importedNames =
     Lamdera.Wire3.encodeSequenceWithoutLength
@@ -268,16 +569,38 @@ decodeImportedNames =
         |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
 
 
+encodeImportedNamesJson : Types.ImportedNames -> Json.Encode.Value
+encodeImportedNamesJson importedNames =
+    Json.Encode.object
+        [ ( "aliases", encodeQualifiedMappingJson importedNames.aliases )
+        , ( "exposedValues", encodeQualifiedMappingJson importedNames.exposedValues )
+        , ( "exposedConstructors", encodeQualifiedMappingJson importedNames.exposedConstructors )
+        ]
+
+
+decodeImportedNamesJson : Decode.Decoder Types.ImportedNames
+decodeImportedNamesJson =
+    Decode.map3
+        (\aliases exposedValues exposedConstructors ->
+            { aliases = aliases
+            , exposedValues = exposedValues
+            , exposedConstructors = exposedConstructors
+            }
+        )
+        (Decode.field "aliases" decodeQualifiedMappingJson)
+        (Decode.field "exposedValues" decodeQualifiedMappingJson)
+        (Decode.field "exposedConstructors" decodeQualifiedMappingJson)
+
+
 encodeQualifiedMapping : FastDict.Dict String ( ModuleName, String ) -> Lamdera.Wire3.Encoder
 encodeQualifiedMapping mapping =
     mapping
         |> FastDict.toList
         |> Lamdera.Wire3.encodeList
-            (\( name, ( moduleName, moduleKey ) ) ->
+            (\( name, ( moduleName, _ ) ) ->
                 Lamdera.Wire3.encodeSequenceWithoutLength
                     [ Lamdera.Wire3.encodeString name
                     , encodeModuleName moduleName
-                    , Lamdera.Wire3.encodeString moduleKey
                     ]
             )
 
@@ -287,12 +610,41 @@ decodeQualifiedMapping =
     Lamdera.Wire3.succeedDecode FastDict.fromList
         |> Lamdera.Wire3.andMapDecode
             (Lamdera.Wire3.decodeList
-                (Lamdera.Wire3.succeedDecode (\name moduleName moduleKey -> ( name, ( moduleName, moduleKey ) ))
+                (Lamdera.Wire3.succeedDecode
+                    (\name moduleName ->
+                        ( name, ( moduleName, Environment.moduleKey moduleName ) )
+                    )
                     |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
                     |> Lamdera.Wire3.andMapDecode decodeModuleName
-                    |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
                 )
             )
+
+
+encodeQualifiedMappingJson : FastDict.Dict String ( ModuleName, String ) -> Json.Encode.Value
+encodeQualifiedMappingJson mapping =
+    mapping
+        |> FastDict.toList
+        |> Json.Encode.list
+            (\( name, ( moduleName, _ ) ) ->
+                Json.Encode.object
+                    [ ( "name", Json.Encode.string name )
+                    , ( "moduleName", Json.Encode.list Json.Encode.string moduleName )
+                    ]
+            )
+
+
+decodeQualifiedMappingJson : Decode.Decoder (FastDict.Dict String ( ModuleName, String ))
+decodeQualifiedMappingJson =
+    Decode.map FastDict.fromList
+        (Decode.list
+            (Decode.map2
+                (\name moduleName ->
+                    ( name, ( moduleName, Environment.moduleKey moduleName ) )
+                )
+                (Decode.field "name" Decode.string)
+                (Decode.field "moduleName" (Decode.list Decode.string))
+            )
+        )
 
 
 encodeFunctionImplementationNoRanges : FunctionImplementation -> Lamdera.Wire3.Encoder
@@ -316,6 +668,21 @@ decodeFunctionImplementationNoRanges =
         |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
         |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList AstWireCodec.decodePattern)
         |> Lamdera.Wire3.andMapDecode AstWireCodec.decodeExpression
+
+
+encodeFunctionImplementationNoRangesJson : FunctionImplementation -> Json.Encode.Value
+encodeFunctionImplementationNoRangesJson implementation =
+    Elm.Syntax.Expression.encodeFunction
+        { documentation = Nothing
+        , signature = Nothing
+        , declaration = fakeNode implementation
+        }
+
+
+decodeFunctionImplementationNoRangesJson : Decode.Decoder FunctionImplementation
+decodeFunctionImplementationNoRangesJson =
+    Elm.Syntax.Expression.functionDecoder
+        |> Decode.map (\function_ -> Node.value function_.declaration)
 
 
 encodeInfixDirectionRaw : InfixDirection -> Lamdera.Wire3.Encoder

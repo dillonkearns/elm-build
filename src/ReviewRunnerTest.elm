@@ -10,6 +10,8 @@ the interpreter, parse results, verify caching behavior.
 import DepGraph
 import Dict
 import Expect
+import Json.Decode
+import Path
 import ReviewRunner
 import SemanticHash
 import Set
@@ -22,6 +24,7 @@ suite =
     describe "ReviewRunner integration"
         [ pureHelperTests
         , ruleFactContractTests
+        , factProjectionTests
         , factHashTests
         , contractHashKeyTests
         , semanticCacheKeyTests
@@ -158,6 +161,73 @@ pureHelperTests =
                         |> List.head
                         |> Maybe.map .message
                         |> Expect.equal (Just "use a |> b instead")
+            ]
+        , describe "configDecoder"
+            [ test "empty object uses defaults" <|
+                \_ ->
+                    Json.Decode.decodeString ReviewRunner.configDecoder "{}"
+                        |> Result.map
+                            (\config ->
+                                { reviewDir = config.reviewDir
+                                , sourceDirs = config.sourceDirs
+                                , buildDirectory = Path.toString config.buildDirectory
+                                , memoProfile = config.memoProfile
+                                , hostNoUnusedExportsExperiment = config.hostNoUnusedExportsExperiment
+                                }
+                            )
+                        |> Expect.equal
+                            (Ok
+                                { reviewDir = "review"
+                                , sourceDirs = [ "src" ]
+                                , buildDirectory = ".elm-review-build"
+                                , memoProfile = False
+                                , hostNoUnusedExportsExperiment = False
+                                }
+                            )
+            , test "explicit values decode correctly" <|
+                \_ ->
+                    Json.Decode.decodeString
+                        ReviewRunner.configDecoder
+                        """{
+                          "reviewDir": "bench/review",
+                          "sourceDirs": ["app", "src"],
+                          "buildDirectory": ".cache/review",
+                          "jobs": 4,
+                          "memoizedFunctions": ["A.b", "C.d"],
+                          "memoProfile": true,
+                          "importersCacheMode": "split",
+                          "depsCacheMode": "fresh",
+                          "reportFormat": "quiet",
+                          "perfTraceJson": "trace.json",
+                          "hostNoUnusedExportsExperiment": true,
+                          "hostNoMissingTypeAnnotationExperiment": true
+                        }"""
+                        |> Result.map
+                            (\config ->
+                                { reviewDir = config.reviewDir
+                                , sourceDirs = config.sourceDirs
+                                , buildDirectory = Path.toString config.buildDirectory
+                                , jobs = config.jobs
+                                , memoizedFunctions = Set.toList config.memoizedFunctions |> List.sort
+                                , memoProfile = config.memoProfile
+                                , perfTraceJson = config.perfTraceJson
+                                , hostNoUnusedExportsExperiment = config.hostNoUnusedExportsExperiment
+                                , hostNoMissingTypeAnnotationExperiment = config.hostNoMissingTypeAnnotationExperiment
+                                }
+                            )
+                        |> Expect.equal
+                            (Ok
+                                { reviewDir = "bench/review"
+                                , sourceDirs = [ "app", "src" ]
+                                , buildDirectory = ".cache/review"
+                                , jobs = Just 4
+                                , memoizedFunctions = [ "A.b", "C.d" ]
+                                , memoProfile = True
+                                , perfTraceJson = Just "trace.json"
+                                , hostNoUnusedExportsExperiment = True
+                                , hostNoMissingTypeAnnotationExperiment = True
+                                }
+                            )
             ]
         , describe "hostNoUnusedExportsErrorsForSources"
             [ test "reports unused explicitly exposed value" <|
@@ -382,6 +452,146 @@ run =
                         |> List.map (\error -> ( error.filePath, error.message ))
                         |> Expect.equal
                             [ ( "src/Types.elm", "Type `Status` is not used" ) ]
+            ]
+        , describe "hostNoMissingTypeAnnotationErrorsForSources"
+            [ test "reports top-level function without signature" <|
+                \_ ->
+                    ReviewRunner.hostNoMissingTypeAnnotationErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (foo)
+
+foo value =
+    value
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> Expect.equal
+                            [ ( 3, "Missing type annotation for `foo`" ) ]
+            ]
+        , describe "hostNoMissingTypeAnnotationInLetInErrorsForSources"
+            [ test "reports let function without signature" <|
+                \_ ->
+                    ReviewRunner.hostNoMissingTypeAnnotationInLetInErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+run value =
+    let
+        helper item =
+            item + 1
+    in
+    helper value
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> Expect.equal
+                            [ ( 5, "Missing type annotation for `helper`" ) ]
+            ]
+        , describe "hostNoExposingEverythingErrorsForSources"
+            [ test "reports exposing everything module definition" <|
+                \_ ->
+                    ReviewRunner.hostNoExposingEverythingErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (..)
+
+foo =
+    1
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> Expect.equal
+                            [ ( 1, "Module exposes everything implicitly \"(..)\"" ) ]
+            ]
+        , describe "hostNoImportingEverythingErrorsForSources"
+            [ test "reports import exposing everything" <|
+                \_ ->
+                    ReviewRunner.hostNoImportingEverythingErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+import Maybe exposing (..)
+
+run =
+    withDefault 0 Nothing
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> Expect.equal
+                            [ ( 3, "Prefer listing what you wish to import and/or using qualified imports" ) ]
+            ]
+        , describe "hostNoDebugLogErrorsForSources"
+            [ test "reports direct Debug.log usage" <|
+                \_ ->
+                    ReviewRunner.hostNoDebugLogErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+run =
+    Debug.log "value" 1
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.column, error.message ))
+                        |> Expect.equal
+                            [ ( 4, 5, "Remove the use of `Debug.log` before shipping to production" ) ]
+            , test "reports aliased Debug.log usage" <|
+                \_ ->
+                    ReviewRunner.hostNoDebugLogErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+import Debug as D
+
+run =
+    D.log "value" 1
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.column, error.message ))
+                        |> Expect.equal
+                            [ ( 6, 5, "Remove the use of `Debug.log` before shipping to production" ) ]
+            , test "reports unqualified imported log usage" <|
+                \_ ->
+                    ReviewRunner.hostNoDebugLogErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+import Debug exposing (log)
+
+run =
+    log "value" 1
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.column, error.message ))
+                        |> Expect.equal
+                            [ ( 6, 5, "Remove the use of `Debug.log` before shipping to production" ) ]
+            ]
+        , describe "hostNoDebugTodoOrToStringErrorsForSources"
+            [ test "reports direct Debug.todo and Debug.toString usage" <|
+                \_ ->
+                    ReviewRunner.hostNoDebugTodoOrToStringErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+run value =
+    if value then
+        Debug.todo "later"
+
+    else
+        Debug.toString value
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.column, error.message ))
+                        |> Expect.equal
+                            [ ( 5, 9, "Remove the use of `Debug.todo` before shipping to production" )
+                            , ( 8, 9, "Remove the use of `Debug.toString` before shipping to production" )
+                            ]
             ]
         , describe "crossModuleSummaryFromSource"
             [ test "captures constructor facts generically" <|
@@ -645,6 +855,152 @@ ruleFactContractTests =
                 ReviewRunner.factContractForRule "NoMissingTypeAnnotation"
                     |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
                     |> Expect.equal (Just [ "DeclarationShape" ])
+        , test "NoMissingTypeAnnotationInLetIn depends on declaration shape facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoMissingTypeAnnotationInLetIn"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "DeclarationShape" ])
+        , test "NoExposingEverything depends on export shape facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoExposingEverything"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "ExportShape" ])
+        , test "NoImportingEverything depends on import shape facts" <|
+            \_ ->
+                ReviewRunner.factContractForRule "NoImportingEverything"
+                    |> Maybe.map (.factSets >> List.map ReviewRunner.factSetToString)
+                    |> Expect.equal (Just [ "ImportShape" ])
+        , test "NoDebug.Log has an expression visitor contract over import and function facts" <|
+            \_ ->
+                ReviewRunner.visitorContractsForRule "NoDebug.Log"
+                    |> Maybe.map
+                        (\contract ->
+                            contract.visitors
+                                |> List.map
+                                    (\visitor ->
+                                        ( visitor.visitorName
+                                        , visitor.kind
+                                        , List.map ReviewRunner.factSetToString visitor.factSets
+                                        )
+                                    )
+                        )
+                    |> Expect.equal
+                        (Just
+                            [ ( "expression-enter"
+                              , ReviewRunner.ExpressionVisitor
+                              , [ "ImportShape", "FunctionUsage" ]
+                              )
+                            ]
+                        )
+        , test "NoDebug.TodoOrToString has an expression visitor contract over import and function facts" <|
+            \_ ->
+                ReviewRunner.visitorContractsForRule "NoDebug.TodoOrToString"
+                    |> Maybe.map
+                        (\contract ->
+                            contract.visitors
+                                |> List.map
+                                    (\visitor ->
+                                        ( visitor.visitorName
+                                        , visitor.kind
+                                        , List.map ReviewRunner.factSetToString visitor.factSets
+                                        )
+                                    )
+                        )
+                    |> Expect.equal
+                        (Just
+                            [ ( "expression-enter"
+                              , ReviewRunner.ExpressionVisitor
+                              , [ "ImportShape", "FunctionUsage" ]
+                              )
+                            ]
+                        )
+        ]
+
+
+factProjectionTests : Test
+factProjectionTests =
+    describe "fact projections"
+        [ test "fact projections expose typed import/export facts and their hashes" <|
+            \_ ->
+                let
+                    source =
+                        """module A exposing (Status(..), run)
+
+import Maybe as M exposing (Maybe(..), withDefault)
+import Result exposing (Result)
+
+type Status
+    = Ready
+    | Waiting
+
+run value =
+    M.withDefault Ready value
+"""
+
+                    projections =
+                        factProjections "src/A.elm" source
+
+                    hashes =
+                        factHashes "src/A.elm" source
+                in
+                Expect.all
+                    [ \_ ->
+                        projections.importShape.value.importedModules
+                            |> Set.toList
+                            |> List.sort
+                            |> Expect.equal [ "Maybe", "Result" ]
+                    , \_ ->
+                        projections.importShape.value.moduleAliases
+                            |> Expect.equal (Dict.fromList [ ( "M", "Maybe" ) ])
+                    , \_ ->
+                        projections.exportShape.value.exposedValues
+                            |> Dict.keys
+                            |> List.sort
+                            |> Expect.equal [ "run" ]
+                    , \_ ->
+                        projections.exportShape.value.exposedConstructors
+                            |> Dict.get "Status"
+                            |> Maybe.map (Dict.keys >> List.sort)
+                            |> Expect.equal (Just [ "Ready", "Waiting" ])
+                    , \_ ->
+                        Expect.equal projections.importShape.hash hashes.importShapeHash
+                    , \_ ->
+                        Expect.equal projections.exportShape.hash hashes.exportShapeHash
+                    ]
+                    ()
+        , test "buildRuleProjectionKey matches legacy contract hash key formatting" <|
+            \_ ->
+                let
+                    source =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+run value =
+    case value of
+        Just number ->
+            number
+
+        Nothing ->
+            0
+"""
+
+                    projections =
+                        factProjections "src/A.elm" source
+
+                    hashes =
+                        factHashes "src/A.elm" source
+
+                    contract =
+                        ReviewRunner.factContractForRule "NoUnused.Variables"
+                            |> Maybe.withDefault
+                                { ruleName = "missing"
+                                , factSets = []
+                                }
+                in
+                ReviewRunner.buildRuleProjectionKey contract projections
+                    |> ReviewRunner.ruleProjectionKeyToString
+                    |> Expect.equal (ReviewRunner.buildFactContractHashKey contract hashes)
         ]
 
 
@@ -986,6 +1342,38 @@ run value =
                 Expect.equal
                     (contractHashKey "NoMissingTypeAnnotation" "src/A.elm" beforeSource)
                     (contractHashKey "NoMissingTypeAnnotation" "src/A.elm" afterSource)
+        , test "body-only edit does not change NoExposingEverything or NoImportingEverything contract key" <|
+            \_ ->
+                let
+                    beforeSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+run value =
+    value + 1
+"""
+
+                    afterSource =
+                        """module A exposing (run)
+
+import Maybe exposing (Maybe(..))
+
+run value =
+    value + 2
+"""
+                in
+                Expect.all
+                    [ \_ ->
+                        Expect.equal
+                            (contractHashKey "NoExposingEverything" "src/A.elm" beforeSource)
+                            (contractHashKey "NoExposingEverything" "src/A.elm" afterSource)
+                    , \_ ->
+                        Expect.equal
+                            (contractHashKey "NoImportingEverything" "src/A.elm" beforeSource)
+                            (contractHashKey "NoImportingEverything" "src/A.elm" afterSource)
+                    ]
+                    ()
         ]
 
 
@@ -996,7 +1384,17 @@ factHashes filePath source =
             hashes
 
         Nothing ->
-            Debug.todo "Expected source to parse for fact hash test"
+            unreachable "Expected source to parse for fact hash test"
+
+
+factProjections : String -> String -> ReviewRunner.FactProjections
+factProjections filePath source =
+    case ReviewRunner.factProjectionsForSource filePath source of
+        Just projections ->
+            projections
+
+        Nothing ->
+            unreachable "Expected source to parse for fact projection test"
 
 
 contractHashKey : String -> String -> String -> String
@@ -1006,10 +1404,19 @@ contractHashKey ruleName filePath source =
             ReviewRunner.buildFactContractHashKey contract hashes
 
         ( Nothing, _ ) ->
-            Debug.todo ("Expected rule fact contract for " ++ ruleName)
+            unreachable ("Expected rule fact contract for " ++ ruleName)
 
         ( _, Nothing ) ->
-            Debug.todo ("Expected source to parse for contract hash key test: " ++ filePath)
+            unreachable ("Expected source to parse for contract hash key test: " ++ filePath)
+
+
+unreachable : String -> a
+unreachable _ =
+    let
+        _ =
+            modBy 0 0
+    in
+    unreachable ""
 
 
 factHashTuple :

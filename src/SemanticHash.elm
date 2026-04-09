@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, FileAspectHashes, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, computeAspectHashesFromFile, computeAspectHashesFromSource, diffIndices, extractDependencies, getSemanticHash, hashExpression, semanticHashForEntry)
+module SemanticHash exposing (DeclarationIndex, FileAspectHashes, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, computeAspectHashesFromFile, computeAspectHashesFromSource, diffIndices, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, semanticHashForEntry)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -18,6 +18,7 @@ import Elm.Syntax.Import exposing (Import)
 import Elm.Syntax.Module exposing (Module(..))
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..))
+import Elm.Syntax.Range exposing (Range)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
 import FNV1a
 import Set exposing (Set)
@@ -438,7 +439,13 @@ Returns (moduleName, functionName) pairs. Local variables (parameters,
 let bindings) are included — the caller should filter them if needed.
 -}
 extractDependencies : Node Expression -> List ( List String, String )
-extractDependencies (Node _ expr) =
+extractDependencies expressionNode =
+    extractDependenciesWithRanges expressionNode
+        |> List.map (\( _, moduleName, name ) -> ( moduleName, name ))
+
+
+extractDependenciesWithRanges : Node Expression -> List ( Range, List String, String )
+extractDependenciesWithRanges ((Node range expr) as expressionNode) =
     case expr of
         FunctionOrValue moduleName name ->
             -- Include all references — the index builder will filter locals
@@ -447,25 +454,25 @@ extractDependencies (Node _ expr) =
                 []
 
             else
-                [ ( moduleName, name ) ]
+                [ ( range, moduleName, name ) ]
 
         OperatorApplication _ _ left right ->
-            extractDependencies left ++ extractDependencies right
+            extractDependenciesWithRanges left ++ extractDependenciesWithRanges right
 
         Application exprs ->
-            List.concatMap extractDependencies exprs
+            List.concatMap extractDependenciesWithRanges exprs
 
         IfBlock cond thenExpr elseExpr ->
-            extractDependencies cond ++ extractDependencies thenExpr ++ extractDependencies elseExpr
+            extractDependenciesWithRanges cond ++ extractDependenciesWithRanges thenExpr ++ extractDependenciesWithRanges elseExpr
 
         Negation inner ->
-            extractDependencies inner
+            extractDependenciesWithRanges inner
 
         TupledExpression exprs ->
-            List.concatMap extractDependencies exprs
+            List.concatMap extractDependenciesWithRanges exprs
 
         ParenthesizedExpression inner ->
-            extractDependencies inner
+            extractDependenciesWithRanges inner
 
         LetExpression { declarations, expression } ->
             let
@@ -475,32 +482,32 @@ extractDependencies (Node _ expr) =
                             (\(Node _ letDecl) ->
                                 case letDecl of
                                     LetFunction func ->
-                                        extractDependencies (Node.value func.declaration |> .expression)
+                                        extractDependenciesWithRanges (Node.value func.declaration |> .expression)
 
                                     LetDestructuring _ expr_ ->
-                                        extractDependencies expr_
+                                        extractDependenciesWithRanges expr_
                             )
             in
-            declDeps ++ extractDependencies expression
+            declDeps ++ extractDependenciesWithRanges expression
 
         CaseExpression { expression, cases } ->
-            extractDependencies expression
-                ++ List.concatMap (\( _, caseExpr ) -> extractDependencies caseExpr) cases
+            extractDependenciesWithRanges expression
+                ++ List.concatMap (\( _, caseExpr ) -> extractDependenciesWithRanges caseExpr) cases
 
         LambdaExpression { expression } ->
-            extractDependencies expression
+            extractDependenciesWithRanges expression
 
         RecordExpr setters ->
-            List.concatMap (\(Node _ ( _, valExpr )) -> extractDependencies valExpr) setters
+            List.concatMap (\(Node _ ( _, valExpr )) -> extractDependenciesWithRanges valExpr) setters
 
         RecordUpdateExpression _ setters ->
-            List.concatMap (\(Node _ ( _, valExpr )) -> extractDependencies valExpr) setters
+            List.concatMap (\(Node _ ( _, valExpr )) -> extractDependenciesWithRanges valExpr) setters
 
         ListExpr items ->
-            List.concatMap extractDependencies items
+            List.concatMap extractDependenciesWithRanges items
 
         RecordAccess inner _ ->
-            extractDependencies inner
+            extractDependenciesWithRanges inner
 
         _ ->
             []

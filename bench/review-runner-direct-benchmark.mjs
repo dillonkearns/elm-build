@@ -9,13 +9,22 @@ import { performance } from "node:perf_hooks";
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const srcRoot = path.join(repoRoot, "src");
 const reviewDir = path.join(repoRoot, "bench", "review");
-const distRunnerPath = path.join(repoRoot, "dist", "review-runner-bench.mjs");
+const useFastEntrypoint = process.argv.includes("--fast-entrypoint");
+const moduleRuleTransportMode = readArg("--transport-mode", "handles");
+const distRunnerPath = path.join(
+  repoRoot,
+  "dist",
+  useFastEntrypoint ? "review-runner-fast-bench.mjs" : "review-runner-bench.mjs"
+);
 const jobs = String(os.cpus().length);
 const scenarios = readArg("--scenarios", "cold,warm,warm_1_file_body_edit,warm_import_graph_change")
   .split(",")
   .map((value) => value.trim())
   .filter(Boolean);
 const useHostImportersExperiments = process.argv.includes("--host-importers-experiments");
+const useHostTypeAnnotationExperiments = process.argv.includes("--host-type-annotation-experiments");
+const useHostDebugExperiments = process.argv.includes("--host-debug-experiments");
+const useHostShapeExperiments = process.argv.includes("--host-shape-experiments");
 
 const fixtureFiles = [
   "Coverage.elm",
@@ -42,17 +51,40 @@ function readArg(flag, fallback) {
 }
 
 function hostExperimentArgs() {
-  if (!useHostImportersExperiments) {
-    return [];
+  const args = [];
+
+  if (useHostImportersExperiments) {
+    args.push(
+      "--host-no-unused-exports-experiment",
+      "--host-no-unused-custom-type-constructors-experiment",
+      "--host-no-unused-custom-type-constructor-args-experiment",
+      "--host-no-unused-parameters-experiment",
+      "--host-no-unused-variables-experiment"
+    );
   }
 
-  return [
-    "--host-no-unused-exports-experiment",
-    "--host-no-unused-custom-type-constructors-experiment",
-    "--host-no-unused-custom-type-constructor-args-experiment",
-    "--host-no-unused-parameters-experiment",
-    "--host-no-unused-variables-experiment",
-  ];
+  if (useHostTypeAnnotationExperiments) {
+    args.push(
+      "--host-no-missing-type-annotation-experiment",
+      "--host-no-missing-type-annotation-in-let-in-experiment"
+    );
+  }
+
+  if (useHostDebugExperiments) {
+    args.push(
+      "--host-no-debug-log-experiment",
+      "--host-no-debug-todo-or-to-string-experiment"
+    );
+  }
+
+  if (useHostShapeExperiments) {
+    args.push(
+      "--host-no-exposing-everything-experiment",
+      "--host-no-importing-everything-experiment"
+    );
+  }
+
+  return args;
 }
 
 function writeElmJson(workspaceRoot) {
@@ -86,33 +118,67 @@ function prepareWorkspace() {
 function runRunner({ fixtureSrcDir, buildDir, root }, name) {
   const tracePath = path.join(root, `${name}.trace.json`);
   const start = performance.now();
-  const result = spawnSync(
-    "node",
-    [
-      distRunnerPath,
-      "--review-dir",
-      reviewDir,
-      "--source-dirs",
-      fixtureSrcDir,
-      "--build",
-      buildDir,
-      "--jobs",
-      jobs,
-      "--importers-cache-mode",
-      "auto",
-      "--deps-cache-mode",
-      "auto",
-      "--report",
-      "quiet",
-      "--perf-trace-json",
-      tracePath,
-      ...hostExperimentArgs(),
-    ],
-    {
-      cwd: repoRoot,
-      encoding: "utf8",
-    }
-  );
+  const runnerConfig = {
+    reviewDir,
+    sourceDirs: [fixtureSrcDir],
+    buildDirectory: buildDir,
+    jobs: Number(jobs),
+    memoizedFunctions: [],
+    memoProfile: false,
+    moduleRuleTransportMode,
+    importersCacheMode: "auto",
+    depsCacheMode: "auto",
+    reportFormat: "quiet",
+    perfTraceJson: tracePath,
+    hostNoUnusedExportsExperiment: useHostImportersExperiments,
+    hostNoUnusedCustomTypeConstructorsExperiment: useHostImportersExperiments,
+    hostNoUnusedCustomTypeConstructorArgsExperiment: useHostImportersExperiments,
+    hostNoUnusedParametersExperiment: useHostImportersExperiments,
+    hostNoUnusedVariablesExperiment: useHostImportersExperiments,
+    hostNoExposingEverythingExperiment: useHostShapeExperiments,
+    hostNoImportingEverythingExperiment: useHostShapeExperiments,
+    hostNoDebugLogExperiment: useHostDebugExperiments,
+    hostNoDebugTodoOrToStringExperiment: useHostDebugExperiments,
+    hostNoMissingTypeAnnotationExperiment: useHostTypeAnnotationExperiments,
+    hostNoMissingTypeAnnotationInLetInExperiment: useHostTypeAnnotationExperiments,
+  };
+
+  const result = useFastEntrypoint
+    ? spawnSync("node", [path.join(repoRoot, "node_modules", ".bin", "elm-pages"), "run", "src/ReviewRunnerFast.elm"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          REVIEW_RUNNER_CONFIG_JSON: JSON.stringify(runnerConfig),
+        },
+      })
+    : spawnSync(
+        "node",
+        [
+          distRunnerPath,
+          "--review-dir",
+          reviewDir,
+          "--source-dirs",
+          fixtureSrcDir,
+          "--build",
+          buildDir,
+          "--jobs",
+          jobs,
+          "--importers-cache-mode",
+          "auto",
+          "--deps-cache-mode",
+          "auto",
+          "--report",
+          "quiet",
+          "--perf-trace-json",
+          tracePath,
+          ...hostExperimentArgs(),
+        ],
+        {
+          cwd: repoRoot,
+          encoding: "utf8",
+        }
+      );
   const wallMs = performance.now() - start;
 
   if (!fs.existsSync(tracePath)) {
@@ -179,7 +245,10 @@ function main() {
     JSON.stringify(
       {
         fixture: "small-12",
+        fast_entrypoint: useFastEntrypoint,
+        module_rule_transport_mode: moduleRuleTransportMode,
         host_importers_experiments: useHostImportersExperiments,
+        host_type_annotation_experiments: useHostTypeAnnotationExperiments,
         scenarios_requested: scenarios,
         root: workspace.root,
         scenarios: scenarioResults,

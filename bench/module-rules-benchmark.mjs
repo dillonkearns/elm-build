@@ -9,8 +9,17 @@ import { performance } from "node:perf_hooks";
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const srcRoot = path.join(repoRoot, "src");
 const baseReviewDir = path.join(repoRoot, "bench", "review");
-const distRunnerPath = path.join(repoRoot, "dist", "review-runner-bench.mjs");
+const elmPagesBin = path.join(repoRoot, "node_modules", ".bin", "elm-pages");
+const useFastEntrypoint = process.argv.includes("--fast-entrypoint");
+const distRunnerPath = path.join(
+  repoRoot,
+  "dist",
+  useFastEntrypoint ? "review-runner-fast-bench.mjs" : "review-runner-bench.mjs"
+);
 const jobs = String(os.cpus().length);
+const useHostTypeAnnotationExperiments = process.argv.includes("--host-type-annotation-experiments");
+const useHostDebugExperiments = process.argv.includes("--host-debug-experiments");
+const useHostShapeExperiments = process.argv.includes("--host-shape-experiments");
 
 const fixtureFiles = [
   "Coverage.elm",
@@ -114,36 +123,113 @@ config =
   return reviewRoot;
 }
 
-function runRunner({ fixtureSrcDir, buildDir, root }, reviewDir, scenarioName) {
+function hostExperimentArgs(ruleName) {
+  if (!useHostTypeAnnotationExperiments) {
+    return [];
+  }
+
+  if (ruleName === "NoMissingTypeAnnotation") {
+    return ["--host-no-missing-type-annotation-experiment"];
+  }
+
+  if (ruleName === "NoMissingTypeAnnotationInLetIn") {
+    return ["--host-no-missing-type-annotation-in-let-in-experiment"];
+  }
+
+  if (useHostDebugExperiments && ruleName === "NoDebug.Log") {
+    return ["--host-no-debug-log-experiment"];
+  }
+
+  if (useHostDebugExperiments && ruleName === "NoDebug.TodoOrToString") {
+    return ["--host-no-debug-todo-or-to-string-experiment"];
+  }
+
+  if (useHostShapeExperiments && ruleName === "NoExposingEverything") {
+    return ["--host-no-exposing-everything-experiment"];
+  }
+
+  if (useHostShapeExperiments && ruleName === "NoImportingEverything") {
+    return ["--host-no-importing-everything-experiment"];
+  }
+
+  return [];
+}
+
+function runRunner({ fixtureSrcDir, buildDir, root }, reviewDir, scenarioName, ruleName) {
   const tracePath = path.join(root, `${scenarioName}.trace.json`);
   const start = performance.now();
-  const result = spawnSync(
-    "node",
-    [
-      distRunnerPath,
-      "--review-dir",
-      reviewDir,
-      "--source-dirs",
-      fixtureSrcDir,
-      "--build",
-      buildDir,
-      "--jobs",
-      jobs,
-      "--importers-cache-mode",
-      "fresh",
-      "--deps-cache-mode",
-      "fresh",
-      "--report",
-      "quiet",
-      "--perf-trace-json",
-      tracePath,
-    ],
-    {
-      cwd: repoRoot,
-      stdio: ["ignore", "ignore", "ignore"],
-    }
-  );
+  const runnerConfig = {
+    reviewDir,
+    sourceDirs: [fixtureSrcDir],
+    buildDirectory: buildDir,
+    jobs: Number(jobs),
+    memoizedFunctions: [],
+    memoProfile: false,
+    importersCacheMode: "fresh",
+    depsCacheMode: "fresh",
+    reportFormat: "quiet",
+    perfTraceJson: tracePath,
+    hostNoUnusedExportsExperiment: false,
+    hostNoUnusedCustomTypeConstructorsExperiment: false,
+    hostNoUnusedCustomTypeConstructorArgsExperiment: false,
+    hostNoUnusedParametersExperiment: false,
+    hostNoUnusedVariablesExperiment: false,
+    hostNoExposingEverythingExperiment:
+      useHostShapeExperiments && ruleName === "NoExposingEverything",
+    hostNoImportingEverythingExperiment:
+      useHostShapeExperiments && ruleName === "NoImportingEverything",
+    hostNoDebugLogExperiment: useHostDebugExperiments && ruleName === "NoDebug.Log",
+    hostNoDebugTodoOrToStringExperiment:
+      useHostDebugExperiments && ruleName === "NoDebug.TodoOrToString",
+    hostNoMissingTypeAnnotationExperiment:
+      useHostTypeAnnotationExperiments && ruleName === "NoMissingTypeAnnotation",
+    hostNoMissingTypeAnnotationInLetInExperiment:
+      useHostTypeAnnotationExperiments && ruleName === "NoMissingTypeAnnotationInLetIn",
+  };
+
+  const result = useFastEntrypoint
+    ? spawnSync("node", [elmPagesBin, "run", "src/ReviewRunnerFast.elm"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          REVIEW_RUNNER_CONFIG_JSON: JSON.stringify(runnerConfig),
+        },
+      })
+    : spawnSync(
+        "node",
+        [
+          distRunnerPath,
+          "--review-dir",
+          reviewDir,
+          "--source-dirs",
+          fixtureSrcDir,
+          "--build",
+          buildDir,
+          "--jobs",
+          jobs,
+          "--importers-cache-mode",
+          "fresh",
+          "--deps-cache-mode",
+          "fresh",
+          "--report",
+          "quiet",
+          "--perf-trace-json",
+          tracePath,
+          ...hostExperimentArgs(ruleName),
+        ],
+        {
+          cwd: repoRoot,
+          encoding: "utf8",
+        }
+      );
   const wallMs = performance.now() - start;
+
+  if (!fs.existsSync(tracePath)) {
+    console.error(result.stdout);
+    console.error(result.stderr);
+    throw new Error(`${scenarioName} did not produce trace output (status ${result.status})`);
+  }
 
   const trace = JSON.parse(fs.readFileSync(tracePath, "utf8"));
   const stage = (stageName) => trace.stages.find((entry) => entry.name === stageName)?.ms ?? 0;
@@ -173,10 +259,10 @@ function runRule(ruleName, rule) {
   const reviewDir = prepareReviewDir(ruleName, rule);
   const originalMathLib = fs.readFileSync(workspace.mathLibPath, "utf8");
 
-  const cold = runRunner(workspace, reviewDir, "cold");
-  const warm = runRunner(workspace, reviewDir, "warm");
+  const cold = runRunner(workspace, reviewDir, "cold", ruleName);
+  const warm = runRunner(workspace, reviewDir, "warm", ruleName);
   mutateBodyEdit(workspace.mathLibPath, originalMathLib);
-  const bodyEdit = runRunner(workspace, reviewDir, "warm_1_file_body_edit");
+  const bodyEdit = runRunner(workspace, reviewDir, "warm_1_file_body_edit", ruleName);
 
   return {
     rule: ruleName,

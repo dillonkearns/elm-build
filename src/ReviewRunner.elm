@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, CrossModuleDep(..), DeclarationCache, FactHashes, FactSet(..), ReviewError, RuleDependencyProfile, RuleFactContract, RuleType(..), benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildFactContractHashKey, buildModuleRecord, checkCache, classifyRuleSource, computeSemanticKey, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, encodeCacheState, encodeFileAsJson, escapeElmString, factContractForRule, factHashesForSource, factHashesForSummary, factSetToString, getDeclarationHashes, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, hostNoUnusedVariablesErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, run, updateCache)
+module ReviewRunner exposing (CacheDecision(..), CacheState, Config, CrossModuleDep(..), DeclarationCache, FactHashes, FactProjectionArtifact, FactProjections, FactSet(..), ReviewError, RuleDependencyProfile, RuleFactContract, RuleProjectionKey, RuleType(..), RuleVisitorContract, VisitorContract, VisitorKind(..), benchmarkPackageSummaryCodecs, benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildFactContractHashKey, buildModuleRecord, buildRuleProjectionKey, checkCache, classifyRuleSource, computeSemanticKey, configDecoder, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, defaultConfig, encodeCacheState, encodeFileAsJson, escapeElmString, factContractForRule, factHashesForSource, factHashesForSummary, factProjectionsForSource, factProjectionsForSummary, factSetToString, getDeclarationHashes, hostNoDebugLogErrorsForSources, hostNoDebugTodoOrToStringErrorsForSources, hostNoExposingEverythingErrorsForSources, hostNoImportingEverythingErrorsForSources, hostNoMissingTypeAnnotationErrorsForSources, hostNoMissingTypeAnnotationInLetInErrorsForSources, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, hostNoUnusedVariablesErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, ruleProjectionKeyToString, run, task, updateCache, visitorContractsForRule)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -97,6 +97,8 @@ type alias Config =
     , jobs : Maybe Int
     , memoizedFunctions : Set.Set String
     , memoProfile : Bool
+    , moduleRuleGroupingMode : ModuleRuleGroupingMode
+    , moduleRuleTransportMode : ModuleRuleTransportMode
     , importersCacheMode : ImportersCacheMode
     , depsCacheMode : ImportersCacheMode
     , reportFormat : ReportFormat
@@ -106,6 +108,39 @@ type alias Config =
     , hostNoUnusedCustomTypeConstructorArgsExperiment : Bool
     , hostNoUnusedParametersExperiment : Bool
     , hostNoUnusedVariablesExperiment : Bool
+    , hostNoExposingEverythingExperiment : Bool
+    , hostNoImportingEverythingExperiment : Bool
+    , hostNoDebugLogExperiment : Bool
+    , hostNoDebugTodoOrToStringExperiment : Bool
+    , hostNoMissingTypeAnnotationExperiment : Bool
+    , hostNoMissingTypeAnnotationInLetInExperiment : Bool
+    , startupOnly : Bool
+    }
+
+
+type alias CliConfig =
+    { reviewDir : String
+    , sourceDirs : List String
+    , buildDirectory : Path
+    , jobs : Maybe Int
+    , memoizedFunctions : Set.Set String
+    , memoProfile : Bool
+    , moduleRuleGroupingMode : ModuleRuleGroupingMode
+    , importersCacheMode : ImportersCacheMode
+    , depsCacheMode : ImportersCacheMode
+    , reportFormat : ReportFormat
+    , perfTraceJson : Maybe String
+    , hostNoUnusedExportsExperiment : Bool
+    , hostNoUnusedCustomTypeConstructorsExperiment : Bool
+    , hostNoUnusedCustomTypeConstructorArgsExperiment : Bool
+    , hostNoUnusedParametersExperiment : Bool
+    , hostNoUnusedVariablesExperiment : Bool
+    , hostNoExposingEverythingExperiment : Bool
+    , hostNoImportingEverythingExperiment : Bool
+    , hostNoDebugLogExperiment : Bool
+    , hostNoDebugTodoOrToStringExperiment : Bool
+    , hostNoMissingTypeAnnotationExperiment : Bool
+    , hostNoMissingTypeAnnotationInLetInExperiment : Bool
     }
 
 
@@ -119,6 +154,120 @@ type ReportFormat
     = ReportHuman
     | ReportJson
     | ReportQuiet
+
+
+type ModuleRuleGroupingMode
+    = ModuleRuleGroupingAuto
+    | ModuleRuleGroupingContracts
+    | ModuleRuleGroupingLegacy
+
+
+type ModuleRuleTransportMode
+    = ModuleRuleTransportHandles
+    | ModuleRuleTransportRecords
+
+
+defaultConfig : Config
+defaultConfig =
+    { reviewDir = "review"
+    , sourceDirs = [ "src" ]
+    , buildDirectory = Path.path ".elm-review-build"
+    , jobs = Nothing
+    , memoizedFunctions = Set.empty
+    , memoProfile = False
+    , moduleRuleGroupingMode = ModuleRuleGroupingLegacy
+    , moduleRuleTransportMode = ModuleRuleTransportHandles
+    , importersCacheMode = ImportersAuto
+    , depsCacheMode = ImportersAuto
+    , reportFormat = ReportHuman
+    , perfTraceJson = Nothing
+    , hostNoUnusedExportsExperiment = False
+    , hostNoUnusedCustomTypeConstructorsExperiment = False
+    , hostNoUnusedCustomTypeConstructorArgsExperiment = False
+    , hostNoUnusedParametersExperiment = False
+    , hostNoUnusedVariablesExperiment = False
+    , hostNoExposingEverythingExperiment = False
+    , hostNoImportingEverythingExperiment = False
+    , hostNoDebugLogExperiment = False
+    , hostNoDebugTodoOrToStringExperiment = False
+    , hostNoMissingTypeAnnotationExperiment = False
+    , hostNoMissingTypeAnnotationInLetInExperiment = False
+    , startupOnly = False
+    }
+
+
+configDecoder : Json.Decode.Decoder Config
+configDecoder =
+    Json.Decode.succeed Config
+        |> decodeAndMap (decodeFieldWithDefault "reviewDir" Json.Decode.string defaultConfig.reviewDir)
+        |> decodeAndMap (decodeFieldWithDefault "sourceDirs" (Json.Decode.list Json.Decode.string) defaultConfig.sourceDirs)
+        |> decodeAndMap (decodeFieldWithDefault "buildDirectory" (Json.Decode.string |> Json.Decode.map Path.path) defaultConfig.buildDirectory)
+        |> decodeAndMap (decodeNullableField "jobs" Json.Decode.int)
+        |> decodeAndMap (decodeFieldWithDefault "memoizedFunctions" (Json.Decode.list Json.Decode.string |> Json.Decode.map Set.fromList) defaultConfig.memoizedFunctions)
+        |> decodeAndMap (decodeFieldWithDefault "memoProfile" Json.Decode.bool defaultConfig.memoProfile)
+        |> decodeAndMap (decodeFieldWithDefault "moduleRuleGroupingMode" moduleRuleGroupingModeDecoder defaultConfig.moduleRuleGroupingMode)
+        |> decodeAndMap (decodeFieldWithDefault "moduleRuleTransportMode" moduleRuleTransportModeDecoder defaultConfig.moduleRuleTransportMode)
+        |> decodeAndMap (decodeFieldWithDefault "importersCacheMode" importersCacheModeDecoder defaultConfig.importersCacheMode)
+        |> decodeAndMap (decodeFieldWithDefault "depsCacheMode" importersCacheModeDecoder defaultConfig.depsCacheMode)
+        |> decodeAndMap (decodeFieldWithDefault "reportFormat" reportFormatDecoder defaultConfig.reportFormat)
+        |> decodeAndMap (decodeNullableField "perfTraceJson" Json.Decode.string)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedExportsExperiment" Json.Decode.bool defaultConfig.hostNoUnusedExportsExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedCustomTypeConstructorsExperiment" Json.Decode.bool defaultConfig.hostNoUnusedCustomTypeConstructorsExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedCustomTypeConstructorArgsExperiment" Json.Decode.bool defaultConfig.hostNoUnusedCustomTypeConstructorArgsExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedParametersExperiment" Json.Decode.bool defaultConfig.hostNoUnusedParametersExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedVariablesExperiment" Json.Decode.bool defaultConfig.hostNoUnusedVariablesExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoExposingEverythingExperiment" Json.Decode.bool defaultConfig.hostNoExposingEverythingExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoImportingEverythingExperiment" Json.Decode.bool defaultConfig.hostNoImportingEverythingExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoDebugLogExperiment" Json.Decode.bool defaultConfig.hostNoDebugLogExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoDebugTodoOrToStringExperiment" Json.Decode.bool defaultConfig.hostNoDebugTodoOrToStringExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoMissingTypeAnnotationExperiment" Json.Decode.bool defaultConfig.hostNoMissingTypeAnnotationExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoMissingTypeAnnotationInLetInExperiment" Json.Decode.bool defaultConfig.hostNoMissingTypeAnnotationInLetInExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "startupOnly" Json.Decode.bool defaultConfig.startupOnly)
+
+
+decodeAndMap : Json.Decode.Decoder a -> Json.Decode.Decoder (a -> b) -> Json.Decode.Decoder b
+decodeAndMap valueDecoder functionDecoder =
+    Json.Decode.map2 (\fn value -> fn value) functionDecoder valueDecoder
+
+
+decodeFieldWithDefault : String -> Json.Decode.Decoder a -> a -> Json.Decode.Decoder a
+decodeFieldWithDefault fieldName decoder fallback =
+    Json.Decode.oneOf
+        [ Json.Decode.field fieldName decoder
+        , Json.Decode.succeed fallback
+        ]
+
+
+decodeNullableField : String -> Json.Decode.Decoder a -> Json.Decode.Decoder (Maybe a)
+decodeNullableField fieldName decoder =
+    Json.Decode.oneOf
+        [ Json.Decode.field fieldName (Json.Decode.nullable decoder)
+        , Json.Decode.succeed Nothing
+        ]
+
+
+importersCacheModeDecoder : Json.Decode.Decoder ImportersCacheMode
+importersCacheModeDecoder =
+    Json.Decode.string
+        |> Json.Decode.map parseImportersCacheMode
+
+
+moduleRuleGroupingModeDecoder : Json.Decode.Decoder ModuleRuleGroupingMode
+moduleRuleGroupingModeDecoder =
+    Json.Decode.string
+        |> Json.Decode.map parseModuleRuleGroupingMode
+
+
+moduleRuleTransportModeDecoder : Json.Decode.Decoder ModuleRuleTransportMode
+moduleRuleTransportModeDecoder =
+    Json.Decode.string
+        |> Json.Decode.map parseModuleRuleTransportMode
+
+
+reportFormatDecoder : Json.Decode.Decoder ReportFormat
+reportFormatDecoder =
+    Json.Decode.string
+        |> Json.Decode.map parseReportFormat
 
 
 type FactSet
@@ -137,6 +286,28 @@ type alias RuleFactContract =
     }
 
 
+type VisitorKind
+    = ExpressionVisitor
+    | DeclarationVisitor
+    | ImportVisitor
+    | ModuleVisitor
+    | ProjectContributionVisitor
+    | ProjectFoldVisitor
+
+
+type alias VisitorContract =
+    { visitorName : String
+    , kind : VisitorKind
+    , factSets : List FactSet
+    }
+
+
+type alias RuleVisitorContract =
+    { ruleName : String
+    , visitors : List VisitorContract
+    }
+
+
 type alias FactHashes =
     { importShapeHash : String
     , exportShapeHash : String
@@ -145,6 +316,29 @@ type alias FactHashes =
     , declarationShapeHash : String
     , functionUsageHash : String
     , typeUsageHash : String
+    }
+
+
+type alias FactProjectionArtifact a =
+    { hash : String
+    , value : a
+    }
+
+
+type alias FactProjections =
+    { importShape : FactProjectionArtifact ImportShapeFacts
+    , exportShape : FactProjectionArtifact ExportShapeFacts
+    , constructorShape : FactProjectionArtifact ConstructorShapeFacts
+    , constructorUsage : FactProjectionArtifact ConstructorUsageFacts
+    , declarationShape : FactProjectionArtifact DeclarationShapeFacts
+    , functionUsage : FactProjectionArtifact FunctionUsageFacts
+    , typeUsage : FactProjectionArtifact TypeUsageFacts
+    }
+
+
+type alias RuleProjectionKey =
+    { ruleName : String
+    , projectionHashes : List ( FactSet, String )
     }
 
 
@@ -215,6 +409,7 @@ type alias CrossModuleSummary =
     , moduleName : String
     , moduleNameRange : Range
     , isExposingAll : Bool
+    , exposingAllRange : Maybe Range
     , valueDeclarationRanges : Dict String Range
     , exposedValues : Dict String Range
     , localTypeDeclarations : Dict String LocalTypeSummary
@@ -243,6 +438,7 @@ type alias CrossModuleSummary =
 
 type alias DependencyRef =
     { owner : String
+    , range : Range
     , moduleParts : List String
     , name : String
     }
@@ -443,105 +639,271 @@ factSetToString factSet =
             "TypeUsage"
 
 
-factContractForRule : String -> Maybe RuleFactContract
-factContractForRule ruleName =
+visitorContractsForRule : String -> Maybe RuleVisitorContract
+visitorContractsForRule ruleName =
     case ruleName of
         "NoUnused.Exports" ->
             Just
                 { ruleName = ruleName
-                , factSets = [ ExportShape, FunctionUsage, ImportShape ]
+                , visitors =
+                    [ { visitorName = "project-contribution"
+                      , kind = ProjectContributionVisitor
+                      , factSets = [ ExportShape, FunctionUsage, ImportShape ]
+                      }
+                    ]
                 }
 
         "NoUnused.CustomTypeConstructors" ->
             Just
                 { ruleName = ruleName
-                , factSets = [ ConstructorShape, ConstructorUsage, ImportShape ]
+                , visitors =
+                    [ { visitorName = "project-contribution"
+                      , kind = ProjectContributionVisitor
+                      , factSets = [ ConstructorShape, ConstructorUsage, ImportShape ]
+                      }
+                    ]
                 }
 
         "NoUnused.CustomTypeConstructorArgs" ->
             Just
                 { ruleName = ruleName
-                , factSets = [ ConstructorShape, ConstructorUsage ]
+                , visitors =
+                    [ { visitorName = "project-contribution"
+                      , kind = ProjectContributionVisitor
+                      , factSets = [ ConstructorShape, ConstructorUsage ]
+                      }
+                    ]
                 }
 
         "NoUnused.Parameters" ->
             Just
                 { ruleName = ruleName
-                , factSets = [ FunctionUsage ]
+                , visitors =
+                    [ { visitorName = "project-contribution"
+                      , kind = ProjectContributionVisitor
+                      , factSets = [ FunctionUsage ]
+                      }
+                    ]
                 }
 
         "NoUnused.Variables" ->
             Just
                 { ruleName = ruleName
-                , factSets = [ ImportShape, TypeUsage, FunctionUsage ]
+                , visitors =
+                    [ { visitorName = "project-contribution"
+                      , kind = ProjectContributionVisitor
+                      , factSets = [ ImportShape, TypeUsage, FunctionUsage ]
+                      }
+                    ]
                 }
 
         "NoMissingTypeAnnotation" ->
             Just
                 { ruleName = ruleName
-                , factSets = [ DeclarationShape ]
+                , visitors =
+                    [ { visitorName = "declaration"
+                      , kind = DeclarationVisitor
+                      , factSets = [ DeclarationShape ]
+                      }
+                    ]
+                }
+
+        "NoMissingTypeAnnotationInLetIn" ->
+            Just
+                { ruleName = ruleName
+                , visitors =
+                    [ { visitorName = "declaration"
+                      , kind = DeclarationVisitor
+                      , factSets = [ DeclarationShape ]
+                      }
+                    ]
+                }
+
+        "NoExposingEverything" ->
+            Just
+                { ruleName = ruleName
+                , visitors =
+                    [ { visitorName = "module"
+                      , kind = ModuleVisitor
+                      , factSets = [ ExportShape ]
+                      }
+                    ]
+                }
+
+        "NoImportingEverything" ->
+            Just
+                { ruleName = ruleName
+                , visitors =
+                    [ { visitorName = "import"
+                      , kind = ImportVisitor
+                      , factSets = [ ImportShape ]
+                      }
+                    ]
+                }
+
+        "NoDebug.Log" ->
+            Just
+                { ruleName = ruleName
+                , visitors =
+                    [ { visitorName = "expression-enter"
+                      , kind = ExpressionVisitor
+                      , factSets = [ ImportShape, FunctionUsage ]
+                      }
+                    ]
+                }
+
+        "NoDebug.TodoOrToString" ->
+            Just
+                { ruleName = ruleName
+                , visitors =
+                    [ { visitorName = "expression-enter"
+                      , kind = ExpressionVisitor
+                      , factSets = [ ImportShape, FunctionUsage ]
+                      }
+                    ]
                 }
 
         _ ->
             Nothing
 
 
+factContractForRule : String -> Maybe RuleFactContract
+factContractForRule ruleName =
+    visitorContractsForRule ruleName
+        |> Maybe.map
+            (\ruleVisitorContract ->
+                { ruleName = ruleVisitorContract.ruleName
+                , factSets =
+                    ruleVisitorContract.visitors
+                        |> List.concatMap .factSets
+                        |> List.foldl
+                            (\factSet acc ->
+                                if List.member factSet acc then
+                                    acc
+
+                                else
+                                    acc ++ [ factSet ]
+                            )
+                            []
+                }
+            )
+
+
 factHashesForSource : String -> String -> Maybe FactHashes
 factHashesForSource filePath source =
+    factProjectionsForSource filePath source
+        |> Maybe.map factHashesFromProjections
+
+
+factProjectionsForSource : String -> String -> Maybe FactProjections
+factProjectionsForSource filePath source =
     crossModuleSummaryFromSource filePath source
-        |> Maybe.map factHashesForSummary
+        |> Maybe.map factProjectionsForSummary
 
 
 factHashesForSummary : CrossModuleSummary -> FactHashes
 factHashesForSummary summary =
-    { importShapeHash =
+    summary
+        |> factProjectionsForSummary
+        |> factHashesFromProjections
+
+
+factProjectionsForSummary : CrossModuleSummary -> FactProjections
+factProjectionsForSummary summary =
+    { importShape =
         summary
             |> importShapeFactsFromSummary
-            |> importShapeFingerprint
-            |> hashFingerprint
-    , exportShapeHash =
+            |> buildFactProjectionArtifact importShapeFingerprint
+    , exportShape =
         summary
             |> exportShapeFactsFromSummary
-            |> exportShapeFingerprint
-            |> hashFingerprint
-    , constructorShapeHash =
+            |> buildFactProjectionArtifact exportShapeFingerprint
+    , constructorShape =
         summary
             |> constructorShapeFactsFromSummary
-            |> constructorShapeFingerprint
-            |> hashFingerprint
-    , constructorUsageHash =
+            |> buildFactProjectionArtifact constructorShapeFingerprint
+    , constructorUsage =
         summary
             |> constructorUsageFactsFromSummary
-            |> constructorUsageFingerprint
-            |> hashFingerprint
-    , declarationShapeHash =
+            |> buildFactProjectionArtifact constructorUsageFingerprint
+    , declarationShape =
         summary
             |> declarationShapeFactsFromSummary
-            |> declarationShapeFingerprint
-            |> hashFingerprint
-    , functionUsageHash =
+            |> buildFactProjectionArtifact declarationShapeFingerprint
+    , functionUsage =
         summary
             |> functionUsageFactsFromSummary
-            |> functionUsageFingerprint
-            |> hashFingerprint
-    , typeUsageHash =
+            |> buildFactProjectionArtifact functionUsageFingerprint
+    , typeUsage =
         summary
             |> typeUsageFactsFromSummary
-            |> typeUsageFingerprint
-            |> hashFingerprint
+            |> buildFactProjectionArtifact typeUsageFingerprint
+    }
+
+
+factHashesFromProjections : FactProjections -> FactHashes
+factHashesFromProjections projections =
+    { importShapeHash =
+        projections.importShape.hash
+    , exportShapeHash =
+        projections.exportShape.hash
+    , constructorShapeHash =
+        projections.constructorShape.hash
+    , constructorUsageHash =
+        projections.constructorUsage.hash
+    , declarationShapeHash =
+        projections.declarationShape.hash
+    , functionUsageHash =
+        projections.functionUsage.hash
+    , typeUsageHash =
+        projections.typeUsage.hash
     }
 
 
 buildFactContractHashKey : RuleFactContract -> FactHashes -> String
 buildFactContractHashKey contract factHashes =
-    contract.ruleName
+    ruleProjectionKeyFromFactHashes contract factHashes
+        |> ruleProjectionKeyToString
+
+
+buildRuleProjectionKey : RuleFactContract -> FactProjections -> RuleProjectionKey
+buildRuleProjectionKey contract projections =
+    { ruleName = contract.ruleName
+    , projectionHashes =
+        contract.factSets
+            |> List.map
+                (\factSet ->
+                    ( factSet
+                    , projectionHashForFactSet factSet projections
+                    )
+                )
+    }
+
+
+ruleProjectionKeyFromFactHashes : RuleFactContract -> FactHashes -> RuleProjectionKey
+ruleProjectionKeyFromFactHashes contract factHashes =
+    { ruleName = contract.ruleName
+    , projectionHashes =
+        contract.factSets
+            |> List.map
+                (\factSet ->
+                    ( factSet
+                    , factHashForFactSet factSet factHashes
+                    )
+                )
+    }
+
+
+ruleProjectionKeyToString : RuleProjectionKey -> String
+ruleProjectionKeyToString ruleProjectionKey =
+    ruleProjectionKey.ruleName
         ++ "|"
-        ++ (contract.factSets
+        ++ (ruleProjectionKey.projectionHashes
                 |> List.map
-                    (\factSet ->
+                    (\( factSet, hash ) ->
                         factSetToString factSet
                             ++ "="
-                            ++ factHashForFactSet factSet factHashes
+                            ++ hash
                     )
                 |> String.join "|"
            )
@@ -570,6 +932,31 @@ factHashForFactSet factSet factHashes =
 
         TypeUsage ->
             factHashes.typeUsageHash
+
+
+projectionHashForFactSet : FactSet -> FactProjections -> String
+projectionHashForFactSet factSet projections =
+    case factSet of
+        ImportShape ->
+            projections.importShape.hash
+
+        ExportShape ->
+            projections.exportShape.hash
+
+        ConstructorShape ->
+            projections.constructorShape.hash
+
+        ConstructorUsage ->
+            projections.constructorUsage.hash
+
+        DeclarationShape ->
+            projections.declarationShape.hash
+
+        FunctionUsage ->
+            projections.functionUsage.hash
+
+        TypeUsage ->
+            projections.typeUsage.hash
 
 
 importShapeFactsFromSummary : CrossModuleSummary -> ImportShapeFacts
@@ -647,6 +1034,16 @@ hashFingerprint fingerprint =
     fingerprint
         |> FNV1a.hash
         |> String.fromInt
+
+
+buildFactProjectionArtifact : (a -> String) -> a -> FactProjectionArtifact a
+buildFactProjectionArtifact fingerprint value =
+    { hash =
+        value
+            |> fingerprint
+            |> hashFingerprint
+    , value = value
+    }
 
 
 importShapeFingerprint : ImportShapeFacts -> String
@@ -1023,11 +1420,11 @@ cacheSchemaVersion =
     "review-runner-v10"
 
 
-programConfig : Program.Config Config
+programConfig : Program.Config CliConfig
 programConfig =
     Program.config
         |> Program.add
-            (OptionsParser.build Config
+            (OptionsParser.build CliConfig
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "review-dir"
                         |> Option.map (Maybe.withDefault "review")
@@ -1056,6 +1453,14 @@ programConfig =
                 |> OptionsParser.with
                     (Option.flag "memo-profile"
                         |> Option.withDescription "Write per-function memo stats to memo-profile.log in the build directory"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "module-rule-grouping-mode"
+                        |> Option.map
+                            (Maybe.map parseModuleRuleGroupingMode
+                                >> Maybe.withDefault ModuleRuleGroupingLegacy
+                            )
+                        |> Option.withDescription "Module rule grouping strategy: auto, contracts, or legacy (default: legacy)"
                     )
                 |> OptionsParser.with
                     (Option.optionalKeywordArg "importers-cache-mode"
@@ -1105,6 +1510,30 @@ programConfig =
                     (Option.flag "host-no-unused-variables-experiment"
                         |> Option.withDescription "Handle the benchmark-heavy NoUnused.Variables categories with a host-native experimental implementation"
                     )
+                |> OptionsParser.with
+                    (Option.flag "host-no-exposing-everything-experiment"
+                        |> Option.withDescription "Handle NoExposingEverything with a host-native experimental implementation"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "host-no-importing-everything-experiment"
+                        |> Option.withDescription "Handle NoImportingEverything with a host-native experimental implementation"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "host-no-debug-log-experiment"
+                        |> Option.withDescription "Handle NoDebug.Log with a visitor-backed host-native experimental implementation"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "host-no-debug-todo-or-to-string-experiment"
+                        |> Option.withDescription "Handle NoDebug.TodoOrToString with a visitor-backed host-native experimental implementation"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "host-no-missing-type-annotation-experiment"
+                        |> Option.withDescription "Handle NoMissingTypeAnnotation with a host-native experimental implementation"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "host-no-missing-type-annotation-in-let-in-experiment"
+                        |> Option.withDescription "Handle NoMissingTypeAnnotationInLetIn with a host-native experimental implementation"
+                    )
             )
 
 
@@ -1136,6 +1565,29 @@ parseImportersCacheMode rawValue =
 
         _ ->
             ImportersFresh
+
+
+parseModuleRuleGroupingMode : String -> ModuleRuleGroupingMode
+parseModuleRuleGroupingMode rawValue =
+    case String.toLower (String.trim rawValue) of
+        "auto" ->
+            ModuleRuleGroupingAuto
+
+        "legacy" ->
+            ModuleRuleGroupingLegacy
+
+        _ ->
+            ModuleRuleGroupingContracts
+
+
+parseModuleRuleTransportMode : String -> ModuleRuleTransportMode
+parseModuleRuleTransportMode rawValue =
+    case String.toLower (String.trim rawValue) of
+        "records" ->
+            ModuleRuleTransportRecords
+
+        _ ->
+            ModuleRuleTransportHandles
 
 
 parseReportFormat : String -> ReportFormat
@@ -1173,6 +1625,51 @@ executionModeHash config =
 
       else
         "host-no-unused-parameters=0"
+    , if config.hostNoExposingEverythingExperiment then
+        "host-no-exposing-everything=1"
+
+      else
+        "host-no-exposing-everything=0"
+    , if config.hostNoImportingEverythingExperiment then
+        "host-no-importing-everything=1"
+
+      else
+        "host-no-importing-everything=0"
+    , if config.hostNoDebugLogExperiment then
+        "host-no-debug-log=1"
+
+      else
+        "host-no-debug-log=0"
+    , if config.hostNoDebugTodoOrToStringExperiment then
+        "host-no-debug-todo-or-to-string=1"
+
+      else
+        "host-no-debug-todo-or-to-string=0"
+    , if config.hostNoMissingTypeAnnotationExperiment then
+        "host-no-missing-type-annotation=1"
+
+      else
+        "host-no-missing-type-annotation=0"
+    , if config.hostNoMissingTypeAnnotationInLetInExperiment then
+        "host-no-missing-type-annotation-in-let-in=1"
+
+      else
+        "host-no-missing-type-annotation-in-let-in=0"
+    , case config.moduleRuleGroupingMode of
+        ModuleRuleGroupingAuto ->
+            "module-rule-grouping=auto"
+
+        ModuleRuleGroupingContracts ->
+            "module-rule-grouping=contracts"
+
+        ModuleRuleGroupingLegacy ->
+            "module-rule-grouping=legacy"
+    , case config.moduleRuleTransportMode of
+        ModuleRuleTransportHandles ->
+            "module-rule-transport=handles"
+
+        ModuleRuleTransportRecords ->
+            "module-rule-transport=records"
     ]
         |> String.join "|"
         |> FNV1a.hash
@@ -1181,7 +1678,36 @@ executionModeHash config =
 
 run : Script
 run =
-    Script.withCliOptions programConfig (task >> BackendTask.quiet)
+    Script.withCliOptions programConfig
+        (\cliConfig ->
+            { reviewDir = cliConfig.reviewDir
+            , sourceDirs = cliConfig.sourceDirs
+            , buildDirectory = cliConfig.buildDirectory
+            , jobs = cliConfig.jobs
+            , memoizedFunctions = cliConfig.memoizedFunctions
+            , memoProfile = cliConfig.memoProfile
+            , moduleRuleGroupingMode = cliConfig.moduleRuleGroupingMode
+            , moduleRuleTransportMode = ModuleRuleTransportHandles
+            , importersCacheMode = cliConfig.importersCacheMode
+            , depsCacheMode = cliConfig.depsCacheMode
+            , reportFormat = cliConfig.reportFormat
+            , perfTraceJson = cliConfig.perfTraceJson
+            , hostNoUnusedExportsExperiment = cliConfig.hostNoUnusedExportsExperiment
+            , hostNoUnusedCustomTypeConstructorsExperiment = cliConfig.hostNoUnusedCustomTypeConstructorsExperiment
+            , hostNoUnusedCustomTypeConstructorArgsExperiment = cliConfig.hostNoUnusedCustomTypeConstructorArgsExperiment
+            , hostNoUnusedParametersExperiment = cliConfig.hostNoUnusedParametersExperiment
+            , hostNoUnusedVariablesExperiment = cliConfig.hostNoUnusedVariablesExperiment
+            , hostNoExposingEverythingExperiment = cliConfig.hostNoExposingEverythingExperiment
+            , hostNoImportingEverythingExperiment = cliConfig.hostNoImportingEverythingExperiment
+            , hostNoDebugLogExperiment = cliConfig.hostNoDebugLogExperiment
+            , hostNoDebugTodoOrToStringExperiment = cliConfig.hostNoDebugTodoOrToStringExperiment
+            , hostNoMissingTypeAnnotationExperiment = cliConfig.hostNoMissingTypeAnnotationExperiment
+            , hostNoMissingTypeAnnotationInLetInExperiment = cliConfig.hostNoMissingTypeAnnotationInLetInExperiment
+            , startupOnly = False
+            }
+                |> task
+                |> BackendTask.quiet
+        )
 
 
 
@@ -1480,6 +2006,47 @@ persistTargetProjectRuntimeCache buildDir targetProjectSeed baseProject =
         |> BackendTask.allowFatal
 
 
+benchmarkPackageSummaryCodecs :
+    { reviewDir : String
+    , buildDirectory : String
+    , iterations : Int
+    }
+    -> BackendTask FatalError String
+benchmarkPackageSummaryCodecs options =
+    Do.do (Script.exec "mkdir" [ "-p", options.buildDirectory ]) <| \_ ->
+    InterpreterProject.benchmarkPackageSummaryCacheCodecs
+        { projectDir = Path.path options.reviewDir
+        , skipPackages = Set.union kernelPackages conflictingPackages
+        , patchSource = patchSource
+        , extraSourceFiles = []
+        , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
+        , sourceDirectories = Just [ options.reviewDir ++ "/src" ]
+        , packageParseCacheDir = options.buildDirectory
+        , iterations = options.iterations
+        }
+        |> BackendTask.map
+            (\result ->
+                Json.Encode.object
+                    [ ( "iterations", Json.Encode.int result.iterations )
+                    , ( "summaryCount", Json.Encode.int result.summaryCount )
+                    , ( "binaryBytes", Json.Encode.int result.binaryBytes )
+                    , ( "shardedBinaryBytes", Json.Encode.int result.shardedBinaryBytes )
+                    , ( "jsonChars", Json.Encode.int result.jsonChars )
+                    , ( "seedCacheHit", Json.Encode.int result.seedCacheHit )
+                    , ( "seedParsePackageSourcesMs", Json.Encode.int result.seedParsePackageSourcesMs )
+                    , ( "seedBuildPackageSummariesFromParsedMs", Json.Encode.int result.seedBuildPackageSummariesFromParsedMs )
+                    , ( "seedDecodePackageSummaryCacheMs", Json.Encode.int result.seedDecodePackageSummaryCacheMs )
+                    , ( "binaryEncodeMs", Json.Encode.int result.binaryEncodeMs )
+                    , ( "binaryDecodeMs", Json.Encode.int result.binaryDecodeMs )
+                    , ( "shardedBinaryEncodeMs", Json.Encode.int result.shardedBinaryEncodeMs )
+                    , ( "shardedBinaryDecodeMs", Json.Encode.int result.shardedBinaryDecodeMs )
+                    , ( "jsonEncodeMs", Json.Encode.int result.jsonEncodeMs )
+                    , ( "jsonDecodeMs", Json.Encode.int result.jsonDecodeMs )
+                    ]
+                    |> Json.Encode.encode 2
+            )
+
+
 benchmarkTargetProjectRuntime :
     { reviewDir : String
     , sourceDirs : List String
@@ -1497,6 +2064,8 @@ benchmarkTargetProjectRuntime options =
             , jobs = Just 1
             , memoizedFunctions = Set.empty
             , memoProfile = False
+            , moduleRuleGroupingMode = ModuleRuleGroupingAuto
+            , moduleRuleTransportMode = ModuleRuleTransportHandles
             , importersCacheMode = ImportersAuto
             , depsCacheMode = ImportersAuto
             , reportFormat = ReportQuiet
@@ -1506,6 +2075,13 @@ benchmarkTargetProjectRuntime options =
             , hostNoUnusedCustomTypeConstructorArgsExperiment = False
             , hostNoUnusedParametersExperiment = False
             , hostNoUnusedVariablesExperiment = False
+            , hostNoExposingEverythingExperiment = False
+            , hostNoImportingEverythingExperiment = False
+            , hostNoDebugLogExperiment = False
+            , hostNoDebugTodoOrToStringExperiment = False
+            , hostNoMissingTypeAnnotationExperiment = False
+            , hostNoMissingTypeAnnotationInLetInExperiment = False
+            , startupOnly = False
             }
     in
     Do.do (withTiming "prepare_config" (prepareConfig config)) <| \preparedConfigTimed ->
@@ -1709,6 +2285,315 @@ hostNoUnusedVariablesErrorsForSources sources =
     sources
         |> evaluateHostNoUnusedVariablesForSources
         |> .errors
+
+
+hostNoExposingEverythingErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoExposingEverythingErrorsForSources sources =
+    sources
+        |> List.filterMap
+            (\sourceFile ->
+                crossModuleSummaryFromSource sourceFile.path sourceFile.source
+                    |> Maybe.map (hostNoExposingEverythingErrorsForSummary sourceFile.path)
+            )
+        |> List.concat
+
+
+hostNoImportingEverythingErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoImportingEverythingErrorsForSources sources =
+    sources
+        |> List.filterMap
+            (\sourceFile ->
+                crossModuleSummaryFromSource sourceFile.path sourceFile.source
+                    |> Maybe.map (hostNoImportingEverythingErrorsForSummary sourceFile.path)
+            )
+        |> List.concat
+
+
+hostNoDebugLogErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoDebugLogErrorsForSources sources =
+    sources
+        |> List.filterMap
+            (\sourceFile ->
+                crossModuleSummaryFromSource sourceFile.path sourceFile.source
+                    |> Maybe.map (hostNoDebugLogErrorsForSummary sourceFile.path)
+            )
+        |> List.concat
+
+
+hostNoDebugTodoOrToStringErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoDebugTodoOrToStringErrorsForSources sources =
+    sources
+        |> List.filterMap
+            (\sourceFile ->
+                crossModuleSummaryFromSource sourceFile.path sourceFile.source
+                    |> Maybe.map (hostNoDebugTodoOrToStringErrorsForSummary sourceFile.path)
+            )
+        |> List.concat
+
+
+hostNoMissingTypeAnnotationErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoMissingTypeAnnotationErrorsForSources sources =
+    sources
+        |> List.filterMap
+            (\sourceFile ->
+                crossModuleSummaryFromSource sourceFile.path sourceFile.source
+                    |> Maybe.map (hostNoMissingTypeAnnotationErrorsForSummary sourceFile.path)
+            )
+        |> List.concat
+
+
+hostNoMissingTypeAnnotationInLetInErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoMissingTypeAnnotationInLetInErrorsForSources sources =
+    sources
+        |> List.filterMap
+            (\sourceFile ->
+                crossModuleSummaryFromSource sourceFile.path sourceFile.source
+                    |> Maybe.map (hostNoMissingTypeAnnotationInLetInErrorsForSummary sourceFile.path)
+            )
+        |> List.concat
+
+
+hostNoExposingEverythingErrorsForSource : String -> String -> List ReviewError
+hostNoExposingEverythingErrorsForSource filePath source =
+    case crossModuleSummaryFromSource filePath source of
+        Just summary ->
+            hostNoExposingEverythingErrorsForSummary filePath summary
+
+        Nothing ->
+            []
+
+
+hostNoExposingEverythingErrorsForSummary : String -> CrossModuleSummary -> List ReviewError
+hostNoExposingEverythingErrorsForSummary filePath summary =
+    case summary.exposingAllRange of
+        Just range ->
+            [ { ruleName = "NoExposingEverything"
+              , filePath = filePath
+              , line = range.start.row
+              , column = max 1 (range.start.column - 1)
+              , message = "Module exposes everything implicitly \"(..)\""
+              }
+            ]
+
+        Nothing ->
+            []
+
+
+hostNoImportingEverythingErrorsForSummary : String -> CrossModuleSummary -> List ReviewError
+hostNoImportingEverythingErrorsForSummary filePath summary =
+    summary.importSummaries
+        |> List.filterMap
+            (\importSummary ->
+                importSummary.exposingAllRange
+                    |> Maybe.map
+                        (\range ->
+                            { ruleName = "NoImportingEverything"
+                            , filePath = filePath
+                            , line = range.start.row
+                            , column = max 1 (range.start.column - 1)
+                            , message = "Prefer listing what you wish to import and/or using qualified imports"
+                            }
+                        )
+            )
+
+
+resolveDependencyRefModuleName : CrossModuleSummary -> DependencyRef -> Maybe String
+resolveDependencyRefModuleName summary dependencyRef =
+    case dependencyRef.moduleParts of
+        [] ->
+            if Dict.get dependencyRef.name summary.importedValueCandidates |> Maybe.map (Set.member "Debug") |> Maybe.withDefault False then
+                Just "Debug"
+
+            else if List.member "Debug" summary.importAllModules then
+                Just "Debug"
+
+            else
+                Nothing
+
+        moduleParts ->
+            let
+                rawModuleName =
+                    String.join "." moduleParts
+            in
+            Just
+                (summary.moduleAliases
+                    |> Dict.get rawModuleName
+                    |> Maybe.withDefault rawModuleName
+                )
+
+
+dependencyRefNameIsShadowed : CrossModuleSummary -> String -> String -> Bool
+dependencyRefNameIsShadowed summary ownerName dependencyName =
+    let
+        topLevelParameterNames =
+            summary.topLevelFunctionSummaries
+                |> List.filter (\functionSummary -> functionSummary.name == ownerName)
+                |> List.concatMap (.parameters >> List.map .name)
+
+        nestedNames =
+            summary.nestedFunctionSummaries
+                |> List.concatMap
+                    (\functionSummary ->
+                        functionSummary.name :: List.map .name functionSummary.parameters
+                    )
+
+        letNames =
+            summary.letBindingSummaries
+                |> List.map .name
+    in
+    Set.member dependencyName summary.localDeclarations
+        || List.member dependencyName topLevelParameterNames
+        || List.member dependencyName nestedNames
+        || List.member dependencyName letNames
+
+
+dependencyRefMatchesResolvedModuleFunction : String -> String -> CrossModuleSummary -> DependencyRef -> Bool
+dependencyRefMatchesResolvedModuleFunction targetModule targetName summary dependencyRef =
+    dependencyRef.name == targetName
+        && (case dependencyRef.moduleParts of
+                [] ->
+                    (not (dependencyRefNameIsShadowed summary dependencyRef.owner dependencyRef.name))
+                        && (resolveDependencyRefModuleName summary dependencyRef == Just targetModule)
+
+                _ ->
+                    resolveDependencyRefModuleName summary dependencyRef == Just targetModule
+           )
+
+
+hostNoDebugLogErrorsForSummary : String -> CrossModuleSummary -> List ReviewError
+hostNoDebugLogErrorsForSummary filePath summary =
+    summary.dependencyRefs
+        |> List.filter (dependencyRefMatchesResolvedModuleFunction "Debug" "log" summary)
+        |> List.map
+            (\dependencyRef ->
+                { ruleName = "NoDebug.Log"
+                , filePath = filePath
+                , line = dependencyRef.range.start.row
+                , column = dependencyRef.range.start.column
+                , message = "Remove the use of `Debug.log` before shipping to production"
+                }
+            )
+
+
+hostNoDebugTodoOrToStringErrorsForSummary : String -> CrossModuleSummary -> List ReviewError
+hostNoDebugTodoOrToStringErrorsForSummary filePath summary =
+    summary.dependencyRefs
+        |> List.filter
+            (\dependencyRef ->
+                dependencyRefMatchesResolvedModuleFunction "Debug" "todo" summary dependencyRef
+                    || dependencyRefMatchesResolvedModuleFunction "Debug" "toString" summary dependencyRef
+            )
+        |> List.map
+            (\dependencyRef ->
+                { ruleName = "NoDebug.TodoOrToString"
+                , filePath = filePath
+                , line = dependencyRef.range.start.row
+                , column = dependencyRef.range.start.column
+                , message = "Remove the use of `Debug." ++ dependencyRef.name ++ "` before shipping to production"
+                }
+            )
+
+
+evaluateHostNoDebugLogForAnalyzedFiles :
+    List AnalyzedTargetFile
+    -> { errors : List ReviewError, counters : Dict String Int }
+evaluateHostNoDebugLogForAnalyzedFiles files =
+    let
+        dependencyCount =
+            files
+                |> List.map (\file -> List.length file.analysis.crossModuleSummary.dependencyRefs)
+                |> List.sum
+
+        errors =
+            files
+                |> List.concatMap
+                    (\file ->
+                        hostNoDebugLogErrorsForSummary file.path file.analysis.crossModuleSummary
+                    )
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "module.host_debug_log.modules", List.length files )
+            , ( "module.host_debug_log.dependencies", dependencyCount )
+            , ( "module.host_debug_log.errors", List.length errors )
+            ]
+    }
+
+
+evaluateHostNoDebugTodoOrToStringForAnalyzedFiles :
+    List AnalyzedTargetFile
+    -> { errors : List ReviewError, counters : Dict String Int }
+evaluateHostNoDebugTodoOrToStringForAnalyzedFiles files =
+    let
+        dependencyCount =
+            files
+                |> List.map (\file -> List.length file.analysis.crossModuleSummary.dependencyRefs)
+                |> List.sum
+
+        errors =
+            files
+                |> List.concatMap
+                    (\file ->
+                        hostNoDebugTodoOrToStringErrorsForSummary file.path file.analysis.crossModuleSummary
+                    )
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "module.host_debug_todo_or_to_string.modules", List.length files )
+            , ( "module.host_debug_todo_or_to_string.dependencies", dependencyCount )
+            , ( "module.host_debug_todo_or_to_string.errors", List.length errors )
+            ]
+    }
+
+
+evaluateHostNoExposingEverythingForAnalyzedFiles :
+    List AnalyzedTargetFile
+    -> { errors : List ReviewError, counters : Dict String Int }
+evaluateHostNoExposingEverythingForAnalyzedFiles files =
+    let
+        errors =
+            files
+                |> List.concatMap
+                    (\file ->
+                        hostNoExposingEverythingErrorsForSummary file.path file.analysis.crossModuleSummary
+                    )
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "module.host_exposing_everything.modules", List.length files )
+            , ( "module.host_exposing_everything.errors", List.length errors )
+            ]
+    }
+
+
+evaluateHostNoImportingEverythingForAnalyzedFiles :
+    List AnalyzedTargetFile
+    -> { errors : List ReviewError, counters : Dict String Int }
+evaluateHostNoImportingEverythingForAnalyzedFiles files =
+    let
+        importCount =
+            files
+                |> List.map (\file -> List.length file.analysis.crossModuleSummary.importSummaries)
+                |> List.sum
+
+        errors =
+            files
+                |> List.concatMap
+                    (\file ->
+                        hostNoImportingEverythingErrorsForSummary file.path file.analysis.crossModuleSummary
+                    )
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "module.host_importing_everything.modules", List.length files )
+            , ( "module.host_importing_everything.imports", importCount )
+            , ( "module.host_importing_everything.errors", List.length errors )
+            ]
+    }
 
 
 evaluateHostNoUnusedExportsForAnalyzedFiles :
@@ -2502,6 +3387,95 @@ hostNoUnusedVariablesFromSummaries packageOpenTypeConstructors summaries =
               )
             , ( "project.host_variables.open_type_modules", Dict.size openTypeConstructors )
             , ( "project.host_variables.errors", List.length errors )
+            ]
+    }
+
+
+hostNoMissingTypeAnnotationErrorsForSummary : String -> CrossModuleSummary -> List ReviewError
+hostNoMissingTypeAnnotationErrorsForSummary filePath summary =
+    summary.topLevelFunctionSummaries
+        |> List.filter (not << .hasSignature)
+        |> List.map
+            (\functionSummary ->
+                { ruleName = "NoMissingTypeAnnotation"
+                , filePath = filePath
+                , line = functionSummary.nameRange.start.row
+                , column = functionSummary.nameRange.start.column
+                , message = "Missing type annotation for `" ++ functionSummary.name ++ "`"
+                }
+            )
+
+
+hostNoMissingTypeAnnotationInLetInErrorsForSummary : String -> CrossModuleSummary -> List ReviewError
+hostNoMissingTypeAnnotationInLetInErrorsForSummary filePath summary =
+    summary.nestedFunctionSummaries
+        |> List.filter (\functionSummary -> functionSummary.name /= "<lambda>" && not functionSummary.hasSignature)
+        |> List.map
+            (\functionSummary ->
+                { ruleName = "NoMissingTypeAnnotationInLetIn"
+                , filePath = filePath
+                , line = functionSummary.nameRange.start.row
+                , column = functionSummary.nameRange.start.column
+                , message = "Missing type annotation for `" ++ functionSummary.name ++ "`"
+                }
+            )
+
+
+evaluateHostNoMissingTypeAnnotationForAnalyzedFiles :
+    List AnalyzedTargetFile
+    -> { errors : List ReviewError, counters : Dict String Int }
+evaluateHostNoMissingTypeAnnotationForAnalyzedFiles files =
+    let
+        functionCount =
+            files
+                |> List.map (\file -> List.length file.analysis.crossModuleSummary.topLevelFunctionSummaries)
+                |> List.sum
+
+        errors =
+            files
+                |> List.concatMap
+                    (\file ->
+                        hostNoMissingTypeAnnotationErrorsForSummary file.path file.analysis.crossModuleSummary
+                    )
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "module.host_missing_type_annotation.modules", List.length files )
+            , ( "module.host_missing_type_annotation.functions", functionCount )
+            , ( "module.host_missing_type_annotation.errors", List.length errors )
+            ]
+    }
+
+
+evaluateHostNoMissingTypeAnnotationInLetInForAnalyzedFiles :
+    List AnalyzedTargetFile
+    -> { errors : List ReviewError, counters : Dict String Int }
+evaluateHostNoMissingTypeAnnotationInLetInForAnalyzedFiles files =
+    let
+        candidateCount =
+            files
+                |> List.map
+                    (\file ->
+                        file.analysis.crossModuleSummary.nestedFunctionSummaries
+                            |> List.filter (\functionSummary -> functionSummary.name /= "<lambda>")
+                            |> List.length
+                    )
+                |> List.sum
+
+        errors =
+            files
+                |> List.concatMap
+                    (\file ->
+                        hostNoMissingTypeAnnotationInLetInErrorsForSummary file.path file.analysis.crossModuleSummary
+                    )
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "module.host_missing_type_annotation_in_let_in.modules", List.length files )
+            , ( "module.host_missing_type_annotation_in_let_in.functions", candidateCount )
+            , ( "module.host_missing_type_annotation_in_let_in.errors", List.length errors )
             ]
     }
 
@@ -3413,6 +4387,14 @@ buildCrossModuleSummary filePath file =
                 Exposing.Explicit _ ->
                     False
 
+        exposingAllRange =
+            case exposingList of
+                Exposing.All range ->
+                    Just range
+
+                Exposing.Explicit _ ->
+                    Nothing
+
         exposedValues =
             case exposingList of
                 Exposing.All _ ->
@@ -3445,6 +4427,7 @@ buildCrossModuleSummary filePath file =
     , moduleName = moduleName
     , moduleNameRange = moduleNameRange
     , isExposingAll = isExposingAll
+    , exposingAllRange = exposingAllRange
     , valueDeclarationRanges = valueDeclarations
     , exposedValues = exposedValues
     , localTypeDeclarations = localTypeDeclarations
@@ -4740,11 +5723,12 @@ crossModuleDependencyRefsFromDeclaration declarationNode =
                 ownerName =
                     Node.value implementation.name
             in
-            implementation.expression
-                |> SemanticHash.extractDependencies
+                implementation.expression
+                |> SemanticHash.extractDependenciesWithRanges
                 |> List.map
-                    (\( moduleParts, name ) ->
+                    (\( range, moduleParts, name ) ->
                         { owner = ownerName
+                        , range = range
                         , moduleParts = moduleParts
                         , name = name
                         }
@@ -5778,14 +6762,128 @@ importersNeedsImporterContext ruleName =
             True
 
 
-moduleRuleUsesDeclarationShapeOnly : { a | name : String } -> Bool
-moduleRuleUsesDeclarationShapeOnly rule =
-    case factContractForRule rule.name of
-        Just contract ->
-            contract.factSets == [ DeclarationShape ]
+buildModuleRuleGroups :
+    ModuleRuleGroupingMode
+    -> List { a | name : String }
+    -> List ( String, List { a | name : String }, Bool )
+buildModuleRuleGroups moduleRuleGroupingMode moduleRules =
+    case moduleRuleGroupingMode of
+        ModuleRuleGroupingAuto ->
+            buildModuleRuleGroups ModuleRuleGroupingContracts moduleRules
 
-        Nothing ->
-            False
+        ModuleRuleGroupingContracts ->
+            let
+                groupedRules =
+                    moduleRules
+                        |> List.foldl
+                            (\rule state ->
+                                case factContractForRule rule.name of
+                                    Just contract ->
+                                        let
+                                            groupKey =
+                                                contract.factSets
+                                                    |> List.map factSetToString
+                                                    |> String.join "+"
+                                        in
+                                        { orderedContractKeys =
+                                            if List.member groupKey state.orderedContractKeys then
+                                                state.orderedContractKeys
+
+                                            else
+                                                state.orderedContractKeys ++ [ groupKey ]
+                                        , contractGroups =
+                                            Dict.update groupKey
+                                                (\maybeRules ->
+                                                    case maybeRules of
+                                                        Just rules ->
+                                                            Just (rule :: rules)
+
+                                                        Nothing ->
+                                                            Just [ rule ]
+                                                )
+                                                state.contractGroups
+                                        , defaultRules = state.defaultRules
+                                        }
+
+                                    Nothing ->
+                                        { state | defaultRules = rule :: state.defaultRules }
+                            )
+                            { orderedContractKeys = []
+                            , contractGroups = Dict.empty
+                            , defaultRules = []
+                            }
+
+                contractGroups =
+                    groupedRules.orderedContractKeys
+                        |> List.filterMap
+                            (\groupKey ->
+                                Dict.get groupKey groupedRules.contractGroups
+                                    |> Maybe.map
+                                        (\rules ->
+                                            ( "fact:" ++ groupKey
+                                            , List.reverse rules
+                                            , True
+                                            )
+                                        )
+                            )
+
+                defaultGroup =
+                    if List.isEmpty groupedRules.defaultRules then
+                        []
+
+                    else
+                        [ ( "default", List.reverse groupedRules.defaultRules, False ) ]
+            in
+            contractGroups ++ defaultGroup
+
+        ModuleRuleGroupingLegacy ->
+            let
+                declarationShapeRules =
+                    moduleRules
+                        |> List.filter
+                            (\rule ->
+                                case factContractForRule rule.name of
+                                    Just contract ->
+                                        contract.factSets == [ DeclarationShape ]
+
+                                    Nothing ->
+                                        False
+                            )
+
+                remainingRules =
+                    moduleRules
+                        |> List.filter
+                            (\rule ->
+                                case factContractForRule rule.name of
+                                    Just contract ->
+                                        contract.factSets /= [ DeclarationShape ]
+
+                                    Nothing ->
+                                        True
+                            )
+            in
+            [ ( "declaration-shape", declarationShapeRules, True )
+            , ( "default", remainingRules, False )
+            ]
+                |> List.filter (\( _, rules, _ ) -> not (List.isEmpty rules))
+
+
+effectiveModuleRuleGroupingMode :
+    ModuleRuleGroupingMode
+    -> Int
+    -> Int
+    -> ModuleRuleGroupingMode
+effectiveModuleRuleGroupingMode moduleRuleGroupingMode staleCount totalCount =
+    case moduleRuleGroupingMode of
+        ModuleRuleGroupingAuto ->
+            if staleCount == totalCount then
+                ModuleRuleGroupingLegacy
+
+            else
+                ModuleRuleGroupingContracts
+
+        _ ->
+            moduleRuleGroupingMode
 
 
 buildModuleRuleGroupFactHashKey :
@@ -6063,6 +7161,19 @@ mapErrorsToDeclarations declarations errors =
 -}
 type alias CacheState =
     Dict String DeclarationCache
+
+
+type alias DeclCacheLoadResult =
+    { cache : CacheState
+    , bytes : Int
+    , shardCount : Int
+    }
+
+
+type alias DeclCachePersistResult =
+    { bytesWritten : Int
+    , shardWrites : Int
+    }
 
 
 {-| Result of checking the cache against current source files.
@@ -6424,6 +7535,169 @@ decodeCacheState json =
         |> Result.toMaybe
 
 
+declCacheManifestPath : String -> String
+declCacheManifestPath declCacheDirectory =
+    declCacheDirectory ++ "/manifest.json"
+
+
+declCacheShardName : String -> String
+declCacheShardName filePath =
+    String.fromInt (FNV1a.hash filePath)
+        ++ "-"
+        ++ String.fromInt (FNV1a.hash (String.reverse filePath))
+        ++ ".json"
+
+
+declCacheShardPath : String -> String -> String
+declCacheShardPath declCacheDirectory filePath =
+    declCacheDirectory ++ "/" ++ declCacheShardName filePath
+
+
+encodeDeclCacheManifest : CacheState -> String
+encodeDeclCacheManifest cache =
+    cache
+        |> Dict.keys
+        |> List.sort
+        |> List.map declCacheShardName
+        |> Json.Encode.list Json.Encode.string
+        |> Json.Encode.encode 0
+
+
+decodeDeclCacheManifest : String -> Maybe (List String)
+decodeDeclCacheManifest json =
+    Json.Decode.decodeString (Json.Decode.list Json.Decode.string) json
+        |> Result.toMaybe
+
+
+loadDeclCache : { legacyPath : String, directory : String } -> BackendTask FatalError DeclCacheLoadResult
+loadDeclCache paths =
+    File.rawFile (declCacheManifestPath paths.directory)
+        |> BackendTask.toResult
+        |> BackendTask.andThen
+            (\manifestResult ->
+                case manifestResult of
+                    Ok manifestBody ->
+                        case decodeDeclCacheManifest manifestBody of
+                            Just shardNames ->
+                                shardNames
+                                    |> List.map
+                                        (\shardName ->
+                                            File.rawFile (paths.directory ++ "/" ++ shardName)
+                                                |> BackendTask.toResult
+                                                |> BackendTask.map
+                                                    (\shardResult ->
+                                                        shardResult
+                                                            |> Result.toMaybe
+                                                            |> Maybe.andThen
+                                                                (\body ->
+                                                                    decodeCacheState body
+                                                                        |> Maybe.map
+                                                                            (\decoded ->
+                                                                                { cache = decoded
+                                                                                , bytes = String.length body
+                                                                                }
+                                                                            )
+                                                                )
+                                                    )
+                                            )
+                                    |> BackendTask.Extra.combine
+                                    |> BackendTask.map
+                                        (\loadedShards ->
+                                            let
+                                                presentShards =
+                                                    loadedShards |> List.filterMap identity
+                                            in
+                                            { cache =
+                                                presentShards
+                                                    |> List.map .cache
+                                                    |> List.foldl Dict.union Dict.empty
+                                            , bytes =
+                                                String.length manifestBody
+                                                    + List.sum (List.map .bytes presentShards)
+                                            , shardCount = List.length presentShards
+                                            }
+                                        )
+
+                            Nothing ->
+                                loadLegacyDeclCache paths.legacyPath
+
+                    Err _ ->
+                        loadLegacyDeclCache paths.legacyPath
+            )
+
+
+loadLegacyDeclCache : String -> BackendTask FatalError DeclCacheLoadResult
+loadLegacyDeclCache legacyPath =
+    File.rawFile legacyPath
+        |> BackendTask.toResult
+        |> BackendTask.map
+            (\result ->
+                { cache =
+                    result
+                        |> Result.toMaybe
+                        |> Maybe.andThen decodeCacheState
+                        |> Maybe.withDefault Dict.empty
+                , bytes =
+                    result
+                        |> Result.map String.length
+                        |> Result.withDefault 0
+                , shardCount = 0
+                }
+            )
+
+
+persistDeclCache : { directory : String, cache : CacheState, changedPaths : List String } -> BackendTask FatalError DeclCachePersistResult
+persistDeclCache config =
+    let
+        uniqueChangedPaths =
+            config.changedPaths
+                |> Set.fromList
+                |> Set.toList
+
+        manifestBody =
+            encodeDeclCacheManifest config.cache
+
+        shardBodies =
+            uniqueChangedPaths
+                |> List.filterMap
+                    (\filePath ->
+                        Dict.get filePath config.cache
+                            |> Maybe.map
+                                (\fileCache ->
+                                    { path = declCacheShardPath config.directory filePath
+                                    , body = encodeCacheState (Dict.singleton filePath fileCache)
+                                    }
+                                )
+                    )
+
+        bytesWritten =
+            String.length manifestBody + List.sum (List.map (\entry -> String.length entry.body) shardBodies)
+    in
+    Do.do (Script.exec "mkdir" [ "-p", config.directory ]) <| \_ ->
+    Do.do
+        (Script.writeFile
+            { path = declCacheManifestPath config.directory
+            , body = manifestBody
+            }
+            |> BackendTask.allowFatal
+        )
+    <| \_ ->
+    Do.do
+        (shardBodies
+            |> List.map
+                (\entry ->
+                    Script.writeFile entry
+                        |> BackendTask.allowFatal
+                )
+            |> BackendTask.Extra.combine
+        )
+    <| \_ ->
+    BackendTask.succeed
+        { bytesWritten = bytesWritten
+        , shardWrites = List.length shardBodies
+        }
+
+
 encodeFileAspectHashes : SemanticHash.FileAspectHashes -> Json.Encode.Value
 encodeFileAspectHashes hashes =
     Json.Encode.object
@@ -6702,6 +7976,7 @@ encodeDependencyRefJson : DependencyRef -> Json.Encode.Value
 encodeDependencyRefJson dependencyRef =
     Json.Encode.object
         [ ( "owner", Json.Encode.string dependencyRef.owner )
+        , ( "range", encodeRangeJson dependencyRef.range )
         , ( "moduleParts", Json.Encode.list Json.Encode.string dependencyRef.moduleParts )
         , ( "name", Json.Encode.string dependencyRef.name )
         ]
@@ -6709,14 +7984,16 @@ encodeDependencyRefJson dependencyRef =
 
 dependencyRefDecoder : Json.Decode.Decoder DependencyRef
 dependencyRefDecoder =
-    Json.Decode.map3
-        (\owner moduleParts name ->
+    Json.Decode.map4
+        (\owner range moduleParts name ->
             { owner = owner
+            , range = range
             , moduleParts = moduleParts
             , name = name
             }
         )
         (Json.Decode.field "owner" Json.Decode.string)
+        (Json.Decode.field "range" rangeDecoder)
         (Json.Decode.field "moduleParts" (Json.Decode.list Json.Decode.string))
         (Json.Decode.field "name" Json.Decode.string)
 
@@ -7105,6 +8382,11 @@ encodeFileAnalysisCache cache =
                             , ( "moduleName", Json.Encode.string analysis.crossModuleSummary.moduleName )
                             , ( "moduleNameRange", encodeRangeJson analysis.crossModuleSummary.moduleNameRange )
                             , ( "isExposingAll", Json.Encode.bool analysis.crossModuleSummary.isExposingAll )
+                            , ( "exposingAllRange"
+                              , analysis.crossModuleSummary.exposingAllRange
+                                    |> Maybe.map encodeRangeJson
+                                    |> Maybe.withDefault Json.Encode.null
+                              )
                             , ( "valueDeclarationRanges", encodeRangeDictJson analysis.crossModuleSummary.valueDeclarationRanges )
                             , ( "exposedValues", encodeRangeDictJson analysis.crossModuleSummary.exposedValues )
                             , ( "localTypeDeclarations", encodeLocalTypeDictJson analysis.crossModuleSummary.localTypeDeclarations )
@@ -7213,6 +8495,7 @@ decodeFileAnalysisCache json =
                             , moduleName = headFields.moduleName
                             , moduleNameRange = headFields.moduleNameRange
                             , isExposingAll = headFields.isExposingAll
+                            , exposingAllRange = headFields.exposingAllRange
                             , valueDeclarationRanges = headFields.valueDeclarationRanges
                             , exposedValues = headFields.exposedValues
                             , localTypeDeclarations = headFields.localTypeDeclarations
@@ -7244,6 +8527,7 @@ decodeFileAnalysisCache json =
                                 , moduleName = primaryFields.moduleName
                                 , moduleNameRange = primaryFields.moduleNameRange
                                 , isExposingAll = primaryFields.isExposingAll
+                                , exposingAllRange = primaryFields.exposingAllRange
                                 , valueDeclarationRanges = primaryFields.valueDeclarationRanges
                                 , exposedValues = primaryFields.exposedValues
                                 , localTypeDeclarations = primaryFields.localTypeDeclarations
@@ -7262,6 +8546,7 @@ decodeFileAnalysisCache json =
                                     , moduleName = coreFields.moduleName
                                     , moduleNameRange = coreFields.moduleNameRange
                                     , isExposingAll = coreFields.isExposingAll
+                                    , exposingAllRange = coreFields.exposingAllRange
                                     , valueDeclarationRanges = declarationFields.valueDeclarationRanges
                                     , exposedValues = declarationFields.exposedValues
                                     , localTypeDeclarations = declarationFields.localTypeDeclarations
@@ -7270,18 +8555,24 @@ decodeFileAnalysisCache json =
                                     , constructorArgumentRanges = declarationFields.constructorArgumentRanges
                                     }
                                 )
-                                (Json.Decode.map4
-                                    (\filePath moduleName moduleNameRange isExposingAll ->
+                                (Json.Decode.map5
+                                    (\filePath moduleName moduleNameRange isExposingAll exposingAllRange ->
                                         { filePath = filePath
                                         , moduleName = moduleName
                                         , moduleNameRange = moduleNameRange
                                         , isExposingAll = isExposingAll
+                                        , exposingAllRange = exposingAllRange
                                         }
                                     )
                                     (Json.Decode.field "filePath" Json.Decode.string)
                                     (Json.Decode.field "moduleName" Json.Decode.string)
                                     (Json.Decode.field "moduleNameRange" rangeDecoder)
                                     (Json.Decode.field "isExposingAll" Json.Decode.bool)
+                                    (Json.Decode.oneOf
+                                        [ Json.Decode.field "exposingAllRange" (Json.Decode.nullable rangeDecoder)
+                                        , Json.Decode.succeed Nothing
+                                        ]
+                                    )
                                 )
                                 (Json.Decode.map5
                                     (\valueDeclarationRanges exposedValues localTypeDeclarations declaredConstructors constructorArgumentRanges ->
@@ -8113,6 +9404,124 @@ buildExpressionForRulesWithHandleVarAndCacheExtract ruleIndices moduleHandlesVar
     "ReviewRunnerHelper.runRulesByIndicesFromHandlesAndExtractCaches " ++ indexList ++ " " ++ moduleHandlesVarName
 
 
+buildExpressionForRulesWithInlineHandles : List Int -> List Int -> String
+buildExpressionForRulesWithInlineHandles ruleIndices handles =
+    let
+        indexList =
+            "[ " ++ (ruleIndices |> List.map String.fromInt |> String.join ", ") ++ " ]"
+
+        handleList =
+            "[ " ++ (handles |> List.map String.fromInt |> String.join ", ") ++ " ]"
+    in
+    "ReviewRunnerHelper.runRulesByIndicesFromHandles " ++ indexList ++ " " ++ handleList
+
+
+buildModuleRuleHandleIntercepts : SharedModulePayloads -> FastDict.Dict String Types.Intercept
+buildModuleRuleHandleIntercepts sharedModulePayloads =
+    FastDict.fromList
+        [ ( "ReviewRunnerHelper.moduleHandlePathMarker"
+          , Types.Intercept
+                (\_ args _ _ ->
+                    case args of
+                        [ Types.Int handle ] ->
+                            sharedModulePayloads.paths
+                                |> Array.get handle
+                                |> Maybe.map Types.String
+                                |> Maybe.withDefault (Types.String "")
+                                |> Types.EvOk
+
+                        _ ->
+                            Types.EvOk (Types.String "")
+                )
+          )
+        , ( "ReviewRunnerHelper.moduleHandleSourceMarker"
+          , Types.Intercept
+                (\_ args _ _ ->
+                    case args of
+                        [ Types.Int handle ] ->
+                            sharedModulePayloads.sources
+                                |> Array.get handle
+                                |> Maybe.map Types.String
+                                |> Maybe.withDefault (Types.String "")
+                                |> Types.EvOk
+
+                        _ ->
+                            Types.EvOk (Types.String "")
+                )
+          )
+        , ( "ReviewRunnerHelper.moduleHandleAstJsonMarker"
+          , Types.Intercept
+                (\_ args _ _ ->
+                    case args of
+                        [ Types.Int handle ] ->
+                            sharedModulePayloads.astJsons
+                                |> Array.get handle
+                                |> Maybe.map Types.String
+                                |> Maybe.withDefault (Types.String "")
+                                |> Types.EvOk
+
+                        _ ->
+                            Types.EvOk (Types.String "")
+                )
+          )
+        ]
+
+
+evaluateSingleModuleRuleBatch :
+    ModuleRuleTransportMode
+    -> InterpreterProject
+    -> List Int
+    -> { a | path : String, source : String, astJson : String }
+    -> Int
+    -> FastDict.Dict String Types.Intercept
+    -> String
+evaluateSingleModuleRuleBatch transportMode reviewProject ruleIndices moduleInput handleIndex handleIntercepts =
+    case transportMode of
+        ModuleRuleTransportHandles ->
+            unwrapEvalResultToString
+                (InterpreterProject.prepareAndEvalWithIntercepts reviewProject
+                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                    , expression = buildExpressionForRulesWithInlineHandles ruleIndices [ handleIndex ]
+                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                    , intercepts = handleIntercepts
+                    }
+                )
+
+        ModuleRuleTransportRecords ->
+            let
+                moduleInputRecord =
+                    { path = moduleInput.path
+                    , source = moduleInput.source
+                    , astJson = moduleInput.astJson
+                    }
+            in
+            case
+                InterpreterProject.prepareAndEval reviewProject
+                    { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                    , expression = buildExpressionForRules ruleIndices [ moduleInputRecord ]
+                    , sourceOverrides = [ reviewRunnerHelperSource ]
+                    }
+            of
+                Ok output ->
+                    output
+
+                Err err ->
+                    err
+
+
+unwrapEvalResultToString : Result String Types.Value -> String
+unwrapEvalResultToString result =
+    case result of
+        Ok (Types.String s) ->
+            s
+
+        Ok _ ->
+            ""
+
+        Err e ->
+            e
+
+
 buildExpressionForRule : Int -> List { path : String, source : String, astJson : String } -> String
 buildExpressionForRule ruleIndex modules =
     let
@@ -8443,92 +9852,99 @@ task config =
         preparedConfig =
             preparedConfigTimed.value
 
-        declCachePath =
-            Path.toString preparedConfig.buildDirectory ++ "/review-decl-cache-" ++ executionModeHash preparedConfig ++ ".json"
+        declCacheBasePath =
+            Path.toString preparedConfig.buildDirectory ++ "/review-decl-cache-" ++ executionModeHash preparedConfig
+
+        declCacheDirectory =
+            declCacheBasePath
+
+        legacyDeclCachePath =
+            declCacheBasePath ++ ".json"
 
         reviewAppHashValue =
             reviewAppHashFromPreparedConfig preparedConfig
     in
-    -- Load previous per-declaration cache from disk
-    Do.do
-        (withTiming "load_decl_cache"
-            (File.rawFile declCachePath
-                |> BackendTask.toResult
-                |> BackendTask.map
-                    (\result ->
-                        { cache =
-                            result
-                                |> Result.toMaybe
-                                |> Maybe.andThen decodeCacheState
-                                |> Maybe.withDefault Dict.empty
-                        , bytes =
-                            result
-                                |> Result.map String.length
-                                |> Result.withDefault 0
-                        }
-                    )
-                )
-        )
-    <| \declCacheTimed ->
-    let
-        previousCache =
-            declCacheTimed.value.cache
-    in
-    Do.do (withTiming "resolve_target_files" (resolveTargetFiles preparedConfig)) <| \targetFilesTimed ->
-    let
-        targetFiles =
-            targetFilesTimed.value
-    in
-    Do.do (loadAnalyzedTargetFiles preparedConfig targetFiles) <| \analyzedTargetFiles ->
-    let
-        targetFileContents =
-            analyzedTargetFiles.files
+    if preparedConfig.startupOnly then
+        writePerfTrace
+            preparedConfig.perfTraceJson
+            { schemaVersion = "1"
+            , reviewAppHash = reviewAppHashValue
+            , cacheDecision = "startup_only"
+            , counters = Dict.empty
+            , stages = [ preparedConfigTimed.stage ]
+            }
 
-        decision =
-            checkCacheWithAnalyses previousCache targetFileContents
-
-        baseStages =
-            [ preparedConfigTimed.stage
-            , declCacheTimed.stage
-            , targetFilesTimed.stage
-            , { name = "read_target_files", ms = analyzedTargetFiles.readMs }
-            , { name = "analyze_target_files", ms = analyzedTargetFiles.analysisMs }
-            ]
-
-        baseCounters =
-            Dict.fromList
-                [ ( "target.files", List.length targetFileContents )
-                , ( "decl_cache.entries", Dict.size previousCache )
-                , ( "decl_cache.loaded_bytes", declCacheTimed.value.bytes )
-                , ( "experiment.host_no_unused_exports", boolToInt preparedConfig.hostNoUnusedExportsExperiment )
-                , ( "experiment.host_no_unused_custom_type_constructors", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorsExperiment )
-                , ( "experiment.host_no_unused_custom_type_constructor_args", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorArgsExperiment )
-                , ( "experiment.host_no_unused_parameters", boolToInt preparedConfig.hostNoUnusedParametersExperiment )
-                , ( "experiment.host_no_unused_variables", boolToInt preparedConfig.hostNoUnusedVariablesExperiment )
-                , ( "analysis_cache.entries", analyzedTargetFiles.cacheEntries )
-                , ( "analysis_cache.loaded_bytes", analyzedTargetFiles.cacheLoadBytes )
-                , ( "analysis_cache.stored_bytes", analyzedTargetFiles.cacheStoreBytes )
-                , ( "analysis_cache.hits", analyzedTargetFiles.analysisHits )
-                , ( "analysis_cache.misses", analyzedTargetFiles.analysisMisses )
-                , ( "source.bytes", analyzedTargetFiles.sourceBytes )
-                , ( "ast_json.bytes", analyzedTargetFiles.astJsonBytes )
-                ]
-
-        finishWithTrace errors extraStages extraCounters =
-            Do.do
-                (writePerfTrace
-                    preparedConfig.perfTraceJson
-                    { schemaVersion = cacheSchemaVersion
-                    , reviewAppHash = reviewAppHashValue
-                    , cacheDecision = cacheDecisionToString decision
-                    , counters = mergeCounterDicts [ baseCounters, extraCounters, errorCounters errors ]
-                    , stages = baseStages ++ extraStages
+    else
+        -- Load previous per-declaration cache from disk
+        Do.do
+            (withTiming "load_decl_cache"
+                (loadDeclCache
+                    { legacyPath = legacyDeclCachePath
+                    , directory = declCacheDirectory
                     }
                 )
-            <| \_ ->
-            reportErrors preparedConfig.reportFormat errors
-    in
-    case decision of
+            )
+        <| \declCacheTimed ->
+        let
+            previousCache =
+                declCacheTimed.value.cache
+        in
+        Do.do (withTiming "resolve_target_files" (resolveTargetFiles preparedConfig)) <| \targetFilesTimed ->
+        let
+            targetFiles =
+                targetFilesTimed.value
+        in
+        Do.do (loadAnalyzedTargetFiles preparedConfig targetFiles) <| \analyzedTargetFiles ->
+        let
+            targetFileContents =
+                analyzedTargetFiles.files
+
+            decision =
+                checkCacheWithAnalyses previousCache targetFileContents
+
+            baseStages =
+                [ preparedConfigTimed.stage
+                , declCacheTimed.stage
+                , targetFilesTimed.stage
+                , { name = "read_target_files", ms = analyzedTargetFiles.readMs }
+                , { name = "analyze_target_files", ms = analyzedTargetFiles.analysisMs }
+                ]
+
+            baseCounters =
+                Dict.fromList
+                    [ ( "target.files", List.length targetFileContents )
+                    , ( "decl_cache.entries", Dict.size previousCache )
+                    , ( "decl_cache.loaded_bytes", declCacheTimed.value.bytes )
+                    , ( "decl_cache.loaded_shards", declCacheTimed.value.shardCount )
+                    , ( "experiment.host_no_unused_exports", boolToInt preparedConfig.hostNoUnusedExportsExperiment )
+                    , ( "experiment.host_no_unused_custom_type_constructors", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorsExperiment )
+                    , ( "experiment.host_no_unused_custom_type_constructor_args", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorArgsExperiment )
+                    , ( "experiment.host_no_unused_parameters", boolToInt preparedConfig.hostNoUnusedParametersExperiment )
+                    , ( "experiment.host_no_unused_variables", boolToInt preparedConfig.hostNoUnusedVariablesExperiment )
+                    , ( "analysis_cache.entries", analyzedTargetFiles.cacheEntries )
+                    , ( "analysis_cache.loaded_bytes", analyzedTargetFiles.cacheLoadBytes )
+                    , ( "analysis_cache.stored_bytes", analyzedTargetFiles.cacheStoreBytes )
+                    , ( "analysis_cache.hits", analyzedTargetFiles.analysisHits )
+                    , ( "analysis_cache.misses", analyzedTargetFiles.analysisMisses )
+                    , ( "source.bytes", analyzedTargetFiles.sourceBytes )
+                    , ( "ast_json.bytes", analyzedTargetFiles.astJsonBytes )
+                    ]
+
+            finishWithTrace errors extraStages extraCounters =
+                Do.do
+                    (writePerfTrace
+                        preparedConfig.perfTraceJson
+                        { schemaVersion = cacheSchemaVersion
+                        , reviewAppHash = reviewAppHashValue
+                        , cacheDecision = cacheDecisionToString decision
+                        , counters = mergeCounterDicts [ baseCounters, extraCounters, errorCounters errors ]
+                        , stages = baseStages ++ extraStages
+                        }
+                    )
+                <| \_ ->
+                reportErrors preparedConfig.reportFormat errors
+        in
+        case decision of
         FullCacheHit errors ->
             -- All declarations cached — skip interpreter entirely
             finishWithTrace
@@ -8559,14 +9975,13 @@ task config =
                     parseReviewOutputTimed.value
             in
             Do.do (withTimingPure "update_decl_cache" (\() -> updateCacheWithAnalyses Dict.empty targetFileContents errors)) <| \updateDeclCacheTimed ->
-            Do.do (withTimingPure "encode_decl_cache" (\() -> encodeCacheState updateDeclCacheTimed.value)) <| \encodeDeclCacheTimed ->
             Do.do
                 (withTiming "persist_decl_cache"
-                    (Script.writeFile
-                        { path = declCachePath
-                        , body = encodeDeclCacheTimed.value
+                    (persistDeclCache
+                        { directory = declCacheDirectory
+                        , cache = updateDeclCacheTimed.value
+                        , changedPaths = List.map .path targetFileContents
                         }
-                        |> BackendTask.allowFatal
                     )
                 )
             <| \persistDeclCacheTimed ->
@@ -8578,7 +9993,6 @@ task config =
                 , { name = "project_rule_eval", ms = runResult.perf.projectRuleEvalMs }
                 , parseReviewOutputTimed.stage
                 , updateDeclCacheTimed.stage
-                , encodeDeclCacheTimed.stage
                 , persistDeclCacheTimed.stage
                 ]
                 (mergeCounterDicts
@@ -8586,7 +10000,8 @@ task config =
                     , runResult.perf.counters
                     , Dict.fromList
                         [ ( "stale.files", List.length targetFileContents )
-                        , ( "decl_cache.stored_bytes", String.length encodeDeclCacheTimed.value )
+                        , ( "decl_cache.stored_bytes", persistDeclCacheTimed.value.bytesWritten )
+                        , ( "decl_cache.written_shards", persistDeclCacheTimed.value.shardWrites )
                         ]
                     ]
                 )
@@ -8614,14 +10029,13 @@ task config =
                     parseReviewOutputTimed.value
             in
             Do.do (withTimingPure "update_decl_cache" (\() -> updateCacheWithAnalyses previousCache targetFileContents freshErrors)) <| \updateDeclCacheTimed ->
-            Do.do (withTimingPure "encode_decl_cache" (\() -> encodeCacheState updateDeclCacheTimed.value)) <| \encodeDeclCacheTimed ->
             Do.do
                 (withTiming "persist_decl_cache"
-                    (Script.writeFile
-                        { path = declCachePath
-                        , body = encodeDeclCacheTimed.value
+                    (persistDeclCache
+                        { directory = declCacheDirectory
+                        , cache = updateDeclCacheTimed.value
+                        , changedPaths = staleFiles
                         }
-                        |> BackendTask.allowFatal
                     )
                 )
             <| \persistDeclCacheTimed ->
@@ -8633,7 +10047,6 @@ task config =
                 , { name = "project_rule_eval", ms = runResult.perf.projectRuleEvalMs }
                 , parseReviewOutputTimed.stage
                 , updateDeclCacheTimed.stage
-                , encodeDeclCacheTimed.stage
                 , persistDeclCacheTimed.stage
                 ]
                 (mergeCounterDicts
@@ -8641,7 +10054,8 @@ task config =
                     , runResult.perf.counters
                     , Dict.fromList
                         [ ( "stale.files", List.length staleFileContents )
-                        , ( "decl_cache.stored_bytes", String.length encodeDeclCacheTimed.value )
+                        , ( "decl_cache.stored_bytes", persistDeclCacheTimed.value.bytesWritten )
+                        , ( "decl_cache.written_shards", persistDeclCacheTimed.value.shardWrites )
                         ]
                     ]
                 )
@@ -8958,6 +10372,12 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         }
                     )
 
+        staleHandlePayloads =
+            moduleHandlePayloads staleModulesWithAst
+
+        staleHandleIntercepts =
+            buildModuleRuleHandleIntercepts staleHandlePayloads.payloads
+
         allModulesWithAst =
             allFileContents
                 |> List.map
@@ -8991,9 +10411,6 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         )
                 )
 
-        moduleRules =
-            ruleInfo |> List.filter (\r -> r.ruleType == ModuleRule)
-
         hostNoUnusedExportsEnabled =
             config.hostNoUnusedExportsExperiment
                 && List.any (\rule -> rule.name == "NoUnused.Exports") ruleInfo
@@ -9013,6 +10430,44 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
         hostNoUnusedVariablesEnabled =
             config.hostNoUnusedVariablesExperiment
                 && List.any (\rule -> rule.name == "NoUnused.Variables") ruleInfo
+
+        hostNoExposingEverythingEnabled =
+            config.hostNoExposingEverythingExperiment
+                && List.any (\rule -> rule.name == "NoExposingEverything") ruleInfo
+
+        hostNoImportingEverythingEnabled =
+            config.hostNoImportingEverythingExperiment
+                && List.any (\rule -> rule.name == "NoImportingEverything") ruleInfo
+
+        hostNoDebugLogEnabled =
+            config.hostNoDebugLogExperiment
+                && List.any (\rule -> rule.name == "NoDebug.Log") ruleInfo
+
+        hostNoDebugTodoOrToStringEnabled =
+            config.hostNoDebugTodoOrToStringExperiment
+                && List.any (\rule -> rule.name == "NoDebug.TodoOrToString") ruleInfo
+
+        hostNoMissingTypeAnnotationEnabled =
+            config.hostNoMissingTypeAnnotationExperiment
+                && List.any (\rule -> rule.name == "NoMissingTypeAnnotation") ruleInfo
+
+        hostNoMissingTypeAnnotationInLetInEnabled =
+            config.hostNoMissingTypeAnnotationInLetInExperiment
+                && List.any (\rule -> rule.name == "NoMissingTypeAnnotationInLetIn") ruleInfo
+
+        moduleRules =
+            ruleInfo
+                |> List.filter (\r -> r.ruleType == ModuleRule)
+                |> List.filter
+                    (\r ->
+                        (not hostNoExposingEverythingEnabled || r.name /= "NoExposingEverything")
+                            && (not hostNoImportingEverythingEnabled || r.name /= "NoImportingEverything")
+                            && (not hostNoDebugLogEnabled || r.name /= "NoDebug.Log")
+                            && (not hostNoDebugTodoOrToStringEnabled || r.name /= "NoDebug.TodoOrToString")
+                            &&
+                            (not hostNoMissingTypeAnnotationEnabled || r.name /= "NoMissingTypeAnnotation")
+                            && (not hostNoMissingTypeAnnotationInLetInEnabled || r.name /= "NoMissingTypeAnnotationInLetIn")
+                    )
 
         projectRules =
             ruleInfo
@@ -9042,18 +10497,19 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
 
         moduleRuleGroups =
             let
-                declarationShapeRules =
-                    moduleRules
-                        |> List.filter moduleRuleUsesDeclarationShapeOnly
-
-                remainingRules =
-                    moduleRules
-                        |> List.filter (not << moduleRuleUsesDeclarationShapeOnly)
+                effectiveGroupingMode =
+                    effectiveModuleRuleGroupingMode
+                        config.moduleRuleGroupingMode
+                        (List.length staleFileContents)
+                        (List.length allFileContents)
             in
-            [ ( "declaration-shape", declarationShapeRules, True )
-            , ( "default", remainingRules, False )
-            ]
-                |> List.filter (\( _, rules, _ ) -> not (List.isEmpty rules))
+            buildModuleRuleGroups effectiveGroupingMode moduleRules
+
+        effectiveModuleRuleGroupingModeValue =
+            effectiveModuleRuleGroupingMode
+                config.moduleRuleGroupingMode
+                (List.length staleFileContents)
+                (List.length allFileContents)
 
         -- Module rules: batch stale files by cache-equivalent rule groups
         moduleRuleJobs =
@@ -9077,12 +10533,6 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                             fileHashes =
                                                 Dict.get file.path allFileAspectHashes
                                                     |> Maybe.withDefault file.analysis.moduleSummary.aspectHashes
-
-                                            moduleWithAst =
-                                                { path = file.path
-                                                , source = file.source
-                                                , astJson = file.analysis.parsedAst.astJson
-                                                }
 
                                             groupNarrowKey =
                                                 if useFactHashKey then
@@ -9110,18 +10560,16 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                             Cache.compute [ "smr", groupName, file.path ]
                                                 keyHash
                                                 (\() ->
-                                                    case
-                                                        InterpreterProject.prepareAndEval reviewProject
-                                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                                            , expression = buildExpressionForRules groupRuleIndices [ moduleWithAst ]
-                                                            , sourceOverrides = [ reviewRunnerHelperSource ]
-                                                            }
-                                                    of
-                                                        Ok s ->
-                                                            s
-
-                                                        Err e ->
-                                                            e
+                                                    evaluateSingleModuleRuleBatch
+                                                        config.moduleRuleTransportMode
+                                                        reviewProject
+                                                        groupRuleIndices
+                                                        { path = file.path
+                                                        , source = file.source
+                                                        , astJson = file.analysis.parsedAst.astJson
+                                                        }
+                                                        fileIdx
+                                                        staleHandleIntercepts
                                                 )
                                             <| \hash ->
                                             Cache.succeed
@@ -9143,53 +10591,263 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             Dict.fromList
                 [ ( "rules.module.count", List.length moduleRules )
                 , ( "rules.project.count", List.length projectRules )
+                , ( "module.host_exposing_everything.enabled", boolToInt hostNoExposingEverythingEnabled )
+                , ( "module.host_importing_everything.enabled", boolToInt hostNoImportingEverythingEnabled )
+                , ( "module.host_debug_log.enabled", boolToInt hostNoDebugLogEnabled )
+                , ( "module.host_debug_todo_or_to_string.enabled", boolToInt hostNoDebugTodoOrToStringEnabled )
+                , ( "module.host_missing_type_annotation.enabled", boolToInt hostNoMissingTypeAnnotationEnabled )
+                , ( "module.host_missing_type_annotation_in_let_in.enabled", boolToInt hostNoMissingTypeAnnotationInLetInEnabled )
                 , ( "project.host_exports.enabled", boolToInt hostNoUnusedExportsEnabled )
                 , ( "project.host_constructors.enabled", boolToInt hostNoUnusedCustomTypeConstructorsEnabled )
                 , ( "project.host_constructor_args.enabled", boolToInt hostNoUnusedCustomTypeConstructorArgsEnabled )
                 , ( "project.host_parameters.enabled", boolToInt hostNoUnusedParametersEnabled )
                 , ( "project.host_variables.enabled", boolToInt hostNoUnusedVariablesEnabled )
+                , ( "module.grouping.groups", List.length moduleRuleGroups )
+                , ( "module.grouping.auto", boolToInt (config.moduleRuleGroupingMode == ModuleRuleGroupingAuto) )
+                , ( "module.grouping.contracts", boolToInt (effectiveModuleRuleGroupingModeValue == ModuleRuleGroupingContracts) )
+                , ( "module.grouping.legacy", boolToInt (effectiveModuleRuleGroupingModeValue == ModuleRuleGroupingLegacy) )
+                , ( "module.transport.handles", boolToInt (config.moduleRuleTransportMode == ModuleRuleTransportHandles) )
+                , ( "module.transport.records", boolToInt (config.moduleRuleTransportMode == ModuleRuleTransportRecords) )
                 ]
     in
     Do.do
         (withTiming "module_rule_eval"
-            (Cache.run { jobs = config.jobs } config.buildDirectory allMonads
-                |> BackendTask.andThen
-                    (\cacheResult ->
-                        let
-                            mrFiles =
-                                if List.isEmpty moduleRuleJobs then
-                                    []
+            (Do.do
+                (Cache.run { jobs = config.jobs } config.buildDirectory allMonads
+                    |> BackendTask.andThen
+                        (\cacheResult ->
+                            let
+                                mrFiles =
+                                    if List.isEmpty moduleRuleJobs then
+                                        []
 
-                                else
-                                    moduleRuleJobs
-                                        |> List.map
-                                            (\job ->
-                                                File.rawFile
-                                                    (Path.toString cacheResult.output ++ "/" ++ job.outputFilename)
-                                                    |> BackendTask.allowFatal
-                                            )
-                        in
-                        mrFiles
-                            |> BackendTask.Extra.combine
-                            |> BackendTask.map
-                                (\staleOutputs ->
-                                    let
-                                        freshModuleErrors =
-                                            staleOutputs
-                                                |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
-                                                |> String.join "\n"
-                                    in
-                                    [ cachedModuleRuleErrors, freshModuleErrors ]
-                                        |> List.filter (not << String.isEmpty)
-                                        |> String.join "\n"
-                                )
+                                    else
+                                        moduleRuleJobs
+                                            |> List.map
+                                                (\job ->
+                                                    File.rawFile
+                                                        (Path.toString cacheResult.output ++ "/" ++ job.outputFilename)
+                                                        |> BackendTask.allowFatal
+                                                )
+                            in
+                            mrFiles
+                                |> BackendTask.Extra.combine
+                                |> BackendTask.map
+                                    (\staleOutputs ->
+                                        staleOutputs
+                                            |> List.filter (\s -> not (String.isEmpty (String.trim s)) && not (String.startsWith "ERROR:" s))
+                                            |> String.join "\n"
+                                    )
+                        )
+                )
+            <| \freshModuleErrors ->
+            Do.do
+                (withTiming "module.host_exposing_everything_eval"
+                    (if hostNoExposingEverythingEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoExposingEverythingForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "module.host_exposing_everything.skipped", 1 ) ]
+                            }
                     )
+                )
+            <| \hostNoExposingEverythingTimed ->
+            Do.do
+                (withTiming "module.host_importing_everything_eval"
+                    (if hostNoImportingEverythingEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoImportingEverythingForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "module.host_importing_everything.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoImportingEverythingTimed ->
+            Do.do
+                (withTiming "module.host_debug_log_eval"
+                    (if hostNoDebugLogEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoDebugLogForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "module.host_debug_log.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoDebugLogTimed ->
+            Do.do
+                (withTiming "module.host_debug_todo_or_to_string_eval"
+                    (if hostNoDebugTodoOrToStringEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoDebugTodoOrToStringForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "module.host_debug_todo_or_to_string.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoDebugTodoOrToStringTimed ->
+            Do.do
+                (withTiming "module.host_missing_type_annotation_eval"
+                    (if hostNoMissingTypeAnnotationEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoMissingTypeAnnotationForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "module.host_missing_type_annotation.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoMissingTypeAnnotationTimed ->
+            Do.do
+                (withTiming "module.host_missing_type_annotation_in_let_in_eval"
+                    (if hostNoMissingTypeAnnotationInLetInEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoMissingTypeAnnotationInLetInForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "module.host_missing_type_annotation_in_let_in.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoMissingTypeAnnotationInLetInTimed ->
+            let
+                hostNoExposingEverythingOutput =
+                    hostNoExposingEverythingTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoExposingEverythingCounters =
+                    mergeCounterDicts
+                        [ hostNoExposingEverythingTimed.value.counters
+                        , Dict.fromList
+                            [ ( "module.host_exposing_everything.ms", hostNoExposingEverythingTimed.stage.ms ) ]
+                        ]
+
+                hostNoImportingEverythingOutput =
+                    hostNoImportingEverythingTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoImportingEverythingCounters =
+                    mergeCounterDicts
+                        [ hostNoImportingEverythingTimed.value.counters
+                        , Dict.fromList
+                            [ ( "module.host_importing_everything.ms", hostNoImportingEverythingTimed.stage.ms ) ]
+                        ]
+
+                hostNoDebugLogOutput =
+                    hostNoDebugLogTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoDebugLogCounters =
+                    mergeCounterDicts
+                        [ hostNoDebugLogTimed.value.counters
+                        , Dict.fromList
+                            [ ( "module.host_debug_log.ms", hostNoDebugLogTimed.stage.ms ) ]
+                        ]
+
+                hostNoDebugTodoOrToStringOutput =
+                    hostNoDebugTodoOrToStringTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoDebugTodoOrToStringCounters =
+                    mergeCounterDicts
+                        [ hostNoDebugTodoOrToStringTimed.value.counters
+                        , Dict.fromList
+                            [ ( "module.host_debug_todo_or_to_string.ms", hostNoDebugTodoOrToStringTimed.stage.ms ) ]
+                        ]
+
+                hostNoMissingTypeAnnotationOutput =
+                    hostNoMissingTypeAnnotationTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoMissingTypeAnnotationCounters =
+                    mergeCounterDicts
+                        [ hostNoMissingTypeAnnotationTimed.value.counters
+                        , Dict.fromList
+                            [ ( "module.host_missing_type_annotation.ms", hostNoMissingTypeAnnotationTimed.stage.ms ) ]
+                        ]
+
+                hostNoMissingTypeAnnotationInLetInOutput =
+                    hostNoMissingTypeAnnotationInLetInTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoMissingTypeAnnotationInLetInCounters =
+                    mergeCounterDicts
+                        [ hostNoMissingTypeAnnotationInLetInTimed.value.counters
+                        , Dict.fromList
+                            [ ( "module.host_missing_type_annotation_in_let_in.ms", hostNoMissingTypeAnnotationInLetInTimed.stage.ms ) ]
+                        ]
+            in
+            BackendTask.succeed
+                { output =
+                    [ cachedModuleRuleErrors
+                    , freshModuleErrors
+                    , hostNoExposingEverythingOutput
+                    , hostNoImportingEverythingOutput
+                    , hostNoDebugLogOutput
+                    , hostNoDebugTodoOrToStringOutput
+                    , hostNoMissingTypeAnnotationOutput
+                    , hostNoMissingTypeAnnotationInLetInOutput
+                    ]
+                        |> List.filter (not << String.isEmpty)
+                        |> String.join "\n"
+                , counters =
+                    mergeCounterDicts
+                        [ hostNoExposingEverythingCounters
+                        , hostNoImportingEverythingCounters
+                        , hostNoDebugLogCounters
+                        , hostNoDebugTodoOrToStringCounters
+                        , hostNoMissingTypeAnnotationCounters
+                        , hostNoMissingTypeAnnotationInLetInCounters
+                        ]
+                }
             )
         )
     <| \modulePhaseTimed ->
     let
         moduleRuleOutput =
-            modulePhaseTimed.value
+            modulePhaseTimed.value.output
+
+        moduleRuleCounters =
+            modulePhaseTimed.value.counters
     in
     Do.do (withTiming "load_target_project_seed" (loadTargetProjectSeed config)) <| \targetProjectSeedTimed ->
     let
@@ -10242,6 +11900,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             , counters =
                 mergeCounterDicts
                     [ basePerfCounters
+                    , moduleRuleCounters
                     , Dict.fromList
                         [ ( "module_rules.stale_modules", List.length staleModulesWithAst )
                         ]
@@ -10284,6 +11943,12 @@ loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents =
                         encodeFileAsJson source
                             |> Maybe.map (\astJson -> { path = path, source = source, astJson = astJson })
                     )
+
+        mrfHandlePayloads =
+            moduleHandlePayloads modulesWithAst
+
+        mrfHandleIntercepts =
+            buildModuleRuleHandleIntercepts mrfHandlePayloads.payloads
 
         -- Compute per-file aspect hashes for narrow cache keys
         allFileAspectHashes : Dict String SemanticHash.FileAspectHashes
@@ -10340,18 +12005,13 @@ loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents =
                             Cache.compute [ "mrf", file.path ]
                                 keyHash
                                 (\() ->
-                                    case
-                                        InterpreterProject.prepareAndEval reviewProject
-                                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                                            , expression = buildExpressionForRules moduleRuleIndices [ file ]
-                                            , sourceOverrides = [ reviewRunnerHelperSource ]
-                                            }
-                                    of
-                                        Ok s ->
-                                            s
-
-                                        Err e ->
-                                            e
+                                    evaluateSingleModuleRuleBatch
+                                        config.moduleRuleTransportMode
+                                        reviewProject
+                                        moduleRuleIndices
+                                        file
+                                        fileIdx
+                                        mrfHandleIntercepts
                                 )
                             <| \hash ->
                             Cache.succeed
@@ -12813,17 +14473,6 @@ loadReviewProjectDetailed config =
                         ]
                 }
             )
-
-
-{-| Write the per-declaration cache to disk.
--}
-persistCache : String -> CacheState -> BackendTask FatalError ()
-persistCache path cache =
-    Script.writeFile
-        { path = path
-        , body = encodeCacheState cache
-        }
-        |> BackendTask.allowFatal
 
 
 {-| Report errors and exit with appropriate code.

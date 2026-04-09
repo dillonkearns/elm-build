@@ -376,11 +376,32 @@ combineTree (Tree tree) =
                 |> String.join "|"
                 |> stringToHash
     in
-    derive {- "combine" -} outputHash <| \{ prefix, buildPath } target ->
-    Do.do (execLog prefix "mkdir" [ "-p", hashToPath buildPath target ]) <| \_ ->
-    combined
-        |> Dict.foldl (\outputFilename hash acc -> execLog prefix "cp" [ "-rl", hashToPath buildPath hash, hashToPath buildPath target ++ "/" ++ outputFilename ] :: acc) []
-        |> BackendTask.Extra.combineBy_ parallelism
+    derive {- "combine" -} outputHash <| \{ buildPath } target ->
+    let
+        destDir : String
+        destDir =
+            hashToPath buildPath target
+
+        entries : List Json.Encode.Value
+        entries =
+            combined
+                |> Dict.toList
+                |> List.map
+                    (\( outputFilename, hash ) ->
+                        Json.Encode.object
+                            [ ( "src", Json.Encode.string (hashToPath buildPath hash) )
+                            , ( "destName", Json.Encode.string outputFilename )
+                            ]
+                    )
+    in
+    BackendTask.Custom.run "linkCopies"
+        (Json.Encode.object
+            [ ( "destDir", Json.Encode.string destDir )
+            , ( "entries", Json.Encode.list identity entries )
+            ]
+        )
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
 
 
 {-| -}
@@ -547,9 +568,13 @@ commandLog prefix cmd args =
 {-| -}
 logCommand : List String -> String -> List String -> BackendTask error a -> BackendTask error a
 logCommand prefix cmd args task =
-    BackendTask.Extra.timed
-        (String.join " " (prefix ++ "Running" :: cmd :: args))
-        (String.join " " (prefix ++ "Ran    " :: cmd :: args))
+    if debug then
+        BackendTask.Extra.timed
+            (String.join " " (prefix ++ "Running" :: cmd :: args))
+            (String.join " " (prefix ++ "Ran    " :: cmd :: args))
+            task
+
+    else
         task
 
 
@@ -646,8 +671,22 @@ listExisting path =
         |> BackendTask.allowFatal
         |> BackendTask.map
             (\raw ->
-                HashSet (innerHashSetFromList raw)
+                HashSet
+                    (raw
+                        |> List.filterMap parseExistingHash
+                        |> innerHashSetFromList
+                    )
             )
+
+
+parseExistingHash : String -> Maybe Int
+parseExistingHash raw =
+    if String.startsWith "tmp-" raw || String.startsWith "workspace-" raw then
+        Nothing
+
+    else
+        Hex.fromString raw
+            |> Result.toMaybe
 
 
 {-| -}
@@ -779,7 +818,9 @@ jobs_ =
 
 {-| -}
 type FileOrDirectory
-    = Hash String
+    = Hash Int
+    | Temporary Int
+    | Workspace Int
 
 
 {-| Build an hashed file from the output of shaXsum/b3sum.
@@ -792,45 +833,74 @@ inputHash raw =
             String.left 8 raw
     in
     Hex.fromString clean
-        |> Result.map (\_ -> Hash clean)
+        |> Result.map Hash
+
+
+hashIntToString : Int -> String
+hashIntToString hash =
+    hash
+        |> Hex.toString
+        |> String.padLeft 8 '0'
 
 
 hashToPath : Path -> FileOrDirectory -> String
-hashToPath buildPath (Hash hash) =
-    Path.toString buildPath ++ "/" ++ hash
+hashToPath buildPath hash =
+    Path.toString buildPath ++ "/" ++ hashToString hash
 
 
 hashToString : FileOrDirectory -> String
-hashToString (Hash hash) =
-    hash
+hashToString fileOrDirectory =
+    case fileOrDirectory of
+        Hash hash ->
+            hashIntToString hash
+
+        Temporary hash ->
+            "tmp-" ++ hashIntToString hash
+
+        Workspace hash ->
+            "workspace-" ++ hashIntToString hash
 
 
 hashToTmp : FileOrDirectory -> FileOrDirectory
-hashToTmp (Hash hash) =
-    Hash ("tmp-" ++ hash)
+hashToTmp fileOrDirectory =
+    case fileOrDirectory of
+        Hash hash ->
+            Temporary hash
+
+        Temporary hash ->
+            Temporary hash
+
+        Workspace hash ->
+            Workspace hash
 
 
 hashToWorkspace : FileOrDirectory -> FileOrDirectory
-hashToWorkspace (Hash hash) =
-    Hash ("workspace-" ++ hash)
+hashToWorkspace fileOrDirectory =
+    case fileOrDirectory of
+        Hash hash ->
+            Workspace hash
+
+        Temporary hash ->
+            Workspace hash
+
+        Workspace hash ->
+            Workspace hash
 
 
 extendHashWith : List String -> FileOrDirectory -> FileOrDirectory
-extendHashWith l (Hash r) =
-    stringToHash (String.join "|" (r :: l))
+extendHashWith l hash =
+    stringToHash (String.join "|" (hashToString hash :: l))
 
 
 stringToHash : String -> FileOrDirectory
 stringToHash raw =
     raw
         |> FNV1a.hash
-        |> Hex.toString
-        |> String.padLeft 8 '0'
         |> Hash
 
 
 type HashSet
-    = HashSet (BST String)
+    = HashSet (BST Int)
 
 
 type BST a
@@ -844,8 +914,8 @@ hashSetEmpty =
 
 
 hashSetMember : FileOrDirectory -> HashSet -> Bool
-hashSetMember (Hash x) (HashSet s) =
-    innerHashSetMember x s
+hashSetMember fileOrDirectory (HashSet s) =
+    innerHashSetMember (hashToInt fileOrDirectory) s
 
 
 innerHashSetMember : comparable -> BST comparable -> Bool
@@ -867,8 +937,8 @@ innerHashSetMember k t =
 
 
 hashSetInsert : FileOrDirectory -> HashSet -> HashSet
-hashSetInsert (Hash x) (HashSet s) =
-    HashSet (innerHashSetInsert x s |> Maybe.withDefault s)
+hashSetInsert fileOrDirectory (HashSet s) =
+    HashSet (innerHashSetInsert (hashToInt fileOrDirectory) s |> Maybe.withDefault s)
 
 
 innerHashSetInsert : comparable -> BST comparable -> Maybe (BST comparable)
@@ -967,6 +1037,19 @@ hashSetToList : HashSet -> List FileOrDirectory
 hashSetToList (HashSet s) =
     innerHashSetToList s
         |> List.map Hash
+
+
+hashToInt : FileOrDirectory -> Int
+hashToInt fileOrDirectory =
+    case fileOrDirectory of
+        Hash hash ->
+            hash
+
+        Temporary hash ->
+            hash
+
+        Workspace hash ->
+            hash
 
 
 innerHashSetToList : BST a -> List a

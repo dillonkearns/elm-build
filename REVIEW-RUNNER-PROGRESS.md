@@ -2005,3 +2005,648 @@ It is partly `persist_decl_cache`, but the larger remaining gap now looks like
 process/bootstrap/runtime overhead outside the traced Elm stages. That makes
 Node/V8 startup or bundle/runtime overhead the next attribution target, not
 another guess inside the existing traced pipeline.
+
+### `elm-pages3` Yield Experiment
+
+I also tried the experimental `../elm-pages3` change that yields between
+`BackendTask` batches to reduce GC backpressure during script execution.
+
+I bundled the runner with the local `elm-pages3` branch and reran the direct
+probe on `small-12` with the full host-backed `NoUnused` set:
+
+| Scenario | Wall | `load_review_project` | `module_rule_eval` | `project_rule_eval` |
+|---|---:|---:|---:|---:|
+| Warm 1-file body edit | `1691ms` | `267ms` | `305ms` | `15ms` |
+
+Compared to the previous direct probe, this is not a meaningful win. The warm
+body-edit wall remained in the same band, and the traced inner stages did not
+show a clear reduction that would justify attributing the remaining gap to GC
+backpressure in `BackendTask` batch scheduling.
+
+Current read:
+
+- The yield-between-batches experiment does not appear to move the common warm
+  path on this benchmark in a meaningful way.
+- The main bottlenecks remain startup/runtime overhead outside traced Elm
+  stages, plus remaining module-rule execution.
+- This is a useful negative result, but it does not change the optimization
+  priority order.
+
+### Type-Annotation Module-Rule Upper Bound
+
+I added two fact-backed upper-bound experiments for the remaining hot module
+rules:
+
+- `NoMissingTypeAnnotation`
+- `NoMissingTypeAnnotationInLetIn`
+
+They reuse the existing cached function summaries:
+
+- top-level function summaries for `NoMissingTypeAnnotation`
+- nested function summaries (excluding lambdas) for `NoMissingTypeAnnotationInLetIn`
+
+Both experiments are isolated behind flags and come with pure helper tests.
+
+Isolated results on `small-12`:
+
+| Rule | Scenario | Interpreted baseline | Host/fact upper bound |
+|---|---|---:|---:|
+| `NoMissingTypeAnnotation` | Cold | `49.63s` | `24.26s` |
+| `NoMissingTypeAnnotation` | Warm 1-file body edit | `1.45s` | `1.286s` |
+| `NoMissingTypeAnnotationInLetIn` | Cold | `55.07s` | `25.36s` |
+| `NoMissingTypeAnnotationInLetIn` | Warm 1-file body edit | `1.52s` | `1.285s` |
+
+The key internal signal is that `module_rule_eval` for the isolated rules
+effectively disappears:
+
+- `NoMissingTypeAnnotation`: `17ms` cold, `3ms` warm body edit
+- `NoMissingTypeAnnotationInLetIn`: `21ms` cold, `4ms` warm body edit
+
+That is strong confirmation that these two rules are real remaining module-rule
+hot spots, and that the cached summary layer is rich enough to bypass them.
+
+Mixed direct probe with all five host-backed `NoUnused` experiments plus both
+type-annotation experiments:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Warm 1-file body edit | `1660ms` | `1479ms` |
+| `module_rule_eval` | `307ms` | `209ms` |
+| `load_review_project` | `213ms` | `207ms` |
+| `project_rule_eval` | `12ms` | `10ms` |
+
+So the type-annotation upper bound buys about `180ms` on the mixed warm
+body-edit path. That is useful, but it also makes the next conclusion clearer:
+the remaining gap to `elm-review` CLI is now increasingly dominated by
+startup/runtime/setup overhead rather than project-rule execution.
+
+### Startup / Bundle Overhead Attribution
+
+I tested the “rich CLI parsing is slow” theory directly by adding a separate
+fast entrypoint (`ReviewRunnerFast.elm`) that takes a single JSON config from
+`REVIEW_RUNNER_CONFIG_JSON` instead of going through the large `Cli.*` options
+surface.
+
+That A/B did **not** show a win on the real warm body-edit path:
+
+| Entry | Warm 1-file body edit |
+|---|---:|
+| Current runner entry | `1587ms` |
+| Fast env-config entry | `1637ms` |
+
+So the rich CLI/options parser is not the main culprit.
+
+I then added two more probes:
+
+- `StartupNoOp.elm`: a minimal no-op script
+- `startupOnly` mode on the fast runner entrypoint, which exits after startup
+  and `prepare_config`
+
+Startup benchmark (`5` iterations):
+
+| Script | Average | Min | Max |
+|---|---:|---:|---:|
+| `StartupNoOp` | `235ms` | `229ms` | `241ms` |
+| `ReviewRunnerFast startupOnly` | `227ms` | `222ms` | `230ms` |
+
+Bundle sizes are effectively identical:
+
+| Bundle | Size |
+|---|---:|
+| `dist/startup-no-op-bench.mjs` | `1,318,265` bytes |
+| `dist/review-runner-fast-bench.mjs` | `1,318,270` bytes |
+
+This is the important conclusion:
+
+- There is a real process/runtime floor of about `230ms`.
+- That floor is basically the same for a no-op script and the fast runner
+  startup-only path.
+- So the large remaining gap on warm body edits is **not** primarily the rich
+  CLI parser, and it is **not** primarily the runner bundle size/import cost.
+
+That moves the priority back to traced work:
+
+- `load_review_project` (~`220ms`)
+- `module_rule_eval` (~`209ms` with current host-backed upper bounds)
+- `persist_decl_cache` (~`90ms`)
+
+And inside `load_review_project`, the biggest remaining target is the package
+summary cache decode itself:
+
+- `decode_package_summary_cache_ms` ~ `137ms`
+- `build_package_env_from_summaries_ms` ~ `3ms`
+- `build_graph_ms` ~ `45ms`
+
+So the next likely high-value experiment is a faster durable cache format for
+package summaries, not more CLI/parser work.
+
+### Package Summary Cache Codec Benchmark
+
+I added a direct codec benchmark for the review-app package summary cache in:
+
+- `src/PackageSummaryCacheBenchmark.elm`
+- `src/ReviewRunner.elm`
+- `src/InterpreterProject.elm`
+
+This uses the exact same review-project loading configuration as the runner:
+
+- same `patchSource`
+- same skipped kernel/conflicting packages
+- same helper reachable imports
+- same reduced package-module closure
+
+It first seeds the package summary cache, then benchmarks repeated encode/decode
+of the same cached summaries in two formats:
+
+- current Lamdera.Wire binary blob
+- JSON encoding of the same reduced package summary structure
+
+Warm benchmark result (`5` iterations):
+
+```json
+{
+  "iterations": 5,
+  "summaryCount": 122,
+  "binaryBytes": 1385602,
+  "jsonChars": 8726090,
+  "seedCacheHit": 1,
+  "seedParsePackageSourcesMs": 0,
+  "seedBuildPackageSummariesFromParsedMs": 0,
+  "seedDecodePackageSummaryCacheMs": 156,
+  "binaryEncodeMs": 832,
+  "binaryDecodeMs": 776,
+  "jsonEncodeMs": 601,
+  "jsonDecodeMs": 1656
+}
+```
+
+The read is straightforward:
+
+- Binary stays much smaller (`1.39MB` vs `8.73MB`).
+- JSON encode is a bit faster.
+- JSON decode is much slower.
+- So a simple “replace the package summary blob with JSON” change is not the
+  right next optimization.
+
+This rules out the easiest alternative format and narrows the next choices to:
+
+- a more specialized binary format
+- pushing more of the decode work into JS/custom backend tasks
+- or shifting attention to the other remaining traced costs first
+
+At this point, the package summary cache is still worth optimizing, but JSON is
+not the path.
+
+### Declaration Cache Sharding
+
+I switched the on-disk declaration cache from one monolithic JSON file to:
+
+- a lightweight manifest
+- one shard per target file
+- legacy fallback for old single-file caches
+
+The in-memory cache shape is unchanged. Only the persistence layout changed.
+
+The direct warm body-edit trace with the current host-backed `NoUnused.*` and
+type-annotation shortcuts now shows:
+
+| Metric | Before | After |
+|---|---:|---:|
+| `decl_cache.stored_bytes` | about `1.9MB` | `1455` bytes |
+| `decl_cache.written_shards` | n/a | `1` |
+| `persist_decl_cache` | about `90ms` | `6ms` |
+
+Warm trace details after the change:
+
+- `load_decl_cache`: `7ms`
+- `decl_cache.loaded_bytes`: `1928102`
+- `decl_cache.loaded_shards`: `12`
+- `persist_decl_cache`: `6ms`
+- `decl_cache.stored_bytes`: `1455`
+- `decl_cache.written_shards`: `1`
+
+So this is a clear constant-factor win on the common partial-miss path.
+
+It does **not** reduce load cost yet because load still reads all current file
+shards. But it removes most of the unnecessary write/encode churn on partial
+misses, and it narrows the next bottleneck further to:
+
+- `load_review_project`
+- remaining `module_rule_eval`
+- startup/runtime floor
+
+### Explicit Fact Projections
+
+I turned the existing fact-hash path into an explicit typed projection layer.
+
+New pieces in `ReviewRunner.elm`:
+
+- `FactProjectionArtifact a = { hash, value }`
+- `FactProjections`
+- `RuleProjectionKey`
+- `factProjectionsForSource`
+- `factProjectionsForSummary`
+- `buildRuleProjectionKey`
+
+The important part is that `factHashesForSummary` now derives from typed
+projection artifacts instead of hashing directly from `CrossModuleSummary`.
+Runtime behavior is intentionally unchanged in this slice. The goal was to make
+the projection boundary explicit and testable before using it to drive more
+invalidation decisions.
+
+Added test coverage:
+
+- direct projection extraction on a representative module
+- projection artifact hash matches legacy `FactHashes`
+- `buildRuleProjectionKey` stringifies to the same key as the legacy
+  `buildFactContractHashKey`
+- existing comment/import/body/signature/constructor hash-stability tests still
+  pass
+
+Validation:
+
+- `npx elm-pages run src/RunTests.elm` -> `246 passed, 0 failed`
+- `npx elm-pages bundle-script src/ReviewRunner.elm --output dist/review-runner-bench.mjs`
+
+This gives us a safer next step for runtime work: use explicit
+`FactProjection`/`RuleProjectionKey` values to narrow remaining interpreted
+module-rule invalidation, instead of bolting more ad hoc fact-hash handling
+onto the existing cache logic.
+
+### Broader Contract-Keyed Module Rule Grouping
+
+I extended the mixed module-rule batching so any module rule with an explicit
+`RuleFactContract` now gets grouped into a projection-keyed batch, instead of
+only the special `DeclarationShape` case.
+
+New explicit module-rule contracts:
+
+- `NoMissingTypeAnnotationInLetIn` -> `DeclarationShape`
+- `NoExposingEverything` -> `ExportShape`
+- `NoImportingEverything` -> `ImportShape`
+
+That means these rules no longer fall into the broad default module-rule batch
+on body-only edits when their projection hashes are unchanged.
+
+Validation:
+
+- `npx elm-pages run src/RunTests.elm` -> `250 passed, 0 failed`
+- `npx elm-pages bundle-script src/ReviewRunner.elm --output dist/review-runner-bench.mjs`
+
+I do **not** have a clean warm body-edit timing for this slice yet. The
+existing direct benchmark harness is a poor fit because it spends most of its
+time reseeding a fresh workspace before it reaches the warmed partial-miss run.
+The next measurement task should be a tiny dedicated warmed-body-edit probe so
+we can isolate the runtime effect of the broader grouping cleanly.
+
+### Dedicated Module-Rule Grouping Probe
+
+I added two measurement tools for the broader contract-keyed module-rule
+grouping work:
+
+- `moduleRuleGroupingMode` in `ReviewRunner` with two modes:
+  - `contracts`
+  - `legacy`
+- `bench/module-rule-grouping-probe.mjs`
+
+The reduced probe uses a module-only review config with:
+
+- `NoExposingEverything`
+- `NoImportingEverything`
+- `NoMissingTypeAnnotation`
+- `NoMissingTypeAnnotationInLetIn`
+- `NoUnused.Patterns`
+
+This isolates the grouping effect without the host-backed `NoUnused.*`
+shortcuts.
+
+Legacy mode completed and produced a clean warm body-edit trace:
+
+| Metric | Legacy |
+|---|---:|
+| `load_review_project` | `188ms` |
+| `module_rule_eval` | `287ms` |
+| `project_rule_eval` | `3ms` |
+| `persist_decl_cache` | `7ms` |
+
+The broader `contracts` mode exposed an important negative signal on the cold
+path: the reduced probe's cold seed did not complete even after running
+materially longer than the legacy cold seed. I stopped that run before claiming
+an A/B number.
+
+Current read:
+
+- The explicit projection layer is correct and test-covered.
+- Grouping more module rules by explicit contracts is architecturally sound.
+- A naive “group every contract-bearing module rule separately” strategy can
+  over-fragment the cold path.
+
+That points to the next refinement:
+
+- apply broader contract-keyed grouping only on partial misses, or
+- keep only the highest-value module rules on separate contract-keyed batches,
+  instead of widening it indiscriminately.
+
+### Auto Grouping On Partial Misses
+
+I refined `moduleRuleGroupingMode` to support:
+
+- `legacy`
+- `contracts`
+- `auto`
+
+`auto` now uses:
+
+- `legacy` for cold/full-stale module runs
+- `contracts` only for true partial misses
+
+I switched the reduced probe to run through `ReviewRunnerFast` with
+`REVIEW_RUNNER_CONFIG_JSON`, because the bundled CLI entrypoint is currently
+broken for benchmark flags.
+
+That let me get a clean A/B from the reduced warmed body-edit path:
+
+| Metric | `legacy` | `auto` |
+|---|---:|---:|
+| `load_review_project` | `203ms` | `196ms` |
+| `module_rule_eval` | `374ms` | `567ms` |
+| `project_rule_eval` | `3ms` | `3ms` |
+| `persist_decl_cache` | `7ms` | `6ms` |
+| grouping counters | `groups=2`, `legacy=1` | `groups=4`, `auto=1`, `contracts=1` |
+
+So even after limiting contract grouping to partial misses, the reduced module
+path is still materially worse. I changed the default module-rule grouping mode
+back to `legacy`.
+
+Current read:
+
+- explicit projection artifacts are still the right abstraction
+- broad contract-keyed module grouping is not paying for itself
+- the next improvement should be narrower, rule-targeted use of those
+  projections rather than more batching fragmentation
+
+### Package Summary Cache: Sharded Decode Benchmark
+
+I extended `PackageSummaryCacheBenchmark` to compare three representations of
+the review-app package summary cache:
+
+- one large Lamdera binary blob
+- one Lamdera binary blob per module (“sharded”)
+- JSON
+
+Measured on the current reduced package closure:
+
+| Metric | One blob | Sharded blobs | JSON |
+|---|---:|---:|---:|
+| Size | `1,385,602` bytes | `1,385,600` bytes | `8,726,090` chars |
+| Encode (`5` iters) | `739ms` | `625ms` | `473ms` |
+| Decode (`5` iters) | `747ms` | `716ms` | `915ms` |
+
+Interpretation:
+
+- JSON is still not the right runtime format because decode is much slower and
+  the payload is much larger.
+- Sharding is directionally better than one large blob, but only by a small
+  margin on decode.
+- So package-summary format work still looks incremental, not like the next
+  big breakthrough.
+
+### Remaining Module-Rule Hotspots
+
+I patched `bench/module-rules-benchmark.mjs` to use the working fast
+env-config path and re-ran isolated module rules.
+
+Current isolated warm 1-file body-edit costs:
+
+| Rule | `load_review_project` | `module_rule_eval` | wall |
+|---|---:|---:|---:|
+| `NoDebug.Log` | `188ms` | `180ms` | `1989ms` |
+| `NoDebug.TodoOrToString` | `199ms` | `188ms` | `2073ms` |
+
+So after the type-annotation work, the debug-family module rules are now the
+next credible module-rule target.
+
+### Generic Prep For Debug-Rule Shortcuts
+
+I added `SemanticHash.extractDependenciesWithRanges` and changed
+`CrossModuleSummary.dependencyRefs` to carry source ranges.
+
+This is not a user-visible optimization by itself yet. The point is to unlock a
+generic fact-based path for rules like:
+
+- `NoDebug.Log`
+- `NoDebug.TodoOrToString`
+
+without introducing another fully ad hoc summary shape just for those rules.
+
+### Visitor-Backed Debug Rules
+
+I added the first explicit `VisitorContract` layer and used it to drive
+host-backed upper-bound experiments for:
+
+- `NoDebug.Log`
+- `NoDebug.TodoOrToString`
+
+The new path reuses `CrossModuleSummary.dependencyRefs` with ranges plus
+module/import resolution helpers, instead of re-entering the interpreted
+expression visitor.
+
+#### Isolated module-rule result
+
+| Rule | Mode | Cold | Warm | Warm 1-file body edit |
+| --- | --- | ---: | ---: | ---: |
+| `NoDebug.Log` | interpreted | `132.51s` | `0.54s` | `2.25s` |
+| `NoDebug.Log` | host-backed | `36.53s` | `0.58s` | `2.19s` |
+| `NoDebug.TodoOrToString` | interpreted | `131.84s` | `0.54s` | `2.25s` |
+| `NoDebug.TodoOrToString` | host-backed | `36.47s` | `0.59s` | `2.21s` |
+
+And the traced rule phase drops sharply:
+
+| Rule | Mode | `module_rule_eval` on warm body edit |
+| --- | --- | ---: |
+| `NoDebug.Log` | interpreted | `198ms` |
+| `NoDebug.Log` | host-backed | `8ms` |
+| `NoDebug.TodoOrToString` | interpreted | `193ms` |
+| `NoDebug.TodoOrToString` | host-backed | `7ms` |
+
+So the visitor-backed seam is real for the isolated rules.
+
+#### Mixed warm body-edit result
+
+I then reran the reduced warmed-body probe on the full `small-12` config with:
+
+- host-backed `NoUnused.*`
+- host-backed type-annotation rules
+- with and without host-backed debug rules
+
+| Metric | No host debug | Host debug |
+| --- | ---: | ---: |
+| wall | `2411ms` | `2478ms` |
+| `load_review_project` | `240ms` | `267ms` |
+| `module_rule_eval` | `290ms` | `284ms` |
+| `project_rule_eval` | `11ms` | `15ms` |
+
+That is the important constraint: the visitor-backed debug shortcuts are
+correct and valuable in isolation, but they do not currently move the mixed
+warm body-edit path enough to justify treating them as the next primary
+optimization lever.
+
+Current interpretation:
+
+- `VisitorContract` is the right architectural direction.
+- Visitor-shaped cached inputs can collapse individual hot rules.
+- The next big mixed-rule wins will come from the remaining shared overheads,
+  not from simply adding more isolated host shortcuts one-by-one.
+
+### Shape-Based Module Rules
+
+I then targeted the two remaining shape-only rules directly:
+
+- `NoExposingEverything`
+- `NoImportingEverything`
+
+These are simpler than the debug rules because error presence depends only on
+already-cached shape facts:
+
+- module `exposing (..)`
+- import `exposing (..)`
+
+The host-backed paths now use parser-derived facts from `CrossModuleSummary`
+instead of string matching, so they are not fooled by comments/docs.
+
+#### Isolated result
+
+| Rule | Mode | Warm body edit wall | `module_rule_eval` |
+| --- | --- | ---: | ---: |
+| `NoExposingEverything` | interpreted | `2251ms` | `174ms` |
+| `NoExposingEverything` | host-backed | `2224ms` | `12ms` |
+| `NoImportingEverything` | interpreted | `2231ms` | `200ms` |
+| `NoImportingEverything` | host-backed | `2306ms` | `10ms` |
+
+So both shape-based rules collapse cleanly in isolation.
+
+#### Mixed warmed body-edit probe
+
+I reran the reduced warmed probe on the current source tree, with:
+
+- host-backed `NoUnused.*`
+- host-backed type-annotation rules
+- host-backed debug rules
+- with and without host-backed shape rules
+
+| Metric | No host shape | Host shape |
+| --- | ---: | ---: |
+| wall | `2394ms` | `2380ms` |
+| `load_review_project` | `229ms` | `240ms` |
+| `module_rule_eval` | `260ms` | `202ms` |
+| `project_rule_eval` | `14ms` | `11ms` |
+
+Interpretation:
+
+- the shape rules are worth keeping
+- they remove about `58ms` from traced `module_rule_eval`
+- but they only move wall time by about `14ms`, because shared overheads are
+  now larger than those two individual rules
+
+At this point the remaining interpreted module cost is effectively:
+
+- `NoUnused.Patterns`
+
+So the next optimization decision is now very focused:
+
+1. eliminate `NoUnused.Patterns`
+2. or switch attention back to `load_review_project`
+
+### Package Summary Cache v6
+
+I switched the package-summary cache format to stop storing `moduleKey`
+strings inside imported-name mappings. That key is a pure function of
+`moduleName`, so the old cache was carrying redundant data in every entry.
+
+Implementation:
+
+- bumped `packageSummaryCacheVersion` in [src/InterpreterProject.elm](src/InterpreterProject.elm)
+- removed `moduleKey` from the serialized qualified-mapping payload
+- reconstruct `moduleKey` during decode with `Environment.moduleKey`
+
+This is a narrow cache-format optimization only. No runtime semantics changed.
+
+#### Package-summary codec benchmark
+
+Using `src/PackageSummaryCacheBenchmark.elm` after the cache-format change:
+
+| Metric | Previous | Current |
+| --- | ---: | ---: |
+| binary bytes | `1,385,602` | `1,313,565` |
+| sharded binary bytes | `1,385,600` | `1,313,563` |
+| json chars | `8,726,090` | `8,537,727` |
+| binary encode (`5` iters) | `739ms` | `723ms` |
+| binary decode (`5` iters) | `747ms` | `741ms` |
+| sharded binary encode (`5` iters) | `625ms` | `581ms` |
+| sharded binary decode (`5` iters) | `716ms` | `705ms` |
+| json encode (`5` iters) | `473ms` | `477ms` |
+| json decode (`5` iters) | `915ms` | `933ms` |
+
+Interpretation:
+
+- The payload got materially smaller.
+- Decode improved slightly, not dramatically.
+- This is a real constant-factor improvement, but it is not the next
+  breakthrough by itself.
+
+#### `small-12` warm body-edit probe
+
+After seeding a fresh workspace once, the reduced warmed body-edit probe
+currently measures:
+
+| Metric | Current |
+| --- | ---: |
+| wall | `2276ms` |
+| `load_review_project` | `231ms` |
+| `module_rule_eval` | `182ms` |
+| `project_rule_eval` | `13ms` |
+| `persist_decl_cache` | `12ms` |
+
+The useful point here is that `load_review_project` is still one of the largest
+remaining traced stages, and this cache-format change only trims it a bit.
+
+### `elm-spa-example` spot check
+
+I also ran a real-app comparison against `rtfeldman/elm-spa-example` (33 files).
+
+Important caveat:
+
+- the normal bundled `withCliOptions` entrypoint is currently broken for this repo
+  under `elm-pages bundle-script`
+- so these runner numbers use the working bundled fast entrypoint
+  (`dist/review-runner-fast-bench.mjs`) rather than the normal flag-based CLI
+
+Current numbers:
+
+| Scenario | runner fast entrypoint | `elm-review` CLI |
+| --- | ---: | ---: |
+| warm, no changes | `300ms` | `436ms` |
+| warm, 1-file body edit | `774ms` | `416ms` |
+
+For the warm body-edit run on `elm-spa-example`, the runner trace showed:
+
+| Stage | Time |
+| --- | ---: |
+| `load_review_project` | `214ms` |
+| `module_rule_eval` | `7ms` |
+| `project_rule_eval` | `8ms` |
+
+Interpretation:
+
+- On a real app, we already beat `elm-review` CLI on warm full-hit runs.
+- On a trivial 1-file body edit, we are still behind.
+- On that body-edit path, the remaining gap is mostly shared overhead and
+  `load_review_project`, not project-rule work.
+
+That keeps the priority order the same:
+
+1. reduce `load_review_project`, especially package-summary decode and related
+   review-project setup
+2. avoid chasing low-leverage transport tweaks that do not reuse decoded data
+3. only optimize individual remaining rules when a benchmark shows they still
+   matter in the mixed path

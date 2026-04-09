@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 
 export function profile(label) {
     console.profile(label);
@@ -70,4 +71,45 @@ export function writeBinaryFile(input) {
             }
         })
     );
+}
+
+async function hardlinkRecursive(src, dest) {
+    const stat = await fs.promises.lstat(src);
+
+    if (stat.isDirectory()) {
+        await fs.promises.mkdir(dest, { recursive: true });
+        const entries = await fs.promises.readdir(src);
+        for (const entry of entries) {
+            await hardlinkRecursive(path.join(src, entry), path.join(dest, entry));
+        }
+        return;
+    }
+
+    if (stat.isSymbolicLink()) {
+        const target = await fs.promises.readlink(src);
+        await fs.promises.symlink(target, dest);
+        return;
+    }
+
+    try {
+        await fs.promises.link(src, dest);
+    } catch (error) {
+        if (error && (error.code === "EXDEV" || error.code === "EEXIST")) {
+            await fs.promises.copyFile(src, dest);
+        } else {
+            throw error;
+        }
+    }
+}
+
+/**
+ * @param {{ destDir: string, entries: Array<{ src: string, destName: string }> }} input
+ * @returns {Promise<void>}
+ */
+export async function linkCopies(input) {
+    await fs.promises.mkdir(input.destDir, { recursive: true });
+
+    for (const entry of input.entries) {
+        await hardlinkRecursive(entry.src, path.join(input.destDir, entry.destName));
+    }
 }
