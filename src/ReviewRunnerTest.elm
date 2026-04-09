@@ -489,6 +489,77 @@ run value =
                         |> Expect.equal
                             [ ( 5, "Missing type annotation for `helper`" ) ]
             ]
+        , describe "hostNoUnusedPatternsErrorsForSources"
+            [ test "reports unused case branch binding" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedPatternsErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+run maybeValue =
+    case maybeValue of
+        Just something ->
+            1
+
+        Nothing ->
+            0
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> Expect.equal
+                            [ ( 5, "Value `something` is not used" ) ]
+            , test "reports unused let destructuring field" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedPatternsErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+run record =
+    let
+        { used, unused } =
+            record
+    in
+    used
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> Expect.equal
+                            [ ( 5, "Value `unused` is not used" ) ]
+            , test "reports useless tuple destructuring" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedPatternsErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+run pair =
+    let
+        (_, _) =
+            pair
+    in
+    1
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> Expect.equal
+                            [ ( 5, "Tuple pattern is not needed" ) ]
+            , test "reports redundant wildcard as-pattern in function arguments" <|
+                \_ ->
+                    ReviewRunner.hostNoUnusedPatternsErrorsForSources
+                        [ { path = "src/A.elm"
+                          , source = """module A exposing (run)
+
+run (_ as alias) =
+    alias
+"""
+                          }
+                        ]
+                        |> List.map (\error -> ( error.line, error.message ))
+                        |> Expect.equal
+                            [ ( 3, "Pattern `_` is not needed" ) ]
+            ]
         , describe "hostNoExposingEverythingErrorsForSources"
             [ test "reports exposing everything module definition" <|
                 \_ ->

@@ -9,6 +9,7 @@ dependency order (packages first, then user sources).
 -}
 
 import BackendTask exposing (BackendTask)
+import BackendTask.Custom
 import BackendTask.Do as Do
 import BackendTask.Env
 import BackendTask.Extra
@@ -17,9 +18,27 @@ import BackendTask.Glob as Glob
 import Dict exposing (Dict)
 import FatalError exposing (FatalError)
 import Json.Decode as Decode
+import Json.Encode
 import Pages.Script as Script
 import Path exposing (Path)
+import Result.Extra
 import Set exposing (Set)
+
+
+readFilesTask : List String -> BackendTask FatalError (List String)
+readFilesTask paths =
+    BackendTask.Custom.run "readFiles"
+        (Json.Encode.list Json.Encode.string paths)
+        (Decode.list Decode.string)
+        |> BackendTask.allowFatal
+
+
+ensureDirTask : String -> BackendTask FatalError ()
+ensureDirTask dirPath =
+    BackendTask.Custom.run "ensureDir"
+        (Json.Encode.string dirPath)
+        (Decode.succeed ())
+        |> BackendTask.allowFatal
 
 
 {-| Load all project sources in dependency order.
@@ -202,7 +221,7 @@ loadPackageDepsCached { projectDir, skipPackages } =
 loadAndWriteCache : String -> String -> String -> String -> String -> Path -> Set String -> BackendTask FatalError (List String)
 loadAndWriteCache expectedKey separator cacheDir cacheKeyPath cacheBlobPath projectDir skipPackages =
     Do.do (loadPackageDeps { projectDir = projectDir, skipPackages = skipPackages }) <| \sources ->
-    Do.exec "mkdir" [ "-p", cacheDir ] <| \_ ->
+    Do.do (ensureDirTask cacheDir) <| \_ ->
     Do.allowFatal (Script.writeFile { path = cacheKeyPath, body = expectedKey }) <| \_ ->
     Do.allowFatal (Script.writeFile { path = cacheBlobPath, body = String.join separator sources }) <| \_ ->
     BackendTask.succeed sources
@@ -349,27 +368,31 @@ dependencies are included even for package-type projects.
 -}
 resolveTransitiveDeps : String -> Dict String String -> BackendTask FatalError (Dict String String)
 resolveTransitiveDeps elmHome knownDeps =
-    knownDeps
-        |> Dict.toList
-        |> List.map
-            (\( pkgName, version ) ->
-                let
-                    pkgElmJsonPath =
+    let
+        knownDepList =
+            Dict.toList knownDeps
+
+        elmJsonPaths =
+            knownDepList
+                |> List.map
+                    (\( pkgName, version ) ->
                         packageBasePath elmHome pkgName version ++ "/elm.json"
-                in
-                File.rawFile pkgElmJsonPath
-                    |> BackendTask.allowFatal
-                    |> BackendTask.andThen
+                    )
+    in
+    readFilesTask elmJsonPaths
+        |> BackendTask.map
+            (\rawElmJsons ->
+                rawElmJsons
+                    |> List.map
                         (\raw ->
                             case Decode.decodeString packageDepsDecoder raw of
                                 Ok depNames ->
-                                    BackendTask.succeed depNames
+                                    depNames
 
                                 Err _ ->
-                                    BackendTask.succeed Set.empty
+                                    Set.empty
                         )
             )
-        |> BackendTask.Extra.combine
         |> BackendTask.map (List.foldl Set.union Set.empty)
         |> BackendTask.andThen
             (\transDepNames ->
@@ -425,31 +448,38 @@ Returns a Dict from package name to its set of dependency names.
 -}
 loadPackageDepGraphs : String -> Dict String String -> BackendTask FatalError (Dict String (Set String))
 loadPackageDepGraphs elmHome allDeps =
-    allDeps
-        |> Dict.toList
-        |> List.map
-            (\( pkgName, version ) ->
-                let
-                    pkgElmJsonPath : String
-                    pkgElmJsonPath =
-                        packageBasePath elmHome pkgName version ++ "/elm.json"
-                in
-                File.rawFile pkgElmJsonPath
-                    |> BackendTask.allowFatal
-                    |> BackendTask.andThen
-                        (\raw ->
-                            case Decode.decodeString packageDepsDecoder raw of
-                                Ok deps ->
-                                    BackendTask.succeed ( pkgName, deps )
+    let
+        depList =
+            Dict.toList allDeps
 
-                                Err err ->
-                                    BackendTask.fail
-                                        (FatalError.fromString
-                                            ("Failed to decode " ++ pkgElmJsonPath ++ ": " ++ Decode.errorToString err)
-                                        )
-                        )
+        elmJsonPaths =
+            depList
+                |> List.map
+                    (\( pkgName, version ) ->
+                        packageBasePath elmHome pkgName version ++ "/elm.json"
+                    )
+    in
+    readFilesTask elmJsonPaths
+        |> BackendTask.andThen
+            (\rawElmJsons ->
+                List.map3
+                    (\( pkgName, _ ) pkgElmJsonPath raw ->
+                        case Decode.decodeString packageDepsDecoder raw of
+                            Ok deps ->
+                                Ok ( pkgName, deps )
+
+                            Err err ->
+                                Err
+                                    (FatalError.fromString
+                                        ("Failed to decode " ++ pkgElmJsonPath ++ ": " ++ Decode.errorToString err)
+                                    )
+                    )
+                    depList
+                    elmJsonPaths
+                    rawElmJsons
+                    |> Result.Extra.combine
+                    |> BackendTask.fromResult
             )
-        |> BackendTask.Extra.combine
         |> BackendTask.map Dict.fromList
 
 
@@ -556,10 +586,5 @@ loadSourcesFromDir dir =
             (\files ->
                 files
                     |> List.sort
-                    |> List.map
-                        (\filePath ->
-                            File.rawFile filePath
-                                |> BackendTask.allowFatal
-                        )
-                    |> BackendTask.Extra.combine
+                    |> readFilesTask
             )

@@ -3,7 +3,7 @@ module Cache exposing
     , Monad, do, succeed, fail
     , writeFile, run, runWith, listExisting, HashSet
     , map, map2, andThen, combine, combineBy, each, sequence
-    , pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, compute, withFile
+    , pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, commandInLinkedDirectory, compute, withFile
     , withPrefix, timed
     , jobs, triggerDebugger
     )
@@ -33,7 +33,7 @@ module Cache exposing
 
 ## Operations
 
-@docs pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, compute, withFile
+@docs pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, commandInLinkedDirectory, compute, withFile
 
 
 ## Output control
@@ -185,7 +185,14 @@ input inputPath k =
         |> andThen
             (\hash ->
                 derive {- "input" -} hash <| \{ prefix, buildPath } target ->
-                execLog prefix "cp" [ Path.toString inputPath, hashToPath buildPath target ]
+                logCommand prefix
+                    "copy"
+                    [ Path.toString inputPath, hashToPath buildPath target ]
+                    (copyRecursiveTask
+                        { from = Path.toString inputPath
+                        , to = hashToPath buildPath target
+                        }
+                    )
             )
         |> andThen k
 
@@ -209,7 +216,14 @@ inputs inputPaths =
                 Ok hash ->
                     ( inputPath
                     , derive {- "inputs" -} hash <| \{ prefix, buildPath } target ->
-                    execLog prefix "cp" [ Path.toString inputPath, hashToPath buildPath target ]
+                    logCommand prefix
+                        "copy"
+                        [ Path.toString inputPath, hashToPath buildPath target ]
+                        (copyRecursiveTask
+                            { from = Path.toString inputPath
+                            , to = hashToPath buildPath target
+                            }
+                        )
                     )
                         |> Ok
 
@@ -262,18 +276,24 @@ derive {- description -} target inner =
                     tmp =
                         hashToTmp target
                 in
-                Do.exec "rm" [ "-rf", hashToPath buildPath tmp ] <| \_ ->
+                Do.do (removePathTask (hashToPath buildPath tmp)) <| \_ ->
                 Do.do
                     (inner input_ tmp
                         |> BackendTask.onError
                             (\e ->
-                                Do.exec "rm" [ "-rf", hashToPath buildPath tmp ] <| \_ ->
+                                Do.do (removePathTask (hashToPath buildPath tmp)) <| \_ ->
                                 BackendTask.fail e
                             )
                     )
                 <| \_ ->
-                Do.exec "mv" [ hashToPath buildPath tmp, hashToPath buildPath target ] <| \_ ->
-                Do.exec "chmod" [ "-R", "a=rX", hashToPath buildPath target ] <| \_ ->
+                Do.do
+                    (movePathTask
+                        { from = hashToPath buildPath tmp
+                        , to = hashToPath buildPath target
+                        }
+                    )
+                <| \_ ->
+                Do.do (chmodReadOnlyRecursiveTask (hashToPath buildPath target)) <| \_ ->
                 BackendTask.succeed ( target, newDeps )
         )
 
@@ -479,14 +499,59 @@ commandInWritableDirectory cmd args hash k =
         workspacePath =
             hashToPath buildPath (hashToWorkspace target)
     in
-    Do.exec "rm" [ "-rf", workspacePath ] <| \_ ->
-    Do.exec "cp" [ "-r", hashToPath buildPath hash, workspacePath ] <| \_ ->
-    Do.exec "chmod" [ "-R", "u+w", workspacePath ] <| \_ ->
+    Do.do (removePathTask workspacePath) <| \_ ->
+    Do.do
+        (copyRecursiveTask
+            { from = hashToPath buildPath hash
+            , to = workspacePath
+            }
+        )
+    <| \_ ->
+    Do.do (chmodUserWritableRecursiveTask workspacePath) <| \_ ->
     Do.do
         (commandLog prefix cmd args
             |> BackendTask.inDir workspacePath
             |> BackendTask.Extra.finally
-                (Script.exec "rm" [ "-rf", workspacePath ])
+                (removePathTask workspacePath)
+        )
+    <| \output ->
+    BackendTask.allowFatal (Script.writeFile { path = hashToPath buildPath target, body = output })
+    )
+        |> andThen k
+
+
+{-| Run a command in a writable workspace whose seeded files are hard-linked from
+the cached directory instead of recursively copied.
+
+Use this only when the command needs writable directories for temp/output files,
+but will not modify the seeded inputs in place.
+-}
+commandInLinkedDirectory : String -> List String -> FileOrDirectory -> (FileOrDirectory -> Monad a) -> Monad a
+commandInLinkedDirectory cmd args hash k =
+    let
+        outputHash : FileOrDirectory
+        outputHash =
+            extendHashWith ("linked" :: cmd :: args) hash
+    in
+    (derive outputHash <| \{ prefix, buildPath } target ->
+    let
+        workspacePath : String
+        workspacePath =
+            hashToPath buildPath (hashToWorkspace target)
+    in
+    Do.do (removePathTask workspacePath) <| \_ ->
+    Do.do
+        (linkTreeTask
+            { from = hashToPath buildPath hash
+            , to = workspacePath
+            }
+        )
+    <| \_ ->
+    Do.do
+        (commandLog prefix cmd args
+            |> BackendTask.inDir workspacePath
+            |> BackendTask.Extra.finally
+                (removePathTask workspacePath)
         )
     <| \output ->
     BackendTask.allowFatal (Script.writeFile { path = hashToPath buildPath target, body = output })
@@ -541,6 +606,66 @@ compute label depsHash fn k =
         BackendTask.allowFatal (Script.writeFile { path = hashToPath buildPath target, body = fn () })
     )
         |> andThen k
+
+
+removePathTask : String -> BackendTask FatalError ()
+removePathTask targetPath =
+    BackendTask.Custom.run "removePath"
+        (Json.Encode.string targetPath)
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+movePathTask : { from : String, to : String } -> BackendTask FatalError ()
+movePathTask paths =
+    BackendTask.Custom.run "movePath"
+        (Json.Encode.object
+            [ ( "from", Json.Encode.string paths.from )
+            , ( "to", Json.Encode.string paths.to )
+            ]
+        )
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+copyRecursiveTask : { from : String, to : String } -> BackendTask FatalError ()
+copyRecursiveTask paths =
+    BackendTask.Custom.run "copyRecursive"
+        (Json.Encode.object
+            [ ( "from", Json.Encode.string paths.from )
+            , ( "to", Json.Encode.string paths.to )
+            ]
+        )
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+linkTreeTask : { from : String, to : String } -> BackendTask FatalError ()
+linkTreeTask paths =
+    BackendTask.Custom.run "linkTree"
+        (Json.Encode.object
+            [ ( "from", Json.Encode.string paths.from )
+            , ( "to", Json.Encode.string paths.to )
+            ]
+        )
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+chmodReadOnlyRecursiveTask : String -> BackendTask FatalError ()
+chmodReadOnlyRecursiveTask targetPath =
+    BackendTask.Custom.run "chmodReadOnlyRecursive"
+        (Json.Encode.string targetPath)
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+chmodUserWritableRecursiveTask : String -> BackendTask FatalError ()
+chmodUserWritableRecursiveTask targetPath =
+    BackendTask.Custom.run "chmodUserWritableRecursive"
+        (Json.Encode.string targetPath)
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
 
 
 {-| -}

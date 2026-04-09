@@ -1,6 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 
+function withFsErrorLogging(label, input, task) {
+    return task.catch((error) => {
+        const renderedInput =
+            typeof input === "string" ? input : JSON.stringify(input);
+        console.error(`[custom-backend-task:${label}] ${renderedInput}`);
+        console.error(error && error.stack ? error.stack : String(error));
+        throw error;
+    });
+}
+
 export function profile(label) {
     console.profile(label);
 }
@@ -62,7 +72,10 @@ export function readdir(path) {
 export function writeBinaryFile(input) {
     const buffer = Buffer.from(input.bytes);
 
-    return new Promise((resolve, reject) =>
+    return withFsErrorLogging(
+        "writeBinaryFile",
+        { path: input.path, bytesLength: input.bytes.length },
+        new Promise((resolve, reject) =>
         fs.writeFile(input.path, buffer, (err) => {
             if (err) {
                 reject(err);
@@ -70,6 +83,140 @@ export function writeBinaryFile(input) {
                 resolve();
             }
         })
+        )
+    );
+}
+
+/**
+ * @param {string[]} paths
+ * @returns {Promise<string[]>}
+ */
+export function readFiles(paths) {
+    return withFsErrorLogging(
+        "readFiles",
+        { count: paths.length, first: paths[0] ?? null },
+        Promise.all(paths.map((filePath) => fs.promises.readFile(filePath, "utf8")))
+    );
+}
+
+/**
+ * @param {string} dirPath
+ * @returns {Promise<void>}
+ */
+export function ensureDir(dirPath) {
+    return withFsErrorLogging(
+        "ensureDir",
+        dirPath,
+        fs.promises.mkdir(dirPath, { recursive: true }).then(() => undefined)
+    );
+}
+
+/**
+ * @param {string[]} dirPaths
+ * @returns {Promise<void>}
+ */
+export async function ensureDirs(dirPaths) {
+    return withFsErrorLogging(
+        "ensureDirs",
+        dirPaths,
+        (async () => {
+            for (const dirPath of dirPaths) {
+                await fs.promises.mkdir(dirPath, { recursive: true });
+            }
+        })()
+    );
+}
+
+/**
+ * @param {string} targetPath
+ * @returns {Promise<void>}
+ */
+export function removePath(targetPath) {
+    return withFsErrorLogging(
+        "removePath",
+        targetPath,
+        fs.promises.rm(targetPath, { recursive: true, force: true }).then(() => undefined)
+    );
+}
+
+/**
+ * @param {{ from: string, to: string }} input
+ * @returns {Promise<void>}
+ */
+export function movePath(input) {
+    return withFsErrorLogging(
+        "movePath",
+        input,
+        fs.promises.rename(input.from, input.to).then(() => undefined)
+    );
+}
+
+/**
+ * @param {{ from: string, to: string }} input
+ * @returns {Promise<void>}
+ */
+export function copyRecursive(input) {
+    return withFsErrorLogging(
+        "copyRecursive",
+        input,
+        fs.promises.cp(input.from, input.to, { recursive: true, force: true }).then(() => undefined)
+    );
+}
+
+/**
+ * @param {{ from: string, to: string }} input
+ * @returns {Promise<void>}
+ */
+export function linkTree(input) {
+    return withFsErrorLogging(
+        "linkTree",
+        input,
+        hardlinkRecursive(input.from, input.to).then(() => undefined)
+    );
+}
+
+async function chmodRecursive(targetPath, modeForEntry) {
+    const stat = await fs.promises.lstat(targetPath);
+    const nextMode = modeForEntry(stat);
+
+    await fs.promises.chmod(targetPath, nextMode);
+
+    if (stat.isDirectory()) {
+        const entries = await fs.promises.readdir(targetPath);
+        for (const entry of entries) {
+            await chmodRecursive(path.join(targetPath, entry), modeForEntry);
+        }
+    }
+}
+
+/**
+ * Approximate `chmod -R a=rX`.
+ *
+ * @param {string} targetPath
+ * @returns {Promise<void>}
+ */
+export function chmodReadOnlyRecursive(targetPath) {
+    return withFsErrorLogging(
+        "chmodReadOnlyRecursive",
+        targetPath,
+        chmodRecursive(targetPath, (stat) => {
+            const executableBits = stat.mode & 0o111;
+            return stat.isDirectory() ? 0o555 : 0o444 | executableBits;
+        }).then(() => undefined)
+    );
+}
+
+/**
+ * Approximate `chmod -R u+w`.
+ *
+ * @param {string} targetPath
+ * @returns {Promise<void>}
+ */
+export function chmodUserWritableRecursive(targetPath) {
+    return withFsErrorLogging(
+        "chmodUserWritableRecursive",
+        targetPath,
+        chmodRecursive(targetPath, (stat) => stat.mode | 0o200).then(() => undefined)
     );
 }
 
@@ -107,9 +254,15 @@ async function hardlinkRecursive(src, dest) {
  * @returns {Promise<void>}
  */
 export async function linkCopies(input) {
-    await fs.promises.mkdir(input.destDir, { recursive: true });
+    return withFsErrorLogging(
+        "linkCopies",
+        { destDir: input.destDir, entries: input.entries.length },
+        (async () => {
+            await fs.promises.mkdir(input.destDir, { recursive: true });
 
-    for (const entry of input.entries) {
-        await hardlinkRecursive(entry.src, path.join(input.destDir, entry.destName));
-    }
+            for (const entry of input.entries) {
+                await hardlinkRecursive(entry.src, path.join(input.destDir, entry.destName));
+            }
+        })()
+    );
 }

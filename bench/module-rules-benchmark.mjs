@@ -9,7 +9,6 @@ import { performance } from "node:perf_hooks";
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const srcRoot = path.join(repoRoot, "src");
 const baseReviewDir = path.join(repoRoot, "bench", "review");
-const elmPagesBin = path.join(repoRoot, "node_modules", ".bin", "elm-pages");
 const useFastEntrypoint = process.argv.includes("--fast-entrypoint");
 const distRunnerPath = path.join(
   repoRoot,
@@ -20,6 +19,7 @@ const jobs = String(os.cpus().length);
 const useHostTypeAnnotationExperiments = process.argv.includes("--host-type-annotation-experiments");
 const useHostDebugExperiments = process.argv.includes("--host-debug-experiments");
 const useHostShapeExperiments = process.argv.includes("--host-shape-experiments");
+const useHostPatternsExperiment = process.argv.includes("--host-patterns-experiment");
 
 const fixtureFiles = [
   "Coverage.elm",
@@ -152,6 +152,10 @@ function hostExperimentArgs(ruleName) {
     return ["--host-no-importing-everything-experiment"];
   }
 
+  if (useHostPatternsExperiment && ruleName === "NoUnused.Patterns") {
+    return ["--host-no-unused-patterns-experiment"];
+  }
+
   return [];
 }
 
@@ -185,10 +189,12 @@ function runRunner({ fixtureSrcDir, buildDir, root }, reviewDir, scenarioName, r
       useHostTypeAnnotationExperiments && ruleName === "NoMissingTypeAnnotation",
     hostNoMissingTypeAnnotationInLetInExperiment:
       useHostTypeAnnotationExperiments && ruleName === "NoMissingTypeAnnotationInLetIn",
+    hostNoUnusedPatternsExperiment:
+      useHostPatternsExperiment && ruleName === "NoUnused.Patterns",
   };
 
   const result = useFastEntrypoint
-    ? spawnSync("node", [elmPagesBin, "run", "src/ReviewRunnerFast.elm"], {
+    ? spawnSync("node", [distRunnerPath], {
         cwd: repoRoot,
         encoding: "utf8",
         env: {

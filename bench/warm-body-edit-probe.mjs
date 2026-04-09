@@ -9,7 +9,7 @@ import { performance } from "node:perf_hooks";
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const srcRoot = path.join(repoRoot, "src");
 const reviewDir = path.join(repoRoot, "bench", "review");
-const elmPagesBin = path.join(repoRoot, "node_modules", ".bin", "elm-pages");
+const fastRunnerPath = path.join(repoRoot, "dist", "review-runner-fast-bench.mjs");
 const jobs = os.cpus().length;
 
 const fixtureFiles = [
@@ -31,6 +31,7 @@ const includeHostImporters = !process.argv.includes("--no-host-importers");
 const includeHostTypeAnnotations = !process.argv.includes("--no-host-type-annotations");
 const includeHostShape = !process.argv.includes("--no-host-shape");
 const includeHostDebug = !process.argv.includes("--no-host-debug");
+const includeHostPatterns = !process.argv.includes("--no-host-patterns");
 const transportMode = readArg("--transport-mode", "handles");
 const groupingModes = (readArg("--modes", "legacy"))
   .split(",")
@@ -95,9 +96,10 @@ function runRunner(workspace, scenarioName, groupingMode) {
     hostNoDebugTodoOrToStringExperiment: includeHostDebug,
     hostNoMissingTypeAnnotationExperiment: includeHostTypeAnnotations,
     hostNoMissingTypeAnnotationInLetInExperiment: includeHostTypeAnnotations,
+    hostNoUnusedPatternsExperiment: includeHostPatterns,
   };
 
-  const result = spawnSync("node", [elmPagesBin, "run", "src/ReviewRunnerFast.elm"], {
+  const result = spawnSync("node", [fastRunnerPath], {
     cwd: repoRoot,
     encoding: "utf8",
     env: {

@@ -1,4 +1,4 @@
-module ReviewRunner exposing (CacheDecision(..), CacheState, Config, CrossModuleDep(..), DeclarationCache, FactHashes, FactProjectionArtifact, FactProjections, FactSet(..), ReviewError, RuleDependencyProfile, RuleFactContract, RuleProjectionKey, RuleType(..), RuleVisitorContract, VisitorContract, VisitorKind(..), benchmarkPackageSummaryCodecs, benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildFactContractHashKey, buildModuleRecord, buildRuleProjectionKey, checkCache, classifyRuleSource, computeSemanticKey, configDecoder, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, defaultConfig, encodeCacheState, encodeFileAsJson, escapeElmString, factContractForRule, factHashesForSource, factHashesForSummary, factProjectionsForSource, factProjectionsForSummary, factSetToString, getDeclarationHashes, hostNoDebugLogErrorsForSources, hostNoDebugTodoOrToStringErrorsForSources, hostNoExposingEverythingErrorsForSources, hostNoImportingEverythingErrorsForSources, hostNoMissingTypeAnnotationErrorsForSources, hostNoMissingTypeAnnotationInLetInErrorsForSources, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, hostNoUnusedVariablesErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, ruleProjectionKeyToString, run, task, updateCache, visitorContractsForRule)
+module ReviewRunner exposing (CacheDecision(..), CacheState, Config, CrossModuleDep(..), DeclarationCache, FactHashes, FactProjectionArtifact, FactProjections, FactSet(..), ReviewError, RuleDependencyProfile, RuleFactContract, RuleProjectionKey, RuleType(..), RuleVisitorContract, VisitorContract, VisitorKind(..), benchmarkPackageSummaryCodecs, benchmarkTargetProjectRuntime, buildExpression, buildExpressionForRule, buildExpressionForRules, buildExpressionWithAst, buildFactContractHashKey, buildModuleRecord, buildRuleProjectionKey, checkCache, classifyRuleSource, computeSemanticKey, configDecoder, conflictingPackages, crossModuleSummaryFromSource, decodeCacheState, defaultConfig, encodeCacheState, encodeFileAsJson, escapeElmString, factContractForRule, factHashesForSource, factHashesForSummary, factProjectionsForSource, factProjectionsForSummary, factSetToString, getDeclarationHashes, hostNoDebugLogErrorsForSources, hostNoDebugTodoOrToStringErrorsForSources, hostNoExposingEverythingErrorsForSources, hostNoImportingEverythingErrorsForSources, hostNoMissingTypeAnnotationErrorsForSources, hostNoMissingTypeAnnotationInLetInErrorsForSources, hostNoUnusedCustomTypeConstructorArgsErrorsForSources, hostNoUnusedCustomTypeConstructorsErrorsForSources, hostNoUnusedExportsErrorsForSources, hostNoUnusedParametersErrorsForSources, hostNoUnusedPatternsErrorsForSources, hostNoUnusedVariablesErrorsForSources, kernelPackages, mapErrorsToDeclarations, narrowCacheKey, parseReviewOutput, patchSource, profileForRule, reviewRunnerHelperSource, ruleProjectionKeyToString, run, task, updateCache, visitorContractsForRule)
 
 {-| Run elm-review rules via the interpreter.
 
@@ -11,12 +11,13 @@ import Ansi.Color
 import Array exposing (Array)
 import AstWireCodec
 import BackendTask exposing (BackendTask)
-import Lamdera.Wire3
+import BackendTask.Custom
 import BackendTask.Do as Do
 import BackendTask.Env
 import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
+import BackendTask.Time
 import Bytes exposing (Bytes)
 import Cache
 import DepGraph
@@ -34,15 +35,15 @@ import Elm.Syntax.Import exposing (Import)
 import Elm.Syntax.Module
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern exposing (Pattern(..))
-import Elm.Syntax.Range exposing (Range)
+import Elm.Syntax.Range exposing (Range, combine)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation)
 import FastDict
 import FatalError exposing (FatalError)
-import Json.Decode
 import FNV1a
+import Json.Decode
 import Json.Encode
+import Lamdera.Wire3
 import SemanticHash
-import BackendTask.Time
 import InterpreterProject exposing (InterpreterProject)
 import MemoRuntime
 import Pages.Script as Script exposing (Script)
@@ -103,6 +104,7 @@ type alias Config =
     , depsCacheMode : ImportersCacheMode
     , reportFormat : ReportFormat
     , perfTraceJson : Maybe String
+    , progressLogPath : Maybe String
     , hostNoUnusedExportsExperiment : Bool
     , hostNoUnusedCustomTypeConstructorsExperiment : Bool
     , hostNoUnusedCustomTypeConstructorArgsExperiment : Bool
@@ -114,6 +116,7 @@ type alias Config =
     , hostNoDebugTodoOrToStringExperiment : Bool
     , hostNoMissingTypeAnnotationExperiment : Bool
     , hostNoMissingTypeAnnotationInLetInExperiment : Bool
+    , hostNoUnusedPatternsExperiment : Bool
     , startupOnly : Bool
     }
 
@@ -130,6 +133,7 @@ type alias CliConfig =
     , depsCacheMode : ImportersCacheMode
     , reportFormat : ReportFormat
     , perfTraceJson : Maybe String
+    , progressLogPath : Maybe String
     , hostNoUnusedExportsExperiment : Bool
     , hostNoUnusedCustomTypeConstructorsExperiment : Bool
     , hostNoUnusedCustomTypeConstructorArgsExperiment : Bool
@@ -141,6 +145,7 @@ type alias CliConfig =
     , hostNoDebugTodoOrToStringExperiment : Bool
     , hostNoMissingTypeAnnotationExperiment : Bool
     , hostNoMissingTypeAnnotationInLetInExperiment : Bool
+    , hostNoUnusedPatternsExperiment : Bool
     }
 
 
@@ -181,6 +186,7 @@ defaultConfig =
     , depsCacheMode = ImportersAuto
     , reportFormat = ReportHuman
     , perfTraceJson = Nothing
+    , progressLogPath = Nothing
     , hostNoUnusedExportsExperiment = False
     , hostNoUnusedCustomTypeConstructorsExperiment = False
     , hostNoUnusedCustomTypeConstructorArgsExperiment = False
@@ -192,6 +198,7 @@ defaultConfig =
     , hostNoDebugTodoOrToStringExperiment = False
     , hostNoMissingTypeAnnotationExperiment = False
     , hostNoMissingTypeAnnotationInLetInExperiment = False
+    , hostNoUnusedPatternsExperiment = False
     , startupOnly = False
     }
 
@@ -211,6 +218,7 @@ configDecoder =
         |> decodeAndMap (decodeFieldWithDefault "depsCacheMode" importersCacheModeDecoder defaultConfig.depsCacheMode)
         |> decodeAndMap (decodeFieldWithDefault "reportFormat" reportFormatDecoder defaultConfig.reportFormat)
         |> decodeAndMap (decodeNullableField "perfTraceJson" Json.Decode.string)
+        |> decodeAndMap (decodeNullableField "progressLogPath" Json.Decode.string)
         |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedExportsExperiment" Json.Decode.bool defaultConfig.hostNoUnusedExportsExperiment)
         |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedCustomTypeConstructorsExperiment" Json.Decode.bool defaultConfig.hostNoUnusedCustomTypeConstructorsExperiment)
         |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedCustomTypeConstructorArgsExperiment" Json.Decode.bool defaultConfig.hostNoUnusedCustomTypeConstructorArgsExperiment)
@@ -222,6 +230,7 @@ configDecoder =
         |> decodeAndMap (decodeFieldWithDefault "hostNoDebugTodoOrToStringExperiment" Json.Decode.bool defaultConfig.hostNoDebugTodoOrToStringExperiment)
         |> decodeAndMap (decodeFieldWithDefault "hostNoMissingTypeAnnotationExperiment" Json.Decode.bool defaultConfig.hostNoMissingTypeAnnotationExperiment)
         |> decodeAndMap (decodeFieldWithDefault "hostNoMissingTypeAnnotationInLetInExperiment" Json.Decode.bool defaultConfig.hostNoMissingTypeAnnotationInLetInExperiment)
+        |> decodeAndMap (decodeFieldWithDefault "hostNoUnusedPatternsExperiment" Json.Decode.bool defaultConfig.hostNoUnusedPatternsExperiment)
         |> decodeAndMap (decodeFieldWithDefault "startupOnly" Json.Decode.bool defaultConfig.startupOnly)
 
 
@@ -1491,6 +1500,10 @@ programConfig =
                         |> Option.withDescription "Write structured review-runner perf trace JSON to the given path"
                     )
                 |> OptionsParser.with
+                    (Option.optionalKeywordArg "progress-log-path"
+                        |> Option.withDescription "Write coarse progress markers to the given path during execution"
+                    )
+                |> OptionsParser.with
                     (Option.flag "host-no-unused-exports-experiment"
                         |> Option.withDescription "Handle NoUnused.Exports with a host-native experimental implementation"
                     )
@@ -1533,6 +1546,10 @@ programConfig =
                 |> OptionsParser.with
                     (Option.flag "host-no-missing-type-annotation-in-let-in-experiment"
                         |> Option.withDescription "Handle NoMissingTypeAnnotationInLetIn with a host-native experimental implementation"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "host-no-unused-patterns-experiment"
+                        |> Option.withDescription "Handle NoUnused.Patterns with a visitor-backed host-native experimental implementation"
                     )
             )
 
@@ -1655,6 +1672,11 @@ executionModeHash config =
 
       else
         "host-no-missing-type-annotation-in-let-in=0"
+    , if config.hostNoUnusedPatternsExperiment then
+        "host-no-unused-patterns=1"
+
+      else
+        "host-no-unused-patterns=0"
     , case config.moduleRuleGroupingMode of
         ModuleRuleGroupingAuto ->
             "module-rule-grouping=auto"
@@ -1692,6 +1714,7 @@ run =
             , depsCacheMode = cliConfig.depsCacheMode
             , reportFormat = cliConfig.reportFormat
             , perfTraceJson = cliConfig.perfTraceJson
+            , progressLogPath = cliConfig.progressLogPath
             , hostNoUnusedExportsExperiment = cliConfig.hostNoUnusedExportsExperiment
             , hostNoUnusedCustomTypeConstructorsExperiment = cliConfig.hostNoUnusedCustomTypeConstructorsExperiment
             , hostNoUnusedCustomTypeConstructorArgsExperiment = cliConfig.hostNoUnusedCustomTypeConstructorArgsExperiment
@@ -1703,6 +1726,7 @@ run =
             , hostNoDebugTodoOrToStringExperiment = cliConfig.hostNoDebugTodoOrToStringExperiment
             , hostNoMissingTypeAnnotationExperiment = cliConfig.hostNoMissingTypeAnnotationExperiment
             , hostNoMissingTypeAnnotationInLetInExperiment = cliConfig.hostNoMissingTypeAnnotationInLetInExperiment
+            , hostNoUnusedPatternsExperiment = cliConfig.hostNoUnusedPatternsExperiment
             , startupOnly = False
             }
                 |> task
@@ -1851,27 +1875,44 @@ loadTargetProjectSeed config =
         Ok directDependencies ->
             Do.do resolveElmHome <| \elmHome ->
             Do.do (ProjectSources.resolvePackageVersions elmHome directDependencies) <| \resolvedDirectDependencies ->
-            Do.do
-                (resolvedDirectDependencies
-                    |> Dict.toList
-                    |> List.sortBy Tuple.first
-                    |> List.map
-                        (\( packageName, version ) ->
-                            let
-                                packageBasePath =
-                                    elmHome ++ "/0.19.1/packages/" ++ packageName ++ "/" ++ version
-                            in
-                            Do.allowFatal (File.rawFile (packageBasePath ++ "/elm.json")) <| \dependencyElmJsonRaw ->
-                            Do.allowFatal (File.rawFile (packageBasePath ++ "/docs.json")) <| \docsJsonRaw ->
-                            BackendTask.succeed
+            let
+                sortedDependencies =
+                    resolvedDirectDependencies
+                        |> Dict.toList
+                        |> List.sortBy Tuple.first
+
+                dependencyPaths =
+                    sortedDependencies
+                        |> List.concatMap
+                            (\( packageName, version ) ->
+                                let
+                                    packageBasePath =
+                                        elmHome ++ "/0.19.1/packages/" ++ packageName ++ "/" ++ version
+                                in
+                                [ packageBasePath ++ "/elm.json"
+                                , packageBasePath ++ "/docs.json"
+                                ]
+                            )
+            in
+            Do.do (readFilesTask dependencyPaths) <| \dependencyContents ->
+            let
+                contentArray =
+                    Array.fromList dependencyContents
+
+                dependencySeeds =
+                    sortedDependencies
+                        |> List.indexedMap
+                            (\index ( packageName, _ ) ->
                                 { name = packageName
-                                , elmJsonRaw = dependencyElmJsonRaw
-                                , docsJsonRaw = docsJsonRaw
+                                , elmJsonRaw =
+                                    Array.get (index * 2) contentArray
+                                        |> Maybe.withDefault ""
+                                , docsJsonRaw =
+                                    Array.get ((index * 2) + 1) contentArray
+                                        |> Maybe.withDefault ""
                                 }
-                        )
-                    |> BackendTask.Extra.combine
-                )
-            <| \dependencySeeds ->
+                            )
+            in
             BackendTask.succeed
                 { elmJsonRaw = elmJsonRaw
                 , directDependencies = dependencySeeds
@@ -1998,7 +2039,7 @@ loadTargetProjectRuntimeCache buildDir targetProjectSeed =
 
 persistTargetProjectRuntimeCache : String -> TargetProjectSeed -> Types.Value -> BackendTask FatalError ()
 persistTargetProjectRuntimeCache buildDir targetProjectSeed baseProject =
-    Do.do (Script.exec "mkdir" [ "-p", buildDir ++ "/target-project-runtime" ]) <| \_ ->
+    Do.do (ensureDirTask (buildDir ++ "/target-project-runtime")) <| \_ ->
     Script.writeFile
         { path = targetProjectRuntimeCachePath buildDir targetProjectSeed
         , body = ValueCodec.encodeValue baseProject
@@ -2013,7 +2054,7 @@ benchmarkPackageSummaryCodecs :
     }
     -> BackendTask FatalError String
 benchmarkPackageSummaryCodecs options =
-    Do.do (Script.exec "mkdir" [ "-p", options.buildDirectory ]) <| \_ ->
+    Do.do (ensureDirTask options.buildDirectory) <| \_ ->
     InterpreterProject.benchmarkPackageSummaryCacheCodecs
         { projectDir = Path.path options.reviewDir
         , skipPackages = Set.union kernelPackages conflictingPackages
@@ -2030,6 +2071,7 @@ benchmarkPackageSummaryCodecs options =
                     [ ( "iterations", Json.Encode.int result.iterations )
                     , ( "summaryCount", Json.Encode.int result.summaryCount )
                     , ( "binaryBytes", Json.Encode.int result.binaryBytes )
+                    , ( "envSeedBinaryBytes", Json.Encode.int result.envSeedBinaryBytes )
                     , ( "shardedBinaryBytes", Json.Encode.int result.shardedBinaryBytes )
                     , ( "jsonChars", Json.Encode.int result.jsonChars )
                     , ( "seedCacheHit", Json.Encode.int result.seedCacheHit )
@@ -2038,6 +2080,8 @@ benchmarkPackageSummaryCodecs options =
                     , ( "seedDecodePackageSummaryCacheMs", Json.Encode.int result.seedDecodePackageSummaryCacheMs )
                     , ( "binaryEncodeMs", Json.Encode.int result.binaryEncodeMs )
                     , ( "binaryDecodeMs", Json.Encode.int result.binaryDecodeMs )
+                    , ( "envSeedBinaryEncodeMs", Json.Encode.int result.envSeedBinaryEncodeMs )
+                    , ( "envSeedBinaryDecodeMs", Json.Encode.int result.envSeedBinaryDecodeMs )
                     , ( "shardedBinaryEncodeMs", Json.Encode.int result.shardedBinaryEncodeMs )
                     , ( "shardedBinaryDecodeMs", Json.Encode.int result.shardedBinaryDecodeMs )
                     , ( "jsonEncodeMs", Json.Encode.int result.jsonEncodeMs )
@@ -2045,6 +2089,30 @@ benchmarkPackageSummaryCodecs options =
                     ]
                     |> Json.Encode.encode 2
             )
+
+
+ensureDirTask : String -> BackendTask FatalError ()
+ensureDirTask dirPath =
+    BackendTask.Custom.run "ensureDir"
+        (Json.Encode.string dirPath)
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+ensureDirsTask : List String -> BackendTask FatalError ()
+ensureDirsTask dirPaths =
+    BackendTask.Custom.run "ensureDirs"
+        (Json.Encode.list Json.Encode.string dirPaths)
+        (Json.Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+readFilesTask : List String -> BackendTask FatalError (List String)
+readFilesTask paths =
+    BackendTask.Custom.run "readFiles"
+        (Json.Encode.list Json.Encode.string paths)
+        (Json.Decode.list Json.Decode.string)
+        |> BackendTask.allowFatal
 
 
 benchmarkTargetProjectRuntime :
@@ -2070,6 +2138,7 @@ benchmarkTargetProjectRuntime options =
             , depsCacheMode = ImportersAuto
             , reportFormat = ReportQuiet
             , perfTraceJson = Nothing
+            , progressLogPath = Nothing
             , hostNoUnusedExportsExperiment = False
             , hostNoUnusedCustomTypeConstructorsExperiment = False
             , hostNoUnusedCustomTypeConstructorArgsExperiment = False
@@ -2081,6 +2150,7 @@ benchmarkTargetProjectRuntime options =
             , hostNoDebugTodoOrToStringExperiment = False
             , hostNoMissingTypeAnnotationExperiment = False
             , hostNoMissingTypeAnnotationInLetInExperiment = False
+            , hostNoUnusedPatternsExperiment = False
             , startupOnly = False
             }
     in
@@ -2349,6 +2419,21 @@ hostNoMissingTypeAnnotationInLetInErrorsForSources sources =
             (\sourceFile ->
                 crossModuleSummaryFromSource sourceFile.path sourceFile.source
                     |> Maybe.map (hostNoMissingTypeAnnotationInLetInErrorsForSummary sourceFile.path)
+            )
+        |> List.concat
+
+
+hostNoUnusedPatternsErrorsForSources : List { path : String, source : String } -> List ReviewError
+hostNoUnusedPatternsErrorsForSources sources =
+    sources
+        |> List.filterMap
+            (\sourceFile ->
+                case Elm.Parser.parseToFile sourceFile.source of
+                    Ok file ->
+                        Just (hostNoUnusedPatternsErrorsForFile sourceFile.path file)
+
+                    Err _ ->
+                        Nothing
             )
         |> List.concat
 
@@ -3421,6 +3506,750 @@ hostNoMissingTypeAnnotationInLetInErrorsForSummary filePath summary =
             )
 
 
+type alias HostNoUnusedPatternsContext =
+    List HostNoUnusedPatternsScope
+
+
+type alias HostNoUnusedPatternsScope =
+    { declared : List HostNoUnusedPattern
+    , used : Set.Set String
+    }
+
+
+type HostNoUnusedPattern
+    = HostNoUnusedSingleValue HostNoUnusedSingleValueData
+    | HostNoUnusedRecordPattern
+        { fields : List (Node String)
+        , recordRange : Range
+        }
+    | HostNoUnusedSimplifiablePattern ReviewError
+
+
+type alias HostNoUnusedSingleValueData =
+    { name : String
+    , range : Range
+    , message : String
+    }
+
+
+type HostNoUnusedPatternUse
+    = HostNoUnusedDestructuring
+    | HostNoUnusedMatching
+
+
+hostNoUnusedPatternsErrorsForFile : String -> Elm.Syntax.File.File -> List ReviewError
+hostNoUnusedPatternsErrorsForFile filePath file =
+    file.declarations
+        |> List.concatMap (hostNoUnusedPatternsVisitTopLevelDeclaration filePath)
+        |> List.map (\error -> { error | filePath = filePath })
+
+
+hostNoUnusedPatternsVisitTopLevelDeclaration : String -> Node Declaration -> List ReviewError
+hostNoUnusedPatternsVisitTopLevelDeclaration filePath declarationNode =
+    case Node.value declarationNode of
+        FunctionDeclaration function ->
+            let
+                implementation =
+                    Node.value function.declaration
+
+                argumentErrors =
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath implementation.arguments []
+
+                ( expressionErrors, _ ) =
+                    hostNoUnusedPatternsVisitExpression filePath implementation.expression []
+            in
+            argumentErrors ++ expressionErrors
+
+        Destructuring _ expression ->
+            hostNoUnusedPatternsVisitExpression filePath expression []
+                |> Tuple.first
+
+        _ ->
+            []
+
+
+hostNoUnusedPatternsVisitExpression :
+    String
+    -> Node Expression
+    -> HostNoUnusedPatternsContext
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsVisitExpression filePath ((Node _ expression) as expressionNode) context =
+    let
+        ( enterErrors, contextAfterEnter ) =
+            hostNoUnusedPatternsExpressionEnter filePath expressionNode context
+
+        contextAfterValue =
+            hostNoUnusedPatternsUseValueFromExpression expressionNode contextAfterEnter
+
+        ( childErrors, contextAfterChildren ) =
+            case expression of
+                Application expressions ->
+                    hostNoUnusedPatternsVisitExpressionList filePath expressions contextAfterValue
+
+                OperatorApplication _ _ left right ->
+                    contextAfterValue
+                        |> hostNoUnusedPatternsVisitExpression filePath left
+                        |> hostNoUnusedPatternsAndThen (\nextContext -> hostNoUnusedPatternsVisitExpression filePath right nextContext)
+
+                IfBlock condition thenExpression elseExpression ->
+                    contextAfterValue
+                        |> hostNoUnusedPatternsVisitExpression filePath condition
+                        |> hostNoUnusedPatternsAndThen (\nextContext -> hostNoUnusedPatternsVisitExpression filePath thenExpression nextContext)
+                        |> hostNoUnusedPatternsAndThen (\nextContext -> hostNoUnusedPatternsVisitExpression filePath elseExpression nextContext)
+
+                Negation inner ->
+                    hostNoUnusedPatternsVisitExpression filePath inner contextAfterValue
+
+                TupledExpression expressions ->
+                    hostNoUnusedPatternsVisitExpressionList filePath expressions contextAfterValue
+
+                ParenthesizedExpression inner ->
+                    hostNoUnusedPatternsVisitExpression filePath inner contextAfterValue
+
+                LetExpression letBlock ->
+                    contextAfterValue
+                        |> hostNoUnusedPatternsVisitLetDeclarationList filePath letBlock.declarations
+                        |> hostNoUnusedPatternsAndThen (\nextContext -> hostNoUnusedPatternsVisitExpression filePath letBlock.expression nextContext)
+
+                CaseExpression caseBlock ->
+                    contextAfterValue
+                        |> hostNoUnusedPatternsVisitExpression filePath caseBlock.expression
+                        |> hostNoUnusedPatternsAndThen (\nextContext -> hostNoUnusedPatternsVisitCaseList filePath caseBlock.cases nextContext)
+
+                LambdaExpression lambda ->
+                    hostNoUnusedPatternsVisitExpression filePath lambda.expression contextAfterValue
+
+                RecordExpr setters ->
+                    hostNoUnusedPatternsVisitExpressionList
+                        filePath
+                        (setters |> List.map (\(Node _ ( _, valueExpression )) -> valueExpression))
+                        contextAfterValue
+
+                ListExpr expressions ->
+                    hostNoUnusedPatternsVisitExpressionList filePath expressions contextAfterValue
+
+                RecordAccess inner _ ->
+                    hostNoUnusedPatternsVisitExpression filePath inner contextAfterValue
+
+                RecordUpdateExpression _ setters ->
+                    hostNoUnusedPatternsVisitExpressionList
+                        filePath
+                        (setters |> List.map (\(Node _ ( _, valueExpression )) -> valueExpression))
+                        contextAfterValue
+
+                FunctionOrValue _ _ ->
+                    ( [], contextAfterValue )
+
+                UnitExpr ->
+                    ( [], contextAfterValue )
+
+                PrefixOperator _ ->
+                    ( [], contextAfterValue )
+
+                Operator _ ->
+                    ( [], contextAfterValue )
+
+                Integer _ ->
+                    ( [], contextAfterValue )
+
+                Hex _ ->
+                    ( [], contextAfterValue )
+
+                Floatable _ ->
+                    ( [], contextAfterValue )
+
+                Literal _ ->
+                    ( [], contextAfterValue )
+
+                CharLiteral _ ->
+                    ( [], contextAfterValue )
+
+                RecordAccessFunction _ ->
+                    ( [], contextAfterValue )
+
+                GLSLExpression _ ->
+                    ( [], contextAfterValue )
+
+        ( exitErrors, contextAfterExit ) =
+            hostNoUnusedPatternsExpressionExit contextAfterChildren expression
+    in
+    ( enterErrors ++ childErrors ++ exitErrors, contextAfterExit )
+
+
+hostNoUnusedPatternsVisitExpressionList :
+    String
+    -> List (Node Expression)
+    -> HostNoUnusedPatternsContext
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsVisitExpressionList filePath expressions context =
+    List.foldl
+        (\expressionNode ( accumulatedErrors, currentContext ) ->
+            let
+                ( expressionErrors, nextContext ) =
+                    hostNoUnusedPatternsVisitExpression filePath expressionNode currentContext
+            in
+            ( accumulatedErrors ++ expressionErrors, nextContext )
+        )
+        ( [], context )
+        expressions
+
+
+hostNoUnusedPatternsVisitLetDeclarationList :
+    String
+    -> List (Node LetDeclaration)
+    -> HostNoUnusedPatternsContext
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsVisitLetDeclarationList filePath declarations context =
+    List.foldl
+        (\declarationNode ( accumulatedErrors, currentContext ) ->
+            let
+                ( declarationErrors, nextContext ) =
+                    hostNoUnusedPatternsVisitLetDeclaration filePath declarationNode currentContext
+            in
+            ( accumulatedErrors ++ declarationErrors, nextContext )
+        )
+        ( [], context )
+        declarations
+
+
+hostNoUnusedPatternsVisitLetDeclaration :
+    String
+    -> Node LetDeclaration
+    -> HostNoUnusedPatternsContext
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsVisitLetDeclaration filePath declarationNode context =
+    case Node.value declarationNode of
+        LetFunction function ->
+            let
+                implementation =
+                    Node.value function.declaration
+
+                argumentErrors =
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath implementation.arguments []
+
+                ( expressionErrors, nextContext ) =
+                    hostNoUnusedPatternsVisitExpression filePath implementation.expression context
+            in
+            ( argumentErrors ++ expressionErrors, nextContext )
+
+        LetDestructuring _ expression ->
+            hostNoUnusedPatternsVisitExpression filePath expression context
+
+
+hostNoUnusedPatternsVisitCaseList :
+    String
+    -> List ( Node Pattern, Node Expression )
+    -> HostNoUnusedPatternsContext
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsVisitCaseList filePath cases context =
+    List.foldl
+        (\caseBranch ( accumulatedErrors, currentContext ) ->
+            let
+                ( branchErrors, nextContext ) =
+                    hostNoUnusedPatternsVisitCaseBranch filePath caseBranch currentContext
+            in
+            ( accumulatedErrors ++ branchErrors, nextContext )
+        )
+        ( [], context )
+        cases
+
+
+hostNoUnusedPatternsVisitCaseBranch :
+    String
+    -> ( Node Pattern, Node Expression )
+    -> HostNoUnusedPatternsContext
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsVisitCaseBranch filePath ( pattern, expression ) context =
+    let
+        branchContext =
+            { declared = hostNoUnusedPatternsFindPatterns HostNoUnusedMatching [ pattern ] []
+            , used = Set.empty
+            }
+                :: context
+
+        ( expressionErrors, contextAfterExpression ) =
+            hostNoUnusedPatternsVisitExpression filePath expression branchContext
+
+        ( exitErrors, contextAfterExit ) =
+            hostNoUnusedPatternsReport contextAfterExpression
+    in
+    ( expressionErrors ++ exitErrors, contextAfterExit )
+
+
+hostNoUnusedPatternsExpressionEnter :
+    String
+    -> Node Expression
+    -> HostNoUnusedPatternsContext
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsExpressionEnter filePath expressionNode context =
+    case Node.value expressionNode of
+        LetExpression { declarations } ->
+            let
+                findPatternsInLetDeclaration letDeclaration foundPatterns =
+                    case Node.value letDeclaration of
+                        LetFunction _ ->
+                            foundPatterns
+
+                        LetDestructuring pattern _ ->
+                            hostNoUnusedPatternsFindPatterns HostNoUnusedDestructuring [ pattern ] foundPatterns
+
+                asPatternErrors letDeclaration errors =
+                    case Node.value letDeclaration of
+                        LetFunction { declaration } ->
+                            hostNoUnusedPatternsFindAsPatternsErrors filePath (Node.value declaration).arguments errors
+
+                        LetDestructuring _ _ ->
+                            errors
+            in
+            ( List.foldl asPatternErrors [] declarations
+            , { declared = List.foldl findPatternsInLetDeclaration [] declarations
+              , used = Set.empty
+              }
+                :: context
+            )
+
+        LambdaExpression { args } ->
+            ( hostNoUnusedPatternsFindAsPatternsErrors filePath args [], context )
+
+        _ ->
+            ( [], context )
+
+
+hostNoUnusedPatternsExpressionExit :
+    HostNoUnusedPatternsContext
+    -> Expression
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsExpressionExit context expression =
+    case expression of
+        LetExpression _ ->
+            hostNoUnusedPatternsReport context
+
+        _ ->
+            ( [], context )
+
+
+hostNoUnusedPatternsReport :
+    HostNoUnusedPatternsContext
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsReport context =
+    case context of
+        headScope :: previousScope :: restOfScopes ->
+            let
+                found =
+                    hostNoUnusedPatternsFindDeclaredPatterns context headScope
+            in
+            ( found.errors
+            , { declared = previousScope.declared
+              , used = Set.union found.used previousScope.used
+              }
+                :: restOfScopes
+            )
+
+        headScope :: [] ->
+            ( hostNoUnusedPatternsFindDeclaredPatternsForRootScope context headScope
+            , []
+            )
+
+        [] ->
+            ( [], [] )
+
+
+hostNoUnusedPatternsFindDeclaredPatterns :
+    HostNoUnusedPatternsContext
+    -> HostNoUnusedPatternsScope
+    -> { errors : List ReviewError, used : Set.Set String }
+hostNoUnusedPatternsFindDeclaredPatterns context scope =
+    List.foldl
+        (\foundPattern acc ->
+            case foundPattern of
+                HostNoUnusedSingleValue value ->
+                    if Set.member value.name acc.used then
+                        { errors = acc.errors
+                        , used = Set.remove value.name acc.used
+                        }
+
+                    else
+                        { errors = hostNoUnusedPatternsSingleError value :: acc.errors
+                        , used = acc.used
+                        }
+
+                HostNoUnusedRecordPattern value ->
+                    { errors =
+                        case hostNoUnusedPatternsRecordError context value of
+                            Just error ->
+                                error :: acc.errors
+
+                            Nothing ->
+                                acc.errors
+                    , used =
+                        hostNoUnusedPatternsRemoveFromSet Node.value value.fields acc.used
+                    }
+
+                HostNoUnusedSimplifiablePattern error ->
+                    { errors = error :: acc.errors
+                    , used = acc.used
+                    }
+        )
+        { errors = [], used = scope.used }
+        scope.declared
+
+
+hostNoUnusedPatternsFindDeclaredPatternsForRootScope :
+    HostNoUnusedPatternsContext
+    -> HostNoUnusedPatternsScope
+    -> List ReviewError
+hostNoUnusedPatternsFindDeclaredPatternsForRootScope context scope =
+    List.foldl
+        (\foundPattern errors ->
+            case foundPattern of
+                HostNoUnusedSingleValue value ->
+                    if Set.member value.name scope.used then
+                        errors
+
+                    else
+                        hostNoUnusedPatternsSingleError value :: errors
+
+                HostNoUnusedRecordPattern value ->
+                    case hostNoUnusedPatternsRecordError context value of
+                        Just error ->
+                            error :: errors
+
+                        Nothing ->
+                            errors
+
+                HostNoUnusedSimplifiablePattern error ->
+                    error :: errors
+        )
+        []
+        scope.declared
+
+
+hostNoUnusedPatternsSingleError : HostNoUnusedSingleValueData -> ReviewError
+hostNoUnusedPatternsSingleError value =
+    { ruleName = "NoUnused.Patterns"
+    , filePath = ""
+    , line = value.range.start.row
+    , column = value.range.start.column
+    , message = value.message
+    }
+
+
+hostNoUnusedPatternsRecordError :
+    HostNoUnusedPatternsContext
+    -> { fields : List (Node String), recordRange : Range }
+    -> Maybe ReviewError
+hostNoUnusedPatternsRecordError context { fields, recordRange } =
+    if List.isEmpty fields then
+        Just
+            { ruleName = "NoUnused.Patterns"
+            , filePath = ""
+            , line = recordRange.start.row
+            , column = recordRange.start.column
+            , message = "Record pattern is not needed"
+            }
+
+    else
+        let
+            ( unused, used ) =
+                List.partition (hostNoUnusedPatternsNodeIsUnused context) fields
+        in
+        case unused of
+            [] ->
+                Nothing
+
+            (Node _ first) :: rest ->
+                let
+                    errorRange =
+                        case used of
+                            [] ->
+                                recordRange
+
+                            _ ->
+                                combine (List.map Node.range unused)
+                in
+                Just
+                    { ruleName = "NoUnused.Patterns"
+                    , filePath = ""
+                    , line = errorRange.start.row
+                    , column = errorRange.start.column
+                    , message = hostNoUnusedPatternsListToMessage first rest
+                    }
+
+
+hostNoUnusedPatternsFindPatterns :
+    HostNoUnusedPatternUse
+    -> List (Node Pattern)
+    -> List HostNoUnusedPattern
+    -> List HostNoUnusedPattern
+hostNoUnusedPatternsFindPatterns use patterns accumulated =
+    case patterns of
+        [] ->
+            accumulated
+
+        (Node range pattern) :: rest ->
+            case pattern of
+                VarPattern name ->
+                    hostNoUnusedPatternsFindPatterns
+                        use
+                        rest
+                        (HostNoUnusedSingleValue
+                            { name = name
+                            , message = "Value `" ++ name ++ "` is not used"
+                            , range = range
+                            }
+                            :: accumulated
+                        )
+
+                TuplePattern [ Node _ AllPattern, Node _ AllPattern ] ->
+                    hostNoUnusedPatternsFindPatterns
+                        use
+                        rest
+                        (HostNoUnusedSimplifiablePattern
+                            { ruleName = "NoUnused.Patterns"
+                            , filePath = ""
+                            , line = range.start.row
+                            , column = range.start.column
+                            , message = "Tuple pattern is not needed"
+                            }
+                            :: accumulated
+                        )
+
+                TuplePattern [ Node _ AllPattern, Node _ AllPattern, Node _ AllPattern ] ->
+                    hostNoUnusedPatternsFindPatterns
+                        use
+                        rest
+                        (HostNoUnusedSimplifiablePattern
+                            { ruleName = "NoUnused.Patterns"
+                            , filePath = ""
+                            , line = range.start.row
+                            , column = range.start.column
+                            , message = "Tuple pattern is not needed"
+                            }
+                            :: accumulated
+                        )
+
+                TuplePattern subPatterns ->
+                    hostNoUnusedPatternsFindPatterns use (subPatterns ++ rest) accumulated
+
+                RecordPattern fields ->
+                    hostNoUnusedPatternsFindPatterns
+                        use
+                        rest
+                        (HostNoUnusedRecordPattern
+                            { fields = fields
+                            , recordRange = range
+                            }
+                            :: accumulated
+                        )
+
+                UnConsPattern first second ->
+                    hostNoUnusedPatternsFindPatterns use (first :: second :: rest) accumulated
+
+                ListPattern subPatterns ->
+                    hostNoUnusedPatternsFindPatterns use (subPatterns ++ rest) accumulated
+
+                NamedPattern _ subPatterns ->
+                    if use == HostNoUnusedDestructuring && List.all (hostNoUnusedPatternsIsAllPattern << Node.value) subPatterns then
+                        hostNoUnusedPatternsFindPatterns
+                            use
+                            rest
+                            (HostNoUnusedSimplifiablePattern
+                                { ruleName = "NoUnused.Patterns"
+                                , filePath = ""
+                                , line = range.start.row
+                                , column = range.start.column
+                                , message = "Named pattern is not needed"
+                                }
+                                :: accumulated
+                            )
+
+                    else
+                        hostNoUnusedPatternsFindPatterns use (subPatterns ++ rest) accumulated
+
+                AsPattern inner name ->
+                    hostNoUnusedPatternsFindPatterns
+                        use
+                        (inner :: rest)
+                        (hostNoUnusedPatternsFindPatternForAsPattern range inner name :: accumulated)
+
+                ParenthesizedPattern inner ->
+                    hostNoUnusedPatternsFindPatterns use (inner :: rest) accumulated
+
+                _ ->
+                    hostNoUnusedPatternsFindPatterns use rest accumulated
+
+
+hostNoUnusedPatternsFindAsPatternsErrors :
+    String
+    -> List (Node Pattern)
+    -> List ReviewError
+    -> List ReviewError
+hostNoUnusedPatternsFindAsPatternsErrors filePath patterns accumulated =
+    case patterns of
+        [] ->
+            accumulated
+
+        pattern :: rest ->
+            case Node.value pattern of
+                AsPattern inner name ->
+                    let
+                        nextAccumulated =
+                            case hostNoUnusedPatternsFindPatternForAsPattern (Node.range pattern) inner name of
+                                HostNoUnusedSimplifiablePattern error ->
+                                    { error | filePath = filePath } :: accumulated
+
+                                _ ->
+                                    accumulated
+                    in
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath (inner :: rest) nextAccumulated
+
+                TuplePattern subPatterns ->
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath (subPatterns ++ rest) accumulated
+
+                UnConsPattern first second ->
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath (first :: second :: rest) accumulated
+
+                ListPattern subPatterns ->
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath (subPatterns ++ rest) accumulated
+
+                NamedPattern _ subPatterns ->
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath (subPatterns ++ rest) accumulated
+
+                ParenthesizedPattern inner ->
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath (inner :: rest) accumulated
+
+                _ ->
+                    hostNoUnusedPatternsFindAsPatternsErrors filePath rest accumulated
+
+
+hostNoUnusedPatternsFindPatternForAsPattern :
+    Range
+    -> Node Pattern
+    -> Node String
+    -> HostNoUnusedPattern
+hostNoUnusedPatternsFindPatternForAsPattern fullPatternRange (Node patternRange pattern) ((Node range name) as nameNode) =
+    case pattern of
+        ParenthesizedPattern subPattern ->
+            hostNoUnusedPatternsFindPatternForAsPattern fullPatternRange subPattern nameNode
+
+        AllPattern ->
+            HostNoUnusedSimplifiablePattern
+                { ruleName = "NoUnused.Patterns"
+                , filePath = ""
+                , line = patternRange.start.row
+                , column = patternRange.start.column
+                , message = "Pattern `_` is not needed"
+                }
+
+        VarPattern _ ->
+            HostNoUnusedSimplifiablePattern
+                { ruleName = "NoUnused.Patterns"
+                , filePath = ""
+                , line = range.start.row
+                , column = range.start.column
+                , message = "Unnecessary duplicate alias `" ++ name ++ "`"
+                }
+
+        AsPattern _ (Node innerRange innerName) ->
+            HostNoUnusedSimplifiablePattern
+                { ruleName = "NoUnused.Patterns"
+                , filePath = ""
+                , line = innerRange.start.row
+                , column = innerRange.start.column
+                , message = "Unnecessary duplicate alias `" ++ innerName ++ "`"
+                }
+
+        _ ->
+            HostNoUnusedSingleValue
+                { name = name
+                , message = "Pattern alias `" ++ name ++ "` is not used"
+                , range = range
+                }
+
+
+hostNoUnusedPatternsUseValueFromExpression :
+    Node Expression
+    -> HostNoUnusedPatternsContext
+    -> HostNoUnusedPatternsContext
+hostNoUnusedPatternsUseValueFromExpression (Node _ expression) context =
+    case expression of
+        FunctionOrValue [] name ->
+            hostNoUnusedPatternsUseValue name context
+
+        RecordUpdateExpression name _ ->
+            hostNoUnusedPatternsUseValue (Node.value name) context
+
+        _ ->
+            context
+
+
+hostNoUnusedPatternsUseValue :
+    String
+    -> HostNoUnusedPatternsContext
+    -> HostNoUnusedPatternsContext
+hostNoUnusedPatternsUseValue name context =
+    case context of
+        [] ->
+            context
+
+        headScope :: restOfScopes ->
+            { headScope | used = Set.insert name headScope.used } :: restOfScopes
+
+
+hostNoUnusedPatternsNodeIsUnused :
+    HostNoUnusedPatternsContext
+    -> Node String
+    -> Bool
+hostNoUnusedPatternsNodeIsUnused context (Node _ value) =
+    case context of
+        headScope :: _ ->
+            not (Set.member value headScope.used)
+
+        [] ->
+            False
+
+
+hostNoUnusedPatternsRemoveFromSet :
+    (a -> comparable)
+    -> List a
+    -> Set.Set comparable
+    -> Set.Set comparable
+hostNoUnusedPatternsRemoveFromSet mapper list initial =
+    List.foldl (\value acc -> Set.remove (mapper value) acc) initial list
+
+
+hostNoUnusedPatternsListToMessage : String -> List (Node String) -> String
+hostNoUnusedPatternsListToMessage first rest =
+    case List.reverse rest of
+        [] ->
+            "Value `" ++ first ++ "` is not used"
+
+        (Node _ last) :: middle ->
+            "Values `" ++ String.join "`, `" (first :: List.map Node.value middle) ++ "` and `" ++ last ++ "` are not used"
+
+
+hostNoUnusedPatternsIsAllPattern : Pattern -> Bool
+hostNoUnusedPatternsIsAllPattern pattern =
+    case pattern of
+        AllPattern ->
+            True
+
+        _ ->
+            False
+
+
+hostNoUnusedPatternsAndThen :
+    (HostNoUnusedPatternsContext -> ( List ReviewError, HostNoUnusedPatternsContext ))
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+    -> ( List ReviewError, HostNoUnusedPatternsContext )
+hostNoUnusedPatternsAndThen nextStep ( errors, context ) =
+    let
+        ( nextErrors, nextContext ) =
+            nextStep context
+    in
+    ( errors ++ nextErrors, nextContext )
+
+
 evaluateHostNoMissingTypeAnnotationForAnalyzedFiles :
     List AnalyzedTargetFile
     -> { errors : List ReviewError, counters : Dict String Int }
@@ -3476,6 +4305,55 @@ evaluateHostNoMissingTypeAnnotationInLetInForAnalyzedFiles files =
             [ ( "module.host_missing_type_annotation_in_let_in.modules", List.length files )
             , ( "module.host_missing_type_annotation_in_let_in.functions", candidateCount )
             , ( "module.host_missing_type_annotation_in_let_in.errors", List.length errors )
+            ]
+    }
+
+
+evaluateHostNoUnusedPatternsForAnalyzedFiles :
+    List AnalyzedTargetFile
+    -> { errors : List ReviewError, counters : Dict String Int }
+evaluateHostNoUnusedPatternsForAnalyzedFiles files =
+    let
+        parsedResults =
+            files
+                |> List.map
+                    (\file ->
+                        case Elm.Parser.parseToFile file.source of
+                            Ok parsedFile ->
+                                Ok ( file.path, parsedFile )
+
+                            Err _ ->
+                                Err file.path
+                    )
+
+        parsedFiles =
+            parsedResults
+                |> List.filterMap Result.toMaybe
+
+        parseFailures =
+            parsedResults
+                |> List.filter
+                    (\result ->
+                        case result of
+                            Err _ ->
+                                True
+
+                            Ok _ ->
+                                False
+                    )
+                |> List.length
+
+        errors =
+            parsedFiles
+                |> List.concatMap (\( filePath, file ) -> hostNoUnusedPatternsErrorsForFile filePath file)
+    in
+    { errors = errors
+    , counters =
+        Dict.fromList
+            [ ( "module.host_no_unused_patterns.modules", List.length files )
+            , ( "module.host_no_unused_patterns.parsed_modules", List.length parsedFiles )
+            , ( "module.host_no_unused_patterns.parse_failures", parseFailures )
+            , ( "module.host_no_unused_patterns.errors", List.length errors )
             ]
     }
 
@@ -7673,7 +8551,7 @@ persistDeclCache config =
         bytesWritten =
             String.length manifestBody + List.sum (List.map (\entry -> String.length entry.body) shardBodies)
     in
-    Do.do (Script.exec "mkdir" [ "-p", config.directory ]) <| \_ ->
+    Do.do (ensureDirTask config.directory) <| \_ ->
     Do.do
         (Script.writeFile
             { path = declCacheManifestPath config.directory
@@ -8986,6 +9864,20 @@ writePerfTrace maybePath trace =
             BackendTask.succeed ()
 
 
+writeProgressMarker : Maybe String -> String -> BackendTask FatalError ()
+writeProgressMarker maybePath marker =
+    case maybePath of
+        Just path ->
+            Script.writeFile
+                { path = path
+                , body = marker ++ "\n"
+                }
+                |> BackendTask.allowFatal
+
+        Nothing ->
+            BackendTask.succeed ()
+
+
 projectCacheMetadataFor : String -> List AnalyzedTargetFile -> ProjectCacheMetadata
 projectCacheMetadataFor helperHash files =
     { schemaVersion = cacheSchemaVersion
@@ -9847,6 +10739,7 @@ reviewRunnerHelperSource =
 
 task : Config -> BackendTask FatalError ()
 task config =
+    Do.do (writeProgressMarker config.progressLogPath "task:start") <| \_ ->
     Do.do (withTiming "prepare_config" (prepareConfig config)) <| \preparedConfigTimed ->
     let
         preparedConfig =
@@ -9864,7 +10757,9 @@ task config =
         reviewAppHashValue =
             reviewAppHashFromPreparedConfig preparedConfig
     in
+    Do.do (writeProgressMarker preparedConfig.progressLogPath "task:prepared_config") <| \_ ->
     if preparedConfig.startupOnly then
+        Do.do (writeProgressMarker preparedConfig.progressLogPath "task:startup_only") <| \_ ->
         writePerfTrace
             preparedConfig.perfTraceJson
             { schemaVersion = "1"
@@ -9875,6 +10770,7 @@ task config =
             }
 
     else
+        Do.do (writeProgressMarker preparedConfig.progressLogPath "task:load_decl_cache") <| \_ ->
         -- Load previous per-declaration cache from disk
         Do.do
             (withTiming "load_decl_cache"
@@ -9889,11 +10785,13 @@ task config =
             previousCache =
                 declCacheTimed.value.cache
         in
+        Do.do (writeProgressMarker preparedConfig.progressLogPath "task:resolve_target_files") <| \_ ->
         Do.do (withTiming "resolve_target_files" (resolveTargetFiles preparedConfig)) <| \targetFilesTimed ->
         let
             targetFiles =
                 targetFilesTimed.value
         in
+        Do.do (writeProgressMarker preparedConfig.progressLogPath "task:load_analyzed_target_files") <| \_ ->
         Do.do (loadAnalyzedTargetFiles preparedConfig targetFiles) <| \analyzedTargetFiles ->
         let
             targetFileContents =
@@ -9921,6 +10819,7 @@ task config =
                     , ( "experiment.host_no_unused_custom_type_constructor_args", boolToInt preparedConfig.hostNoUnusedCustomTypeConstructorArgsExperiment )
                     , ( "experiment.host_no_unused_parameters", boolToInt preparedConfig.hostNoUnusedParametersExperiment )
                     , ( "experiment.host_no_unused_variables", boolToInt preparedConfig.hostNoUnusedVariablesExperiment )
+                    , ( "experiment.host_no_unused_patterns", boolToInt preparedConfig.hostNoUnusedPatternsExperiment )
                     , ( "analysis_cache.entries", analyzedTargetFiles.cacheEntries )
                     , ( "analysis_cache.loaded_bytes", analyzedTargetFiles.cacheLoadBytes )
                     , ( "analysis_cache.stored_bytes", analyzedTargetFiles.cacheStoreBytes )
@@ -9947,6 +10846,7 @@ task config =
         case decision of
         FullCacheHit errors ->
             -- All declarations cached — skip interpreter entirely
+            Do.do (writeProgressMarker preparedConfig.progressLogPath "task:full_cache_hit") <| \_ ->
             finishWithTrace
                 errors
                 []
@@ -9958,16 +10858,19 @@ task config =
 
         ColdMiss _ ->
             -- No cache — treat all files as stale (same code path as PartialMiss)
+            Do.do (writeProgressMarker preparedConfig.progressLogPath "task:cold:load_review_project") <| \_ ->
             Do.do (withTiming "load_review_project" (loadReviewProjectDetailed preparedConfig)) <| \reviewProjectTimed ->
             let
                 reviewProject =
                     reviewProjectTimed.value.project
             in
+            Do.do (writeProgressMarker preparedConfig.progressLogPath "task:cold:get_rule_info") <| \_ ->
             Do.do (withTiming "get_rule_info" (getRuleInfoWithProject preparedConfig reviewProject)) <| \ruleInfoTimed ->
             let
                 ruleInfo =
                     ruleInfoTimed.value
             in
+            Do.do (writeProgressMarker preparedConfig.progressLogPath "task:cold:eval") <| \_ ->
             Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents targetFileContents []) <| \runResult ->
             Do.do (withTimingPure "parse_review_output" (\() -> parseReviewOutput runResult.output)) <| \parseReviewOutputTimed ->
             let
@@ -10009,11 +10912,13 @@ task config =
         PartialMiss { cachedErrors, staleFiles } ->
             -- Some files changed. Module rules on unchanged files use cachedErrors.
             -- Only stale files need module rule re-eval. Project rules always re-eval.
+            Do.do (writeProgressMarker preparedConfig.progressLogPath "task:partial:load_review_project") <| \_ ->
             Do.do (withTiming "load_review_project" (loadReviewProjectDetailed preparedConfig)) <| \reviewProjectTimed ->
             let
                 reviewProject =
                     reviewProjectTimed.value.project
             in
+            Do.do (writeProgressMarker preparedConfig.progressLogPath "task:partial:get_rule_info") <| \_ ->
             Do.do (withTiming "get_rule_info" (getRuleInfoWithProject preparedConfig reviewProject)) <| \ruleInfoTimed ->
             let
                 ruleInfo =
@@ -10022,6 +10927,7 @@ task config =
                 staleFileContents =
                     targetFileContents |> List.filter (\f -> List.member f.path staleFiles)
             in
+            Do.do (writeProgressMarker preparedConfig.progressLogPath "task:partial:eval") <| \_ ->
             Do.do (loadAndEvalHybridPartialWithProject preparedConfig reviewProject ruleInfo targetFileContents staleFileContents cachedErrors) <| \runResult ->
             Do.do (withTimingPure "parse_review_output" (\() -> parseReviewOutput runResult.output)) <| \parseReviewOutputTimed ->
             let
@@ -10063,6 +10969,7 @@ task config =
 
 prepareConfig : Config -> BackendTask FatalError Config
 prepareConfig config =
+    Do.do (writeProgressMarker config.progressLogPath "prepare:review_app_hash") <| \_ ->
     Do.do (reviewAppHash config) <| \appHash ->
     let
         preparedConfig =
@@ -10071,7 +10978,9 @@ prepareConfig config =
                     Path.path (Path.toString config.buildDirectory ++ "/review-app-" ++ appHash)
             }
     in
-    Do.do (Script.exec "mkdir" [ "-p", Path.toString preparedConfig.buildDirectory ]) <| \_ ->
+    Do.do (writeProgressMarker preparedConfig.progressLogPath "prepare:ensure_build_dir") <| \_ ->
+    Do.do (ensureDirTask (Path.toString preparedConfig.buildDirectory)) <| \_ ->
+    Do.do (writeProgressMarker preparedConfig.progressLogPath "prepare:ensure_review_deps") <| \_ ->
     Do.do (ensureReviewDepsCached preparedConfig) <| \_ ->
     BackendTask.succeed preparedConfig
 
@@ -10455,6 +11364,10 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
             config.hostNoMissingTypeAnnotationInLetInExperiment
                 && List.any (\rule -> rule.name == "NoMissingTypeAnnotationInLetIn") ruleInfo
 
+        hostNoUnusedPatternsEnabled =
+            config.hostNoUnusedPatternsExperiment
+                && List.any (\rule -> rule.name == "NoUnused.Patterns") ruleInfo
+
         moduleRules =
             ruleInfo
                 |> List.filter (\r -> r.ruleType == ModuleRule)
@@ -10467,6 +11380,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                             &&
                             (not hostNoMissingTypeAnnotationEnabled || r.name /= "NoMissingTypeAnnotation")
                             && (not hostNoMissingTypeAnnotationInLetInEnabled || r.name /= "NoMissingTypeAnnotationInLetIn")
+                            && (not hostNoUnusedPatternsEnabled || r.name /= "NoUnused.Patterns")
                     )
 
         projectRules =
@@ -10597,6 +11511,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 , ( "module.host_debug_todo_or_to_string.enabled", boolToInt hostNoDebugTodoOrToStringEnabled )
                 , ( "module.host_missing_type_annotation.enabled", boolToInt hostNoMissingTypeAnnotationEnabled )
                 , ( "module.host_missing_type_annotation_in_let_in.enabled", boolToInt hostNoMissingTypeAnnotationInLetInEnabled )
+                , ( "module.host_no_unused_patterns.enabled", boolToInt hostNoUnusedPatternsEnabled )
                 , ( "project.host_exports.enabled", boolToInt hostNoUnusedExportsEnabled )
                 , ( "project.host_constructors.enabled", boolToInt hostNoUnusedCustomTypeConstructorsEnabled )
                 , ( "project.host_constructor_args.enabled", boolToInt hostNoUnusedCustomTypeConstructorArgsEnabled )
@@ -10610,6 +11525,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                 , ( "module.transport.records", boolToInt (config.moduleRuleTransportMode == ModuleRuleTransportRecords) )
                 ]
     in
+    Do.do (writeProgressMarker config.progressLogPath "eval:module_rule_eval:start") <| \_ ->
     Do.do
         (withTiming "module_rule_eval"
             (Do.do
@@ -10743,6 +11659,23 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     )
                 )
             <| \hostNoMissingTypeAnnotationInLetInTimed ->
+            Do.do
+                (withTiming "module.host_no_unused_patterns_eval"
+                    (if hostNoUnusedPatternsEnabled then
+                        deferTask
+                            (\() ->
+                                evaluateHostNoUnusedPatternsForAnalyzedFiles allFileContents
+                                    |> BackendTask.succeed
+                            )
+
+                     else
+                        BackendTask.succeed
+                            { errors = []
+                            , counters = Dict.fromList [ ( "module.host_no_unused_patterns.skipped", 1 ) ]
+                            }
+                    )
+                )
+            <| \hostNoUnusedPatternsTimed ->
             let
                 hostNoExposingEverythingOutput =
                     hostNoExposingEverythingTimed.value.errors
@@ -10815,6 +11748,18 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         , Dict.fromList
                             [ ( "module.host_missing_type_annotation_in_let_in.ms", hostNoMissingTypeAnnotationInLetInTimed.stage.ms ) ]
                         ]
+
+                hostNoUnusedPatternsOutput =
+                    hostNoUnusedPatternsTimed.value.errors
+                        |> List.map formatErrorLine
+                        |> String.join "\n"
+
+                hostNoUnusedPatternsCounters =
+                    mergeCounterDicts
+                        [ hostNoUnusedPatternsTimed.value.counters
+                        , Dict.fromList
+                            [ ( "module.host_no_unused_patterns.ms", hostNoUnusedPatternsTimed.stage.ms ) ]
+                        ]
             in
             BackendTask.succeed
                 { output =
@@ -10826,6 +11771,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     , hostNoDebugTodoOrToStringOutput
                     , hostNoMissingTypeAnnotationOutput
                     , hostNoMissingTypeAnnotationInLetInOutput
+                    , hostNoUnusedPatternsOutput
                     ]
                         |> List.filter (not << String.isEmpty)
                         |> String.join "\n"
@@ -10837,6 +11783,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                         , hostNoDebugTodoOrToStringCounters
                         , hostNoMissingTypeAnnotationCounters
                         , hostNoMissingTypeAnnotationInLetInCounters
+                        , hostNoUnusedPatternsCounters
                         ]
                 }
             )
@@ -10849,6 +11796,8 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
         moduleRuleCounters =
             modulePhaseTimed.value.counters
     in
+    Do.do (writeProgressMarker config.progressLogPath "eval:module_rule_eval:done") <| \_ ->
+    Do.do (writeProgressMarker config.progressLogPath "eval:load_target_project_seed:start") <| \_ ->
     Do.do (withTiming "load_target_project_seed" (loadTargetProjectSeed config)) <| \targetProjectSeedTimed ->
     let
         packageExposedModules =
@@ -10857,7 +11806,9 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
         packageOpenTypeConstructors =
             openTypeConstructorsIndexFromTargetProjectSeed targetProjectSeedTimed.value
     in
+    Do.do (writeProgressMarker config.progressLogPath "eval:build_target_project_runtime:start") <| \_ ->
     Do.do (withTiming "build_target_project_runtime" (buildTargetProjectRuntime (Path.toString config.buildDirectory) reviewProject targetProjectSeedTimed.value)) <| \targetProjectRuntimeTimed ->
+    Do.do (writeProgressMarker config.progressLogPath "eval:project_rule_eval:start") <| \_ ->
     Do.do
         (withTiming "project_rule_eval"
             (Do.do
@@ -11121,9 +12072,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                     doCacheDir =
                         Path.toString config.buildDirectory ++ "/pr-deps-of"
                 in
-                Do.do (Script.exec "mkdir" [ "-p", prImportersFoldCacheDir ]) <| \_ ->
-                Do.do (Script.exec "mkdir" [ "-p", prCacheDir ]) <| \_ ->
-                Do.do (Script.exec "mkdir" [ "-p", doCacheDir ]) <| \_ ->
+                Do.do (ensureDirsTask [ prImportersFoldCacheDir, prCacheDir, doCacheDir ]) <| \_ ->
                 Do.do
                     (withTiming "project.importers_fold.cache_check"
                         (if List.isEmpty importersFoldOnlyRules then
@@ -12260,7 +13209,7 @@ loadAndEvalHybridWithProject config reviewProject ruleInfo targetFileContents =
                             }
                         )
         in
-        Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
+        Do.do (ensureDirTask ruleCacheDir) <| \_ ->
         Do.do
             (errorsByRule
                 |> List.map
@@ -12764,7 +13713,7 @@ saveRuleCaches buildDir updatedRulesValue =
         serialized =
             ValueCodec.encodeValue updatedRulesValue
     in
-    Do.do (Script.exec "mkdir" [ "-p", cacheDir ]) <| \_ ->
+    Do.do (ensureDirTask cacheDir) <| \_ ->
     Script.writeFile { path = cacheDir ++ "/all-rules.json", body = serialized }
         |> BackendTask.allowFatal
 
@@ -13791,7 +14740,7 @@ projectRuleYieldHandler buildDir tag payload =
                                 basePath =
                                     ruleCacheDir ++ "/" ++ ruleKey ++ ".base.json"
                             in
-                            Do.do (Script.exec "mkdir" [ "-p", ruleCacheDir ]) <| \_ ->
+                            Do.do (ensureDirTask ruleCacheDir) <| \_ ->
                             Do.do
                                 (Script.writeFile
                                     { path = basePath

@@ -227,7 +227,7 @@ evalWith (ElmProject project) { imports, expression } k =
                 )
         )
     <| \projectDirHash ->
-    Cache.commandInWritableDirectory "sh" [ "-c", script ] projectDirHash k
+    Cache.commandInLinkedDirectory "sh" [ "-c", script ] projectDirHash k
 
 
 {-| Parse "ModuleName.valueName" into its parts.

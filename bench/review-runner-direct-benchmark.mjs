@@ -25,6 +25,7 @@ const useHostImportersExperiments = process.argv.includes("--host-importers-expe
 const useHostTypeAnnotationExperiments = process.argv.includes("--host-type-annotation-experiments");
 const useHostDebugExperiments = process.argv.includes("--host-debug-experiments");
 const useHostShapeExperiments = process.argv.includes("--host-shape-experiments");
+const useHostPatternsExperiment = process.argv.includes("--host-patterns-experiment");
 
 const fixtureFiles = [
   "Coverage.elm",
@@ -84,6 +85,10 @@ function hostExperimentArgs() {
     );
   }
 
+  if (useHostPatternsExperiment) {
+    args.push("--host-no-unused-patterns-experiment");
+  }
+
   return args;
 }
 
@@ -141,10 +146,11 @@ function runRunner({ fixtureSrcDir, buildDir, root }, name) {
     hostNoDebugTodoOrToStringExperiment: useHostDebugExperiments,
     hostNoMissingTypeAnnotationExperiment: useHostTypeAnnotationExperiments,
     hostNoMissingTypeAnnotationInLetInExperiment: useHostTypeAnnotationExperiments,
+    hostNoUnusedPatternsExperiment: useHostPatternsExperiment,
   };
 
   const result = useFastEntrypoint
-    ? spawnSync("node", [path.join(repoRoot, "node_modules", ".bin", "elm-pages"), "run", "src/ReviewRunnerFast.elm"], {
+    ? spawnSync("node", [distRunnerPath], {
         cwd: repoRoot,
         encoding: "utf8",
         env: {

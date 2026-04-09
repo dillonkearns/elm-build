@@ -9,7 +9,7 @@ import { performance } from "node:perf_hooks";
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const srcRoot = path.join(repoRoot, "src");
 const baseReviewDir = path.join(repoRoot, "bench", "review");
-const elmPagesBin = path.join(repoRoot, "node_modules", ".bin", "elm-pages");
+const fastRunnerPath = path.join(repoRoot, "dist", "review-runner-fast-bench.mjs");
 const jobs = String(os.cpus().length);
 
 const fixtureFiles = [
@@ -127,7 +127,7 @@ function runRunner(workspace, reviewDir, scenarioName, groupingMode) {
   };
 
   const start = performance.now();
-  const result = spawnSync("node", [elmPagesBin, "run", "src/ReviewRunnerFast.elm"], {
+  const result = spawnSync("node", [fastRunnerPath], {
     cwd: repoRoot,
     encoding: "utf8",
     env: {

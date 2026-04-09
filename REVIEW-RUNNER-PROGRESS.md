@@ -2650,3 +2650,48 @@ That keeps the priority order the same:
 2. avoid chasing low-leverage transport tweaks that do not reuse decoded data
 3. only optimize individual remaining rules when a benchmark shows they still
    matter in the mixed path
+
+### Package env-seed experiment
+
+I also tried a more interpreter-ready package cache artifact: a direct
+`PackageEnvSeed` containing:
+
+- interfaces
+- functions keyed by module
+- imported names keyed by module
+
+I benchmarked that artifact against the current summary blob and the sharded
+summary blob.
+
+| Metric | One blob | Env seed | Sharded blob |
+| --- | ---: | ---: | ---: |
+| bytes | `1,313,565` | `1,318,239` | `1,313,563` |
+| encode (`5` iters) | `757ms` | `828ms` | `679ms` |
+| decode (`5` iters) | `784ms` | `721ms` | `703ms` |
+
+Interpretation:
+
+- The env-seed artifact decodes faster than the current one-blob summary cache.
+- But it is only modestly better, and still not better than sharded binary.
+
+I then wired the env-seed artifact into `load_review_project` so warm runs could
+decode it and build the package env directly. That did not produce an end-to-end
+win on the warmed body-edit path:
+
+| Metric | Runtime env-seed attempt |
+| --- | ---: |
+| wall | `2659ms` |
+| `load_review_project` | `234ms` |
+| `module_rule_eval` | `194ms` |
+| `project_rule_eval` | `14ms` |
+
+That is effectively flat to slightly worse than the previous warmed probe, so I
+reverted the runtime integration and kept only the benchmark helpers.
+
+Conclusion:
+
+- `PackageEnvSeed` is a useful measurement artifact.
+- It is not the next production cache boundary.
+- The remaining opportunity inside `load_review_project` is not just “use a
+  slightly different binary payload”; it likely needs a more structural change
+  or a different source of overhead reduction.

@@ -58,6 +58,13 @@ type alias CachedPackageModuleSummary =
     Eval.Module.CachedModuleSummary
 
 
+type alias PackageEnvSeed =
+    { interfaces : List ( ModuleName, List Exposed )
+    , functionsByModule : List ( String, List FunctionImplementation )
+    , importsByModule : List ( String, Types.ImportedNames )
+    }
+
+
 type alias LoadProfile =
     { resolveSourceDirectoriesMs : Int
     , loadPackageSourcesMs : Int
@@ -118,6 +125,14 @@ benchmarkThunk thunk =
         }
 
 
+readFilesTask : List String -> BackendTask FatalError (List String)
+readFilesTask paths =
+    BackendTask.Custom.run "readFiles"
+        (Json.Encode.list Json.Encode.string paths)
+        (Decode.list Decode.string)
+        |> BackendTask.allowFatal
+
+
 repeatBinaryEncode : Int -> List CachedPackageModuleSummary -> Int -> Int
 repeatBinaryEncode iterations summaries acc =
     if iterations <= 0 then
@@ -139,6 +154,39 @@ repeatBinaryDecode iterations bytes acc =
         case decodePackageSummaryCache bytes of
             Just summaries ->
                 repeatBinaryDecode (iterations - 1) bytes (acc + List.length summaries)
+
+            Nothing ->
+                -1
+
+
+repeatEnvSeedBinaryEncode : Int -> PackageEnvSeed -> Int -> Int
+repeatEnvSeedBinaryEncode iterations envSeed acc =
+    if iterations <= 0 then
+        acc
+
+    else
+        repeatEnvSeedBinaryEncode
+            (iterations - 1)
+            envSeed
+            (acc + Bytes.width (encodePackageEnvSeed envSeed))
+
+
+repeatEnvSeedBinaryDecode : Int -> Bytes.Bytes -> Int -> Int
+repeatEnvSeedBinaryDecode iterations bytes acc =
+    if iterations <= 0 then
+        acc
+
+    else
+        case decodePackageEnvSeed bytes of
+            Just envSeed ->
+                repeatEnvSeedBinaryDecode
+                    (iterations - 1)
+                    bytes
+                    (acc
+                        + List.length envSeed.interfaces
+                        + List.length envSeed.functionsByModule
+                        + List.length envSeed.importsByModule
+                    )
 
             Nothing ->
                 -1
@@ -225,6 +273,7 @@ benchmarkPackageSummaryCacheCodecs :
         { iterations : Int
         , summaryCount : Int
         , binaryBytes : Int
+        , envSeedBinaryBytes : Int
         , shardedBinaryBytes : Int
         , jsonChars : Int
         , seedCacheHit : Int
@@ -233,6 +282,8 @@ benchmarkPackageSummaryCacheCodecs :
         , seedDecodePackageSummaryCacheMs : Int
         , binaryEncodeMs : Int
         , binaryDecodeMs : Int
+        , envSeedBinaryEncodeMs : Int
+        , envSeedBinaryDecodeMs : Int
         , shardedBinaryEncodeMs : Int
         , shardedBinaryDecodeMs : Int
         , jsonEncodeMs : Int
@@ -258,6 +309,12 @@ benchmarkPackageSummaryCacheCodecs config =
 
         Just summaries ->
             let
+                envSeed =
+                    packageEnvSeedFromSummaries summaries
+
+                envSeedBytes =
+                    encodePackageEnvSeed envSeed
+
                 jsonString =
                     encodePackageSummaryCacheJson summaries
 
@@ -266,6 +323,8 @@ benchmarkPackageSummaryCacheCodecs config =
             in
             Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations summaries 0)) <| \binaryEncodeTimed ->
             Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations cacheBytes 0)) <| \binaryDecodeTimed ->
+            Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryEncode config.iterations envSeed 0)) <| \envSeedBinaryEncodeTimed ->
+            Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryDecode config.iterations envSeedBytes 0)) <| \envSeedBinaryDecodeTimed ->
             Do.do (benchmarkThunk (\_ -> repeatShardedBinaryEncode config.iterations summaries 0)) <| \shardedBinaryEncodeTimed ->
             Do.do (benchmarkThunk (\_ -> repeatShardedBinaryDecode config.iterations shardedBytes 0)) <| \shardedBinaryDecodeTimed ->
             Do.do (benchmarkThunk (\_ -> repeatJsonEncode config.iterations summaries 0)) <| \jsonEncodeTimed ->
@@ -274,6 +333,7 @@ benchmarkPackageSummaryCacheCodecs config =
                 { iterations = config.iterations
                 , summaryCount = List.length summaries
                 , binaryBytes = Bytes.width cacheBytes
+                , envSeedBinaryBytes = Bytes.width envSeedBytes
                 , shardedBinaryBytes = List.foldl (\bytes total -> total + Bytes.width bytes) 0 shardedBytes
                 , jsonChars = String.length jsonString
                 , seedCacheHit = seedLoad.profile.packageSummaryCacheHit
@@ -282,6 +342,8 @@ benchmarkPackageSummaryCacheCodecs config =
                 , seedDecodePackageSummaryCacheMs = seedLoad.profile.decodePackageSummaryCacheMs
                 , binaryEncodeMs = binaryEncodeTimed.ms
                 , binaryDecodeMs = binaryDecodeTimed.ms
+                , envSeedBinaryEncodeMs = envSeedBinaryEncodeTimed.ms
+                , envSeedBinaryDecodeMs = envSeedBinaryDecodeTimed.ms
                 , shardedBinaryEncodeMs = shardedBinaryEncodeTimed.ms
                 , shardedBinaryDecodeMs = shardedBinaryDecodeTimed.ms
                 , jsonEncodeMs = jsonEncodeTimed.ms
@@ -341,6 +403,51 @@ decodePackageSummaryCacheJson jsonString =
         (Decode.list decodeCachedPackageModuleSummaryJson)
         jsonString
         |> Result.toMaybe
+
+
+packageEnvSeedFromSummaries : List CachedPackageModuleSummary -> PackageEnvSeed
+packageEnvSeedFromSummaries summaries =
+    { interfaces =
+        summaries
+            |> List.map (\summary -> ( summary.moduleName, summary.interface ))
+    , functionsByModule =
+        summaries
+            |> List.map
+                (\summary ->
+                    ( Environment.moduleKey summary.moduleName
+                    , summary.functions
+                    )
+                )
+    , importsByModule =
+        summaries
+            |> List.map
+                (\summary ->
+                    ( Environment.moduleKey summary.moduleName
+                    , summary.importedNames
+                    )
+                )
+    }
+
+
+encodePackageEnvSeed : PackageEnvSeed -> Bytes.Bytes
+encodePackageEnvSeed envSeed =
+    Lamdera.Wire3.encodeSequenceWithoutLength
+        [ Lamdera.Wire3.encodeList encodeInterfaceEntry envSeed.interfaces
+        , Lamdera.Wire3.encodeList encodeFunctionModuleEntry envSeed.functionsByModule
+        , Lamdera.Wire3.encodeList encodeImportModuleEntry envSeed.importsByModule
+        ]
+        |> Lamdera.Wire3.bytesEncode
+
+
+decodePackageEnvSeed : Bytes.Bytes -> Maybe PackageEnvSeed
+decodePackageEnvSeed bytes =
+    bytes
+        |> Lamdera.Wire3.bytesDecode
+            (Lamdera.Wire3.succeedDecode PackageEnvSeed
+                |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeInterfaceEntry)
+                |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeFunctionModuleEntry)
+                |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeImportModuleEntry)
+            )
 
 
 writeBinaryFile : { path : String, bytes : Bytes.Bytes } -> BackendTask FatalError ()
@@ -647,6 +754,51 @@ decodeQualifiedMappingJson =
         )
 
 
+encodeInterfaceEntry : ( ModuleName, List Exposed ) -> Lamdera.Wire3.Encoder
+encodeInterfaceEntry ( moduleName, interface ) =
+    Lamdera.Wire3.encodeSequenceWithoutLength
+        [ encodeModuleName moduleName
+        , Lamdera.Wire3.encodeList encodeExposed interface
+        ]
+
+
+decodeInterfaceEntry : Lamdera.Wire3.Decoder ( ModuleName, List Exposed )
+decodeInterfaceEntry =
+    Lamdera.Wire3.succeedDecode Tuple.pair
+        |> Lamdera.Wire3.andMapDecode decodeModuleName
+        |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeExposed)
+
+
+encodeFunctionModuleEntry : ( String, List FunctionImplementation ) -> Lamdera.Wire3.Encoder
+encodeFunctionModuleEntry ( moduleKey, functions ) =
+    Lamdera.Wire3.encodeSequenceWithoutLength
+        [ Lamdera.Wire3.encodeString moduleKey
+        , Lamdera.Wire3.encodeList encodeFunctionImplementationNoRanges functions
+        ]
+
+
+decodeFunctionModuleEntry : Lamdera.Wire3.Decoder ( String, List FunctionImplementation )
+decodeFunctionModuleEntry =
+    Lamdera.Wire3.succeedDecode Tuple.pair
+        |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+        |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeFunctionImplementationNoRanges)
+
+
+encodeImportModuleEntry : ( String, Types.ImportedNames ) -> Lamdera.Wire3.Encoder
+encodeImportModuleEntry ( moduleKey, importedNames ) =
+    Lamdera.Wire3.encodeSequenceWithoutLength
+        [ Lamdera.Wire3.encodeString moduleKey
+        , encodeImportedNames importedNames
+        ]
+
+
+decodeImportModuleEntry : Lamdera.Wire3.Decoder ( String, Types.ImportedNames )
+decodeImportModuleEntry =
+    Lamdera.Wire3.succeedDecode Tuple.pair
+        |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+        |> Lamdera.Wire3.andMapDecode decodeImportedNames
+
+
 encodeFunctionImplementationNoRanges : FunctionImplementation -> Lamdera.Wire3.Encoder
 encodeFunctionImplementationNoRanges implementation =
     Lamdera.Wire3.encodeSequenceWithoutLength
@@ -852,14 +1004,8 @@ loadWithProfile config =
     in
     Do.do
         (withTiming
-            (elmFiles
-                |> List.map
-                    (\filePath ->
-                        File.rawFile filePath
-                            |> BackendTask.allowFatal
-                            |> BackendTask.map (\content -> ( filePath, content ))
-                    )
-                |> BackendTask.Extra.combine
+            (readFilesTask elmFiles
+                |> BackendTask.map (List.map2 Tuple.pair elmFiles)
             )
         )
     <| \userFileContentsTimed ->
@@ -869,14 +1015,8 @@ loadWithProfile config =
     in
     Do.do
         (withTiming
-            (config.extraSourceFiles
-                |> List.map
-                    (\filePath ->
-                        File.rawFile filePath
-                            |> BackendTask.allowFatal
-                            |> BackendTask.map (\content -> ( filePath, content ))
-                    )
-                |> BackendTask.Extra.combine
+            (readFilesTask config.extraSourceFiles
+                |> BackendTask.map (List.map2 Tuple.pair config.extraSourceFiles)
             )
         )
     <| \extraFileContentsTimed ->
