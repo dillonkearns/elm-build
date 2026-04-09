@@ -13,3 +13,4 @@ bun.lockb
 .elm-mutation-test-debug*
 reports/
 dist/
+bench/profiles/

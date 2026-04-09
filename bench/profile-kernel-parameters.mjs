@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * Direct A/B comparison of the isolated NoUnused.Exports family
- * (interpreted path, no host experiments) between the baseline and
- * kernel-Dict/Set interpreter bundles.
+ * Capture a Node --cpu-prof of the warm_import_graph_change run on
+ * NoUnused.Parameters using the kernel-Dict/Set review-runner bundle.
  *
- * Rebuilds workspaces the same way as importers-family-benchmark.mjs but
- * runs each scenario against both dist/review-runner-bench-baseline.mjs
- * and dist/review-runner-bench.mjs, capturing wall time and traced stages.
+ * Preps a workspace, does a cold + warm pair (no profiling) to seed
+ * caches, mutates MathLib.elm to trigger an import-graph invalidation,
+ * then runs the third invocation with --cpu-prof so we only capture
+ * the partial-miss hot path.
+ *
+ * Usage:
+ *   node bench/profile-kernel-parameters.mjs [--output-dir <dir>]
  */
 
 import { spawnSync } from "node:child_process";
@@ -19,9 +22,16 @@ import { performance } from "node:perf_hooks";
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const srcRoot = path.join(repoRoot, "src");
 const baseReviewDir = path.join(repoRoot, "bench", "review");
-const baselineRunnerPath = path.join(repoRoot, "dist", "review-runner-bench-kernel-only.mjs");
-const kernelRunnerPath = path.join(repoRoot, "dist", "review-runner-bench.mjs");
+const runnerPath = path.join(repoRoot, "dist", "review-runner-bench.mjs");
 const jobs = String(os.cpus().length);
+
+const outputDirArgIndex = process.argv.indexOf("--output-dir");
+const outputDir =
+  outputDirArgIndex !== -1 && process.argv[outputDirArgIndex + 1]
+    ? path.resolve(process.argv[outputDirArgIndex + 1])
+    : path.join(repoRoot, "bench", "profiles", "kernel-parameters");
+
+fs.mkdirSync(outputDir, { recursive: true });
 
 const fixtureFiles = [
   "Coverage.elm",
@@ -38,20 +48,7 @@ const fixtureFiles = [
   "Validator.elm",
 ];
 
-const ruleSet = process.argv[2] || "exports";
-
-const reviewConfigs = {
-  exports: `module ReviewConfig exposing (config)
-
-import NoUnused.Exports
-import Review.Rule as Rule exposing (Rule)
-
-
-config : List Rule
-config =
-    [ NoUnused.Exports.rule ]
-`,
-  parameters: `module ReviewConfig exposing (config)
+const reviewConfig = `module ReviewConfig exposing (config)
 
 import NoUnused.Parameters
 import Review.Rule as Rule exposing (Rule)
@@ -60,17 +57,10 @@ import Review.Rule as Rule exposing (Rule)
 config : List Rule
 config =
     [ NoUnused.Parameters.rule ]
-`,
-};
+`;
 
-const reviewConfig = reviewConfigs[ruleSet];
-if (!reviewConfig) {
-  console.error(`Unknown rule set: ${ruleSet}`);
-  process.exit(2);
-}
-
-function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
+function ensureDir(d) {
+  fs.mkdirSync(d, { recursive: true });
 }
 
 function writeElmJson(workspaceRoot) {
@@ -79,8 +69,8 @@ function writeElmJson(workspaceRoot) {
   fs.writeFileSync(path.join(workspaceRoot, "elm.json"), JSON.stringify(rootElmJson, null, 2));
 }
 
-function prepareWorkspace(tag) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), `elm-build2-importers-kernel-ab-${tag}-`));
+function prepareWorkspace() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "elm-build2-profile-params-"));
   const fixtureSrcDir = path.join(root, "src");
   const buildDir = path.join(root, ".elm-review-build");
   ensureDir(fixtureSrcDir);
@@ -98,19 +88,35 @@ function prepareWorkspace(tag) {
 }
 
 function prepareReviewDir() {
-  const reviewRoot = fs.mkdtempSync(path.join(os.tmpdir(), "elm-build2-importers-kernel-review-"));
+  const reviewRoot = fs.mkdtempSync(path.join(os.tmpdir(), "elm-build2-profile-params-review-"));
   ensureDir(path.join(reviewRoot, "src"));
   fs.copyFileSync(path.join(baseReviewDir, "elm.json"), path.join(reviewRoot, "elm.json"));
   fs.writeFileSync(path.join(reviewRoot, "src", "ReviewConfig.elm"), reviewConfig);
   return reviewRoot;
 }
 
-function runRunner(runnerPath, { fixtureSrcDir, buildDir, root }, reviewDir, name) {
+function runRunner({ fixtureSrcDir, buildDir, root }, reviewDir, name, { profile } = {}) {
   const tracePath = path.join(root, `${name}.trace.json`);
+  const nodeArgs = profile
+    ? [
+        "--cpu-prof",
+        "--cpu-prof-dir",
+        outputDir,
+        "--cpu-prof-name",
+        `${name}.cpuprofile`,
+        // Sample every 10ms instead of the default 1ms so the profile
+        // file stays well under the V8 string limit on long runs.
+        "--cpu-prof-interval",
+        "10000",
+      ]
+    : [];
+
+  console.error(`[${name}] starting ${profile ? "(with --cpu-prof)" : ""}`);
   const start = performance.now();
   const result = spawnSync(
     "node",
     [
+      ...nodeArgs,
       runnerPath,
       "--review-dir",
       reviewDir,
@@ -135,20 +141,17 @@ function runRunner(runnerPath, { fixtureSrcDir, buildDir, root }, reviewDir, nam
     }
   );
   const wallMs = performance.now() - start;
-  if (!fs.existsSync(tracePath)) {
-    return { name, wall_ms: Math.round(wallMs), error: `no trace (exit ${result.status})` };
-  }
-  const trace = JSON.parse(fs.readFileSync(tracePath, "utf8"));
-  const stage = (stageName) => trace.stages.find((entry) => entry.name === stageName)?.ms ?? 0;
-  const counter = (key) => trace.counters[key] ?? 0;
+
+  const trace = fs.existsSync(tracePath) ? JSON.parse(fs.readFileSync(tracePath, "utf8")) : null;
+  const stage = (stageName) => trace?.stages.find((entry) => entry.name === stageName)?.ms ?? 0;
+
   return {
     name,
     wall_ms: Math.round(wallMs),
-    errors_total: counter("errors.total"),
     load_review_project_ms: stage("load_review_project"),
     module_rule_eval_ms: stage("module_rule_eval"),
     project_rule_eval_ms: stage("project_rule_eval"),
-    importers_eval_total_ms: counter("project.importers.eval_total_ms"),
+    errors_total: trace?.counters?.["errors.total"] ?? null,
   };
 }
 
@@ -159,28 +162,27 @@ function mutateImportGraphEdit(mathLibPath, originalSource) {
   );
 }
 
-function runOne(runnerPath, tag) {
-  const workspace = prepareWorkspace(tag);
+function main() {
+  const workspace = prepareWorkspace();
   const reviewDir = prepareReviewDir();
   const originalMathLib = fs.readFileSync(workspace.mathLibPath, "utf8");
-  const cold = runRunner(runnerPath, workspace, reviewDir, "cold");
-  const warm = runRunner(runnerPath, workspace, reviewDir, "warm");
+
+  console.error(`workspace: ${workspace.root}`);
+  console.error(`review:    ${reviewDir}`);
+  console.error(`outputDir: ${outputDir}`);
+
+  const cold = runRunner(workspace, reviewDir, "cold");
+  const warm = runRunner(workspace, reviewDir, "warm");
   mutateImportGraphEdit(workspace.mathLibPath, originalMathLib);
-  const importGraph = runRunner(runnerPath, workspace, reviewDir, "warm_import_graph_change");
-  return {
-    tag,
-    runner: runnerPath,
+  const importGraph = runRunner(workspace, reviewDir, "warm_import_graph_change", { profile: true });
+
+  const summary = {
+    workspace: workspace.root,
+    outputDir,
     scenarios: [cold, warm, importGraph],
   };
-}
-
-function main() {
-  const results = [];
-  console.error(`Running baseline (${path.basename(baselineRunnerPath)}) ...`);
-  results.push(runOne(baselineRunnerPath, "baseline"));
-  console.error(`Running optimized (${path.basename(kernelRunnerPath)}) ...`);
-  results.push(runOne(kernelRunnerPath, "optimized"));
-  console.log(JSON.stringify({ family: ruleSet + " interpreted", results }, null, 2));
+  fs.writeFileSync(path.join(outputDir, "summary.json"), JSON.stringify(summary, null, 2));
+  console.log(JSON.stringify(summary, null, 2));
 }
 
 main();
