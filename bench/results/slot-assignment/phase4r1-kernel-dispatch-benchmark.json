@@ -1,0 +1,13 @@
+{
+  "results": [
+    {"name":"literal","description":"bare integer literal","iterations":10000,"oldPathTotalMs":13,"newPathTotalMs":3,"oldPathMeanUs":1.3,"newPathMeanUs":0.3,"speedup":4.333333333333333,"oldPathDetail":"Int 42","newPathDetail":"Int 42","status":"OK"}
+    ,{"name":"user-only-let","description":"user decl: let with 3 bindings, no core","iterations":10000,"oldPathTotalMs":158,"newPathTotalMs":18,"oldPathMeanUs":15.8,"newPathMeanUs":1.8,"speedup":8.777777777777779,"oldPathDetail":"Int 1","newPathDetail":"Int 1","status":"OK"}
+    ,{"name":"user-decl-chain","description":"chain through 4 user decls, each with a + operator","iterations":10000,"oldPathTotalMs":44,"newPathTotalMs":28,"oldPathMeanUs":4.4,"newPathMeanUs":2.8,"speedup":1.5714285714285714,"oldPathDetail":"Int 40","newPathDetail":"Int 40","status":"OK"}
+    ,{"name":"maybe-case","description":"case on Just, references user decl","iterations":10000,"oldPathTotalMs":26,"newPathTotalMs":16,"oldPathMeanUs":2.6,"newPathMeanUs":1.6,"speedup":1.625,"oldPathDetail":"Int 10","newPathDetail":"Int 10","status":"OK"}
+    ,{"name":"core-arith","description":"core operator + via user decl wrapper","iterations":10000,"oldPathTotalMs":11,"newPathTotalMs":8,"oldPathMeanUs":1.1,"newPathMeanUs":0.8,"speedup":1.375,"oldPathDetail":"Int 3","newPathDetail":"Int 3","status":"OK"}
+    ,{"name":"core-list-sum","description":"user decl calls List.sum [1..10]","iterations":10000,"oldPathTotalMs":464,"newPathTotalMs":465,"oldPathMeanUs":46.4,"newPathMeanUs":46.5,"speedup":0.9978494623655914,"oldPathDetail":"Int 55","newPathDetail":"Int 55","status":"OK"}
+    ,{"name":"ast-walker","description":"recursive case walker on a small AST — mimics review rules","iterations":10000,"oldPathTotalMs":505,"newPathTotalMs":176,"oldPathMeanUs":50.5,"newPathMeanUs":17.6,"speedup":2.8693181818181817,"oldPathDetail":"Int -74","newPathDetail":"Int -74","status":"OK"}
+    ,{"name":"factorial-10","description":"self-recursive factorial of 10","iterations":10000,"oldPathTotalMs":191,"newPathTotalMs":167,"oldPathMeanUs":19.1,"newPathMeanUs":16.7,"speedup":1.1437125748502994,"oldPathDetail":"Int 3628800","newPathDetail":"Int 3628800","status":"OK"}
+    ,{"name":"record-pipeline","description":"record update pipeline with .x access","iterations":10000,"oldPathTotalMs":94,"newPathTotalMs":62,"oldPathMeanUs":9.4,"newPathMeanUs":6.2,"speedup":1.5161290322580645,"oldPathDetail":"Int 15","newPathDetail":"Int 15","status":"OK"}
+  ]
+}
