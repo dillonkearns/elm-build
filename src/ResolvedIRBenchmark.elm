@@ -137,6 +137,114 @@ userOnly =
             3
     in
     x
+
+
+
+-- AST WALKER — simulates review-rule workload
+
+
+type Expr
+    = Lit Int
+    | Add Expr Expr
+    | Mul Expr Expr
+    | Sub Expr Expr
+    | IfZero Expr Expr Expr
+
+
+evalExpr : Expr -> Int
+evalExpr expr =
+    case expr of
+        Lit n ->
+            n
+
+        Add a b ->
+            evalExpr a + evalExpr b
+
+        Mul a b ->
+            evalExpr a * evalExpr b
+
+        Sub a b ->
+            evalExpr a - evalExpr b
+
+        IfZero c t f ->
+            if evalExpr c == 0 then
+                evalExpr t
+
+            else
+                evalExpr f
+
+
+sampleAst : Expr
+sampleAst =
+    Add
+        (Mul (Lit 2) (Lit 3))
+        (Sub
+            (Mul (Lit 4) (Lit 5))
+            (IfZero
+                (Sub (Lit 10) (Lit 10))
+                (Lit 100)
+                (Lit 200)
+            )
+        )
+
+
+astResult : Int
+astResult =
+    evalExpr sampleAst
+
+
+
+-- FACTORIAL — self-recursive function
+
+
+factorial : Int -> Int
+factorial n =
+    if n == 0 then
+        1
+
+    else
+        n * factorial (n - 1)
+
+
+factorial10 : Int
+factorial10 =
+    factorial 10
+
+
+
+-- RECORD WORK
+
+
+type alias Point =
+    { x : Int, y : Int }
+
+
+origin : Point
+origin =
+    { x = 0, y = 0 }
+
+
+moveX : Int -> Point -> Point
+moveX dx p =
+    { p | x = p.x + dx }
+
+
+moveY : Int -> Point -> Point
+moveY dy p =
+    { p | y = p.y + dy }
+
+
+movedPoint : Point
+movedPoint =
+    origin
+        |> moveX 10
+        |> moveY 20
+        |> moveX 5
+
+
+movedPointX : Int
+movedPointX =
+    movedPoint.x
 """
 
 
@@ -183,6 +291,21 @@ scenarios =
       , source = "Fixture.listSum"
       , expression = FunctionOrValue [ "Fixture" ] "listSum"
       , description = "user decl calls List.sum [1..10]"
+      }
+    , { name = "ast-walker"
+      , source = "Fixture.astResult"
+      , expression = FunctionOrValue [ "Fixture" ] "astResult"
+      , description = "recursive case walker on a small AST — mimics review rules"
+      }
+    , { name = "factorial-10"
+      , source = "Fixture.factorial10"
+      , expression = FunctionOrValue [ "Fixture" ] "factorial10"
+      , description = "self-recursive factorial of 10"
+      }
+    , { name = "record-pipeline"
+      , source = "Fixture.movedPointX"
+      , expression = FunctionOrValue [ "Fixture" ] "movedPointX"
+      , description = "record update pipeline with .x access"
       }
     ]
 
