@@ -3287,3 +3287,116 @@ hot path.
   a ~1.15-1.55x improvement on the real workload, and the
   standalone benchmark now runs the whole `review_rule_mock_large`
   Dict/Set workload in under half a second.
+
+### Round 5: Deep Dive Into The `List.map` Shortcut Bug
+
+Spent a focused round trying to track down the open `List.map`
+correctness regression from round 4. Came away with a much sharper
+understanding of the bug, but no fix yet — the real cause turned
+out to be subtler than every theory I tested.
+
+#### Key discoveries
+
+1. **`List.map` in elm/core is not a thin wrapper.** The
+   override I'd been reading at `codegen/Elm/src/List.elm` is the
+   source-level override that the codegen *would* use, but
+   `generated/Core/List.elm` (which the interpreter actually
+   loads) compiles `List.map` as
+   `foldr (\\x acc -> cons (f x) acc) [] xs` — a pure-Elm
+   `foldr + cons` implementation. So the *baseline* review runner
+   never reaches `Kernel.List.map` at all when it executes
+   user code that calls `List.map`. Verified by replacing
+   `Kernel.List.map` with `EvalResult.fail "..."` and confirming
+   the baseline still produces 7 errors.
+
+2. **My new `["List"]` shortcut for `map` doesn't run either.**
+   Added a diagnostic at the entry of `userModuleKernelFastPath`
+   that fails immediately for any name starting with `"map"`.
+   With the `("map", ...)` entry enabled, the diagnostic still
+   never fires. So the shortcut entry is *present* in
+   `kernelFunctions`, but elm-review's compiled rule code never
+   triggers a lookup for `["List"] "map"` through that path.
+
+3. **Yet adding the entry still changes behavior.** With the
+   shortcut entry present and `Kernel.List.map` rigged to fail
+   loudly, the runner reports `0` errors instead of `7`. With the
+   entry removed and the same rigged kernel, the runner reports
+   `7` errors correctly. The entry's presence is what flips the
+   behavior — but neither code path I can find consults it for
+   `["List"] "map"`.
+
+4. **The `map_UNUSED` test rules out "any new entry breaks it".**
+   Adding a brand new entry under the name `"map_UNUSED"` (same
+   shape, same kernel function pointer) keeps the runner at the
+   correct `7` errors. So it's not just "added an entry to the
+   `["List"]` module" — it's specifically having a key named
+   `"map"` in there.
+
+5. **Errors are silently swallowed.** `runProjectRulesFresh` in
+   `src/ReviewRunner.elm` has a `Err err -> BackendTask.succeed err`
+   branch that turns interpreter evaluation errors into the
+   "rule output" string. `parseReviewOutput` then runs over that
+   string and silently discards anything that doesn't match the
+   pipe-separated `RULE:|FILE:|LINE:|COL:|MSG:` shape. So when
+   *any* interpreter-side error fires deep inside the rule
+   evaluation, the user-visible behavior is "0 errors found".
+   That's why every diagnostic that crashes inside `map` came
+   back as `[]` instead of an explicit error message.
+
+#### Eliminated theories
+
+- It's not the yield handling. Both the yield-aware and
+  `EvalResult.toResult` versions of `mapHelp` fail the same way.
+- It's not `Kernel.List.map`'s body. Replacing it with a
+  hard-fail or with a return-empty-list still produces the same
+  external `0`-errors behavior.
+- It's not the `Environment.empty` vs caller-`env` choice for
+  the `PartiallyApplied` closure env (tested both).
+- It's not `evalKernelFunctionWithKey` vs `runKernelTuple`
+  inlining (tested both).
+- It's not the cached arity / yield-aware fold/map fixes from
+  round 4 (tested with each combination).
+- It's not the `Elm.Kernel.List.map` entry being present in
+  parallel — that entry has been there since round 1 and works
+  fine. Disabling it (rigging it to fail) doesn't trigger.
+
+#### What's left
+
+Some code path I haven't inspected reads the `["List"]`
+namespace specifically when an entry with `name = "map"` is
+present, in a way that doesn't go through `userModuleKernelFastPath`,
+`evalKernelFunctionWithKey`, `evalNonVariant`, or `operatorKernelFunctions`.
+Likely candidates I haven't fully verified yet:
+
+- **`Eval.Module`'s import resolution** — `defaultImports` includes
+  `import List exposing (List, (::))`. There may be a place that
+  walks the `["List"]` namespace at module-load time and
+  consumes a `"map"` key for something I'm not expecting (maybe
+  via the operators table or via a special `Maybe.map` /
+  `List.map` resolution path tied to `Tuple.Extra`-style
+  package interfaces).
+- **`elm-pages bundle-script`'s esbuild minification** — even
+  though my source-level diagnostics always landed in the bundle
+  via `grep`, esbuild's tree-shaking could in principle eliminate
+  branches based on the dict's apparent shape at module init.
+  Worth disabling minification once and rerunning.
+- **A FastDict edge case at module initialization time** —
+  unlikely but possible. Would show up as the dict reporting
+  different sizes / orderings depending on whether the `"map"`
+  key is added.
+
+#### Status
+
+- Round 4 still committed and working: ten higher-order List
+  shortcuts active, `map` excluded, error counts correct,
+  measurable speedup on the standalone benchmark and the real
+  review runner A/B.
+- The deep-dive harness lives on as `bench/map-bug-diag.mjs` so
+  the next investigator (or future me) can quickly reproduce and
+  iterate.
+- Best next step before committing more time: build the runner
+  bundle in non-minified mode (`elm-pages bundle-script` with
+  `NODE_ENV=development` or similar) so a `Debug.log` from inside
+  `userModuleKernelFastPath` actually survives to stderr. That
+  would let us see *which name* the shortcut is actually being
+  consulted for during the review run, instead of guessing.
