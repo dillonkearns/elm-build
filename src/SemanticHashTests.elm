@@ -317,6 +317,56 @@ suite =
                         _ ->
                             Expect.fail "Expected both hashes to exist"
             ]
+        , describe "declarationHash"
+            [ test "single-module index: empty ModuleName returns bare-name lookup" <|
+                \_ ->
+                    let
+                        index =
+                            SemanticHash.buildIndexFromSource "module Foo exposing (..)\n\nfoo = 42\n"
+                    in
+                    SemanticHash.declarationHash [] "foo" index
+                        |> Expect.equal (SemanticHash.getSemanticHash index "foo")
+            , test "single-segment ModuleName joins with dot" <|
+                \_ ->
+                    let
+                        index =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "Main", source = "module Main exposing (..)\n\nfoo = 42\n" } ]
+                    in
+                    SemanticHash.declarationHash [ "Main" ] "foo" index
+                        |> Expect.equal (SemanticHash.getSemanticHash index "Main.foo")
+            , test "multi-segment ModuleName joins with dots" <|
+                \_ ->
+                    let
+                        index =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "Foo.Bar", source = "module Foo.Bar exposing (..)\n\nbaz = 42\n" } ]
+                    in
+                    SemanticHash.declarationHash [ "Foo", "Bar" ] "baz" index
+                        |> Expect.equal (SemanticHash.getSemanticHash index "Foo.Bar.baz")
+            , test "returns Nothing for missing declaration" <|
+                \_ ->
+                    let
+                        index =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "Main", source = "module Main exposing (..)\n\nfoo = 42\n" } ]
+                    in
+                    SemanticHash.declarationHash [ "Main" ] "nonexistent" index
+                        |> Expect.equal Nothing
+            , test "returns a non-empty hash for a known declaration" <|
+                \_ ->
+                    let
+                        index =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "Main", source = "module Main exposing (..)\n\nfoo = 42\n" } ]
+                    in
+                    case SemanticHash.declarationHash [ "Main" ] "foo" index of
+                        Just hash ->
+                            String.isEmpty hash |> Expect.equal False
+
+                        Nothing ->
+                            Expect.fail "Expected declarationHash to return a value"
+            ]
         , describe "diffIndices"
             [ test "identical indices have no changes" <|
                 \_ ->
