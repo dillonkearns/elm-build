@@ -3400,3 +3400,286 @@ Likely candidates I haven't fully verified yet:
   `userModuleKernelFastPath` actually survives to stderr. That
   would let us see *which name* the shortcut is actually being
   consulted for during the review run, instead of guessing.
+
+### Round 6: Non-Minified Bundle + Targeted Probes
+
+Built the runner bundle with `elm-pages bundle-script --optimize 0`
+and used the resulting `dist/review-runner-bench-debug.mjs` to get
+host-side `Debug.log` output. That unlocked a whole new round of
+evidence for the `List.map` shortcut bug.
+
+#### What I actually learned
+
+1. **The round 5 claim "my ['List'] shortcut for `map` doesn't run"
+   was wrong.** With a `Debug.log` at the top of
+   `userModuleKernelFastPath`, we can see `("List", "map")` hit the
+   fast path 383 times during a fresh `NoUnused.Parameters` run.
+   The previous session's inference was based on bundle-stripped
+   logs that silently dropped the trace.
+
+2. **Only setup-phase lookups reach `Kernel.List.map`.** Counting
+   by the `env.currentModule` at lookup time, the 383 hits break
+   down as:
+   - 351 from `["Elm","Version"]`
+   - 25 from `["Elm","License"]`
+   - 2 from `["Review","Rule"]` (both with `len = 0`)
+   - 2 from `["Review","ModuleNameLookupTable","Compute"]` (no
+     matching `Kernel.List.map` call — PA created, never applied)
+   - 1 from `["Review","Project"]`
+   - 1 from `["Review","Project","Internal"]`
+   - 1 from `["ReviewRunnerHelper"]` (the `errors |> List.map
+     formatError` in `runRulesByIndices`, with `len = 1`)
+
+   Nothing from the actual rule iteration loop. `mutatingMap`
+   also never fires (as observed in round 5).
+
+3. **The single `ReviewRunnerHelper` call reveals the failure
+   mode.** Logging `firstItem = Value.toString x` inside
+   `Kernel.List.map` for that call shows the input list
+   contains **a `Rule` value, not a `ReviewError`**:
+
+   ```
+   firstItem = Rule { exceptions = ..., id = 0,
+                      name = "NoUnused.Parameters", ...,
+                      ruleProjectVisitor = Ok <function> }
+   len = 1
+   ```
+
+   In `runRulesByIndices` we have
+   `( errors, _ ) = Rule.review selectedRules project` and then
+   `errors |> List.map formatError`. With the map shortcut
+   enabled, `errors` is the **`selectedRules` list** (one
+   `Rule NoUnused.Parameters`) rather than a list of
+   `ReviewError`s. So either `Rule.review` is returning a
+   `(rules, errors)`-shaped tuple, or the tuple positions are
+   being swapped somewhere, or `runRulesResult.errors` is
+   resolving to `runRulesResult.rules`. The list length of 7
+   that the baseline produces never shows up.
+
+4. **Test C (`Kernel.List.map` reversed to match `foldr`
+   order).** Compiled `List.map` is
+   `foldr (\x acc -> cons (f x) acc) [] xs`, which applies `f`
+   right-to-left. My kernel iterated left-to-right. Reversed
+   the input list so `f` is applied in the same order as
+   `foldr`. Bug still reproduces. **Rules out evaluation
+   order.**
+
+5. **Test D (AST-delegating wrapper).** Added an
+   `astDelegateTwo` helper in `Kernel.elm` that registers the
+   map entry as a kernel function whose body is
+   `evalFn args impl.arguments 2 name (AstImpl impl.expression)
+   cfg env` — i.e. the shortcut is present in `kernelFunctions`
+   but the actual two-arg execution falls straight back to
+   `Core.List.map`'s AST. Bug **still** reproduces. NOTE: this
+   test isn't fully clean — the delegation passes the caller's
+   env straight through, but `Core.List.map`'s body references
+   `foldr` unqualified, which only resolves in the `List`
+   module's scope. So Test D might be failing for its own env
+   reason rather than telling us about the original bug.
+
+6. **Test E (`userModuleKernelFastPath` skips `List.map`).**
+   Kept the `("map", ...)` entry in `kernelFunctions["List"]`
+   but added an early-return `Nothing` in
+   `userModuleKernelFastPath` specifically for
+   `moduleName == ["List"] && name == "map"`. This **fixes**
+   the bug (`7` errors correctly reported). So the entry being
+   *in the dict* is fine — only the fast-path dispatch routing
+   `List.map` through `runKernelTuple` + `KernelImpl` breaks
+   things.
+
+7. **Fixes I tried that did NOT help:** Swapping
+   `Environment.empty moduleName` for the caller `env` in
+   `runKernelTuple`'s `PartiallyApplied`. Swapping
+   `List.repeat argCount (fakeNode AllPattern)` for real
+   `VarPattern`s. Neither fix affected the bug, so it's not
+   about the closure env or the pattern shape of the PA.
+
+#### So what IS it?
+
+The `PartiallyApplied (KernelImpl …)` that `runKernelTuple`
+creates for `List.map` differs from the baseline
+`PartiallyApplied (AstImpl …)` in several ways, and only the
+`KernelImpl` flag matters — but I couldn't narrow it further
+without modifying `reviewRunnerHelperSource` to print
+`Rule.review`'s actual return shape, and my attempts to do
+that via an interpreted `Debug.log` were silently dropped by
+`parseReviewOutput` (which filters to pipe-separated error
+lines).
+
+My strongest remaining hypothesis: elm-review's
+`runRulesResult : { errors, fixedErrors, rules, project,
+extracts }` record field access is resolving the `.errors`
+field to the `.rules` value, specifically when
+`runRulesResult` is built through a code path that consumed
+a `List.map` produced via `runKernelTuple`. But that's a
+really weird claim and I don't have direct evidence for it —
+so this is the next thread to pull on.
+
+#### Status
+
+- Reverted to round 4's working config: ten higher-order
+  `["List"]` shortcuts, `map` excluded. `bench/map-bug-diag.mjs`
+  against the `--optimize 0` bundle reports `I found 7 error(s)
+  in 2 file(s)` as expected.
+- Deep-dive notes and the AST-delegating helper are gone from
+  the interpreter source; the interesting diagnostics live in
+  this progress doc for the next investigator to pick up.
+- Next step if I come back to this: instrument the `runRules`
+  result directly (either modifying
+  `reviewRunnerHelperSource` to emit debug info as fake error
+  lines — `RULE:DEBUG|FILE:…|LINE:…|COL:…|MSG:…` — so
+  `parseReviewOutput` keeps them, or adding a host-side
+  intercept that logs the `.errors` / `.rules` values just
+  before `runRulesResult` is destructured).
+
+### Round 7: Root Cause Found — Custom Constructor Partial Application
+
+Picked the thread back up and this time chased the bug all the
+way to the root. Fix landed, `List.map` shortcut re-enabled.
+
+#### How I found it
+
+Round 6 had tried to instrument `reviewRunnerHelperSource` with
+a fake error line (`RULE:DEBUG|FILE:…|…|MSG:…`) to survive
+`parseReviewOutput`, but the probe kept getting silently
+dropped. Root cause of the silent drop: I was patching the
+wrong runner function. The diag harness goes through:
+
+```
+task → ColdMiss → loadAndEvalHybridPartialWithProject
+     → runProjectRulesWithCacheWrite
+     → buildExpressionForRulesWithHandleVarAndCacheExtract
+     → "ReviewRunnerHelper.runRulesByIndicesFromHandlesAndExtractCaches …"
+```
+
+Once I noticed that, I gave up on emitting debug probes from
+inside the interpreted helper source entirely and just added
+host-side `Script.log` calls to `runProjectRulesWithCacheWrite`'s
+`Ok (Types.String output) / Ok _ / Err err` branches in
+`src/ReviewRunner.elm`. That surfaced the actual failure mode
+immediately:
+
+```
+[DBG-CW] entering, expression=ReviewRunnerHelper.runRulesByIndicesFromHandlesAndExtractCaches [ 0 ] reviewModuleHandles__
+[DBG-CW] Err: ERROR: Eval error: type error: Expected the
+first argument to be anything -> anything, got Node { end =
+{ column = 0, row = 0 }, start = { column = 0, row = 0 } }
+[module: Review.ModuleNameLookupTable.Compute] [stack: ]
+```
+
+So the interpreter was erroring out inside
+`Review.ModuleNameLookupTable.Compute`, complaining that the
+first argument to a `twoWithError` kernel (with a
+`function evalFunction anything to anything` selector on the
+first position) was a `Node {…}` value instead of a function.
+That's a type-error path — and because `runProjectRulesFresh`
+turns interpreter errors into strings that
+`parseReviewOutput` filters out, this gave the "0 errors"
+user-visible symptom.
+
+#### The actual bug
+
+Grep `Review/ModuleNameLookupTable/Compute.elm:474`:
+
+```elm
+|> List.map (Node Range.emptyRange)
+```
+
+`Node : Range -> a -> Node a` is a **custom type constructor**.
+In the interpreter, `Node Range.emptyRange` is represented as
+
+```elm
+Custom { moduleName = ["Elm","Syntax","Node"], name = "Node" }
+       [Range.emptyRange]
+```
+
+not as a `PartiallyApplied`. When passed through the shortcut
+path for `List.map`, it hits `twoWithError`'s first-argument
+selector, which is
+`function evalFunction anything to anything`. That selector's
+`fromValue` was:
+
+```elm
+fromValue value =
+    case value of
+        PartiallyApplied localEnv oldArgs patterns … ->
+            Just (\arg cfg _ -> … evalFunctionWith …)
+        _ ->
+            Nothing
+```
+
+It matched `PartiallyApplied` only. So for a partially-applied
+constructor (`Custom ref [arg0]`), `fromValue` returned
+`Nothing`, `twoWithError` produced a type-error, and the
+whole rule run came back as an unparseable error string.
+
+Crucially, this only mattered when `List.map` went through
+the user-level `["List"]` shortcut — the compiled baseline
+`List.map f xs = foldr (\x acc -> cons (f x) acc) [] xs`
+path doesn't go through `function.fromValue` at all; it just
+uses `evalApplication`'s `Custom name customArgs ->
+Custom name (customArgs ++ values)` branch (Eval/Expression.elm
+line 1624). That's why `List.foldl`, `List.filter`, etc.
+higher-order shortcuts *were* fine — none of them happen to
+be called with a partially-applied constructor inside
+`NoUnused.Parameters`, but `List.map (Node Range.emptyRange)`
+in `Review.ModuleNameLookupTable.Compute` exercises exactly
+that pattern.
+
+#### The fix
+
+Add a `Custom ref customArgs ->` case to
+`function.fromValue` in `elm-interpreter/src/Kernel.elm`
+mirroring the behavior of `evalApplication`'s Custom branch —
+when the extracted closure is applied to one more arg, return
+`Custom ref (customArgs ++ [arg])`:
+
+```elm
+Custom ref customArgs ->
+    Just
+        (\arg _ env ->
+            let
+                newValue =
+                    Custom ref (customArgs ++ [ inSelector.toValue arg ])
+            in
+            case outSelector.fromValue newValue of
+                Just ov -> EvalResult.succeed ov
+                Nothing -> EvalResult.fail <| typeError env …
+        )
+```
+
+With that fix plus the `("map", …)` entry re-added to the
+`["List"]` shortcut, `bench/map-bug-diag.mjs` now reports
+`I found 7 error(s) in 2 file(s)` as expected. `elm-test-rs`
+still shows 1124 passed / 9 failed — the same pre-existing
+failures as round 4.
+
+#### Why none of the other round 5/6 hypotheses panned out
+
+- *Not* evaluation order — kernel foldr-order iteration still
+  failed the same way. Order only matters for effectful `f`;
+  this `f` was `Node Range.emptyRange`, pure.
+- *Not* the `runKernelTuple` env / pattern shape. Both tests
+  (caller env vs. `Environment.empty`, `AllPattern` vs.
+  `VarPattern`) kept reproducing. Round 6 was right that the
+  issue was downstream of `runKernelTuple`, but wrong about
+  *where* downstream — the real failure point was
+  `function.fromValue`, not the PA fields themselves.
+- *Not* a tuple-destructure oddity in `runRulesByIndices`.
+  The "errors list contains a Rule, not a ReviewError" clue
+  from round 6 was a red herring — by the time rule execution
+  reached that code path, the interpreter state was already
+  polluted by the `Review.ModuleNameLookupTable.Compute` type
+  error. Host-side logging at the outermost boundary caught
+  the *first* failure, which was the real one.
+
+#### Status
+
+- **Fix landed.** `src/Kernel.elm`: `("map", …)` added to
+  `["List"]` shortcut alongside the other ten; `function`
+  selector now handles `Custom` constructor partial
+  applications.
+- Next thing to measure: re-run the standalone interpreter
+  benchmark and the review runner A/B to quantify the
+  speedup round 4's doc estimated at `~1.5-2x` on the warm
+  import-graph path.
