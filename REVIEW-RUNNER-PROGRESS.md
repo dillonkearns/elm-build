@@ -3683,3 +3683,169 @@ failures as round 4.
   benchmark and the review runner A/B to quantify the
   speedup round 4's doc estimated at `~1.5-2x` on the warm
   import-graph path.
+
+### Round 8: Fresh CPU Profile + Failed TCO-Cache Attempt
+
+#### A/B result for the List.map shortcut
+
+Ran `bench/review-runner-benchmark.mjs --fixture small-12` twice
+against the 12-rule ReviewConfig (all the NoDebug/NoUnused/etc.
+rules): once with `List.map` included in `["List"]` kernel
+shortcut, once with it excluded.
+
+| Scenario                   | With map | Without map | Delta |
+|----------------------------|---------:|------------:|------:|
+| cold                       |  419.72s |     433.66s | -3.2% |
+| warm (full cache hit)      |    0.44s |       0.43s | noise |
+| warm_1_file_body_edit      |    2.59s |       2.64s | noise |
+| warm_1_file_comment_only   |    1.17s |       1.17s |  same |
+| warm_import_graph_change   |  103.62s |     106.70s | -2.9% |
+
+Round 4's `~1.5-2x` estimate was from a NoUnused.Parameters-only
+workload; in the full 12-rule config most of the wall time is
+dominated by module rules that don't go through the interpreter
+path (host-side code runs them faster), so `List.map`'s
+contribution dilutes to a consistent ~3% improvement on the
+interpreter-heavy `cold` and `warm_import_graph_change` scenarios.
+Still a clean win, just smaller than the isolated benchmark
+suggested.
+
+#### CPU profile of warm_import_graph_change
+
+Wrote `bench/profile-warm-import-graph.mjs` which primes cold →
+warm caches, mutates the import graph, then runs the
+import-graph-change scenario under `node --cpu-prof`. Landed
+against `dist/review-runner-bench-debug.mjs` (the `--optimize 0`
+bundle — names stay readable). 140s total profile time, summary
+in `.scratch/profile-round8-analysis.md`.
+
+Top self-time offenders (warm_import_graph_change, debug bundle):
+
+| self(s) |     % | Function |
+|--------:|------:|----------|
+|   17.4  |  12.4 | (garbage collector) |
+|   15.3  |  11.0 | `_Utils_cmp` (FastDict key comparison) |
+|   10.0  |   7.1 | `FastDict.get` |
+|    9.8  |   7.0 | `A2` (2-arg curried application) |
+|    8.9  |   6.3 | `_Utils_eqHelp` (structural equality) |
+|    5.0  |   3.6 | `evalOrRecurse` |
+|    3.3  |   2.4 | `Recursion.runRecursion` (trampoline) |
+|    3.2  |   2.3 | `A3` |
+|    2.7  |   1.9 | `containsSelfCall` (isTailRecursive AST walk) |
+|    1.9  |   1.4 | `evalExpression` main switch |
+|    1.8  |   1.3 | `FastDict.insertHelp` |
+|    1.8  |   1.3 | `evalNonVariant` |
+|    1.7  |   1.2 | `FastDict.balance` |
+|    1.6  |   1.2 | `A4` |
+|    1.5  |   1.1 | `evalApplication` |
+
+**Grouped:**
+- **Dict ops** (`_Utils_cmp` + `get` + `insert` + `member` + `balance`): **~30%**. Every variable reference in `env.values` is a red-black-tree Dict.get with O(len) string comparison. This is the biggest lever, by far.
+- **GC**: **12.4%**. Allocation pressure from intermediate `PartiallyApplied`s, Env record copies (`_Utils_update`), closures.
+- **Currying wrappers** (`A2`..`A5`): **~11.3%**. Elm compiler output overhead; hard to shrink without breaking generated code.
+- **Equality** (`_Utils_eqHelp`): 6.3%. Probably Dict + pattern matching.
+- **Trampoline + evalOrRecurse**: ~6.0%.
+- **`containsSelfCall`**: 1.9%. Pure waste (walks same AST repeatedly).
+
+#### Failed attempt: `isTailRecursive` cache in `Implementation`
+
+Tried embedding a `Maybe Bool` in `AstImpl`:
+
+```elm
+type Implementation
+    = AstImpl (Node Expression) (Maybe Bool)  -- Maybe Bool = cached isTailRecursive
+    | KernelImpl ModuleName String (List Value -> Eval Value)
+```
+
+Populated `Just (isTailRecursive name function.expression)` at
+each of ~20 `AstImpl` construction sites in `evalNonVariant`.
+Passed `Nothing` for lambdas and synthetic asts. Used the cached
+value in `call`.
+
+Tests passed (1124/9, unchanged). Correctness verified via
+`map-bug-diag`. But the bench **regressed by ~2.4%** on the
+interpreter-heavy scenarios:
+
+| Scenario                   | Baseline | With cache | Delta |
+|----------------------------|---------:|-----------:|------:|
+| cold                       |  419.72s |    429.98s | +2.4% |
+| warm_import_graph_change   |  103.62s |    106.09s | +2.4% |
+
+**Why it regressed:** the cache was populated at the wrong
+level. `evalNonVariant` creates a fresh `PartiallyApplied` on
+every lookup — the `Maybe Bool` is computed once, used once,
+then thrown away. So the cache never gets *reused*; it runs
+`isTailRecursive` the same number of times as before, and adds
+`Just ...` heap allocation per PA construction. The allocation
+overhead ate the (zero) savings.
+
+Reverted. The code is back at `df767a8 + Custom-constructor fix`
+(= `b3299a1`).
+
+#### What a real `isTailRecursive` cache would need
+
+The cache has to live in a **persistent** structure — somewhere
+that survives across function lookups, not inside the ephemeral
+`PartiallyApplied`. Two viable options:
+
+1.  **Expand `SharedContext`** to carry a parallel
+    `Dict String (Dict String Bool)` of per-function TCO flags,
+    populated once at module-build time in
+    `Eval/Module.elm:buildModuleEnv` and in the `coreFunctions`
+    bootstrap. Lookups in `evalNonVariant` would consult this
+    dict and pass the flag into `call`. Cost: one extra Dict.get
+    per lookup, but in exchange, zero `isTailRecursive` walks at
+    run time.
+
+2.  **Wrap `FunctionImplementation`** in a new record type
+    (`{ impl : FunctionImplementation, isTco : Bool }`) stored
+    in `SharedContext.functions`. Forces every reader of
+    `shared.functions` to destructure, but no extra dict lookup.
+
+(1) is less invasive; (2) is faster at steady state. Neither
+was worth the bigger refactor this session given that the
+entire line item is only 1.9% of the profile.
+
+#### What's actually worth optimizing next
+
+Ranked by size of the available win vs. implementation effort:
+
+1.  **`env.values` lookup representation** (~30% combined).
+    `EnvValues = Dict String Value` turns every variable
+    reference into an O(log n) red-black tree walk with O(len)
+    string comparisons at every node. Realistic function-body
+    scopes have 5-20 bindings; a **list of tuples with
+    LIFO ordering** would likely be faster (sequential memory,
+    recently-added bindings checked first, no tree rebalancing
+    on `_Utils_update`). Bigger win probably comes from
+    **interning variable names to Ints at parse time** so
+    `_Utils_cmp` collapses to a single integer compare — but
+    that requires a parse-time AST rewrite pass.
+
+2.  **Reduce `PartiallyApplied` allocation churn** (~12% GC).
+    Every function lookup allocates a new PA. Some of these
+    could be pre-constructed once and stored in
+    `env.shared.functions` (e.g. zero-arg top-level values).
+    Harder: the PA's stored `Env` captures a moving target, so
+    we'd need to separate "code" (cacheable) from "closure
+    context" (per-call).
+
+3.  **Cache `isTailRecursive` in `SharedContext`** (~1.9%).
+    Small but cheap — one buildModuleEnv pass to populate a
+    parallel dict. Pick this up if (1) and (2) land and we
+    want the last ~2%.
+
+4.  **`List.length` and similar first-order List helpers**
+    (~0.7% each). Add to the `["List"]` kernel shortcut set
+    with straight `List.length` kernel fns. Cheap win, low risk
+    (no higher-order callbacks → no Custom-constructor pitfall).
+
+#### Status
+
+- Bench harness and profile script landed (`bench/profile-warm-import-graph.mjs`).
+- Profile analysis saved to `.scratch/profile-round8-analysis.md`.
+- No interpreter code changes this round — the TCO cache
+  attempt was reverted.
+- `bench/results/review-runner-scenarios.json` NOT updated
+  from this round's runs (the canonical numbers there are
+  from a different bench config with `host_importers_experiments: true`).
