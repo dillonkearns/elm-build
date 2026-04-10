@@ -3974,3 +3974,117 @@ parse-time pass, the remaining profile opportunities are:
     env-lookup win *and* `isTailRecursive` caching *and*
     pre-resolved module qualifications *and* a cleaner
     place to hang future optimizations.
+
+### Round 10: Flat Closures Via Top-Level-Function PA Trim
+
+**Landed.** ~8-15% wins across every interpreter-heavy scenario.
+Fixes the biggest actionable bucket from the Round 8 profile (GC
+pressure, 12.4%) without needing a parse-time pass.
+
+#### The observation
+
+Every time the interpreter resolves a `FunctionOrValue` that
+points at a top-level module function (which is *most* function
+references in real Elm code — `Dict.get`, `List.map`, every
+imported helper…), it builds a `PartiallyApplied` whose captured
+env inherits the *caller's* full `env.values` dict. But a
+top-level module function's body can only legitimately reference:
+
+  * its own parameters,
+  * its own let bindings,
+  * module-level names (`currentModuleFunctions` / `shared.functions`),
+  * imports.
+
+It *never* reads caller locals. So every name the caller had
+bound at the reference site was being threaded through the PA
+for no reason, showing up downstream in:
+
+  * `bindSimplePatterns` inserting args on top of the inherited
+    dict,
+  * `fingerprintValues` / `valuesSize` walks inside the TCO cycle
+    check,
+  * `hasBoundedProgressInValues` on every TCO loop iteration,
+  * `Dict.union` in `Environment.with`,
+
+…and of course in the per-PA heap retention that drives the GC
+bucket.
+
+There was already evidence this was safe: the cross-module branch
+in `evalNonVariant` (lines ~2912-2940) had been hand-inlined a
+while back to clear `values` for exactly this reason, with an
+explicit "combine clearing values + Environment.call into a
+single record construction" comment. The same-module paths had
+been left alone.
+
+#### The change
+
+Added two new helpers in `src/Environment.elm`:
+
+- `callModuleFn : ModuleName -> String -> Env -> Env`
+- `callModuleFnNoStack : ModuleName -> String -> Env -> Env`
+
+Both are flat-closure variants of `call` / `callNoStack` that zero
+out both `values` *and* `letFunctions` on the returned env.
+Swapped them in at the five top-level-function PA creation sites
+in `src/Eval/Expression.elm`:
+
+1.  `evalFunctionOrValue []name` → `currentModuleFunctions`
+    branch (unqualified same-module top-level reference)
+2.  `evalUnqualifiedAfterLocalMiss` → same, after letFunctions
+    and values have been checked and missed
+3.  `evalQualifiedOrVariant []name` → `currentModuleFunctions`
+    branch
+4.  `evalNonVariant` same-module branch (qualified reference to
+    a same-module top-level function)
+5.  `evalQualifiedOrVariantSlow` → record-alias-constructor path
+
+Let-function PA sites (where the body may genuinely close over
+enclosing locals) were **left alone** and still use
+`Environment.callNoStack`.
+
+The round 8/9 lambda-trim attempt — which tried the same thing
+via a per-closure `freeVariables` AST walk — was abandoned
+because the walk cost ate the savings. This version sidesteps
+that entirely: the trim for a top-level function PA is O(1)
+(just pass `Dict.empty`), no AST inspection needed, because we
+can statically prove the callee doesn't need caller values.
+
+#### Bench (small-12 fixture, 12-rule config, three runs)
+
+| Scenario                  | Baseline | Run 1   | Run 2   | Run 3   | Best Δ  |
+|---------------------------|---------:|--------:|--------:|--------:|--------:|
+| cold                      |  419.72s | 369.78s | 398.77s | 384.33s |  -11.9% |
+| warm                      |    0.44s |   0.43s |   0.43s |   0.43s |  noise  |
+| warm_1_file_body_edit     |    2.59s |   2.60s |   2.56s |   2.34s |   -9.7% |
+| warm_1_file_comment_only  |    1.17s |   1.17s |   1.17s |   1.00s |  -14.5% |
+| warm_import_graph_change  |  103.62s |  95.09s |  99.92s |  91.03s |  -12.2% |
+
+The win is consistent across all scenarios where the interpreter
+does meaningful work — and it even shows up in the cached-hit
+scenarios once the smaller captured envs propagate through warm
+paths. `warm` itself (0.04s internal) is pure cache-hit bookkeeping
+so there's nothing to move.
+
+Interpreter test suite unchanged at 1124/9 (same pre-existing
+failures as `df767a8`). `map-bug-diag` smoke test reports 7
+errors as expected.
+
+#### Implications for the next rounds
+
+- **Split Env (#7) is next up** per the 2026-04-10 Obsidian plan.
+  With `letFunctions` + `values` both cleared at the trim sites,
+  the remaining per-PA record copy is now 8 mutable-ish fields
+  (currentModule, currentModuleKey, callStack, shared,
+  currentModuleFunctions, imports, callDepth, recursionCheck).
+  Splitting the dynamic (`values`, `callStack`, `callDepth`,
+  `recursionCheck`, `letFunctions`) from the static
+  (`currentModule*`, `shared`, `currentModuleFunctions`, `imports`)
+  would shrink the per-call copy further.
+- The lambda case — which round 8 tried and abandoned — is now
+  the only remaining sink for `env.values` dead weight. Worth
+  revisiting *if* we later get a parse-time pass going that can
+  precompute free vars for every lambda AST node. Until then, the
+  per-capture `freeVariables` walk is too expensive.
+- Closure compilation (#11) payoff shrinks slightly because the
+  interpreter dispatch bucket is now a smaller fraction of the
+  (smaller) total runtime. Reprofile after split Env lands.
