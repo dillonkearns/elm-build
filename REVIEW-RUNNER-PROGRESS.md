@@ -3849,3 +3849,128 @@ Ranked by size of the available win vs. implementation effort:
 - `bench/results/review-runner-scenarios.json` NOT updated
   from this round's runs (the canonical numbers there are
   from a different bench config with `host_importers_experiments: true`).
+
+### Round 9: Env `Dict Int Value` Experiment — Failed
+
+Took the biggest profile win on the board (Dict ops ~30% combined,
+of which `_Utils_cmp` was 11%) and tried the obvious approach:
+change `EnvValues = Dict String Value` → `Dict Int Value` with
+FNV-1a hashed keys, so the tree comparisons collapse from
+O(len) string compares to O(1) integer compares.
+
+#### What I changed
+
+- Moved `hashString` → `Environment.nameKey : String -> Int`
+  (exported), same FNV-1a algorithm as the existing function
+- Flipped the type alias in `src/Types.elm`
+- Threaded `nameKey` through all inserts
+  (`addValue`, `withBindings`, `bindSimplePatternsHelp`,
+  `Eval.Module`'s `injectedValues` merge) and all reads
+  (`Eval.Expression.evalFunctionOrValue []name` at lines
+  867, 1205, 2540)
+- Fixed `fingerprintValues` (was using `String.length k`;
+  now mixes the Int hash directly)
+- Rewrote the one site that was using `Dict.keys env.values
+  |> Set.fromList` (the let-block shadowing check in
+  `evalLetBlockFull`) to do per-name `Dict.member` against
+  the hashed key instead of set-building
+- Tests: 1124/9 (unchanged pre-existing failures), diag
+  smoke test reported 7 errors correctly
+
+#### Why it failed
+
+Bench on small-12:
+
+| Scenario                 | Baseline | Int keys | Delta  |
+|--------------------------|---------:|---------:|-------:|
+| cold                     |  419.72s |  422.64s | +0.7%  |
+| warm                     |    0.44s |    0.42s | noise  |
+| warm_1_file_body_edit    |    2.59s |    2.55s | noise  |
+| warm_1_file_comment_only |    1.17s |    1.16s | noise  |
+| warm_import_graph_change |  103.62s |  104.52s | +0.9%  |
+
+All within run-to-run noise. But the debug-bundle profile
+(`--optimize 0`) tells the real story:
+
+|                          | Round 8 baseline | Round 9 int keys | Delta  |
+|--------------------------|-----------------:|-----------------:|-------:|
+| Total profile time       |          139.88s |          199.06s | +42%   |
+| GC                       |    17.4s (12.4%) |    37.0s (18.6%) | +112%  |
+| `_Char_toCode`           |     0.9s (0.7%)  |   **22.2s (11.2%)** | +2367% |
+| `_Utils_chr`             |             —    |      4.6s (2.3%) | new    |
+| `_Utils_cmp`             |    15.3s (11.0%) |    13.6s (6.8%)  | -11%   |
+| `FastDict.get`           |    10.0s (7.1%)  |    11.2s (5.6%)  | -8%    |
+| `nameKey` (self)         |             —    |      1.2s (0.6%) | new    |
+
+`_Utils_cmp` **did** drop as the theory predicted — strings
+aren't being compared in tree walks anymore. But the
+replacement cost — computing the hash on every lookup via
+`String.foldl` — blew up `_Char_toCode` from 0.9s to 22.2s
+and doubled the GC spend. Every lookup now iterates every
+character of the name string and allocates intermediate
+values for the foldl closure and the Char wrapping. Net:
+42% *slower* in the debug bundle, zero win in the optimized
+bundle (V8 presumably inlines enough of the foldl to hide
+the worst of it, but still nothing to gain).
+
+`_Utils_cmp` at 6.8% post-change is lower than 11% because
+the remaining cost is from Dicts **outside** `env.values` —
+`env.shared.functions`, `currentModuleFunctions`,
+`letFunctions`, `env.imports.*`, `moduleImports`, and many
+other FastDicts that still use String keys. `env.values` was
+only a fraction of the original 11%.
+
+#### The lesson
+
+**You cannot hash on the lookup path.** The only viable
+version of this optimization needs hashes *precomputed* and
+*attached to the AST nodes*, so the lookup reads an already-
+computed Int without re-walking the name's characters.
+
+Approaches that could make this work, none cheap:
+
+1.  **Lift to an internal IR.** Compile the elm-syntax AST
+    to a simpler interpreter IR at module-build time, where
+    every `FunctionOrValue [] name` becomes `LocalRef Int`
+    (pre-assigned unique index) or similar. Lookups become
+    integer indexed. Biggest potential win but biggest
+    refactor — touches every `evalExpression` branch plus
+    module loading.
+2.  **Annotate via side table keyed by AST node identity.**
+    Elm doesn't give us stable node identity in the
+    elm-syntax types, so this ends up being basically "build
+    a new AST" anyway.
+3.  **Wrap FunctionImplementation** with a precomputed Dict
+    of `name → hash` captured when the implementation was
+    first seen. Lookups inside that function's body consult
+    the wrapped dict. Still O(log n) on every lookup but
+    string compares only once per name, not per char. Only a
+    partial win.
+
+None of these fit inside a single session. `env.values`
+optimization is parked here until I'm ready to tackle the
+IR lift. The branch has been reverted back to
+`b3299a1 + Custom-constructor fix`; nothing to commit from
+this round's interpreter code.
+
+#### New next priorities
+
+Now that the env-dict shortcut is off the table without a
+parse-time pass, the remaining profile opportunities are:
+
+1.  **Reduce `Env` record allocation.** Every binding
+    constructs a full Env record copy (10 fields). Batch
+    bindings where possible; use `replaceValues` instead of
+    `addValue` when multiple bindings come in together.
+    Existing `bindSimplePatternsHelp` already does this for
+    simple patterns — find sites still using `addValue` in a
+    loop. Probably 1-5% win.
+2.  **First-order `List.*` shortcuts** (`length`, `isEmpty`,
+    `reverse`, `head`, `tail`). Low risk (no higher-order
+    callbacks → no Custom-constructor pitfall). Small but
+    cheap: maybe 1-2% combined.
+3.  **IR lift** (the big one). If there's appetite for a
+    multi-session investment, this unlocks the ~10-15%
+    env-lookup win *and* `isTailRecursive` caching *and*
+    pre-resolved module qualifications *and* a cleaner
+    place to hang future optimizations.
