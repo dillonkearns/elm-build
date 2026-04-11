@@ -2518,7 +2518,30 @@ prepareRawEvalWithYieldAndMemo (InterpreterProject project) { imports, expressio
                     project.packageEnv
 
         rawResult =
-            if FastDict.isEmpty injectedValues then
+            if useResolvedIRPath && Set.isEmpty memoizedFunctions then
+                let
+                    parseResult =
+                        evalSources
+                            |> List.map
+                                (\src ->
+                                    Elm.Parser.parseToFile src
+                                        |> Result.mapError Types.ParsingError
+                                )
+                            |> combineFileResults
+                in
+                case parseResult of
+                    Err _ ->
+                        Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Parse error in prepareAndEvalWithYield (resolved IR path)" }
+
+                    Ok parsedModules ->
+                        Eval.Module.evalWithResolvedIRFromFilesAndIntercepts
+                            env
+                            parsedModules
+                            injectedValues
+                            intercepts
+                            (FunctionOrValue [] "results")
+
+            else if FastDict.isEmpty injectedValues then
                 Eval.Module.evalWithInterceptsAndMemoRaw env evalSources intercepts memoizedFunctions (FunctionOrValue [] "results")
 
             else
@@ -2543,6 +2566,59 @@ prepareRawEvalWithYieldAndMemo (InterpreterProject project) { imports, expressio
                         Eval.Module.evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw env parsedModules injectedValues intercepts memoizedFunctions (FunctionOrValue [] "results")
     in
     rawResult
+
+
+{-| Phase 4 Round 2 gate: when True, route yield-driving eval calls
+through the new resolved-IR evaluator instead of the old string-keyed
+path. Falls back to the old path when `memoizedFunctions` is non-empty
+since memo support hasn't been ported yet.
+
+Flip this to `False` to A/B the two paths during benchmarking. When
+Phase 4 Round 3 lands (deletion of the old evaluator), this constant
+goes away.
+
+-}
+useResolvedIRPath : Bool
+useResolvedIRPath =
+    True
+
+
+{-| Convert the `EvalResult Value` returned by the new
+`evalWithResolvedIRFromFilesAndIntercepts` entry point into the
+`Result String Value` shape callers of `prepareAndEvalWithIntercepts`
+expect. Only the synchronous `EvOk` / `EvErr` variants can be
+translated directly; an intercept that returns `EvYield` / `EvMemoLookup`
+/ `EvMemoStore` through this synchronous path would be a programming
+error (no yield handler is installed), so we surface it as a formatted
+error string to make it obvious if it happens.
+
+-}
+resolvedEvalResultToResult : Types.EvalResult Types.Value -> Result String Types.Value
+resolvedEvalResultToResult result =
+    case result of
+        Types.EvOk value ->
+            Ok value
+
+        Types.EvErr errorData ->
+            Err
+                (formatError
+                    (Types.EvalError errorData)
+                )
+
+        Types.EvOkTrace value _ _ ->
+            Ok value
+
+        Types.EvErrTrace errorData _ _ ->
+            Err (formatError (Types.EvalError errorData))
+
+        Types.EvYield tag _ _ ->
+            Err ("ERROR: Unexpected EvYield '" ++ tag ++ "' in synchronous intercept path (resolvedEvalResultToResult)")
+
+        Types.EvMemoLookup _ _ ->
+            Err "ERROR: Unexpected EvMemoLookup in synchronous intercept path (resolvedEvalResultToResult)"
+
+        Types.EvMemoStore _ _ ->
+            Err "ERROR: Unexpected EvMemoStore in synchronous intercept path (resolvedEvalResultToResult)"
 
 
 {-| Evaluate with intercepts that can yield to the framework.
@@ -2800,13 +2876,27 @@ prepareAndEvalWithIntercepts (InterpreterProject project) { imports, expression,
             in
             case project.baseUserEnv of
                 Just baseEnv ->
-                    -- Fast path: baseUserEnv has all user modules pre-loaded.
-                    -- Only parse sourceOverrides + wrapper (small/new).
-                    Eval.Module.evalWithIntercepts baseEnv (sourceOverrides ++ [ wrapperSource ]) intercepts (FunctionOrValue [] "results")
-                        |> Result.mapError formatError
+                    if useResolvedIRPath then
+                        Eval.Module.evalWithResolvedIRFromFilesAndIntercepts
+                            baseEnv
+                            newFiles
+                            FastDict.empty
+                            intercepts
+                            (FunctionOrValue [] "results")
+                            |> resolvedEvalResultToResult
+
+                    else
+                        -- Fast path: baseUserEnv has all user modules pre-loaded.
+                        -- Only parse sourceOverrides + wrapper (small/new).
+                        Eval.Module.evalWithIntercepts baseEnv (sourceOverrides ++ [ wrapperSource ]) intercepts (FunctionOrValue [] "results")
+                            |> Result.mapError formatError
 
                 Nothing ->
-                    -- Fallback: parse everything from scratch
+                    -- Fallback: parse everything from scratch. We don't
+                    -- route this through the new path because the new
+                    -- entry point assumes the base env already has the
+                    -- user modules built in — without a baseUserEnv,
+                    -- reusing it would silently miss user declarations.
                     Eval.Module.evalWithIntercepts project.packageEnv allSources intercepts (FunctionOrValue [] "results")
                         |> Result.mapError formatError
 
