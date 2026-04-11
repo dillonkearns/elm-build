@@ -13911,7 +13911,8 @@ runProjectRulesWithCacheWriteModules buildDir baseProjectValue reviewProject prI
         injectedValues =
             FastDict.singleton modulesVarName (moduleInputsValue modulesWithAst)
 
-        fallbackOutput =
+        fallbackOutput : () -> BackendTask FatalError String
+        fallbackOutput () =
             runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst
 
         loadedRuleCaches =
@@ -13950,7 +13951,7 @@ runProjectRulesWithCacheWriteModules buildDir baseProjectValue reviewProject prI
                     }
 
             Ok _ ->
-                Do.do fallbackOutput <| \output ->
+                Do.do (fallbackOutput ()) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -13960,7 +13961,7 @@ runProjectRulesWithCacheWriteModules buildDir baseProjectValue reviewProject prI
                     }
 
             Err _ ->
-                Do.do fallbackOutput <| \output ->
+                Do.do (fallbackOutput ()) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -13998,7 +13999,7 @@ runProjectRulesWithCacheWriteModules buildDir baseProjectValue reviewProject prI
                     }
 
             Ok _ ->
-                Do.do fallbackOutput <| \output ->
+                Do.do (fallbackOutput ()) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -14008,7 +14009,7 @@ runProjectRulesWithCacheWriteModules buildDir baseProjectValue reviewProject prI
                     }
 
             Err _ ->
-                Do.do fallbackOutput <| \output ->
+                Do.do (fallbackOutput ()) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -14043,7 +14044,8 @@ runProjectRulesWithCacheWrite buildDir baseProjectValue reviewProject prIndices 
         injectedValues =
             FastDict.singleton moduleHandlesVarName sharedModuleHandlePayloads.handlesValue
 
-        fallbackOutput =
+        fallbackOutput : () -> BackendTask FatalError String
+        fallbackOutput () =
             runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst
 
         loadedRuleCaches =
@@ -14082,7 +14084,7 @@ runProjectRulesWithCacheWrite buildDir baseProjectValue reviewProject prIndices 
                     }
 
             Ok _ ->
-                Do.do fallbackOutput <| \output ->
+                Do.do (fallbackOutput ()) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -14092,7 +14094,7 @@ runProjectRulesWithCacheWrite buildDir baseProjectValue reviewProject prIndices 
                     }
 
             Err _ ->
-                Do.do fallbackOutput <| \output ->
+                Do.do (fallbackOutput ()) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -14130,7 +14132,7 @@ runProjectRulesWithCacheWrite buildDir baseProjectValue reviewProject prIndices 
                     }
 
             Ok _ ->
-                Do.do fallbackOutput <| \output ->
+                Do.do (fallbackOutput ()) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -14140,7 +14142,7 @@ runProjectRulesWithCacheWrite buildDir baseProjectValue reviewProject prIndices 
                     }
 
             Err _ ->
-                Do.do fallbackOutput <| \output ->
+                Do.do (fallbackOutput ()) <| \output ->
                 BackendTask.succeed
                     { output = output
                     , memoCache = memoCache
@@ -14174,7 +14176,8 @@ runProjectRulesWithWarmRuleCachesModules counterPrefix buildDir baseProjectValue
         injectedValues =
             FastDict.singleton modulesVarName (moduleInputsValue modulesWithAst)
 
-        fallbackOutput =
+        fallbackOutput : () -> BackendTask FatalError String
+        fallbackOutput () =
             runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst
     in
     Do.do
@@ -14236,7 +14239,7 @@ runProjectRulesWithWarmRuleCachesModules counterPrefix buildDir baseProjectValue
                     }
 
             Ok _ ->
-                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") (fallbackOutput ())) <| \fallbackTimed ->
                 BackendTask.succeed
                     { output = fallbackTimed.value
                     , memoCache = memoCache
@@ -14254,7 +14257,7 @@ runProjectRulesWithWarmRuleCachesModules counterPrefix buildDir baseProjectValue
                     }
 
             Err _ ->
-                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") (fallbackOutput ())) <| \fallbackTimed ->
                 BackendTask.succeed
                     { output = fallbackTimed.value
                     , memoCache = memoCache
@@ -14303,7 +14306,7 @@ runProjectRulesWithWarmRuleCachesModules counterPrefix buildDir baseProjectValue
                     }
 
             Ok _ ->
-                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") (fallbackOutput ())) <| \fallbackTimed ->
                 BackendTask.succeed
                     { output = fallbackTimed.value
                     , memoCache = memoCache
@@ -14321,7 +14324,7 @@ runProjectRulesWithWarmRuleCachesModules counterPrefix buildDir baseProjectValue
                     }
 
             Err _ ->
-                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") (fallbackOutput ())) <| \fallbackTimed ->
                 BackendTask.succeed
                     { output = fallbackTimed.value
                     , memoCache = memoCache
@@ -14360,7 +14363,8 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir baseProjectValue review
         expression =
             buildExpressionForRulesWithHandleVar prIndices moduleHandlesVarName
 
-        fallbackOutput =
+        fallbackOutput : () -> BackendTask FatalError String
+        fallbackOutput () =
             runProjectRulesFresh baseProjectValue reviewProject prIndices modulesWithAst
     in
     Do.do
@@ -14439,7 +14443,7 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir baseProjectValue review
                     }
 
             Ok _ ->
-                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") (fallbackOutput ())) <| \fallbackTimed ->
                 BackendTask.succeed
                     { output = fallbackTimed.value
                     , memoCache = memoCache
@@ -14457,7 +14461,7 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir baseProjectValue review
                     }
 
             Err _ ->
-                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") (fallbackOutput ())) <| \fallbackTimed ->
                 BackendTask.succeed
                     { output = fallbackTimed.value
                     , memoCache = memoCache
@@ -14506,7 +14510,7 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir baseProjectValue review
                     }
 
             Ok _ ->
-                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") (fallbackOutput ())) <| \fallbackTimed ->
                 BackendTask.succeed
                     { output = fallbackTimed.value
                     , memoCache = memoCache
@@ -14524,7 +14528,7 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir baseProjectValue review
                     }
 
             Err _ ->
-                Do.do (withTiming (counterPrefix ++ ".fallback_eval") fallbackOutput) <| \fallbackTimed ->
+                Do.do (withTiming (counterPrefix ++ ".fallback_eval") (fallbackOutput ())) <| \fallbackTimed ->
                 BackendTask.succeed
                     { output = fallbackTimed.value
                     , memoCache = memoCache
@@ -14912,7 +14916,8 @@ evalProjectRulesWithWarmState config baseProjectValue reviewProject helperHash p
             Do.do (persistProjectCacheMetadata buildDir projectMetadata) <| \_ ->
             persistProjectEvalOutput maybeOutputCache output
 
-        fallbackOutput =
+        fallbackOutput : () -> BackendTask FatalError String
+        fallbackOutput () =
             runProjectRulesFresh baseProjectValue reviewProject prIndices allModulesWithAst
 
         usedCachedProject =
@@ -14955,7 +14960,7 @@ evalProjectRulesWithWarmState config baseProjectValue reviewProject helperHash p
                     }
 
             Ok _ ->
-                Do.do fallbackOutput <| \fallback ->
+                Do.do (fallbackOutput ()) <| \fallback ->
                 Do.do (persistProjectEvalOutput maybeOutputCache fallback) <| \output ->
                 BackendTask.succeed
                     { output = output
@@ -14965,7 +14970,7 @@ evalProjectRulesWithWarmState config baseProjectValue reviewProject helperHash p
                     }
 
             Err _ ->
-                Do.do fallbackOutput <| \fallback ->
+                Do.do (fallbackOutput ()) <| \fallback ->
                 Do.do (persistProjectEvalOutput maybeOutputCache fallback) <| \output ->
                 BackendTask.succeed
                     { output = output
@@ -15011,7 +15016,7 @@ evalProjectRulesWithWarmState config baseProjectValue reviewProject helperHash p
                     }
 
             Ok _ ->
-                Do.do fallbackOutput <| \fallback ->
+                Do.do (fallbackOutput ()) <| \fallback ->
                 Do.do (persistProjectEvalOutput maybeOutputCache fallback) <| \output ->
                 BackendTask.succeed
                     { output = output
@@ -15021,7 +15026,7 @@ evalProjectRulesWithWarmState config baseProjectValue reviewProject helperHash p
                     }
 
             Err _ ->
-                Do.do fallbackOutput <| \fallback ->
+                Do.do (fallbackOutput ()) <| \fallback ->
                 Do.do (persistProjectEvalOutput maybeOutputCache fallback) <| \output ->
                 BackendTask.succeed
                     { output = output
