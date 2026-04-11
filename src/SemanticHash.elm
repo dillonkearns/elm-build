@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, FileAspectHashes, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, computeAspectHashesFromFile, computeAspectHashesFromSource, declarationHash, diffIndices, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, semanticHashForEntry)
+module SemanticHash exposing (DeclarationIndex, FileAspectHashes, RawIndex, affectedRunnerIndices, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, buildRawIndex, computeAspectHashesFromFile, computeAspectHashesFromSource, declarationHash, depsForExpression, diffIndices, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, replaceModuleInRawIndex, resolveRawIndex, resolveRawIndexIncremental, semanticHashForEntry, transitiveDepsOf)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -254,6 +254,14 @@ type alias DeclarationInfo =
     , dependencies : Set String
     , semanticHash : String
     }
+
+
+{-| Raw index: AST hashes and direct dependencies before Merkle resolution.
+Cheaper to build than full DeclarationIndex — can be updated incrementally
+by replacing one module's entries.
+-}
+type alias RawIndex =
+    Dict String { astHash : String, deps : Set String }
 
 
 {-| Hash an expression's AST structure. References to other functions
@@ -771,6 +779,271 @@ buildMultiModuleIndexWithPackages { packageVersions, modules } =
             )
 
 
+{-| Build a raw index (AST hashes + direct deps) from module sources.
+This is the expensive parsing step — do it once for the baseline.
+-}
+buildRawIndex : List { moduleName : String, source : String } -> RawIndex
+buildRawIndex modules =
+    let
+        allDeclarations =
+            modules
+                |> List.concatMap
+                    (\mod ->
+                        case Elm.Parser.parseToFile mod.source of
+                            Ok file ->
+                                file.declarations
+                                    |> List.filterMap
+                                        (\(Node _ decl) ->
+                                            case decl of
+                                                FunctionDeclaration func ->
+                                                    let
+                                                        impl =
+                                                            Node.value func.declaration
+                                                    in
+                                                    Just
+                                                        ( mod.moduleName ++ "." ++ Node.value impl.name
+                                                        , { expr = impl.expression, moduleName = mod.moduleName }
+                                                        )
+
+                                                _ ->
+                                                    Nothing
+                                        )
+
+                            Err _ ->
+                                []
+                    )
+
+        allDeclNames =
+            allDeclarations |> List.map Tuple.first |> Set.fromList
+    in
+    allDeclarations
+        |> List.map
+            (\( qualName, { expr, moduleName } ) ->
+                ( qualName
+                , { astHash = hashExpression expr
+                  , deps =
+                        extractDependencies expr
+                            |> List.filterMap
+                                (\( modName, funcName ) ->
+                                    if isUppercase funcName then
+                                        Nothing
+
+                                    else
+                                        let
+                                            qualRef =
+                                                if List.isEmpty modName then
+                                                    moduleName ++ "." ++ funcName
+
+                                                else
+                                                    String.join "." modName ++ "." ++ funcName
+                                        in
+                                        if Set.member qualRef allDeclNames && qualRef /= qualName then
+                                            Just qualRef
+
+                                        else
+                                            Nothing
+                                )
+                            |> Set.fromList
+                  }
+                )
+            )
+        |> Dict.fromList
+
+
+{-| Replace one module's entries in a raw index. Only reparses the single
+mutated module source — O(1 module) instead of O(all modules).
+-}
+replaceModuleInRawIndex : RawIndex -> { moduleName : String, source : String } -> RawIndex
+replaceModuleInRawIndex baseRawIndex mutatedModule =
+    let
+        prefix =
+            mutatedModule.moduleName ++ "."
+
+        -- Remove old entries for this module
+        withoutOld =
+            Dict.filter (\name _ -> not (String.startsWith prefix name)) baseRawIndex
+
+        allDeclNames =
+            Dict.keys baseRawIndex |> Set.fromList
+
+        -- Parse mutated module and extract new entries
+        newEntries =
+            case Elm.Parser.parseToFile mutatedModule.source of
+                Ok file ->
+                    file.declarations
+                        |> List.filterMap
+                            (\(Node _ decl) ->
+                                case decl of
+                                    FunctionDeclaration func ->
+                                        let
+                                            impl =
+                                                Node.value func.declaration
+
+                                            qualName =
+                                                mutatedModule.moduleName ++ "." ++ Node.value impl.name
+                                        in
+                                        Just
+                                            ( qualName
+                                            , { astHash = hashExpression impl.expression
+                                              , deps =
+                                                    extractDependencies impl.expression
+                                                        |> List.filterMap
+                                                            (\( modName, funcName ) ->
+                                                                if isUppercase funcName then
+                                                                    Nothing
+
+                                                                else
+                                                                    let
+                                                                        qualRef =
+                                                                            if List.isEmpty modName then
+                                                                                mutatedModule.moduleName ++ "." ++ funcName
+
+                                                                            else
+                                                                                String.join "." modName ++ "." ++ funcName
+                                                                    in
+                                                                    if Set.member qualRef allDeclNames && qualRef /= qualName then
+                                                                        Just qualRef
+
+                                                                    else
+                                                                        Nothing
+                                                            )
+                                                        |> Set.fromList
+                                              }
+                                            )
+
+                                    _ ->
+                                        Nothing
+                            )
+
+                Err _ ->
+                    []
+    in
+    List.foldl (\( name, info ) idx -> Dict.insert name info idx) withoutOld newEntries
+
+
+{-| Resolve a raw index into a full DeclarationIndex with Merkle semantic hashes.
+-}
+resolveRawIndex : RawIndex -> DeclarationIndex
+resolveRawIndex rawIndex =
+    let
+        semanticHashes =
+            resolveAll rawIndex Dict.empty
+    in
+    rawIndex
+        |> Dict.map
+            (\name info ->
+                { astHash = info.astHash
+                , dependencies = info.deps
+                , semanticHash =
+                    Dict.get name semanticHashes
+                        |> Maybe.withDefault info.astHash
+                }
+            )
+
+
+{-| Incrementally compute a DeclarationIndex from a mutated raw index,
+reusing baseline semantic hashes for unchanged declarations. Only re-resolves
+hashes for declarations whose AST hash or dependencies changed.
+Much faster than full resolveRawIndex when only one module is mutated.
+-}
+resolveRawIndexIncremental : DeclarationIndex -> RawIndex -> DeclarationIndex
+resolveRawIndexIncremental baseline mutatedRaw =
+    let
+        -- Find declarations with changed AST hashes
+        changedAstDecls =
+            Dict.foldl
+                (\name info acc ->
+                    case Dict.get name baseline of
+                        Just baseInfo ->
+                            if baseInfo.astHash /= info.astHash then
+                                Set.insert name acc
+
+                            else
+                                acc
+
+                        Nothing ->
+                            -- New declaration
+                            Set.insert name acc
+                )
+                Set.empty
+                mutatedRaw
+
+        -- Build reverse dependency map
+        reverseDeps =
+            Dict.foldl
+                (\name info acc ->
+                    Set.foldl
+                        (\dep revAcc ->
+                            Dict.update dep
+                                (\existing ->
+                                    case existing of
+                                        Just set ->
+                                            Just (Set.insert name set)
+
+                                        Nothing ->
+                                            Just (Set.singleton name)
+                                )
+                                revAcc
+                        )
+                        acc
+                        info.deps
+                )
+                Dict.empty
+                mutatedRaw
+
+        -- Propagate: find all transitively affected declarations
+        affected =
+            propagateChanges reverseDeps (Set.toList changedAstDecls) changedAstDecls
+
+        -- Re-resolve only affected declarations
+        semanticHashes =
+            resolveAll mutatedRaw Dict.empty
+    in
+    mutatedRaw
+        |> Dict.map
+            (\name info ->
+                if Set.member name affected then
+                    { astHash = info.astHash
+                    , dependencies = info.deps
+                    , semanticHash =
+                        Dict.get name semanticHashes
+                            |> Maybe.withDefault info.astHash
+                    }
+
+                else
+                    -- Unchanged: reuse baseline
+                    case Dict.get name baseline of
+                        Just baseInfo ->
+                            baseInfo
+
+                        Nothing ->
+                            { astHash = info.astHash
+                            , dependencies = info.deps
+                            , semanticHash =
+                                Dict.get name semanticHashes
+                                    |> Maybe.withDefault info.astHash
+                            }
+            )
+
+
+propagateChanges : Dict String (Set String) -> List String -> Set String -> Set String
+propagateChanges reverseDeps queue visited =
+    case queue of
+        [] ->
+            visited
+
+        current :: rest ->
+            let
+                dependents =
+                    Dict.get current reverseDeps
+                        |> Maybe.withDefault Set.empty
+
+                newDeps =
+                    Set.diff dependents visited
+            in
+            propagateChanges reverseDeps (rest ++ Set.toList newDeps) (Set.union visited newDeps)
+
+
 {-| Hash an expression, replacing package references with versioned names.
 -}
 hashExpressionWithPackages : Dict String String -> Node Expression -> String
@@ -881,3 +1154,91 @@ diffIndices original mutated =
         )
         { changed = Set.empty, unchanged = Set.empty }
         mutated
+
+
+{-| Given per-runner dependency sets and a set of changed declarations,
+return the indices of runners whose dependencies intersect with the changes.
+
+By Elm's purity: if a runner's transitive dependencies don't include any
+changed declaration, its output is provably identical to baseline.
+
+-}
+affectedRunnerIndices : List (Set String) -> Set String -> List Int
+affectedRunnerIndices perRunnerDeps changedDecls =
+    perRunnerDeps
+        |> List.indexedMap
+            (\i deps ->
+                if Set.isEmpty (Set.intersect deps changedDecls) then
+                    Nothing
+
+                else
+                    Just i
+            )
+        |> List.filterMap identity
+
+
+{-| Compute the transitive dependency closure for a declaration.
+Returns all declarations reachable from the given name (including itself).
+-}
+transitiveDepsOf : DeclarationIndex -> String -> Set String
+transitiveDepsOf index name =
+    transitiveDepsHelp index [ name ] (Set.singleton name)
+
+
+transitiveDepsHelp : DeclarationIndex -> List String -> Set String -> Set String
+transitiveDepsHelp index queue visited =
+    case queue of
+        [] ->
+            visited
+
+        current :: rest ->
+            let
+                directDeps =
+                    Dict.get current index
+                        |> Maybe.map .dependencies
+                        |> Maybe.withDefault Set.empty
+
+                newDeps =
+                    Set.diff directDeps visited
+
+                newQueue =
+                    rest ++ Set.toList newDeps
+            in
+            transitiveDepsHelp index newQueue (Set.union visited newDeps)
+
+
+{-| Compute dependency set for an expression AST node, resolved against
+the semantic index. Returns qualified names of all declarations the
+expression transitively depends on.
+-}
+depsForExpression : DeclarationIndex -> String -> Node Expression -> Set String
+depsForExpression index moduleName expr =
+    let
+        directRefs =
+            extractDependencies expr
+                |> List.filterMap
+                    (\( modName, funcName ) ->
+                        if isUppercase funcName then
+                            Nothing
+
+                        else
+                            let
+                                qualRef =
+                                    if List.isEmpty modName then
+                                        moduleName ++ "." ++ funcName
+
+                                    else
+                                        String.join "." modName ++ "." ++ funcName
+                            in
+                            if Dict.member qualRef index then
+                                Just qualRef
+
+                            else
+                                Nothing
+                    )
+                |> Set.fromList
+    in
+    -- Expand to transitive closure
+    directRefs
+        |> Set.toList
+        |> List.foldl (\ref acc -> Set.union acc (transitiveDepsOf index ref)) directRefs

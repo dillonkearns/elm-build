@@ -85,7 +85,7 @@ task config =
                 , patchSource = patchSource
                 , patchUserSource = \_ source -> source
                 , extraSourceFiles = []
-                , extraReachableImports = []
+                , extraReachableImports = [ "Test", "Fuzz", "Expect", "Test.Runner" ]
                 , sourceDirectories = Just allDirectories
                 }
             )

@@ -448,6 +448,153 @@ suite =
                         ]
                         diff
             ]
+        , describe "affectedRunners (semantic hash-based runner selection)"
+            [ test "mutation affecting one function only selects runners that depend on it" <|
+                \_ ->
+                    let
+                        moduleA =
+                            { moduleName = "A"
+                            , source = "module A exposing (..)\n\nadd x y = x + y\n\nmul x y = x * y\n"
+                            }
+
+                        testModule =
+                            { moduleName = "Tests"
+                            , source = "module Tests exposing (..)\n\nimport A\nimport Test exposing (..)\n\naddTest = test \"add\" (\\_ -> A.add 1 2)\nmulTest = test \"mul\" (\\_ -> A.mul 3 4)\nsuite = describe \"t\" [addTest, mulTest]\n"
+                            }
+
+                        original =
+                            SemanticHash.buildMultiModuleIndex [ moduleA, testModule ]
+
+                        mutatedA =
+                            { moduleName = "A"
+                            , source = "module A exposing (..)\n\nadd x y = x - y\n\nmul x y = x * y\n"
+                            }
+
+                        mutated =
+                            SemanticHash.buildMultiModuleIndex [ mutatedA, testModule ]
+
+                        diff =
+                            SemanticHash.diffIndices original mutated
+                    in
+                    Expect.all
+                        [ \d -> Set.member "A.add" d.changed |> Expect.equal True |> Expect.onFail "A.add should be changed"
+                        , \d -> Set.member "A.mul" d.changed |> Expect.equal False |> Expect.onFail "A.mul should NOT be changed"
+                        , \d -> Set.member "Tests.addTest" d.changed |> Expect.equal True |> Expect.onFail "Tests.addTest should be changed (depends on A.add)"
+                        , \d -> Set.member "Tests.mulTest" d.changed |> Expect.equal False |> Expect.onFail "Tests.mulTest should NOT be changed"
+                        ]
+                        diff
+            , test "mutation to transitive dependency propagates through Merkle tree" <|
+                \_ ->
+                    let
+                        moduleA =
+                            { moduleName = "A"
+                            , source = "module A exposing (..)\n\nhelper x = x + 1\n\npublic x = helper (helper x)\n"
+                            }
+
+                        testModule =
+                            { moduleName = "Tests"
+                            , source = "module Tests exposing (..)\n\nimport A\nimport Test exposing (..)\n\nt1 = test \"uses public\" (\\_ -> A.public 5)\nt2 = test \"standalone\" (\\_ -> 42)\nsuite = describe \"t\" [t1, t2]\n"
+                            }
+
+                        original =
+                            SemanticHash.buildMultiModuleIndex [ moduleA, testModule ]
+
+                        mutatedA =
+                            { moduleName = "A"
+                            , source = "module A exposing (..)\n\nhelper x = x + 2\n\npublic x = helper (helper x)\n"
+                            }
+
+                        mutated =
+                            SemanticHash.buildMultiModuleIndex [ mutatedA, testModule ]
+
+                        diff =
+                            SemanticHash.diffIndices original mutated
+                    in
+                    Expect.all
+                        [ \d -> Set.member "A.helper" d.changed |> Expect.equal True |> Expect.onFail "A.helper should be changed"
+                        , \d -> Set.member "A.public" d.changed |> Expect.equal True |> Expect.onFail "A.public should be changed (depends on helper)"
+                        , \d -> Set.member "Tests.t1" d.changed |> Expect.equal True |> Expect.onFail "Tests.t1 should be changed (depends on A.public)"
+                        , \d -> Set.member "Tests.t2" d.changed |> Expect.equal False |> Expect.onFail "Tests.t2 should NOT be changed (standalone)"
+                        ]
+                        diff
+            , test "equivalent mutation produces no changed declarations" <|
+                \_ ->
+                    let
+                        moduleA =
+                            { moduleName = "A"
+                            , source = "module A exposing (..)\n\nfoo x = x + 1\n"
+                            }
+
+                        original =
+                            SemanticHash.buildMultiModuleIndex [ moduleA ]
+
+                        -- Same source = same index = no changes
+                        mutated =
+                            SemanticHash.buildMultiModuleIndex [ moduleA ]
+
+                        diff =
+                            SemanticHash.diffIndices original mutated
+                    in
+                    Set.isEmpty diff.changed
+                        |> Expect.equal True
+                        |> Expect.onFail "Identical source should produce no changed declarations"
+            , test "affectedRunnerIndices selects correct subset" <|
+                \_ ->
+                    let
+                        -- Runner 0 depends on A.add, runner 1 depends on A.mul
+                        perRunnerDeps =
+                            [ Set.fromList [ "A.add" ]
+                            , Set.fromList [ "A.mul" ]
+                            , Set.fromList [ "A.add", "A.mul" ]
+                            ]
+
+                        changedDecls =
+                            Set.singleton "A.add"
+                    in
+                    SemanticHash.affectedRunnerIndices perRunnerDeps changedDecls
+                        |> Expect.equal [ 0, 2 ]
+            , test "depsForExpression finds transitive deps from inline test expression" <|
+                \_ ->
+                    let
+                        index =
+                            SemanticHash.buildMultiModuleIndex
+                                [ { moduleName = "A"
+                                  , source = "module A exposing (..)\n\nhelper x = x + 1\n\npublic x = helper x\n"
+                                  }
+                                ]
+
+                        -- Simulate an inline test body: \_ -> A.public 5
+                        expr =
+                            parseExpression "module T exposing (..)\n\nimport A\n\nt = A.public 5\n"
+                    in
+                    case expr of
+                        Just e ->
+                            let
+                                deps =
+                                    SemanticHash.depsForExpression index "T" e
+                            in
+                            Expect.all
+                                [ \d -> Set.member "A.public" d |> Expect.equal True |> Expect.onFail "Should include A.public"
+                                , \d -> Set.member "A.helper" d |> Expect.equal True |> Expect.onFail "Should include A.helper (transitive)"
+                                ]
+                                deps
+
+                        Nothing ->
+                            Expect.fail "Failed to parse"
+            , test "affectedRunnerIndices returns empty when no runner affected" <|
+                \_ ->
+                    let
+                        perRunnerDeps =
+                            [ Set.fromList [ "A.add" ]
+                            , Set.fromList [ "A.mul" ]
+                            ]
+
+                        changedDecls =
+                            Set.singleton "B.other"
+                    in
+                    SemanticHash.affectedRunnerIndices perRunnerDeps changedDecls
+                        |> Expect.equal []
+            ]
         ]
 
 

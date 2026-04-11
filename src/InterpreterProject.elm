@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -269,6 +269,83 @@ packageSummaryCacheKey allPackageSources =
         |> String.fromInt
 
 
+{-| Cache version for the user-code normalization blob. Bump whenever
+the `FunctionImplementation` wire format or the normalization rewrite shape
+changes in a way that would make old blobs incorrect.
+-}
+userNormCacheVersion : String
+userNormCacheVersion =
+    "v3"
+
+
+{-| Disk path for the combined user-normalization cache blob.
+
+Key includes a combined hash over every user file's content and the package
+environment fingerprint. Any user or package change invalidates the whole
+blob and triggers a full re-normalize — coarser than per-file caching but
+dramatically faster on the common "nothing changed" warm path (one binary
+read + decode instead of dozens of stat/read round-trips).
+-}
+userNormCacheBlobPath : String -> String -> String -> String
+userNormCacheBlobPath cacheDir packageKey userKey =
+    cacheDir ++ "/user-normalized-" ++ userNormCacheVersion ++ "-" ++ packageKey ++ "-" ++ userKey ++ ".blob"
+
+
+{-| Combined hash over every user file's source content, independent of
+iteration order. Any byte change in any user file invalidates the blob.
+-}
+userNormBundleKey : List String -> String
+userNormBundleKey userFileContents =
+    userFileContents
+        |> List.map (FNV1a.hash >> String.fromInt)
+        |> List.sort
+        |> String.join "|"
+        |> FNV1a.hash
+        |> String.fromInt
+
+
+{-| Entry in the combined user-normalization blob: one per module, carrying
+the module name and the list of normalized function implementations.
+-}
+type alias UserNormCacheEntry =
+    { moduleName : List String
+    , functions : List FunctionImplementation
+    }
+
+
+encodeUserNormBundle : List UserNormCacheEntry -> Bytes.Bytes
+encodeUserNormBundle entries =
+    entries
+        |> Lamdera.Wire3.encodeList encodeUserNormCacheEntry
+        |> Lamdera.Wire3.bytesEncode
+
+
+decodeUserNormBundle : Bytes.Bytes -> Maybe (List UserNormCacheEntry)
+decodeUserNormBundle bytes =
+    bytes
+        |> Lamdera.Wire3.bytesDecode (Lamdera.Wire3.decodeList decodeUserNormCacheEntry)
+
+
+encodeUserNormCacheEntry : UserNormCacheEntry -> Lamdera.Wire3.Encoder
+encodeUserNormCacheEntry entry =
+    Lamdera.Wire3.encodeSequenceWithoutLength
+        [ encodeModuleName entry.moduleName
+        , Lamdera.Wire3.encodeList encodeFunctionImplementationNoRanges entry.functions
+        ]
+
+
+decodeUserNormCacheEntry : Lamdera.Wire3.Decoder UserNormCacheEntry
+decodeUserNormCacheEntry =
+    Lamdera.Wire3.succeedDecode
+        (\moduleName functions ->
+            { moduleName = moduleName
+            , functions = functions
+            }
+        )
+        |> Lamdera.Wire3.andMapDecode decodeModuleName
+        |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeFunctionImplementationNoRanges)
+
+
 benchmarkPackageSummaryCacheCodecs :
     { projectDir : Path
     , skipPackages : Set String
@@ -510,6 +587,129 @@ decodePackageEnvSeed bytes =
                 |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeFunctionModuleEntry)
                 |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeImportModuleEntry)
             )
+
+
+ensureDirTask : String -> BackendTask FatalError ()
+ensureDirTask dirPath =
+    BackendTask.Custom.run "ensureDir"
+        (Json.Encode.string dirPath)
+        (Decode.succeed ())
+        |> BackendTask.allowFatal
+
+
+{-| Normalize every user module in topological order, checking a single
+combined cache blob first. On hit, decode the blob and replace each module's
+function dict in one pass. On miss, normalize each module in turn (each one
+sees previously-normalized siblings) and write the combined result back out.
+
+The key includes a fingerprint over every user file's content plus the
+package environment key. Any user or package change busts the whole blob —
+coarse but almost free: the common "nothing changed" warm path is a single
+binary read + decode, not 30-50 stat/read round-trips.
+-}
+buildUserNormalizedEnv :
+    { cacheDir : Maybe String
+    , packageKey : String
+    , userModules : List File
+    , userFileContents : List String
+    }
+    -> Eval.Module.ProjectEnv
+    -> BackendTask FatalError Eval.Module.ProjectEnv
+buildUserNormalizedEnv config envBeforeNorm =
+    case config.cacheDir of
+        Nothing ->
+            BackendTask.succeed (normalizeAllUserModulesFresh config.userModules envBeforeNorm |> Tuple.first)
+
+        Just cacheDir ->
+            let
+                userKey : String
+                userKey =
+                    userNormBundleKey config.userFileContents
+
+                cachePath : String
+                cachePath =
+                    userNormCacheBlobPath cacheDir config.packageKey userKey
+            in
+            File.exists cachePath
+                |> BackendTask.allowFatal
+                |> BackendTask.andThen
+                    (\exists ->
+                        if exists then
+                            File.binaryFile cachePath
+                                |> BackendTask.allowFatal
+                                |> BackendTask.map
+                                    (\bytes ->
+                                        case decodeUserNormBundle bytes of
+                                            Just entries ->
+                                                applyUserNormBundle entries envBeforeNorm
+
+                                            Nothing ->
+                                                -- Decode failed; re-normalize fresh
+                                                normalizeAllUserModulesFresh config.userModules envBeforeNorm
+                                                    |> Tuple.first
+                                    )
+
+                        else
+                            let
+                                ( normalizedEnv, entries ) =
+                                    normalizeAllUserModulesFresh config.userModules envBeforeNorm
+                            in
+                            Do.do (ensureDirTask cacheDir) <| \_ ->
+                            writeBinaryFile
+                                { path = cachePath
+                                , bytes = encodeUserNormBundle entries
+                                }
+                                |> BackendTask.map (\_ -> normalizedEnv)
+                    )
+
+
+{-| Normalize every user module in topo order without consulting a cache.
+Returns the updated env alongside the list of `UserNormCacheEntry` records
+we can feed to the encoder.
+-}
+normalizeAllUserModulesFresh : List File -> Eval.Module.ProjectEnv -> ( Eval.Module.ProjectEnv, List UserNormCacheEntry )
+normalizeAllUserModulesFresh userModules envBeforeNorm =
+    userModules
+        |> List.foldl
+            (\userFile ( envAcc, entriesAcc ) ->
+                let
+                    moduleName : List String
+                    moduleName =
+                        Eval.Module.fileModuleName userFile
+
+                    ( updatedEnv, normalizedFns ) =
+                        Eval.Module.normalizeOneModuleInEnv moduleName envAcc
+                in
+                ( updatedEnv
+                , { moduleName = moduleName
+                  , functions = FastDict.values normalizedFns
+                  }
+                    :: entriesAcc
+                )
+            )
+            ( envBeforeNorm, [] )
+        |> Tuple.mapSecond List.reverse
+
+
+{-| Install a decoded `UserNormCacheEntry` list into the env. Each entry
+contains only the functions whose bodies were rewritten during normalization;
+those overlay the originals that the env already parsed.
+-}
+applyUserNormBundle : List UserNormCacheEntry -> Eval.Module.ProjectEnv -> Eval.Module.ProjectEnv
+applyUserNormBundle entries env =
+    List.foldl
+        (\entry currentEnv ->
+            let
+                deltaDict : FastDict.Dict String FunctionImplementation
+                deltaDict =
+                    entry.functions
+                        |> List.map (\f -> ( Node.value f.name, f ))
+                        |> FastDict.fromList
+            in
+            Eval.Module.mergeModuleFunctionsIntoEnv entry.moduleName deltaDict currentEnv
+        )
+        env
+        entries
 
 
 writeBinaryFile : { path : String, bytes : Bytes.Bytes } -> BackendTask FatalError ()
@@ -993,7 +1193,11 @@ loadWith config =
         , extraSourceFiles = config.extraSourceFiles
         , extraReachableImports = config.extraReachableImports
         , sourceDirectories = config.sourceDirectories
-        , packageParseCacheDir = Nothing
+        , packageParseCacheDir =
+            -- Default to the project's `.elm-build` directory so the package
+            -- summary cache (including normalized top-level constants) is
+            -- persisted across runs without every caller having to opt in.
+            Just (Path.toString config.projectDir ++ "/.elm-build")
         }
         |> BackendTask.map .project
 
@@ -1233,7 +1437,12 @@ loadWithProfile config =
                     Do.do BackendTask.Time.now <| \buildPackageSummariesStart ->
                     let
                         packageSummaries =
-                            Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources
+                            -- Normalize top-level constants here so the cache
+                            -- stores the rewritten bodies. Subsequent project
+                            -- loads hit the summary cache and skip both the
+                            -- normalization pass AND its re-evaluation cost.
+                            Eval.Module.normalizeSummaries
+                                (Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources)
                     in
                     Do.do BackendTask.Time.now <| \buildPackageSummariesFinish ->
                     let
@@ -1387,11 +1596,26 @@ loadWithProfile config =
                                 |> List.filterMap (\src -> DepGraph.parseModuleName src)
                                 |> List.filterMap (\name -> Dict.get name userParsedFiles)
 
-                        baseUserEnvResult : Maybe Eval.Module.ProjectEnv
-                        baseUserEnvResult =
+                        envBeforeUserNormResult : Result Types.Error Eval.Module.ProjectEnv
+                        envBeforeUserNormResult =
                             Eval.Module.extendWithFiles pkgEnv userModulesInOrder
-                                |> Result.toMaybe
                     in
+                    Do.do
+                        (case envBeforeUserNormResult of
+                            Err _ ->
+                                BackendTask.succeed Nothing
+
+                            Ok envBeforeUserNorm ->
+                                buildUserNormalizedEnv
+                                    { cacheDir = config.packageParseCacheDir
+                                    , packageKey = packageSummaryCacheKey allPackageSources
+                                    , userModules = userModulesInOrder
+                                    , userFileContents = userFileContents |> List.map Tuple.second
+                                    }
+                                    envBeforeUserNorm
+                                    |> BackendTask.map Just
+                        )
+                    <| \baseUserEnvResult ->
                     Do.do BackendTask.Time.now <| \baseUserEnvFinish ->
                     let
                         buildBaseUserEnvMs =
@@ -2000,15 +2224,75 @@ then walks the resulting CallTree to extract all evaluated source ranges.
 Returns both the test result string and the list of covered ranges.
 
 -}
-evalWithCoverage :
+evalSimple :
     InterpreterProject
     ->
         { imports : List String
         , expression : String
         , sourceOverrides : List String
         }
+    -> BackendTask FatalError String
+evalSimple (InterpreterProject project) { imports, expression, sourceOverrides } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        filteredSources =
+            topoSortModules project.moduleGraph neededModules
+
+        userFilteredSources =
+            filteredSources
+                |> List.filter
+                    (\src ->
+                        case DepGraph.parseModuleName src of
+                            Just name ->
+                                not (Set.member name project.packageModuleNames)
+
+                            Nothing ->
+                                True
+                    )
+
+        allSources =
+            userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
+
+        result =
+            Eval.Module.evalWithEnv
+                project.packageEnv
+                allSources
+                (FunctionOrValue [] "results")
+    in
+    BackendTask.succeed
+        (case result of
+            Ok (Types.String s) ->
+                s
+
+            Ok _ ->
+                "ERROR: Expected String result"
+
+            Err (Types.ParsingError _) ->
+                "ERROR: Parsing error"
+
+            Err (Types.EvalError evalErr) ->
+                "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+        )
+
+
+evalWithCoverage :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , probeLines : Set Int
+        }
     -> BackendTask FatalError { result : String, coveredRanges : List Range }
-evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverrides } =
+evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverrides, probeLines } =
     let
         wrapperSource : String
         wrapperSource =
@@ -2043,8 +2327,9 @@ evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverr
         allSources =
             userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
 
-        ( result, callTrees, _ ) =
-            Eval.Module.traceWithEnv
+        ( result, coveredRanges ) =
+            Eval.Module.coverageWithEnvAndLimit Nothing
+                probeLines
                 project.packageEnv
                 allSources
                 (FunctionOrValue [] "results")
@@ -2062,9 +2347,6 @@ evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverr
 
                 Err (Types.EvalError evalErr) ->
                     "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
-
-        coveredRanges =
-            Coverage.extractRanges callTrees
     in
     BackendTask.succeed { result = resultString, coveredRanges = coveredRanges }
 
