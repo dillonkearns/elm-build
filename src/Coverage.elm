@@ -26,12 +26,20 @@ extractRanges trees =
 
 
 extractFromNode : CallTree -> List Range
-extractFromNode (CallNode node) =
-    let
-        (Node range _) =
-            node.expression
-    in
-    range :: extractRanges node.children
+extractFromNode tree =
+    case tree of
+        CallNode node ->
+            let
+                (Node range _) =
+                    node.expression
+            in
+            range :: extractRanges node.children
+
+        CoverageRange range ->
+            [ range ]
+
+        CoverageSet _ ->
+            []
 
 
 {-| Check if a target range is covered by any range in the covered list.

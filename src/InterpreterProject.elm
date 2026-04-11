@@ -2620,6 +2620,12 @@ resolvedEvalResultToResult result =
         Types.EvMemoStore _ _ ->
             Err "ERROR: Unexpected EvMemoStore in synchronous intercept path (resolvedEvalResultToResult)"
 
+        Types.EvOkCoverage value _ ->
+            Ok value
+
+        Types.EvErrCoverage errorData _ ->
+            Err (formatError (Types.EvalError errorData))
+
 
 {-| Evaluate with intercepts that can yield to the framework.
 
@@ -2726,6 +2732,12 @@ driveYields yieldHandler evalResult =
                         driveYields yieldHandler (resume resumeValue)
                     )
 
+        Types.EvOkCoverage value _ ->
+            BackendTask.succeed (Ok value)
+
+        Types.EvErrCoverage evalErr _ ->
+            BackendTask.succeed (Err (formatError (Types.EvalError evalErr)))
+
 
 driveYieldsState :
     state
@@ -2758,6 +2770,12 @@ driveYieldsState state yieldHandler evalResult =
                     (\( nextState, resumeValue ) ->
                         driveYieldsState nextState yieldHandler (resume resumeValue)
                     )
+
+        Types.EvOkCoverage value _ ->
+            BackendTask.succeed ( Ok value, state )
+
+        Types.EvErrCoverage evalErr _ ->
+            BackendTask.succeed ( Err (formatError (Types.EvalError evalErr)), state )
 
 
 driveYieldsAndMemo :
@@ -2826,6 +2844,20 @@ driveYieldsAndMemo memoCache memoStats yieldHandler evalResult =
                             (\resumeValue ->
                                 driveYieldsAndMemo memoCache memoStats yieldHandler (resume resumeValue)
                             )
+
+        Types.EvOkCoverage value _ ->
+            BackendTask.succeed
+                { result = Ok value
+                , memoCache = memoCache
+                , memoStats = memoStats
+                }
+
+        Types.EvErrCoverage evalErr _ ->
+            BackendTask.succeed
+                { result = Err (formatError (Types.EvalError evalErr))
+                , memoCache = memoCache
+                , memoStats = memoStats
+                }
 
 
 {-| Like prepareAndEval but with function intercepts (synchronous, no yield support).
