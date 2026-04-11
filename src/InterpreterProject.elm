@@ -993,7 +993,11 @@ loadWith config =
         , extraSourceFiles = config.extraSourceFiles
         , extraReachableImports = config.extraReachableImports
         , sourceDirectories = config.sourceDirectories
-        , packageParseCacheDir = Nothing
+        , packageParseCacheDir =
+            -- Default to the project's `.elm-build` directory so the package
+            -- summary cache (including normalized top-level constants) is
+            -- persisted across runs without every caller having to opt in.
+            Just (Path.toString config.projectDir ++ "/.elm-build")
         }
         |> BackendTask.map .project
 
@@ -1233,7 +1237,12 @@ loadWithProfile config =
                     Do.do BackendTask.Time.now <| \buildPackageSummariesStart ->
                     let
                         packageSummaries =
-                            Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources
+                            -- Normalize top-level constants here so the cache
+                            -- stores the rewritten bodies. Subsequent project
+                            -- loads hit the summary cache and skip both the
+                            -- normalization pass AND its re-evaluation cost.
+                            Eval.Module.normalizeSummaries
+                                (Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources)
                     in
                     Do.do BackendTask.Time.now <| \buildPackageSummariesFinish ->
                     let
