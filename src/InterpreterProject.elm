@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -2386,6 +2386,26 @@ that bypass the caching layer (e.g. benchmarking).
 getPackageEnv : InterpreterProject -> Eval.Module.ProjectEnv
 getPackageEnv (InterpreterProject project) =
     project.packageEnv
+
+
+precomputedValuesCount : InterpreterProject -> Int
+precomputedValuesCount (InterpreterProject project) =
+    case project.baseUserEnv of
+        Just env ->
+            Eval.Module.precomputedValuesCount env
+
+        Nothing ->
+            Eval.Module.precomputedValuesCount project.packageEnv
+
+
+precomputedValuesByModule : InterpreterProject -> List ( String, Int )
+precomputedValuesByModule (InterpreterProject project) =
+    case project.baseUserEnv of
+        Just env ->
+            Eval.Module.precomputedValuesByModule env
+
+        Nothing ->
+            Eval.Module.precomputedValuesByModule project.packageEnv
 
 
 {-| Get the dependency graph for the project's user source files.
