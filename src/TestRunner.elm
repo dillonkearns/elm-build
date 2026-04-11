@@ -268,7 +268,7 @@ runTestFile config project testFile =
         <| \cacheResult ->
         Do.allowFatal (File.rawFile (Path.toString cacheResult.output)) <| \output ->
         if String.startsWith "ERROR:" output then
-            Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 60 output ++ ")")) <| \_ ->
+            Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 500 output ++ ")")) <| \_ ->
             BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = 1 }
 
         else
