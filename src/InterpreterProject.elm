@@ -1398,7 +1398,7 @@ loadWithProfile config =
 
                         baseUserEnvResult : Maybe Eval.Module.ProjectEnv
                         baseUserEnvResult =
-                            Eval.Module.extendWithFiles pkgEnv userModulesInOrder
+                            Eval.Module.extendWithFilesNormalized pkgEnv userModulesInOrder
                                 |> Result.toMaybe
                     in
                     Do.do BackendTask.Time.now <| \baseUserEnvFinish ->
