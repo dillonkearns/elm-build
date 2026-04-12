@@ -1,14 +1,14 @@
 module InterpreterProjectTest exposing (suite)
 
 import Expect
-import InterpreterProject
+import ProjectRoots
 import Set
 import Test exposing (Test, describe, test)
 
 
 suite : Test
 suite =
-    describe "InterpreterProject"
+    describe "ProjectRoots"
         [ rootModuleNamesTests ]
 
 
@@ -24,7 +24,7 @@ rootModuleNamesTests =
     describe "computeRootModuleNames"
         [ test "user modules become roots (all mods minus pkg mods)" <|
             \_ ->
-                InterpreterProject.computeRootModuleNames
+                ProjectRoots.computeRootModuleNames
                     { allModuleNames = Set.fromList [ "Main", "App.Foo", "Url", "Dict" ]
                     , pkgModuleNames = Set.fromList [ "Url", "Dict" ]
                     , extraReachableImports = []
@@ -32,7 +32,7 @@ rootModuleNamesTests =
                     |> Expect.equal (Set.fromList [ "Main", "App.Foo" ])
         , test "extraReachableImports union with user modules" <|
             \_ ->
-                InterpreterProject.computeRootModuleNames
+                ProjectRoots.computeRootModuleNames
                     { allModuleNames = Set.fromList [ "Main", "Url" ]
                     , pkgModuleNames = Set.fromList [ "Url" ]
                     , extraReachableImports = [ "Test", "Fuzz" ]
@@ -40,7 +40,7 @@ rootModuleNamesTests =
                     |> Expect.equal (Set.fromList [ "Main", "Test", "Fuzz" ])
         , test "empty user modules still yields extras" <|
             \_ ->
-                InterpreterProject.computeRootModuleNames
+                ProjectRoots.computeRootModuleNames
                     { allModuleNames = Set.fromList [ "Url" ]
                     , pkgModuleNames = Set.fromList [ "Url" ]
                     , extraReachableImports = [ "Test" ]
@@ -48,7 +48,7 @@ rootModuleNamesTests =
                     |> Expect.equal (Set.fromList [ "Test" ])
         , test "no pkg overlap leaves all mods as roots" <|
             \_ ->
-                InterpreterProject.computeRootModuleNames
+                ProjectRoots.computeRootModuleNames
                     { allModuleNames = Set.fromList [ "A", "B", "C" ]
                     , pkgModuleNames = Set.empty
                     , extraReachableImports = []

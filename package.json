@@ -5,7 +5,7 @@
     },
     "scripts": {
         "start": "bunx elm-pages run src/Build.elm",
-        "test": "npx elm-pages bundle-script src/TestRunner.elm --output test-runner.mjs && node --stack-size=8192 test-runner.mjs --test tests/DepGraphTest.elm,tests/InterpreterProjectTest.elm",
+        "test": "npx elm-test-rs",
         "bench:review-runner": "node bench/review-runner-benchmark.mjs",
         "bench:review-cli": "node bench/elm-review-cli-benchmark.mjs",
         "bench:file-summary": "node bench/file-summary-benchmark.mjs"
