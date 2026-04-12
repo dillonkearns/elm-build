@@ -333,6 +333,19 @@ decodeUserNormBundle bytes =
 
 encodeUserNormCacheEntry : UserNormCacheEntry -> Lamdera.Wire3.Encoder
 encodeUserNormCacheEntry entry =
+    -- Filter precomputed values to only those that round-trip through Wire3.
+    -- `Int Infinity` (from `round (1 / 0)`), non-finite Floats, `JsonValue`,
+    -- `PartiallyApplied`, etc. are held in the in-memory precomputed cache
+    -- for runtime speedups but must not hit the on-disk blob — their encoded
+    -- bytes don't decode back to the same value (or at all), which silently
+    -- corrupts subsequent warm-run reads.
+    let
+        serializable : List ( String, Types.Value )
+        serializable =
+            List.filter
+                (\( _, value ) -> Eval.Module.isLosslessValue value)
+                entry.precomputedValues
+    in
     Lamdera.Wire3.encodeSequenceWithoutLength
         [ encodeModuleName entry.moduleName
         , Lamdera.Wire3.encodeList encodeFunctionImplementationNoRanges entry.functions
@@ -343,7 +356,7 @@ encodeUserNormCacheEntry entry =
                     , ValueWireCodec.encodeValue value
                     ]
             )
-            entry.precomputedValues
+            serializable
         ]
 
 
