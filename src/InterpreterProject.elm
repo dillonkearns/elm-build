@@ -618,21 +618,18 @@ ensureDirTask dirPath =
         |> BackendTask.allowFatal
 
 
-{-| Normalize every user module in topological order, checking a single
-combined cache blob first. On hit, decode the blob and replace each module's
-function dict in one pass. On miss, normalize each module in turn (each one
-sees previously-normalized siblings) and write the combined result back out.
+{-| Normalize every user module in topological order with per-file caching.
 
-The key includes a fingerprint over every user file's content plus the
-package environment key. Any user or package change busts the whole blob —
-coarse but almost free: the common "nothing changed" warm path is a single
-binary read + decode, not 30-50 stat/read round-trips.
+Each module gets its own cache blob keyed on `(packageKey, moduleContentHash)`.
+On a code change, only changed files are re-normalized; unchanged files load
+from their individual cache. This makes the code-change scenario nearly as fast
+as the fully-warm case.
 -}
 buildUserNormalizedEnv :
     { cacheDir : Maybe String
     , packageKey : String
     , userModules : List File
-    , userFileContents : List String
+    , userFileContents : Dict String String
     }
     -> Eval.Module.ProjectEnv
     -> BackendTask FatalError Eval.Module.ProjectEnv
@@ -642,46 +639,100 @@ buildUserNormalizedEnv config envBeforeNorm =
             BackendTask.succeed (normalizeAllUserModulesFresh config.userModules envBeforeNorm |> Tuple.first)
 
         Just cacheDir ->
-            let
-                userKey : String
-                userKey =
-                    userNormBundleKey config.userFileContents
+            normalizePerFile cacheDir config.packageKey config.userModules config.userFileContents envBeforeNorm
 
-                cachePath : String
-                cachePath =
-                    userNormCacheBlobPath cacheDir config.packageKey userKey
-            in
-            File.exists cachePath
-                |> BackendTask.allowFatal
-                |> BackendTask.andThen
-                    (\exists ->
-                        if exists then
-                            File.binaryFile cachePath
-                                |> BackendTask.allowFatal
-                                |> BackendTask.map
-                                    (\bytes ->
-                                        case decodeUserNormBundle bytes of
-                                            Just entries ->
-                                                applyUserNormBundle entries envBeforeNorm
 
-                                            Nothing ->
-                                                -- Decode failed; re-normalize fresh
-                                                normalizeAllUserModulesFresh config.userModules envBeforeNorm
-                                                    |> Tuple.first
-                                    )
+normalizePerFile :
+    String
+    -> String
+    -> List File
+    -> Dict String String
+    -> Eval.Module.ProjectEnv
+    -> BackendTask FatalError Eval.Module.ProjectEnv
+normalizePerFile cacheDir packageKey userModules userFileContents envBeforeNorm =
+    Do.do (ensureDirTask cacheDir) <| \_ ->
+    userModules
+        |> List.foldl
+            (\userFile envTask ->
+                Do.do envTask <| \envAcc ->
+                let
+                    moduleName : List String
+                    moduleName =
+                        Eval.Module.fileModuleName userFile
 
-                        else
-                            let
-                                ( normalizedEnv, entries ) =
-                                    normalizeAllUserModulesFresh config.userModules envBeforeNorm
-                            in
-                            Do.do (ensureDirTask cacheDir) <| \_ ->
-                            writeBinaryFile
-                                { path = cachePath
-                                , bytes = encodeUserNormBundle entries
-                                }
-                                |> BackendTask.map (\_ -> normalizedEnv)
-                    )
+                    moduleKey : String
+                    moduleKey =
+                        String.join "." moduleName
+
+                    contentHash : String
+                    contentHash =
+                        Dict.get moduleKey userFileContents
+                            |> Maybe.map (FNV1a.hash >> String.fromInt)
+                            |> Maybe.withDefault "0"
+
+                    perFilePath : String
+                    perFilePath =
+                        cacheDir
+                            ++ "/user-norm-"
+                            ++ userNormCacheVersion
+                            ++ "-"
+                            ++ packageKey
+                            ++ "-"
+                            ++ moduleKey
+                            ++ "-"
+                            ++ contentHash
+                            ++ ".blob"
+                in
+                File.exists perFilePath
+                    |> BackendTask.allowFatal
+                    |> BackendTask.andThen
+                        (\exists ->
+                            if exists then
+                                File.binaryFile perFilePath
+                                    |> BackendTask.allowFatal
+                                    |> BackendTask.map
+                                        (\bytes ->
+                                            case decodeUserNormBundle bytes of
+                                                Just [ entry ] ->
+                                                    applyUserNormBundle [ entry ] envAcc
+
+                                                _ ->
+                                                    Tuple.first (normalizeOneAndCache cacheDir perFilePath moduleName envAcc)
+                                        )
+
+                            else
+                                let
+                                    ( env, entry ) =
+                                        normalizeOneAndCache cacheDir perFilePath moduleName envAcc
+                                in
+                                writeBinaryFile
+                                    { path = perFilePath
+                                    , bytes = encodeUserNormBundle [ entry ]
+                                    }
+                                    |> BackendTask.map (\_ -> env)
+                        )
+            )
+            (BackendTask.succeed envBeforeNorm)
+
+
+normalizeOneAndCache : String -> String -> List String -> Eval.Module.ProjectEnv -> ( Eval.Module.ProjectEnv, UserNormCacheEntry )
+normalizeOneAndCache _ _ moduleName envAcc =
+    let
+        ( updatedEnv, normalizedFns ) =
+            Eval.Module.normalizeOneModuleInEnv moduleName envAcc
+
+        modulePrecomputed : List ( String, Types.Value )
+        modulePrecomputed =
+            Eval.Module.getModulePrecomputedValues moduleName updatedEnv
+                |> FastDict.toList
+
+        entry =
+            { moduleName = moduleName
+            , functions = FastDict.values normalizedFns
+            , precomputedValues = modulePrecomputed
+            }
+    in
+    ( updatedEnv, entry )
 
 
 {-| Normalize every user module in topo order without consulting a cache.
@@ -1643,7 +1694,14 @@ loadWithProfile config =
                                     { cacheDir = config.packageParseCacheDir
                                     , packageKey = packageSummaryCacheKey allPackageSources
                                     , userModules = userModulesInOrder
-                                    , userFileContents = userFileContents |> List.map Tuple.second
+                                    , userFileContents =
+                                        userFileContents
+                                            |> List.filterMap
+                                                (\( _, content ) ->
+                                                    DepGraph.parseModuleName content
+                                                        |> Maybe.map (\name -> ( name, content ))
+                                                )
+                                            |> Dict.fromList
                                     }
                                     envBeforeUserNorm
                                     |> BackendTask.map Just
