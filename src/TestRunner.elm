@@ -434,7 +434,11 @@ kernelPackages =
         , "elm/browser"
         , "elm/http"
         , "elm/file"
-        , "elm/url"
+
+        -- elm/url is NOT skipped: its source files load and parse fine,
+        -- and `patchSource` below rewrites `Url.percentEncode` /
+        -- `percentDecode` bodies (which would otherwise bottom out at
+        -- `Elm.Kernel.Url.*`) to pure-Elm implementations.
         ]
 
 
@@ -459,6 +463,13 @@ evalErrorKindToString kind =
 
 patchSource : String -> String
 patchSource source =
+    source
+        |> patchTestRunner
+        |> patchUrl
+
+
+patchTestRunner : String -> String
+patchTestRunner source =
     if String.contains "runThunk =\n    Elm.Kernel.Test.runThunk" source then
         source
             |> String.replace
@@ -467,3 +478,95 @@ patchSource source =
 
     else
         source
+
+
+{-| Rewrite `elm/url`'s `Url.elm` so `percentEncode` / `percentDecode`
+don't reach `Elm.Kernel.Url.*` (which our interpreter has no native
+implementation for). The replacement is a self-contained pure-Elm
+version inlined into the `Url` module itself, using standard
+`Char.toCode` / `String.toList` / UTF-8 bit-twiddling. Only triggers on
+the specific body of `elm/url`'s stock `Url.elm`, so if the source ever
+changes we'll notice (the patch silently no-ops and tests that need
+percent-encoding will fail).
+-}
+patchUrl : String -> String
+patchUrl source =
+    if String.contains "Elm.Kernel.Url.percentEncode" source then
+        source
+            |> String.replace "import Elm.Kernel.Url\n" ""
+            |> String.replace
+                "percentEncode : String -> String\npercentEncode =\n  Elm.Kernel.Url.percentEncode"
+                percentEncodePatched
+            |> String.replace
+                "percentDecode : String -> Maybe String\npercentDecode =\n  Elm.Kernel.Url.percentDecode"
+                percentDecodePatched
+
+    else
+        source
+
+
+percentEncodePatched : String
+percentEncodePatched =
+    String.join "\n"
+        [ "percentEncode : String -> String"
+        , "percentEncode str ="
+        , "    let"
+        , "        hexChar n ="
+        , "            if n < 10 then Char.fromCode (0x30 + n)"
+        , "            else Char.fromCode (0x41 + n - 10)"
+        , "        hexByte n ="
+        , "            String.fromList [ '%', hexChar (n // 16), hexChar (modBy 16 n) ]"
+        , "        encodeByte code ="
+        , "            if (code >= 0x41 && code <= 0x5A)"
+        , "                || (code >= 0x61 && code <= 0x7A)"
+        , "                || (code >= 0x30 && code <= 0x39)"
+        , "                || code == 0x2D || code == 0x5F || code == 0x2E || code == 0x7E"
+        , "            then"
+        , "                String.fromChar (Char.fromCode code)"
+        , "            else"
+        , "                hexByte code"
+        , "        encodeCodePoint code ="
+        , "            if code < 0x80 then"
+        , "                encodeByte code"
+        , "            else if code < 0x800 then"
+        , "                hexByte (0xC0 + (code // 64)) ++ hexByte (0x80 + modBy 64 code)"
+        , "            else if code < 0x10000 then"
+        , "                hexByte (0xE0 + (code // 4096))"
+        , "                    ++ hexByte (0x80 + modBy 64 (code // 64))"
+        , "                    ++ hexByte (0x80 + modBy 64 code)"
+        , "            else"
+        , "                hexByte (0xF0 + (code // 262144))"
+        , "                    ++ hexByte (0x80 + modBy 64 (code // 4096))"
+        , "                    ++ hexByte (0x80 + modBy 64 (code // 64))"
+        , "                    ++ hexByte (0x80 + modBy 64 code)"
+        , "    in"
+        , "    String.foldr (\\c acc -> encodeCodePoint (Char.toCode c) ++ acc) \"\" str"
+        ]
+
+
+percentDecodePatched : String
+percentDecodePatched =
+    String.join "\n"
+        [ "percentDecode : String -> Maybe String"
+        , "percentDecode str ="
+        , "    let"
+        , "        hexVal c ="
+        , "            let code = Char.toCode c"
+        , "            in"
+        , "            if code >= 0x30 && code <= 0x39 then Just (code - 0x30)"
+        , "            else if code >= 0x41 && code <= 0x46 then Just (code - 0x41 + 10)"
+        , "            else if code >= 0x61 && code <= 0x66 then Just (code - 0x61 + 10)"
+        , "            else Nothing"
+        , "        helper remaining acc ="
+        , "            case remaining of"
+        , "                [] ->"
+        , "                    Just (String.fromList (List.reverse acc))"
+        , "                '%' :: hi :: lo :: rest ->"
+        , "                    case ( hexVal hi, hexVal lo ) of"
+        , "                        ( Just h, Just l ) -> helper rest (Char.fromCode (h * 16 + l) :: acc)"
+        , "                        _ -> Nothing"
+        , "                c :: rest ->"
+        , "                    helper rest (c :: acc)"
+        , "    in"
+        , "    helper (String.toList str) []"
+        ]

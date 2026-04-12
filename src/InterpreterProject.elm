@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, computeRootModuleNames, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -1376,11 +1376,11 @@ loadWithProfile config =
 
         rootModuleNames : Set String
         rootModuleNames =
-            moduleGraph.moduleToSource
-                |> Dict.keys
-                |> Set.fromList
-                |> Set.diff pkgModuleNames
-                |> Set.union (Set.fromList config.extraReachableImports)
+            computeRootModuleNames
+                { allModuleNames = moduleGraph.moduleToSource |> Dict.keys |> Set.fromList
+                , pkgModuleNames = pkgModuleNames
+                , extraReachableImports = config.extraReachableImports
+                }
 
         reachablePackageModuleNames : Set String
         reachablePackageModuleNames =
@@ -3290,6 +3290,30 @@ topoSortModules graph needed =
                 |> List.foldl dfs { visited = Set.empty, order = [] }
     in
     result.order
+
+
+{-| Compute the root module names for reachability analysis.
+
+Roots = (user modules) ∪ extraReachableImports, where "user modules" are all
+module names in the graph minus the known package module names.
+
+Extracted as a pure function so the regression test in `tests/InterpreterProjectTest.elm`
+can lock in the argument order of `Set.diff`. The previous implementation used
+`allModuleNames |> Set.diff pkgModuleNames`, which pipe-expands to
+`Set.diff pkgModuleNames allModuleNames` — i.e. `pkgMods − allMods` = ∅. The
+resulting root set collapsed to just `extraReachableImports`, so DFS never
+walked into package deps reached only via user code (e.g. `Markdown.InlineParser → Url`).
+
+-}
+computeRootModuleNames :
+    { allModuleNames : Set String
+    , pkgModuleNames : Set String
+    , extraReachableImports : List String
+    }
+    -> Set String
+computeRootModuleNames { allModuleNames, pkgModuleNames, extraReachableImports } =
+    Set.diff allModuleNames pkgModuleNames
+        |> Set.union (Set.fromList extraReachableImports)
 
 
 reachableModules : ModuleGraph -> Set String -> Set String
