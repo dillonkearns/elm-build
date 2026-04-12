@@ -9,7 +9,8 @@ import Test exposing (Test, describe, test)
 suite : Test
 suite =
     describe "ProjectRoots"
-        [ rootModuleNamesTests ]
+        [ rootModuleNamesTests
+        ]
 
 
 {-| Regression: `rootModuleNames` once used `allMods |> Set.diff pkgMods`, which

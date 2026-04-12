@@ -41,6 +41,7 @@ import Lamdera.Wire3
 import MemoRuntime
 import Path exposing (Path)
 import ProjectRoots
+import ValueWireCodec
 import ProjectSources
 import SemanticHash
 import Set exposing (Set)
@@ -276,7 +277,7 @@ changes in a way that would make old blobs incorrect.
 -}
 userNormCacheVersion : String
 userNormCacheVersion =
-    "v3"
+    "v4"
 
 
 {-| Disk path for the combined user-normalization cache blob.
@@ -306,11 +307,14 @@ userNormBundleKey userFileContents =
 
 
 {-| Entry in the combined user-normalization blob: one per module, carrying
-the module name and the list of normalized function implementations.
+the module name, the list of normalized function implementations, and any
+precomputed constant values (zero-arg functions evaluated to concrete Values
+that survived `isLosslessValue`).
 -}
 type alias UserNormCacheEntry =
     { moduleName : List String
     , functions : List FunctionImplementation
+    , precomputedValues : List ( String, Types.Value )
     }
 
 
@@ -332,19 +336,35 @@ encodeUserNormCacheEntry entry =
     Lamdera.Wire3.encodeSequenceWithoutLength
         [ encodeModuleName entry.moduleName
         , Lamdera.Wire3.encodeList encodeFunctionImplementationNoRanges entry.functions
+        , Lamdera.Wire3.encodeList
+            (\( name, value ) ->
+                Lamdera.Wire3.encodeSequenceWithoutLength
+                    [ Lamdera.Wire3.encodeString name
+                    , ValueWireCodec.encodeValue value
+                    ]
+            )
+            entry.precomputedValues
         ]
 
 
 decodeUserNormCacheEntry : Lamdera.Wire3.Decoder UserNormCacheEntry
 decodeUserNormCacheEntry =
     Lamdera.Wire3.succeedDecode
-        (\moduleName functions ->
+        (\moduleName functions precomputedValues ->
             { moduleName = moduleName
             , functions = functions
+            , precomputedValues = precomputedValues
             }
         )
         |> Lamdera.Wire3.andMapDecode decodeModuleName
         |> Lamdera.Wire3.andMapDecode (Lamdera.Wire3.decodeList decodeFunctionImplementationNoRanges)
+        |> Lamdera.Wire3.andMapDecode
+            (Lamdera.Wire3.decodeList
+                (Lamdera.Wire3.succeedDecode Tuple.pair
+                    |> Lamdera.Wire3.andMapDecode Lamdera.Wire3.decodeString
+                    |> Lamdera.Wire3.andMapDecode ValueWireCodec.decodeValue
+                )
+            )
 
 
 benchmarkPackageSummaryCacheCodecs :
@@ -680,10 +700,16 @@ normalizeAllUserModulesFresh userModules envBeforeNorm =
 
                     ( updatedEnv, normalizedFns ) =
                         Eval.Module.normalizeOneModuleInEnv moduleName envAcc
+
+                    modulePrecomputed : List ( String, Types.Value )
+                    modulePrecomputed =
+                        Eval.Module.getModulePrecomputedValues moduleName updatedEnv
+                            |> FastDict.toList
                 in
                 ( updatedEnv
                 , { moduleName = moduleName
                   , functions = FastDict.values normalizedFns
+                  , precomputedValues = modulePrecomputed
                   }
                     :: entriesAcc
                 )
@@ -693,8 +719,8 @@ normalizeAllUserModulesFresh userModules envBeforeNorm =
 
 
 {-| Install a decoded `UserNormCacheEntry` list into the env. Each entry
-contains only the functions whose bodies were rewritten during normalization;
-those overlay the originals that the env already parsed.
+contains the functions whose bodies were rewritten during normalization (overlaid
+onto the originals) AND the precomputed constant values.
 -}
 applyUserNormBundle : List UserNormCacheEntry -> Eval.Module.ProjectEnv -> Eval.Module.ProjectEnv
 applyUserNormBundle entries env =
@@ -706,8 +732,14 @@ applyUserNormBundle entries env =
                     entry.functions
                         |> List.map (\f -> ( Node.value f.name, f ))
                         |> FastDict.fromList
+
+                precomputedDict : FastDict.Dict String Types.Value
+                precomputedDict =
+                    FastDict.fromList entry.precomputedValues
             in
-            Eval.Module.mergeModuleFunctionsIntoEnv entry.moduleName deltaDict currentEnv
+            currentEnv
+                |> Eval.Module.mergeModuleFunctionsIntoEnv entry.moduleName deltaDict
+                |> Eval.Module.setModulePrecomputedValues entry.moduleName precomputedDict
         )
         env
         entries
