@@ -2198,7 +2198,12 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                     String.join "|" fileOverrideHashKeys
 
                 sourceOverrideKey =
-                    String.join "|" (List.map (\s -> String.left 100 s) sourceOverrides)
+                    -- Hash each override over its full contents. The
+                    -- previous `String.left 100` truncation collided
+                    -- on overrides that shared a 100-char prefix.
+                    sourceOverrides
+                        |> List.map (\s -> String.fromInt (FNV1a.hash s))
+                        |> String.join "|"
             in
             String.join "\n"
                 (entryPointHashes ++ [ overrideKey, sourceOverrideKey, wrapperSource ])
