@@ -1,0 +1,10 @@
+{
+  "results": [
+    {"name":"literal","description":"bare integer literal","iterations":20000,"oldPathTotalMs":21,"newPathTotalMs":6,"oldPathMeanUs":1.05,"newPathMeanUs":0.3,"speedup":3.5,"oldPathDetail":"Int 42","newPathDetail":"Int 42","status":"OK"}
+    ,{"name":"user-only-let","description":"user decl: let with 3 bindings, no core","iterations":20000,"oldPathTotalMs":189,"newPathTotalMs":31,"oldPathMeanUs":9.45,"newPathMeanUs":1.55,"speedup":6.096774193548387,"oldPathDetail":"Int 1","newPathDetail":"Int 1","status":"OK"}
+    ,{"name":"user-decl-chain","description":"chain through 4 user decls, each with a + operator","iterations":20000,"oldPathTotalMs":81,"newPathTotalMs":54,"oldPathMeanUs":4.05,"newPathMeanUs":2.7,"speedup":1.5,"oldPathDetail":"Int 40","newPathDetail":"Int 40","status":"OK"}
+    ,{"name":"maybe-case","description":"case on Just, references user decl","iterations":20000,"oldPathTotalMs":48,"newPathTotalMs":27,"oldPathMeanUs":2.4,"newPathMeanUs":1.35,"speedup":1.7777777777777777,"oldPathDetail":"Int 10","newPathDetail":"Int 10","status":"OK"}
+    ,{"name":"core-arith","description":"core operator + via user decl wrapper","iterations":20000,"oldPathTotalMs":23,"newPathTotalMs":18,"oldPathMeanUs":1.15,"newPathMeanUs":0.9,"speedup":1.2777777777777777,"oldPathDetail":"Int 3","newPathDetail":"Int 3","status":"OK"}
+    ,{"name":"core-list-sum","description":"user decl calls List.sum [1..10]","iterations":20000,"oldPathTotalMs":941,"newPathTotalMs":959,"oldPathMeanUs":47.05,"newPathMeanUs":47.95,"speedup":0.9812304483837331,"oldPathDetail":"Int 55","newPathDetail":"Int 55","status":"OK"}
+  ]
+}

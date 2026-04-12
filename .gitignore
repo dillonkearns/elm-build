@@ -1,6 +1,8 @@
 .elm-pages
 .build/
 .elm-build/
+.elm-review-build/
+.elm-review-build-runner-check/
 .elm-mutation-test/
 codegen/Gen
 dist/

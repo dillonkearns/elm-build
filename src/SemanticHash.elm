@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, FileAspectHashes, RawIndex, affectedRunnerIndices, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, buildRawIndex, computeAspectHashesFromFile, computeAspectHashesFromSource, depsForExpression, diffIndices, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, replaceModuleInRawIndex, resolveRawIndex, resolveRawIndexIncremental, semanticHashForEntry, transitiveDepsOf)
+module SemanticHash exposing (DeclarationIndex, FileAspectHashes, RawIndex, affectedRunnerIndices, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, buildRawIndex, computeAspectHashesFromFile, computeAspectHashesFromSource, declarationHash, depsForExpression, diffIndices, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, replaceModuleInRawIndex, resolveRawIndex, resolveRawIndexIncremental, semanticHashForEntry, transitiveDepsOf)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -636,6 +636,34 @@ the evaluation result is provably unchanged (Elm's purity guarantees this).
 semanticHashForEntry : DeclarationIndex -> String -> Maybe String
 semanticHashForEntry index entryPoint =
     getSemanticHash index entryPoint
+
+
+{-| Look up a declaration's semantic hash by module name and function name.
+
+    declarationHash [ "Elm", "Core" ] "map" index
+    --> Just "<hash>"
+
+Preferred API for callers holding `ModuleName` (`List String`) — the form
+used throughout elm-interpreter and elm-syntax — rather than the joined
+internal key. Mirrors the multi-module key convention: joined module name
+`++ "." ++` function name.
+
+For single-module indices from `buildIndexFromSource` / `buildIndexFromFile`,
+pass `[]` as the module name — those index by bare function name.
+
+-}
+declarationHash : List String -> String -> DeclarationIndex -> Maybe String
+declarationHash moduleName funcName index =
+    let
+        key : String
+        key =
+            if List.isEmpty moduleName then
+                funcName
+
+            else
+                String.join "." moduleName ++ "." ++ funcName
+    in
+    getSemanticHash index key
 
 
 {-| Build a semantic hash index from multiple modules.
