@@ -5,6 +5,7 @@
 codegen/Gen
 dist/
 myscript.mjs
+test-runner.mjs
 *.cpuprofile
 elm-stuff
 node_modules
