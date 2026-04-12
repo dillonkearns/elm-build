@@ -2333,35 +2333,53 @@ evalSimple (InterpreterProject project) { imports, expression, sourceOverrides }
         wrapperSource =
             generateWrapper imports expression
 
-        wrapperImports =
-            DepGraph.parseImports wrapperSource |> Set.fromList
-
-        neededModules =
-            transitiveModuleDeps project.moduleGraph.imports wrapperImports
-
-        filteredSources =
-            topoSortModules project.moduleGraph neededModules
-
-        userFilteredSources =
-            filteredSources
-                |> List.filter
-                    (\src ->
-                        case DepGraph.parseModuleName src of
-                            Just name ->
-                                not (Set.member name project.packageModuleNames)
-
-                            Nothing ->
-                                True
-                    )
-
-        allSources =
-            userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
-
         result =
-            Eval.Module.evalWithEnv
-                project.packageEnv
-                allSources
-                (FunctionOrValue [] "results")
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    -- Fast path: baseUserEnv already contains every user
+                    -- module loaded from loadWithProfile. Parsing the
+                    -- sourceOverrides + wrapper against that env skips the
+                    -- per-call user-module parse + buildModuleEnv pass.
+                    -- The old evaluator (which evalWithEnv routes through)
+                    -- doesn't read `projectEnv.resolved`, so the stale
+                    -- resolved metadata on baseUserEnv is inert here —
+                    -- see plan §1.1 and the useResolvedIRPath = True
+                    -- finding at InterpreterProject.elm:2914+.
+                    Eval.Module.evalWithEnv
+                        baseEnv
+                        (sourceOverrides ++ [ wrapperSource ])
+                        (FunctionOrValue [] "results")
+
+                Nothing ->
+                    let
+                        wrapperImports =
+                            DepGraph.parseImports wrapperSource |> Set.fromList
+
+                        neededModules =
+                            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+                        filteredSources =
+                            topoSortModules project.moduleGraph neededModules
+
+                        userFilteredSources =
+                            filteredSources
+                                |> List.filter
+                                    (\src ->
+                                        case DepGraph.parseModuleName src of
+                                            Just name ->
+                                                not (Set.member name project.packageModuleNames)
+
+                                            Nothing ->
+                                                True
+                                    )
+
+                        allSources =
+                            userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
+                    in
+                    Eval.Module.evalWithEnv
+                        project.packageEnv
+                        allSources
+                        (FunctionOrValue [] "results")
     in
     BackendTask.succeed
         (case result of
@@ -2394,41 +2412,51 @@ evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverr
         wrapperSource =
             generateWrapper imports expression
 
-        wrapperImports : Set String
-        wrapperImports =
-            DepGraph.parseImports wrapperSource |> Set.fromList
-
-        neededModules : Set String
-        neededModules =
-            transitiveModuleDeps project.moduleGraph.imports wrapperImports
-
-        filteredSources : List String
-        filteredSources =
-            topoSortModules project.moduleGraph neededModules
-
-        userFilteredSources : List String
-        userFilteredSources =
-            filteredSources
-                |> List.filter
-                    (\src ->
-                        case DepGraph.parseModuleName src of
-                            Just name ->
-                                not (Set.member name project.packageModuleNames)
-
-                            Nothing ->
-                                True
-                    )
-    in
-    let
-        allSources =
-            userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
-
         ( result, coveredRanges ) =
-            Eval.Module.coverageWithEnvAndLimit Nothing
-                probeLines
-                project.packageEnv
-                allSources
-                (FunctionOrValue [] "results")
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    -- Fast path: see evalSimple for rationale.
+                    Eval.Module.coverageWithEnvAndLimit Nothing
+                        probeLines
+                        baseEnv
+                        (sourceOverrides ++ [ wrapperSource ])
+                        (FunctionOrValue [] "results")
+
+                Nothing ->
+                    let
+                        wrapperImports : Set String
+                        wrapperImports =
+                            DepGraph.parseImports wrapperSource |> Set.fromList
+
+                        neededModules : Set String
+                        neededModules =
+                            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+                        filteredSources : List String
+                        filteredSources =
+                            topoSortModules project.moduleGraph neededModules
+
+                        userFilteredSources : List String
+                        userFilteredSources =
+                            filteredSources
+                                |> List.filter
+                                    (\src ->
+                                        case DepGraph.parseModuleName src of
+                                            Just name ->
+                                                not (Set.member name project.packageModuleNames)
+
+                                            Nothing ->
+                                                True
+                                    )
+
+                        allSources =
+                            userFilteredSources ++ sourceOverrides ++ [ wrapperSource ]
+                    in
+                    Eval.Module.coverageWithEnvAndLimit Nothing
+                        probeLines
+                        project.packageEnv
+                        allSources
+                        (FunctionOrValue [] "results")
 
         resultString =
             case result of
