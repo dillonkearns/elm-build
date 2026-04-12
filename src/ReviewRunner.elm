@@ -12526,9 +12526,7 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                                     mergeCounterDicts
                                                         [ depsResult.counters
                                                         , Dict.fromList
-                                                            [ ( "project.deps.mode.fresh", 0 )
-                                                            , ( "project.deps.mode.split", 1 )
-                                                            , ( "project.deps.rule_cache.entries", depsResult.loadedRuleCaches.entryCount )
+                                                            [ ( "project.deps.rule_cache.entries", depsResult.loadedRuleCaches.entryCount )
                                                             , ( "project.deps.rule_cache.loaded_bytes", depsResult.loadedRuleCaches.bytes )
                                                             ]
                                                         ]
@@ -12650,10 +12648,6 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                                 , ( "project.importers.rule_cache.loaded_bytes", importersEval.loadedRuleCaches.bytes )
                                                 , ( "project.importers.cached_output_read_ms", importersCachedOutputsTimed.stage.ms )
                                                 , ( "project.deps.cached_output_read_ms", depsCachedOutputsTimed.stage.ms )
-                                                , ( "project.importers.eval_total_ms"
-                                                  , Maybe.withDefault 0 (Dict.get "project.importers.eval_total_ms" importersEval.counters)
-                                                        + Maybe.withDefault 0 (Dict.get "project.importers_fold.eval_total_ms" importersFoldEval.counters)
-                                                  )
                                                 ]
                                             , importersFoldEval.counters
                                             , importersEval.counters
@@ -14211,22 +14205,26 @@ runProjectRulesWithWarmRuleCachesModules counterPrefix buildDir baseProjectValue
                 ]
     in
     if Set.isEmpty memoizedFunctions then
+        -- Inline timing pattern: see comment in runProjectRulesWithWarmRuleCaches.
+        Do.do BackendTask.Time.now <| \warmEvalStart ->
         Do.do
-            (withTiming (counterPrefix ++ ".warm_eval")
-                (deferTask
-                    (\() ->
-                        InterpreterProject.prepareAndEvalWithYield reviewProject
-                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                            , expression = expression
-                            , sourceOverrides = [ reviewRunnerHelperSource ]
-                            , intercepts = intercepts
-                            , injectedValues = injectedValues
-                            }
-                            (projectRuleYieldHandler buildDir)
-                    )
-                )
+            (InterpreterProject.prepareAndEvalWithYield reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = expression
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                , intercepts = intercepts
+                , injectedValues = injectedValues
+                }
+                (projectRuleYieldHandler buildDir)
             )
-        <| \evalTimed ->
+        <| \evalResultRaw ->
+        Do.do BackendTask.Time.now <| \warmEvalFinish ->
+        let
+            evalTimed =
+                { value = evalResultRaw
+                , stage = { name = counterPrefix ++ ".warm_eval", ms = stageMs warmEvalStart warmEvalFinish }
+                }
+        in
         case evalTimed.value of
             Ok (Types.String output) ->
                 BackendTask.succeed
@@ -14415,22 +14413,30 @@ runProjectRulesWithWarmRuleCaches counterPrefix buildDir baseProjectValue review
                 ]
     in
     if Set.isEmpty memoizedFunctions then
+        -- Inline timing pattern: `withTiming` wrapping `prepareAndEvalWithYield`
+        -- silently under-reports because elm-pages' hash-cached `BackendTask.Time.now`
+        -- can return the same value for the start/finish pair when they're
+        -- passed via `withTiming`'s closure capture. Inlining the Time.now
+        -- bookends and computing the delta in a let binding measures correctly.
+        Do.do BackendTask.Time.now <| \warmEvalStart ->
         Do.do
-            (withTiming (counterPrefix ++ ".warm_eval")
-                (deferTask
-                    (\() ->
-                        InterpreterProject.prepareAndEvalWithYield reviewProject
-                            { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
-                            , expression = expression
-                            , sourceOverrides = [ reviewRunnerHelperSource ]
-                            , intercepts = intercepts
-                            , injectedValues = injectedValues
-                            }
-                            (projectRuleYieldHandler buildDir)
-                    )
-                )
+            (InterpreterProject.prepareAndEvalWithYield reviewProject
+                { imports = [ "ReviewRunnerHelper", "ReviewConfig" ]
+                , expression = expression
+                , sourceOverrides = [ reviewRunnerHelperSource ]
+                , intercepts = intercepts
+                , injectedValues = injectedValues
+                }
+                (projectRuleYieldHandler buildDir)
             )
-        <| \evalTimed ->
+        <| \evalResultRaw ->
+        Do.do BackendTask.Time.now <| \warmEvalFinish ->
+        let
+            evalTimed =
+                { value = evalResultRaw
+                , stage = { name = counterPrefix ++ ".warm_eval", ms = stageMs warmEvalStart warmEvalFinish }
+                }
+        in
         case evalTimed.value of
             Ok (Types.String output) ->
                 BackendTask.succeed
