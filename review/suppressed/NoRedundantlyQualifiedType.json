@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 80, "filePath": "src/ReviewRunner.elm" },
+    { "count": 12, "filePath": "src/InterpreterProject.elm" },
+    { "count": 6, "filePath": "src/InterpreterMemoBenchmark.elm" },
+    { "count": 3, "filePath": "src/MutationTestRunnerTest.elm" },
+    { "count": 1, "filePath": "src/CoreExtraBenchmark.elm" },
+    { "count": 1, "filePath": "src/MutationTestRunner.elm" },
+    { "count": 1, "filePath": "src/ParseVsEvalBenchmark.elm" },
+    { "count": 1, "filePath": "src/RunCoreExtraTests.elm" },
+    { "count": 1, "filePath": "src/TestRunner.elm" }
+  ]
+}

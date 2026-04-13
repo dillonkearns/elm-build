@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 34, "filePath": "src/ReviewRunner.elm" },
+    { "count": 15, "filePath": "src/ReviewRunnerTest.elm" },
+    { "count": 10, "filePath": "src/InterpreterProject.elm" },
+    { "count": 9, "filePath": "src/AstWireCodecSingleModuleRepro.elm" },
+    { "count": 7, "filePath": "src/MutationTestRunner.elm" },
+    { "count": 4, "filePath": "src/Mutator.elm" },
+    { "count": 3, "filePath": "src/TestRunner.elm" },
+    { "count": 2, "filePath": "src/ReviewPackageRoundtripValidator.elm" },
+    { "count": 2, "filePath": "src/RunTests.elm" },
+    { "count": 2, "filePath": "src/TestAnalysis.elm" },
+    { "count": 1, "filePath": "src/CoreExtraBenchmark.elm" },
+    { "count": 1, "filePath": "src/InterpreterMemoBenchmark.elm" },
+    { "count": 1, "filePath": "src/InterpreterTestRunner.elm" },
+    { "count": 1, "filePath": "src/PureTestRunner.elm" },
+    { "count": 1, "filePath": "src/SampleTests.elm" },
+    { "count": 1, "filePath": "src/SemanticHash.elm" },
+    { "count": 1, "filePath": "src/ValueWireCodec.elm" }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 44, "filePath": "src/ReviewRunner.elm" },
+    { "count": 13, "filePath": "src/InterpreterProject.elm" },
+    { "count": 7, "filePath": "src/MutationTestRunner.elm" },
+    { "count": 3, "filePath": "src/Mutator.elm" },
+    { "count": 3, "filePath": "src/MutatorTests.elm" },
+    { "count": 1, "filePath": "src/ElmProject.elm" },
+    { "count": 1, "filePath": "src/ParseVsEvalBenchmark.elm" },
+    { "count": 1, "filePath": "src/ResolvedIRBenchmark.elm" },
+    { "count": 1, "filePath": "src/SemanticHash.elm" },
+    { "count": 1, "filePath": "src/SemanticHashTests.elm" },
+    { "count": 1, "filePath": "src/TestRunner.elm" },
+    { "count": 1, "filePath": "src/ValueWireCodecSelfTest.elm" }
+  ]
+}
