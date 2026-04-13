@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 66, "filePath": "src/ReviewRunner.elm" },
+    { "count": 60, "filePath": "src/MutatorTests.elm" },
+    { "count": 11, "filePath": "src/ReviewRunnerTest.elm" },
+    { "count": 9, "filePath": "src/AstWireCodecSingleModuleRepro.elm" },
+    { "count": 4, "filePath": "src/InterpreterBenchmark.elm" },
+    { "count": 3, "filePath": "src/MutationTestRunnerTest.elm" },
+    { "count": 3, "filePath": "src/Mutator.elm" },
+    { "count": 2, "filePath": "src/AstWireCodecTests.elm" },
+    { "count": 2, "filePath": "src/LamderaStrictDecodeProgression.elm" },
+    { "count": 2, "filePath": "src/ProjectSources.elm" },
+    { "count": 2, "filePath": "src/ResolvedIRBenchmark.elm" },
+    { "count": 2, "filePath": "src/ReviewPackageRoundtripValidator.elm" },
+    { "count": 2, "filePath": "src/SimpleSampleTests.elm" },
+    { "count": 1, "filePath": "src/BackendTask/Extra.elm" },
+    { "count": 1, "filePath": "src/EvalDemo.elm" },
+    { "count": 1, "filePath": "src/InterpreterMemoBenchmark.elm" },
+    { "count": 1, "filePath": "src/InterpreterProject.elm" },
+    { "count": 1, "filePath": "src/TestAnalysis.elm" }
+  ]
+}

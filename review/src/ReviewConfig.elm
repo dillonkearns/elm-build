@@ -115,6 +115,7 @@ config =
         |> List.map
             (Rule.ignoreErrorsForDirectories
                 [ "codegen/Gen"
+                , "elm-interpreter"
                 ]
             )
 

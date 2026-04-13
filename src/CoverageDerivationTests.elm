@@ -1,4 +1,4 @@
-module CoverageTests exposing (suite)
+module CoverageDerivationTests exposing (suite)
 
 import Coverage
 import Elm.Syntax.Range exposing (Range)

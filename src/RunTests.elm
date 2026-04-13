@@ -7,7 +7,7 @@ import BackendTask.Do as Do
 import FatalError exposing (FatalError)
 import Pages.Script as Script exposing (Script)
 import Random
-import CoverageTests
+import CoverageDerivationTests
 import DepGraphTests
 import ReviewRunnerTest
 import SemanticHashTests
@@ -31,7 +31,7 @@ runAll =
             Random.initialSeed 42
 
         allSuites =
-            Test.describe "All" [ TestAnalysisTests.suite, MutatorTests.suite, MutationTestRunnerTest.suite, DepGraphTests.suite, MutationReportTests.suite, CoverageTests.suite, SemanticHashTests.suite, AstWireCodecTests.suite, ReviewRunnerTest.suite ]
+            Test.describe "All" [ TestAnalysisTests.suite, MutatorTests.suite, MutationTestRunnerTest.suite, DepGraphTests.suite, MutationReportTests.suite, CoverageDerivationTests.suite, SemanticHashTests.suite, AstWireCodecTests.suite, ReviewRunnerTest.suite ]
 
         runners =
             case Test.Runner.fromTest 100 seed allSuites of

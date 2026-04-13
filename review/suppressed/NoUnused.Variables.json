@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "automatically created by": "elm-review suppress",
+  "learn more": "elm-review suppress --help",
+  "suppressions": [
+    { "count": 19, "filePath": "src/ReviewRunner.elm" },
+    { "count": 6, "filePath": "src/AstWireCodec.elm" },
+    { "count": 5, "filePath": "src/InterpreterProject.elm" },
+    { "count": 5, "filePath": "src/MutationTestRunner.elm" },
+    { "count": 4, "filePath": "src/Mutator.elm" },
+    { "count": 4, "filePath": "src/ParseVsEvalBenchmark.elm" },
+    { "count": 4, "filePath": "src/ReviewRunnerTest.elm" },
+    { "count": 3, "filePath": "src/ResolvedIRBenchmark.elm" },
+    { "count": 3, "filePath": "src/TestRunner.elm" },
+    { "count": 2, "filePath": "src/Cache.elm" },
+    { "count": 2, "filePath": "src/InterpreterBenchmark.elm" },
+    { "count": 2, "filePath": "src/SemanticHash.elm" },
+    { "count": 2, "filePath": "src/SemanticHashTests.elm" },
+    { "count": 2, "filePath": "src/ValueWireCodecSelfTest.elm" },
+    { "count": 1, "filePath": "src/CoreExtraBenchmark.elm" },
+    { "count": 1, "filePath": "src/DepGraphTests.elm" },
+    { "count": 1, "filePath": "src/LamderaStrictDecodeProgression.elm" },
+    { "count": 1, "filePath": "src/MutationReportTests.elm" },
+    { "count": 1, "filePath": "src/MutationTestRunnerTest.elm" },
+    { "count": 1, "filePath": "src/MutatorTests.elm" },
+    { "count": 1, "filePath": "src/PriceCalculatorTests.elm" },
+    { "count": 1, "filePath": "src/RunTests.elm" },
+    { "count": 1, "filePath": "src/TestAnalysis.elm" }
+  ]
+}

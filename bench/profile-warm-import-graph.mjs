@@ -21,7 +21,7 @@ import path from "node:path";
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const srcRoot = path.join(repoRoot, "src");
 const reviewDir = path.join(repoRoot, "bench", "review");
-const distRunnerPath = path.join(repoRoot, "dist", "review-runner-bench-debug.mjs");
+const distRunnerPath = path.join(repoRoot, "dist", "review-runner-bench.mjs");
 const jobs = String(os.cpus().length);
 
 const fixtureFiles = [
@@ -118,6 +118,7 @@ ensureDir(profDir);
 const profiled = runReviewer(workspace, "import-graph-trace.json", [
   "--cpu-prof",
   "--cpu-prof-dir", profDir,
+  "--cpu-prof-interval", "5000", // 5ms between samples → ~12k samples for 60s run, much smaller profile
 ]);
 console.log(`    exit=${profiled.exitCode}`);
 
