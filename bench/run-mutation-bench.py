@@ -17,10 +17,6 @@ and a minimal `elm.json`. Invokes the bundled mutation runner (must be pre-built
 via `bunx elm-pages bundle-script src/MutationTestRunner.elm --output
 dist/mutation-runner.mjs`) with cwd set to the fixture dir.
 
-The runner requires `--stack-size=10000` — the loadWith path exercises a
-deep recursion in `Eval.Expression.evalOrRecurse` that overflows the default
-stack. See `.scratch/hot-path-exploration-2026-04-12.md` for context.
-
 Writes each sample to
 `.scratch/mutation-bench-samples-<timestamp>-<label>.json` and prints a summary
 to stdout.
@@ -133,14 +129,12 @@ def run_one(fixture_dir: Path) -> dict:
         )
     clean_cache(fixture_dir)
     # Wrap with /usr/bin/time -p to get a wall-clock number even if the runner
-    # prints its own timing. Node's --stack-size=10000 is required to avoid
-    # the evalOrRecurse overflow during loadWith.
+    # prints its own timing.
     result = subprocess.run(
         [
             "/usr/bin/time",
             "-p",
             "node",
-            "--stack-size=10000",
             str(BUNDLE_PATH),
             "--mutate",
             "src/MathLib.elm",
