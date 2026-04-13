@@ -151,6 +151,12 @@ task config =
             allDirectories =
                 "tests" :: sourceDirectories
         in
+        -- Resolve the test file upfront when the user provided `--test`
+        -- explicitly, so we can pass its module name as the normalization
+        -- root. In auto-discovery mode (`--mutate` without `--test`) we
+        -- can't know the test file until after the dep graph is built, so
+        -- we fall back to `Nothing` and normalize every user module.
+        Do.do (earlyTestModuleName config) <| \earlyTestModule ->
         -- Load the project via InterpreterProject (packages parsed once, cached)
         Do.do
             (BackendTask.Extra.timed "Loading project" "Loaded project"
@@ -162,6 +168,7 @@ task config =
                     , extraSourceFiles = []
                     , extraReachableImports = [ "Test", "Fuzz", "Expect", "Test.Runner" ]
                     , sourceDirectories = Just allDirectories
+                    , normalizationRoots = Maybe.map List.singleton earlyTestModule
                     }
                 )
             )
@@ -1503,6 +1510,24 @@ ensureDependenciesFetched config =
                     |> BackendTask.toResult
                     |> BackendTask.map (\_ -> ())
             )
+
+
+{-| Best-effort early discovery of the test module name so we can pass it
+as `normalizationRoots` BEFORE calling `loadWith`. Only works when the
+user supplied `--test` explicitly; in auto-discovery mode we return
+`Nothing` and the loader normalizes every user module (correct but
+slower on cold load).
+-}
+earlyTestModuleName : Config -> BackendTask FatalError (Maybe String)
+earlyTestModuleName config =
+    case config.testFile of
+        Just explicit ->
+            File.rawFile explicit
+                |> BackendTask.allowFatal
+                |> BackendTask.map DepGraph.parseModuleName
+
+        Nothing ->
+            BackendTask.succeed Nothing
 
 
 {-| Resolve the test file: use --test if provided, otherwise auto-discover.

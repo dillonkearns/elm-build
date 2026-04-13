@@ -35,6 +35,7 @@ import Environment
 import FastDict
 import FatalError exposing (FatalError)
 import FNV1a
+import FunctionReachability
 import Json.Decode as Decode
 import Json.Encode
 import Lamdera.Wire3
@@ -425,6 +426,7 @@ benchmarkPackageSummaryCacheCodecs config =
             , extraSourceFiles = config.extraSourceFiles
             , extraReachableImports = config.extraReachableImports
             , sourceDirectories = config.sourceDirectories
+            , normalizationRoots = Nothing
             , packageParseCacheDir = Just config.packageParseCacheDir
             }
         )
@@ -1297,6 +1299,7 @@ load { projectDir } =
         , extraSourceFiles = []
         , extraReachableImports = []
         , sourceDirectories = Nothing
+        , normalizationRoots = Nothing
         }
 
 
@@ -1306,6 +1309,30 @@ load { projectDir } =
   - `patchSource` — transform applied to each package source after loading
   - `extraSourceFiles` — additional source files to include
   - `sourceDirectories` — `Nothing` reads from elm.json, `Just` overrides
+  - `normalizationRoots` — list of user module names whose top-level
+    functions are the evaluation entry points. When `Just`, the loader
+    runs a function-level reachability walk (see
+    `FunctionReachability.computeReachable`) from those modules and only
+    normalizes user modules containing a reachable function. Modules
+    outside the live set stay parsed-but-unnormalized: they're still
+    loaded into `ProjectEnv` so runtime lookups work, they just skip
+    the expensive eager `tryNormalizeConstant` pass on cold-user load.
+
+    Cache interaction: the `user-norm-v4-*.blob` cache key is the
+    per-module content hash, independent of the reachability set. Cache
+    hits always apply; `normalizationRoots` only gates whether a cache
+    MISS does work. Over time the on-disk cache fills up regardless of
+    which plan any individual run uses.
+
+    `Nothing` means "no plan information, normalize every user module
+    eagerly" — the safe conservative default for raw loaders,
+    interactive REPL evaluation, and anything where the eventual
+    evaluation plan isn't known at load time.
+
+    Callers that DO know their plan upfront should pass it: test runners
+    pass test module names, ReviewRunner passes `["ReviewConfig"]`,
+    benchmark runners pass their fixture modules. See
+    `src/FunctionReachability.elm` for the walk semantics.
 
 -}
 loadWith :
@@ -1316,6 +1343,7 @@ loadWith :
     , extraSourceFiles : List String
     , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
+    , normalizationRoots : Maybe (List String)
     }
     -> BackendTask FatalError InterpreterProject
 loadWith config =
@@ -1327,6 +1355,7 @@ loadWith config =
         , extraSourceFiles = config.extraSourceFiles
         , extraReachableImports = config.extraReachableImports
         , sourceDirectories = config.sourceDirectories
+        , normalizationRoots = config.normalizationRoots
         , packageParseCacheDir =
             -- Default to the project's `.elm-build` directory so the package
             -- summary cache (including normalized top-level constants) is
@@ -1344,6 +1373,7 @@ loadWithProfile :
     , extraSourceFiles : List String
     , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
+    , normalizationRoots : Maybe (List String)
     , packageParseCacheDir : Maybe String
     }
     -> BackendTask FatalError { project : InterpreterProject, profile : LoadProfile }
@@ -1730,6 +1760,68 @@ loadWithProfile config =
                                 |> List.filterMap (\src -> DepGraph.parseModuleName src)
                                 |> List.filterMap (\name -> Dict.get name userParsedFiles)
 
+                        -- When `normalizationRoots` is provided, only normalize
+                        -- user modules that contain a function reachable — at
+                        -- the function-call level — from the roots' top-level
+                        -- definitions. Module-level reachability is too
+                        -- coarse: for example, `tests/OrderTests.elm` imports
+                        -- `Order.Extra`, which imports `String.Extra`, which
+                        -- imports `String.Diacritics` — but `OrderTests`
+                        -- doesn't call any Order.Extra function that
+                        -- transitively touches `removeDiacritics`, so
+                        -- `String.Diacritics.lookupArray` is dead code for
+                        -- that test run. Function-level reachability walks
+                        -- each test's function bodies and tracks the
+                        -- transitive call graph.
+                        normalizationReachable : Maybe (Set String)
+                        normalizationReachable =
+                            case config.normalizationRoots of
+                                Nothing ->
+                                    Nothing
+
+                                Just rootModuleNamesList ->
+                                    let
+                                        seeds : Set FunctionReachability.Reference
+                                        seeds =
+                                            rootModuleNamesList
+                                                |> List.concatMap
+                                                    (\rmn ->
+                                                        case Dict.get rmn userParsedFiles of
+                                                            Just file ->
+                                                                FunctionReachability.findTopLevelNames file
+                                                                    |> Set.toList
+                                                                    |> List.map (\name -> ( rmn, name ))
+
+                                                            Nothing ->
+                                                                []
+                                                    )
+                                                |> Set.fromList
+
+                                        reachableFns : Set FunctionReachability.Reference
+                                        reachableFns =
+                                            FunctionReachability.computeReachable userParsedFiles seeds
+
+                                        liveModules : Set String
+                                        liveModules =
+                                            Set.foldl (\( mn, _ ) acc -> Set.insert mn acc) Set.empty reachableFns
+                                    in
+                                    Just (Set.intersect liveModules userModuleNamesSet)
+
+                        userModulesToNormalize : List File
+                        userModulesToNormalize =
+                            case normalizationReachable of
+                                Nothing ->
+                                    userModulesInOrder
+
+                                Just reachable ->
+                                    userModulesInOrder
+                                        |> List.filter
+                                            (\file ->
+                                                case Eval.Module.fileModuleName file of
+                                                    name ->
+                                                        Set.member (String.join "." name) reachable
+                                            )
+
                         envBeforeUserNormResult : Result Types.Error Eval.Module.ProjectEnv
                         envBeforeUserNormResult =
                             Eval.Module.extendWithFiles pkgEnv userModulesInOrder
@@ -1743,7 +1835,7 @@ loadWithProfile config =
                                 buildUserNormalizedEnv
                                     { cacheDir = config.packageParseCacheDir
                                     , packageKey = packageSummaryCacheKey allPackageSources
-                                    , userModules = userModulesInOrder
+                                    , userModules = userModulesToNormalize
                                     , userFileContents =
                                         userFileContents
                                             |> List.filterMap

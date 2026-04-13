@@ -150,6 +150,7 @@ task config =
             , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
             , extraReachableImports = []
             , sourceDirectories = Just [ coreExtraDir ++ "/tests" ]
+            , normalizationRoots = Just ("SimpleTestRunner" :: testModuleImports)
             }
         )
     <| \project ->

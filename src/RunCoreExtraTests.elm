@@ -113,6 +113,16 @@ buildModuleEval mod =
 
 task : Config -> BackendTask FatalError ()
 task config =
+    let
+        -- Union of every test module name evaluated by this runner, so
+        -- the function-level reachability walk only normalizes user
+        -- modules actually called from one of these entry points.
+        allRoots : List String
+        allRoots =
+            testModules
+                |> List.concatMap .imports
+                |> (::) "SimpleTestRunner"
+    in
     Do.do
         (BackendTask.Extra.timed "[profile] InterpreterProject.loadWith" "[profile] InterpreterProject.loadWith done"
             (InterpreterProject.loadWith
@@ -123,6 +133,7 @@ task config =
                 , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
                 , extraReachableImports = []
                 , sourceDirectories = Just [ coreExtraDir ++ "/src", coreExtraDir ++ "/tests" ]
+                , normalizationRoots = Just allRoots
                 }
             )
         )

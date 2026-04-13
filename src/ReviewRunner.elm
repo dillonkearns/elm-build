@@ -15378,6 +15378,7 @@ loadReviewProjectForRuleInfo config =
         , extraSourceFiles = []
         , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
         , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
+        , normalizationRoots = Just [ "ReviewConfig" ]
         , packageParseCacheDir = Just (Path.toString config.buildDirectory)
         }
         |> BackendTask.map (.project >> InterpreterProject.withEnvMode config.envMode)
@@ -15500,6 +15501,7 @@ loadReviewProjectDetailed config =
         , extraSourceFiles = []
         , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
         , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
+        , normalizationRoots = Just [ "ReviewConfig" ]
         , packageParseCacheDir = Just (Path.toString config.buildDirectory)
         }
         |> BackendTask.map
