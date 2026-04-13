@@ -1,0 +1,291 @@
+{
+  "label": "phase1c1-post-merge-resolved-list-unplanned",
+  "fixture": "small-12",
+  "env_mode": "resolved-list-unplanned",
+  "n": 5,
+  "elapsed_seconds": 1571.0959131717682,
+  "samples": [
+    {
+      "cold": {
+        "wall": 251.12,
+        "internal": 222.03
+      },
+      "warm": {
+        "wall": 0.41,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.25,
+        "internal": 1.21
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.0,
+        "internal": 0.11
+      },
+      "warm_import_graph_change": {
+        "wall": 54.66,
+        "internal": 53.61
+      }
+    },
+    {
+      "cold": {
+        "wall": 245.03,
+        "internal": 217.87
+      },
+      "warm": {
+        "wall": 0.4,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.14,
+        "internal": 1.15
+      },
+      "warm_1_file_comment_only": {
+        "wall": 0.98,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 53.15,
+        "internal": 52.1
+      }
+    },
+    {
+      "cold": {
+        "wall": 253.25,
+        "internal": 225.04
+      },
+      "warm": {
+        "wall": 0.41,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.21,
+        "internal": 1.17
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.0,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 55.83,
+        "internal": 54.73
+      }
+    },
+    {
+      "cold": {
+        "wall": 269.18,
+        "internal": 240.13
+      },
+      "warm": {
+        "wall": 0.47,
+        "internal": 0.06
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.31,
+        "internal": 1.24
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.05,
+        "internal": 0.12
+      },
+      "warm_import_graph_change": {
+        "wall": 57.11,
+        "internal": 56.01
+      }
+    },
+    {
+      "cold": {
+        "wall": 249.97,
+        "internal": 221.92
+      },
+      "warm": {
+        "wall": 0.43,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.21,
+        "internal": 1.16
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.01,
+        "internal": 0.11
+      },
+      "warm_import_graph_change": {
+        "wall": 47.99,
+        "internal": 46.95
+      }
+    }
+  ],
+  "aggregate": {
+    "cold": {
+      "wall": {
+        "n": 5,
+        "median": 251.12,
+        "mad": 2.1299999999999955,
+        "min": 245.03,
+        "max": 269.18,
+        "range": 24.150000000000006,
+        "range_pct": 9.61691621535521,
+        "samples": [
+          245.03,
+          249.97,
+          251.12,
+          253.25,
+          269.18
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 222.03,
+        "mad": 3.009999999999991,
+        "min": 217.87,
+        "max": 240.13,
+        "range": 22.25999999999999,
+        "range_pct": 10.025672206458584,
+        "samples": [
+          217.87,
+          221.92,
+          222.03,
+          225.04,
+          240.13
+        ]
+      }
+    },
+    "warm": {
+      "wall": {
+        "n": 5,
+        "median": 0.41,
+        "mad": 0.009999999999999953,
+        "min": 0.4,
+        "max": 0.47,
+        "range": 0.06999999999999995,
+        "range_pct": 17.073170731707307,
+        "samples": [
+          0.4,
+          0.41,
+          0.41,
+          0.43,
+          0.47
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 0.04,
+        "mad": 0.0,
+        "min": 0.04,
+        "max": 0.06,
+        "range": 0.019999999999999997,
+        "range_pct": 49.999999999999986,
+        "samples": [
+          0.04,
+          0.04,
+          0.04,
+          0.04,
+          0.06
+        ]
+      }
+    },
+    "warm_1_file_body_edit": {
+      "wall": {
+        "n": 5,
+        "median": 2.21,
+        "mad": 0.040000000000000036,
+        "min": 2.14,
+        "max": 2.31,
+        "range": 0.16999999999999993,
+        "range_pct": 7.692307692307689,
+        "samples": [
+          2.14,
+          2.21,
+          2.21,
+          2.25,
+          2.31
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 1.17,
+        "mad": 0.020000000000000018,
+        "min": 1.15,
+        "max": 1.24,
+        "range": 0.09000000000000008,
+        "range_pct": 7.6923076923077,
+        "samples": [
+          1.15,
+          1.16,
+          1.17,
+          1.21,
+          1.24
+        ]
+      }
+    },
+    "warm_1_file_comment_only": {
+      "wall": {
+        "n": 5,
+        "median": 1.0,
+        "mad": 0.010000000000000009,
+        "min": 0.98,
+        "max": 1.05,
+        "range": 0.07000000000000006,
+        "range_pct": 7.000000000000006,
+        "samples": [
+          0.98,
+          1.0,
+          1.0,
+          1.01,
+          1.05
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 0.11,
+        "mad": 0.009999999999999995,
+        "min": 0.1,
+        "max": 0.12,
+        "range": 0.01999999999999999,
+        "range_pct": 18.181818181818173,
+        "samples": [
+          0.1,
+          0.1,
+          0.11,
+          0.11,
+          0.12
+        ]
+      }
+    },
+    "warm_import_graph_change": {
+      "wall": {
+        "n": 5,
+        "median": 54.66,
+        "mad": 1.509999999999998,
+        "min": 47.99,
+        "max": 57.11,
+        "range": 9.119999999999997,
+        "range_pct": 16.684961580680568,
+        "samples": [
+          47.99,
+          53.15,
+          54.66,
+          55.83,
+          57.11
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 53.61,
+        "mad": 1.509999999999998,
+        "min": 46.95,
+        "max": 56.01,
+        "range": 9.059999999999995,
+        "range_pct": 16.89983212087296,
+        "samples": [
+          46.95,
+          52.1,
+          53.61,
+          54.73,
+          56.01
+        ]
+      }
+    }
+  }
+}
