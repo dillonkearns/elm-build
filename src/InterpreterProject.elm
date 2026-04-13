@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -1239,7 +1239,44 @@ type InterpreterProject
         , packageEnv : Eval.Module.ProjectEnv
         , baseUserEnv : Maybe Eval.Module.ProjectEnv
         , semanticIndex : SemanticHash.DeclarationIndex
+        , envMode : EnvMode
         }
+
+
+{-| Selects the interpreter environment representation for this project's
+evaluations.
+
+- `LegacyAst` — the old AST-based evaluator with `Dict String Value` locals.
+  The canonical production path; same behavior this project has always had.
+- `ResolvedListUnplanned` — routes through the resolved IR evaluator
+  (`Eval.Module.evalWithResolvedIRFromFilesAndIntercepts`). Closures still
+  capture the whole enclosing locals list; no slot planning. Used as an
+  A/B baseline against `LegacyAst` to isolate "does finishing the IR
+  integration help on its own" from the slot refactor.
+- `ResolvedListSlotted` — resolved IR + copy-on-capture closures driven by
+  resolver-emitted `captureSlots`. In Phase 1 this behaves identically to
+  `ResolvedListUnplanned`; Phase 3 adds the slot-refactor semantics.
+
+The mode is stored on the `InterpreterProject` opaque type and read by
+the eval entry points. Callers set it once after `load`/`loadWith` via
+`withEnvMode`. Defaulting to `LegacyAst` preserves existing behavior for
+every caller that hasn't opted in.
+-}
+type EnvMode
+    = LegacyAst
+    | ResolvedListUnplanned
+    | ResolvedListSlotted
+
+
+{-| Attach an `EnvMode` to a loaded `InterpreterProject`. Calling this
+lets downstream eval entry points route through the resolved IR path
+(`ResolvedListUnplanned` / `ResolvedListSlotted`) instead of the default
+`LegacyAst` path. Idempotent and cheap — just updates one field on the
+opaque record.
+-}
+withEnvMode : EnvMode -> InterpreterProject -> InterpreterProject
+withEnvMode mode (InterpreterProject project) =
+    InterpreterProject { project | envMode = mode }
 
 
 {-| Initialize an InterpreterProject with default settings.
@@ -1771,6 +1808,7 @@ loadWithProfile config =
                                 , packageEnv = pkgEnv
                                 , baseUserEnv = baseUserEnvResult
                                 , semanticIndex = semanticIndex
+                                , envMode = LegacyAst
                                 }
                         , profile =
                             { resolveSourceDirectoriesMs = sourceDirectoriesTimed.ms
@@ -2353,11 +2391,10 @@ evalSimple (InterpreterProject project) { imports, expression, sourceOverrides }
                     -- module loaded from loadWithProfile. Parsing the
                     -- sourceOverrides + wrapper against that env skips the
                     -- per-call user-module parse + buildModuleEnv pass.
-                    -- The old evaluator (which evalWithEnv routes through)
-                    -- doesn't read `projectEnv.resolved`, so the stale
-                    -- resolved metadata on baseUserEnv is inert here —
-                    -- see plan §1.1 and the useResolvedIRPath = True
-                    -- finding at InterpreterProject.elm:2914+.
+                    -- Phase 1a fixed `replaceModuleInEnv` / `extendWithFiles`
+                    -- so the `resolved` sidecar on baseUserEnv stays coherent
+                    -- with `env`, which keeps this path valid for both
+                    -- LegacyAst and ResolvedList* envModes.
                     Eval.Module.evalWithEnv
                         baseEnv
                         (sourceOverrides ++ [ wrapperSource ])
@@ -2956,8 +2993,25 @@ prepareRawEvalWithYieldAndMemo (InterpreterProject project) { imports, expressio
                 Nothing ->
                     project.packageEnv
 
+        useResolvedIR : Bool
+        useResolvedIR =
+            case project.envMode of
+                LegacyAst ->
+                    False
+
+                ResolvedListUnplanned ->
+                    True
+
+                ResolvedListSlotted ->
+                    True
+
         rawResult =
-            if useResolvedIRPath && Set.isEmpty memoizedFunctions then
+            if useResolvedIR && Set.isEmpty memoizedFunctions then
+                -- Phase 1c: route yield-driving evals through the resolved-IR
+                -- entry point when the project's envMode selects it. Memo is
+                -- still gated out because `evalWithResolvedIRFromFilesAndIntercepts`
+                -- doesn't support memoizedFunctions; the else-branches handle
+                -- memo via the legacy path.
                 let
                     parseResult =
                         evalSources
@@ -2973,12 +3027,11 @@ prepareRawEvalWithYieldAndMemo (InterpreterProject project) { imports, expressio
                         Types.EvErr { currentModule = [], callStack = [], error = Types.TypeError "Parse error in prepareAndEvalWithYield (resolved IR path)" }
 
                     Ok parsedModules ->
-                        Eval.Module.evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw
+                        Eval.Module.evalWithResolvedIRFromFilesAndIntercepts
                             env
                             parsedModules
                             injectedValues
                             intercepts
-                            Set.empty
                             (FunctionOrValue [] "results")
 
             else if FastDict.isEmpty injectedValues then
@@ -3006,21 +3059,6 @@ prepareRawEvalWithYieldAndMemo (InterpreterProject project) { imports, expressio
                         Eval.Module.evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw env parsedModules injectedValues intercepts memoizedFunctions (FunctionOrValue [] "results")
     in
     rawResult
-
-
-{-| Phase 4 Round 2 gate: when True, route yield-driving eval calls
-through the new resolved-IR evaluator instead of the old string-keyed
-path. Falls back to the old path when `memoizedFunctions` is non-empty
-since memo support hasn't been ported yet.
-
-Flip this to `False` to A/B the two paths during benchmarking. When
-Phase 4 Round 3 lands (deletion of the old evaluator), this constant
-goes away.
-
--}
-useResolvedIRPath : Bool
-useResolvedIRPath =
-    True
 
 
 {-| Convert the `EvalResult Value` returned by the new
@@ -3348,21 +3386,21 @@ prepareAndEvalWithIntercepts (InterpreterProject project) { imports, expression,
             in
             case project.baseUserEnv of
                 Just baseEnv ->
-                    if useResolvedIRPath then
-                        Eval.Module.evalWithEnvFromFilesAndValuesAndInterceptsAndMemoRaw
-                            baseEnv
-                            newFiles
-                            FastDict.empty
-                            intercepts
-                            Set.empty
-                            (FunctionOrValue [] "results")
-                            |> resolvedEvalResultToResult
+                    case project.envMode of
+                        LegacyAst ->
+                            -- Fast path: baseUserEnv has all user modules pre-loaded.
+                            -- Only parse sourceOverrides + wrapper (small/new).
+                            Eval.Module.evalWithIntercepts baseEnv (sourceOverrides ++ [ wrapperSource ]) intercepts (FunctionOrValue [] "results")
+                                |> Result.mapError formatError
 
-                    else
-                        -- Fast path: baseUserEnv has all user modules pre-loaded.
-                        -- Only parse sourceOverrides + wrapper (small/new).
-                        Eval.Module.evalWithIntercepts baseEnv (sourceOverrides ++ [ wrapperSource ]) intercepts (FunctionOrValue [] "results")
-                            |> Result.mapError formatError
+                        _ ->
+                            Eval.Module.evalWithResolvedIRFromFilesAndIntercepts
+                                baseEnv
+                                newFiles
+                                FastDict.empty
+                                intercepts
+                                (FunctionOrValue [] "results")
+                                |> resolvedEvalResultToResult
 
                 Nothing ->
                     -- Fallback: parse everything from scratch. We don't

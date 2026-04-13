@@ -44,7 +44,7 @@ import Json.Decode
 import Json.Encode
 import Lamdera.Wire3
 import SemanticHash
-import InterpreterProject exposing (InterpreterProject)
+import InterpreterProject exposing (EnvMode(..), InterpreterProject)
 import MemoRuntime
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
@@ -102,6 +102,7 @@ type alias Config =
     , moduleRuleTransportMode : ModuleRuleTransportMode
     , importersCacheMode : ImportersCacheMode
     , depsCacheMode : ImportersCacheMode
+    , envMode : EnvMode
     , reportFormat : ReportFormat
     , perfTraceJson : Maybe String
     , progressLogPath : Maybe String
@@ -150,21 +151,6 @@ type alias CliConfig =
     }
 
 
-{-| Interpreter environment representation mode.
-
-- `LegacyAst` — old AST-based evaluator with `Dict String Value` locals. Canonical production path today.
-- `ResolvedListUnplanned` — resolved IR path wired end-to-end, still using whole-locals closure capture (pre-slot-refactor).
-- `ResolvedListSlotted` — resolved IR path with resolver-emitted captureSlots and copy-on-capture at RLambda eval.
-
-In Phase 0 all three values behave identically (legacy-ast). Later phases read this field to route through the resolved-IR path.
-
--}
-type EnvMode
-    = LegacyAst
-    | ResolvedListUnplanned
-    | ResolvedListSlotted
-
-
 type ImportersCacheMode
     = ImportersAuto
     | ImportersFresh
@@ -200,6 +186,7 @@ defaultConfig =
     , moduleRuleTransportMode = ModuleRuleTransportHandles
     , importersCacheMode = ImportersAuto
     , depsCacheMode = ImportersAuto
+    , envMode = LegacyAst
     , reportFormat = ReportHuman
     , perfTraceJson = Nothing
     , progressLogPath = Nothing
@@ -232,6 +219,7 @@ configDecoder =
         |> decodeAndMap (decodeFieldWithDefault "moduleRuleTransportMode" moduleRuleTransportModeDecoder defaultConfig.moduleRuleTransportMode)
         |> decodeAndMap (decodeFieldWithDefault "importersCacheMode" importersCacheModeDecoder defaultConfig.importersCacheMode)
         |> decodeAndMap (decodeFieldWithDefault "depsCacheMode" importersCacheModeDecoder defaultConfig.depsCacheMode)
+        |> decodeAndMap (decodeFieldWithDefault "envMode" envModeDecoder defaultConfig.envMode)
         |> decodeAndMap (decodeFieldWithDefault "reportFormat" reportFormatDecoder defaultConfig.reportFormat)
         |> decodeAndMap (decodeNullableField "perfTraceJson" Json.Decode.string)
         |> decodeAndMap (decodeNullableField "progressLogPath" Json.Decode.string)
@@ -275,6 +263,12 @@ importersCacheModeDecoder : Json.Decode.Decoder ImportersCacheMode
 importersCacheModeDecoder =
     Json.Decode.string
         |> Json.Decode.map parseImportersCacheMode
+
+
+envModeDecoder : Json.Decode.Decoder EnvMode
+envModeDecoder =
+    Json.Decode.string
+        |> Json.Decode.map parseEnvMode
 
 
 moduleRuleGroupingModeDecoder : Json.Decode.Decoder ModuleRuleGroupingMode
@@ -1752,6 +1746,7 @@ run =
             , moduleRuleTransportMode = ModuleRuleTransportHandles
             , importersCacheMode = cliConfig.importersCacheMode
             , depsCacheMode = cliConfig.depsCacheMode
+            , envMode = cliConfig.envMode
             , reportFormat = cliConfig.reportFormat
             , perfTraceJson = cliConfig.perfTraceJson
             , progressLogPath = cliConfig.progressLogPath
@@ -2191,6 +2186,7 @@ benchmarkTargetProjectRuntime options =
             , moduleRuleTransportMode = ModuleRuleTransportHandles
             , importersCacheMode = ImportersAuto
             , depsCacheMode = ImportersAuto
+            , envMode = LegacyAst
             , reportFormat = ReportQuiet
             , perfTraceJson = Nothing
             , progressLogPath = Nothing
@@ -15384,7 +15380,7 @@ loadReviewProjectForRuleInfo config =
         , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
         , packageParseCacheDir = Just (Path.toString config.buildDirectory)
         }
-        |> BackendTask.map .project
+        |> BackendTask.map (.project >> InterpreterProject.withEnvMode config.envMode)
 
 
 encodeRuleInfo : List RuleInfo -> String
@@ -15508,7 +15504,7 @@ loadReviewProjectDetailed config =
         }
         |> BackendTask.map
             (\loaded ->
-                { project = loaded.project
+                { project = InterpreterProject.withEnvMode config.envMode loaded.project
                 , counters =
                     Dict.fromList
                         [ ( "load_review_project.resolve_source_directories_ms", loaded.profile.resolveSourceDirectoriesMs )
