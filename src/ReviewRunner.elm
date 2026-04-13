@@ -131,6 +131,7 @@ type alias CliConfig =
     , moduleRuleGroupingMode : ModuleRuleGroupingMode
     , importersCacheMode : ImportersCacheMode
     , depsCacheMode : ImportersCacheMode
+    , envMode : EnvMode
     , reportFormat : ReportFormat
     , perfTraceJson : Maybe String
     , progressLogPath : Maybe String
@@ -147,6 +148,21 @@ type alias CliConfig =
     , hostNoMissingTypeAnnotationInLetInExperiment : Bool
     , hostNoUnusedPatternsExperiment : Bool
     }
+
+
+{-| Interpreter environment representation mode.
+
+- `LegacyAst` — old AST-based evaluator with `Dict String Value` locals. Canonical production path today.
+- `ResolvedListUnplanned` — resolved IR path wired end-to-end, still using whole-locals closure capture (pre-slot-refactor).
+- `ResolvedListSlotted` — resolved IR path with resolver-emitted captureSlots and copy-on-capture at RLambda eval.
+
+In Phase 0 all three values behave identically (legacy-ast). Later phases read this field to route through the resolved-IR path.
+
+-}
+type EnvMode
+    = LegacyAst
+    | ResolvedListUnplanned
+    | ResolvedListSlotted
 
 
 type ImportersCacheMode
@@ -1488,6 +1504,14 @@ programConfig =
                         |> Option.withDescription "DependenciesOf project-rule strategy: auto, fresh, or split (default: auto)"
                     )
                 |> OptionsParser.with
+                    (Option.optionalKeywordArg "env-mode"
+                        |> Option.map
+                            (Maybe.map parseEnvMode
+                                >> Maybe.withDefault LegacyAst
+                            )
+                        |> Option.withDescription "Interpreter env representation: legacy-ast, resolved-list-unplanned, or resolved-list-slotted (default: legacy-ast). In Phase 0, all modes behave identically."
+                    )
+                |> OptionsParser.with
                     (Option.optionalKeywordArg "report"
                         |> Option.map
                             (Maybe.map parseReportFormat
@@ -1569,6 +1593,22 @@ parseMemoizedFunctions rawValue =
         |> List.map String.trim
         |> List.filter (not << String.isEmpty)
         |> Set.fromList
+
+
+parseEnvMode : String -> EnvMode
+parseEnvMode rawValue =
+    case String.toLower (String.trim rawValue) of
+        "legacy-ast" ->
+            LegacyAst
+
+        "resolved-list-unplanned" ->
+            ResolvedListUnplanned
+
+        "resolved-list-slotted" ->
+            ResolvedListSlotted
+
+        _ ->
+            LegacyAst
 
 
 parseImportersCacheMode : String -> ImportersCacheMode

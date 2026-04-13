@@ -43,7 +43,7 @@ ROW_RE = re.compile(
 )
 
 
-def run_one(fixture: str) -> dict:
+def run_one(fixture: str, env_mode: str) -> dict:
     """Run one benchmark pass and return {scenario: {wall, internal}}."""
     result = subprocess.run(
         [
@@ -52,6 +52,8 @@ def run_one(fixture: str) -> dict:
             "--fixture",
             fixture,
             "--skip-bundle",
+            "--env-mode",
+            env_mode,
         ],
         capture_output=True,
         text=True,
@@ -98,6 +100,12 @@ def main():
     ap.add_argument("n", type=int, nargs="?", default=5, help="number of samples")
     ap.add_argument("label", nargs="?", help="label for this run (defaults to HEAD SHA)")
     ap.add_argument("--fixture", default="small-12", help="fixture name")
+    ap.add_argument(
+        "--env-mode",
+        default="legacy-ast",
+        choices=["legacy-ast", "resolved-list-unplanned", "resolved-list-slotted"],
+        help="Interpreter env representation mode to pass through to the runner (default: legacy-ast)",
+    )
     args = ap.parse_args()
 
     if not args.label:
@@ -112,7 +120,7 @@ def main():
             args.label = "unlabeled"
 
     print(
-        f"Running {args.n} samples on fixture={args.fixture} label={args.label}",
+        f"Running {args.n} samples on fixture={args.fixture} env-mode={args.env_mode} label={args.label}",
         file=sys.stderr,
     )
     print(
@@ -125,7 +133,7 @@ def main():
     t0 = time.time()
     for i in range(args.n):
         print(f"  [{i+1}/{args.n}] running...", file=sys.stderr, flush=True)
-        scenarios = run_one(args.fixture)
+        scenarios = run_one(args.fixture, args.env_mode)
         samples.append(scenarios)
         for s in SCENARIOS:
             print(
@@ -153,6 +161,7 @@ def main():
             {
                 "label": args.label,
                 "fixture": args.fixture,
+                "env_mode": args.env_mode,
                 "n": args.n,
                 "elapsed_seconds": elapsed,
                 "samples": samples,
@@ -164,7 +173,7 @@ def main():
     print(f"Wrote {out_path}", file=sys.stderr)
 
     # Print a clean summary to stdout
-    print(f"\n== {args.label} n={args.n} fixture={args.fixture} ==")
+    print(f"\n== {args.label} n={args.n} fixture={args.fixture} env-mode={args.env_mode} ==")
     print(f"{'scenario':30}  {'med_wall':>10}  {'mad':>6}  {'range':>10}  {'med_internal':>12}")
     for s in SCENARIOS:
         w = agg[s]["wall"]

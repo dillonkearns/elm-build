@@ -24,6 +24,9 @@ const depsCacheMode = process.argv.includes("--deps-cache-mode")
   : "auto";
 const jobs = String(os.cpus().length);
 const hostImportersExperiments = process.argv.includes("--host-importers-experiments");
+const envMode = process.argv.includes("--env-mode")
+  ? process.argv[process.argv.indexOf("--env-mode") + 1]
+  : "legacy-ast";
 
 function hostExperimentArgs() {
   if (!hostImportersExperiments) {
@@ -159,6 +162,8 @@ function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersC
       importersCacheMode,
       "--deps-cache-mode",
       depsCacheMode,
+      "--env-mode",
+      envMode,
       "--perf-trace-json",
       tracePath,
       ...hostExperimentArgs(),
