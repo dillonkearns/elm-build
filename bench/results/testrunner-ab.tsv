@@ -28,3 +28,4 @@ timestamp	label	runs	mean_ms	stddev_ms	min_ms	max_ms	files	env
 2026-04-13T19:04:58Z	V_remove_accents_final	3	6116.1	38.6	6072.4	6145.3	tests/String/RemoveAccentsTest.elm	
 2026-04-13T19:15:53Z	W_subset_fn_reach	8	1166.9	13.1	1153.4	1192.3	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
 2026-04-13T19:16:28Z	X_remove_accents_fn_reach	3	5669.8	29.1	5649.7	5703.1	tests/String/RemoveAccentsTest.elm	
+2026-04-13T20:18:25Z	Z_final	5	1135.8	8.7	1125.8	1143.8	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	

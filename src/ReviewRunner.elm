@@ -15342,7 +15342,7 @@ loadReviewProjectForRuleInfo config =
         , extraSourceFiles = []
         , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
         , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
-        , normalizationRoots = Nothing
+        , normalizationRoots = Just [ "ReviewConfig" ]
         , packageParseCacheDir = Just (Path.toString config.buildDirectory)
         }
         |> BackendTask.map .project
@@ -15465,7 +15465,7 @@ loadReviewProjectDetailed config =
         , extraSourceFiles = []
         , extraReachableImports = DepGraph.parseImports reviewRunnerHelperSource
         , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
-        , normalizationRoots = Nothing
+        , normalizationRoots = Just [ "ReviewConfig" ]
         , packageParseCacheDir = Just (Path.toString config.buildDirectory)
         }
         |> BackendTask.map
