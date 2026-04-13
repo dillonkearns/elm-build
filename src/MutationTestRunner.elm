@@ -1611,9 +1611,8 @@ resolveTestFile config project =
                             Do.log ("Found test file: " ++ single) <| \_ ->
                             BackendTask.succeed single
 
-                        first :: _ ->
-                            Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test files: " ++ String.join ", " testFiles ++ " (using first)") <| \_ ->
-                            BackendTask.succeed first
+                        _ :: _ ->
+                            BackendTask.fail (ambiguousTestFileError testFiles (Just moduleName))
 
                         [] ->
                             BackendTask.fail
@@ -1633,15 +1632,53 @@ resolveTestFile config project =
                             Do.log ("Found test file: " ++ single) <| \_ ->
                             BackendTask.succeed single
 
-                        first :: _ ->
-                            Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test files: " ++ String.join ", " testFiles ++ " (using first)") <| \_ ->
-                            BackendTask.succeed first
+                        _ :: _ ->
+                            BackendTask.fail (ambiguousTestFileError testFiles Nothing)
 
                         [] ->
                             BackendTask.fail
                                 (FatalError.fromString
                                     "No test files found in tests/**/*.elm. Use --test to specify manually."
                                 )
+
+
+{-| Abort with a clear, actionable message when auto-discovery finds
+more than one candidate test file. The runner used to silently pick
+the first file, which was a quiet footgun — especially when the first
+file happened to be the one that crashed the interpreter. Users should
+pick explicitly with `--test`.
+-}
+ambiguousTestFileError : List String -> Maybe String -> FatalError
+ambiguousTestFileError testFiles maybeModuleName =
+    let
+        header : String
+        header =
+            case maybeModuleName of
+                Just moduleName ->
+                    "Found " ++ String.fromInt (List.length testFiles) ++ " test files that import " ++ moduleName ++ ":"
+
+                Nothing ->
+                    "Found " ++ String.fromInt (List.length testFiles) ++ " test files under tests/:"
+
+        bullets : String
+        bullets =
+            testFiles
+                |> List.map (\f -> "  - " ++ f)
+                |> String.join "\n"
+
+        firstFile : String
+        firstFile =
+            List.head testFiles |> Maybe.withDefault "tests/MyTests.elm"
+    in
+    FatalError.build
+        { title = "Ambiguous test file"
+        , body =
+            header
+                ++ "\n"
+                ++ bullets
+                ++ "\n\nPick one with --test, e.g. --test "
+                ++ firstFile
+        }
 
 
 {-| Find test files that transitively import the given module.
