@@ -779,18 +779,140 @@ buildMultiModuleIndexWithPackages { packageVersions, modules } =
             )
 
 
+{-| Per-module view of `import` declarations, used to resolve qualified
+references in expressions back to their real declaring module.
+
+  - `aliasMap` maps the prefix a user writes (`Bar` in `Bar.baz`) to the real
+    module name (`Foo.Bar`). Plain `import Foo` registers `"Foo" → "Foo"`;
+    `import Foo.Bar as Bar` registers `"Bar" → "Foo.Bar"`. When a later
+    `import X.Y as X` shadows an earlier `import X`, the later entry wins.
+  - `exposedMap` maps an explicitly-exposed unqualified name (`bar` from
+    `import Foo exposing (bar)`) to the real module it came from.
+  - `openImports` lists modules imported with `exposing (..)`. For bare
+    references, we try each in order and take the first match that exists in
+    the index.
+
+-}
+type alias ImportResolver =
+    { aliasMap : Dict String String
+    , exposedMap : Dict String String
+    , openImports : List String
+    }
+
+
+buildImportResolver : List (Node Import) -> ImportResolver
+buildImportResolver imports =
+    List.foldl
+        (\(Node _ imp) acc ->
+            let
+                realModule : String
+                realModule =
+                    String.join "." (Node.value imp.moduleName)
+
+                prefix : String
+                prefix =
+                    case imp.moduleAlias of
+                        Just aliasNode ->
+                            String.join "." (Node.value aliasNode)
+
+                        Nothing ->
+                            realModule
+
+                withAlias : ImportResolver
+                withAlias =
+                    { acc | aliasMap = Dict.insert prefix realModule acc.aliasMap }
+            in
+            case imp.exposingList of
+                Nothing ->
+                    withAlias
+
+                Just (Node _ (All _)) ->
+                    { withAlias | openImports = withAlias.openImports ++ [ realModule ] }
+
+                Just (Node _ (Explicit exposedList)) ->
+                    List.foldl
+                        (\(Node _ topLevel) resolver ->
+                            case topLevel of
+                                FunctionExpose name ->
+                                    { resolver | exposedMap = Dict.insert name realModule resolver.exposedMap }
+
+                                _ ->
+                                    resolver
+                        )
+                        withAlias
+                        exposedList
+        )
+        { aliasMap = Dict.empty, exposedMap = Dict.empty, openImports = [] }
+        imports
+
+
+{-| Resolve a `(modulePrefix, funcName)` reference from an expression AST to
+a fully-qualified declaration name, consulting the module's import resolver.
+Falls back to the historical behavior (prefix used as-is, bare names assumed
+local to the current module) when no import matches.
+-}
+resolveImport : ImportResolver -> Set String -> String -> ( List String, String ) -> String
+resolveImport resolver allDeclNames currentModule ( modName, funcName ) =
+    case modName of
+        [] ->
+            case Dict.get funcName resolver.exposedMap of
+                Just realModule ->
+                    realModule ++ "." ++ funcName
+
+                Nothing ->
+                    let
+                        fromOpen : Maybe String
+                        fromOpen =
+                            resolver.openImports
+                                |> List.filterMap
+                                    (\realModule ->
+                                        let
+                                            qualRef =
+                                                realModule ++ "." ++ funcName
+                                        in
+                                        if Set.member qualRef allDeclNames then
+                                            Just qualRef
+
+                                        else
+                                            Nothing
+                                    )
+                                |> List.head
+                    in
+                    fromOpen
+                        |> Maybe.withDefault (currentModule ++ "." ++ funcName)
+
+        _ ->
+            let
+                prefix : String
+                prefix =
+                    String.join "." modName
+            in
+            case Dict.get prefix resolver.aliasMap of
+                Just realModule ->
+                    realModule ++ "." ++ funcName
+
+                Nothing ->
+                    prefix ++ "." ++ funcName
+
+
 {-| Build a raw index (AST hashes + direct deps) from module sources.
 This is the expensive parsing step — do it once for the baseline.
 -}
 buildRawIndex : List { moduleName : String, source : String } -> RawIndex
 buildRawIndex modules =
     let
+        allDeclarations : List ( String, { expr : Node Expression, moduleName : String, resolver : ImportResolver } )
         allDeclarations =
             modules
                 |> List.concatMap
                     (\mod ->
                         case Elm.Parser.parseToFile mod.source of
                             Ok file ->
+                                let
+                                    resolver : ImportResolver
+                                    resolver =
+                                        buildImportResolver file.imports
+                                in
                                 file.declarations
                                     |> List.filterMap
                                         (\(Node _ decl) ->
@@ -802,7 +924,10 @@ buildRawIndex modules =
                                                     in
                                                     Just
                                                         ( mod.moduleName ++ "." ++ Node.value impl.name
-                                                        , { expr = impl.expression, moduleName = mod.moduleName }
+                                                        , { expr = impl.expression
+                                                          , moduleName = mod.moduleName
+                                                          , resolver = resolver
+                                                          }
                                                         )
 
                                                 _ ->
@@ -818,7 +943,7 @@ buildRawIndex modules =
     in
     allDeclarations
         |> List.map
-            (\( qualName, { expr, moduleName } ) ->
+            (\( qualName, { expr, moduleName, resolver } ) ->
                 ( qualName
                 , { astHash = hashExpression expr
                   , deps =
@@ -831,11 +956,7 @@ buildRawIndex modules =
                                     else
                                         let
                                             qualRef =
-                                                if List.isEmpty modName then
-                                                    moduleName ++ "." ++ funcName
-
-                                                else
-                                                    String.join "." modName ++ "." ++ funcName
+                                                resolveImport resolver allDeclNames moduleName ( modName, funcName )
                                         in
                                         if Set.member qualRef allDeclNames && qualRef /= qualName then
                                             Just qualRef
@@ -870,6 +991,11 @@ replaceModuleInRawIndex baseRawIndex mutatedModule =
         newEntries =
             case Elm.Parser.parseToFile mutatedModule.source of
                 Ok file ->
+                    let
+                        resolver : ImportResolver
+                        resolver =
+                            buildImportResolver file.imports
+                    in
                     file.declarations
                         |> List.filterMap
                             (\(Node _ decl) ->
@@ -895,11 +1021,7 @@ replaceModuleInRawIndex baseRawIndex mutatedModule =
                                                                 else
                                                                     let
                                                                         qualRef =
-                                                                            if List.isEmpty modName then
-                                                                                mutatedModule.moduleName ++ "." ++ funcName
-
-                                                                            else
-                                                                                String.join "." modName ++ "." ++ funcName
+                                                                            resolveImport resolver allDeclNames mutatedModule.moduleName ( modName, funcName )
                                                                     in
                                                                     if Set.member qualRef allDeclNames && qualRef /= qualName then
                                                                         Just qualRef

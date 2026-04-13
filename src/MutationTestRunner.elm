@@ -182,12 +182,30 @@ task config =
                 DepGraph.parseModuleName testSource
                     |> Maybe.withDefault "Tests"
 
+            -- Fast path: scan type annotations for `suite : Test`.
+            -- Avoids spinning up the interpreter for the common case and
+            -- dodges a whole class of stack-overflow problems on large
+            -- suites (probing used to run every test via runToString).
+            staticTestValues : List String
+            staticTestValues =
+                TestAnalysis.discoverTestValues testSource
+
             candidateNames : List String
             candidateNames =
-                TestAnalysis.getCandidateNames testSource
+                if List.isEmpty staticTestValues then
+                    TestAnalysis.getCandidateNames testSource
+
+                else
+                    []
         in
-        Do.log ("Found " ++ String.fromInt (List.length candidateNames) ++ " candidate values in " ++ testModuleName) <| \_ ->
-        -- Discover which candidates are actually Test values via the interpreter
+        Do.log
+            (if List.isEmpty staticTestValues then
+                "Found " ++ String.fromInt (List.length candidateNames) ++ " candidate values in " ++ testModuleName
+
+             else
+                "Found " ++ String.fromInt (List.length staticTestValues) ++ " Test value(s) in " ++ testModuleName ++ " (via type annotation)"
+            )
+        <| \_ ->
         let
             packageEnv =
                 InterpreterProject.getPackageEnv project
@@ -204,58 +222,64 @@ task config =
                 simpleTestRunnerSource :: userSources
         in
         Do.do
-            (BackendTask.Extra.timed "Discovering test values" "Discovered test values"
-                (let
-                    probeResults =
-                        candidateNames
-                            |> List.map
-                                (\name ->
-                                    ( name, TestAnalysis.probeCandidate packageEnv testModuleName name probeSources )
+            (if List.isEmpty staticTestValues then
+                -- No annotations found — fall back to interpreter probe to
+                -- discover untyped Test values.
+                BackendTask.Extra.timed "Discovering test values" "Discovered test values"
+                    (let
+                        probeResults =
+                            candidateNames
+                                |> List.map
+                                    (\name ->
+                                        ( name, TestAnalysis.probeCandidate packageEnv testModuleName name probeSources )
+                                    )
+
+                        testValues =
+                            probeResults
+                                |> List.filterMap
+                                    (\( name, result ) ->
+                                        case result of
+                                            Ok _ ->
+                                                Just name
+
+                                            Err _ ->
+                                                Nothing
+                                    )
+
+                        rejections =
+                            probeResults
+                                |> List.filterMap
+                                    (\( name, result ) ->
+                                        case result of
+                                            Err reason ->
+                                                Just (testModuleName ++ "." ++ name ++ ": " ++ reason)
+
+                                            Ok _ ->
+                                                Nothing
+                                    )
+                     in
+                     if List.isEmpty testValues then
+                        BackendTask.fail
+                            (FatalError.fromString
+                                ("No Test values found in "
+                                    ++ testModuleName
+                                    ++ ".\nCandidates rejected:\n  "
+                                    ++ String.join "\n  " rejections
                                 )
-
-                    testValues =
-                        probeResults
-                            |> List.filterMap
-                                (\( name, result ) ->
-                                    case result of
-                                        Ok _ ->
-                                            Just name
-
-                                        Err _ ->
-                                            Nothing
-                                )
-
-                    rejections =
-                        probeResults
-                            |> List.filterMap
-                                (\( name, result ) ->
-                                    case result of
-                                        Err reason ->
-                                            Just (testModuleName ++ "." ++ name ++ ": " ++ reason)
-
-                                        Ok _ ->
-                                            Nothing
-                                )
-                 in
-                 if List.isEmpty testValues then
-                    BackendTask.fail
-                        (FatalError.fromString
-                            ("No Test values found in "
-                                ++ testModuleName
-                                ++ ".\nCandidates rejected:\n  "
-                                ++ String.join "\n  " rejections
                             )
-                        )
-
-                 else
-                    (if List.isEmpty rejections then
-                        BackendTask.succeed ()
 
                      else
-                        Script.log ("Rejected candidates: " ++ String.join ", " rejections)
+                        (if List.isEmpty rejections then
+                            BackendTask.succeed ()
+
+                         else
+                            Script.log ("Rejected candidates: " ++ String.join ", " rejections)
+                        )
+                            |> BackendTask.map (\() -> testValues)
                     )
-                        |> BackendTask.map (\() -> testValues)
-                )
+
+             else
+                BackendTask.succeed staticTestValues
             )
         <| \testValues ->
         let
@@ -1344,25 +1368,50 @@ displayMultiFileReport config allFileResults =
                     totalSurvived > 0 || totalErrors > 0
     in
     if shouldFail then
+        let
+            reason : String
+            reason =
+                case config.breakThreshold of
+                    Just threshold ->
+                        "Score: "
+                            ++ String.fromInt scoreInt
+                            ++ "% (threshold: "
+                            ++ String.fromInt threshold
+                            ++ "%)"
+
+                    Nothing ->
+                        [ if totalSurvived > 0 then
+                            Just (String.fromInt totalSurvived ++ " surviving mutant" ++ pluralS totalSurvived)
+
+                          else
+                            Nothing
+                        , if totalErrors > 0 then
+                            Just (String.fromInt totalErrors ++ " errored mutant" ++ pluralS totalErrors)
+
+                          else
+                            Nothing
+                        ]
+                            |> List.filterMap identity
+                            |> String.join ", "
+        in
         BackendTask.fail
             (FatalError.build
-                { title = "Mutation testing incomplete"
-                , body =
-                    "Score: "
-                        ++ String.fromInt scoreInt
-                        ++ "%"
-                        ++ (case config.breakThreshold of
-                                Just threshold ->
-                                    " (threshold: " ++ String.fromInt threshold ++ "%)"
-
-                                Nothing ->
-                                    ""
-                           )
+                { title = "Mutation testing failed"
+                , body = reason
                 }
             )
 
     else
         Do.noop
+
+
+pluralS : Int -> String
+pluralS n =
+    if n == 1 then
+        ""
+
+    else
+        "s"
 
 
 isKilled : MutationResult -> Bool

@@ -206,6 +206,10 @@ Returns Ok if it's a Test (with the result string), or Err with a reason why not
 probeCandidate : Eval.Module.ProjectEnv -> String -> String -> List String -> Result String String
 probeCandidate projectEnv testModuleName name extraSources =
     let
+        -- Use `countTests`, not `runToString`: we only need to confirm the
+        -- value is a Test (fromTest will type-error at runtime otherwise),
+        -- not actually run any test bodies. Running full suites through the
+        -- interpreter blows the JS call stack on large test modules.
         probeWrapper =
             String.join "\n"
                 [ "module Probe__ exposing (probe__)"
@@ -214,7 +218,7 @@ probeCandidate projectEnv testModuleName name extraSources =
                 , ""
                 , "probe__ : String"
                 , "probe__ ="
-                , "    SimpleTestRunner.runToString " ++ testModuleName ++ "." ++ name
+                , "    SimpleTestRunner.countTests " ++ testModuleName ++ "." ++ name
                 , ""
                 ]
 
