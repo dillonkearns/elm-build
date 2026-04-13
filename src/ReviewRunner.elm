@@ -9708,6 +9708,19 @@ mergeCounterDicts dicts =
             Dict.empty
 
 
+{-| Wrap a BackendTask with start/finish `BackendTask.Time.now` bookends
+and return a `Timed` record with the elapsed milliseconds.
+
+**Known limitation:** when `work` is `InterpreterProject.prepareAndEvalWithYield`
+(or something that wraps it via `deferTask`), `withTiming` silently under-reports
+by ~1000x. The two `BackendTask.Time.now` requests collapse into a single
+hash-cached timestamp, likely due to how elm-pages batches identical requests
+inside a nested function call scope. The outer and inline patterns work fine,
+so the workaround at each affected call site is to bookend the call with
+inline `Do.do BackendTask.Time.now` captures and compute `stageMs` in a let,
+then carry the result forward. See `runProjectRulesWithWarmRuleCaches` for
+the canonical form.
+-}
 withTiming : String -> BackendTask FatalError a -> BackendTask FatalError (Timed a)
 withTiming name work =
     Do.do BackendTask.Time.now <| \start ->
@@ -12367,8 +12380,9 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                 initialMemoCache
 
                             else
+                                -- Inline timing: same fix as deps.fresh_eval.
+                                Do.do BackendTask.Time.now <| \foldFreshStart ->
                                 Do.do
-                                    (withTiming "project.importers_fold.fresh_eval"
                                     (runProjectRulesWithCacheWrite
                                         (Path.toString config.buildDirectory)
                                         targetProjectRuntimeTimed.value.baseProject
@@ -12379,19 +12393,19 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                         config.memoizedFunctions
                                         config.memoProfile
                                         initialMemoCache
-                                        )
                                     )
-                                <| \freshTimed ->
+                                <| \foldFreshRaw ->
+                                Do.do BackendTask.Time.now <| \foldFreshFinish ->
                                 BackendTask.succeed
-                                    { output = freshTimed.value.output
-                                    , memoCache = freshTimed.value.memoCache
-                                    , memoStats = freshTimed.value.memoStats
+                                    { output = foldFreshRaw.output
+                                    , memoCache = foldFreshRaw.memoCache
+                                    , memoStats = foldFreshRaw.memoStats
                                     , loadedRuleCaches = emptyLoadedRuleCaches
                                     , counters =
                                         Dict.fromList
                                             [ ( "project.importers_fold.mode.fresh", 1 )
                                             , ( "project.importers_fold.mode.split", 0 )
-                                            , ( "project.importers_fold.fresh_eval_ms", freshTimed.stage.ms )
+                                            , ( "project.importers_fold.fresh_eval_ms", stageMs foldFreshStart foldFreshFinish )
                                             ]
                                     }
                         )
@@ -12444,31 +12458,32 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                     importersFoldEval.memoCache
 
                             else
+                                -- Inline timing: same fix as deps.fresh_eval above.
+                                Do.do BackendTask.Time.now <| \importersFreshStart ->
                                 Do.do
-                                    (withTiming "project.importers.fresh_eval"
                                     (runProjectRulesWithCacheWrite
                                         (Path.toString config.buildDirectory)
                                         targetProjectRuntimeTimed.value.baseProject
                                         reviewProject
                                         ioIndices
                                         importersAffectedModules
-                                            importersMissedPaths
-                                            config.memoizedFunctions
-                                            config.memoProfile
-                                            importersFoldEval.memoCache
-                                        )
+                                        importersMissedPaths
+                                        config.memoizedFunctions
+                                        config.memoProfile
+                                        importersFoldEval.memoCache
                                     )
-                                <| \freshTimed ->
+                                <| \importersFreshRaw ->
+                                Do.do BackendTask.Time.now <| \importersFreshFinish ->
                                 BackendTask.succeed
-                                    { output = freshTimed.value.output
-                                    , memoCache = freshTimed.value.memoCache
-                                    , memoStats = freshTimed.value.memoStats
+                                    { output = importersFreshRaw.output
+                                    , memoCache = importersFreshRaw.memoCache
+                                    , memoStats = importersFreshRaw.memoStats
                                     , loadedRuleCaches = emptyLoadedRuleCaches
                                     , counters =
                                         Dict.fromList
                                             [ ( "project.importers.mode.fresh", 1 )
                                             , ( "project.importers.mode.split", 0 )
-                                            , ( "project.importers.fresh_eval_ms", freshTimed.stage.ms )
+                                            , ( "project.importers.fresh_eval_ms", stageMs importersFreshStart importersFreshFinish )
                                             ]
                                     }
                         )
@@ -12534,31 +12549,36 @@ loadAndEvalHybridPartialWithProject config reviewProject ruleInfo allFileContent
                                         )
 
                             else
+                                -- Inline timing: `withTiming` wrapping
+                                -- `runProjectRulesWithCacheWriteModules` (which
+                                -- internally calls `prepareAndEvalWithYield`)
+                                -- hits the same under-reporting bug as the
+                                -- warm_eval path. Use inline Time.now bookends.
+                                Do.do BackendTask.Time.now <| \depsFreshStart ->
                                 Do.do
-                                    (withTiming "project.deps.fresh_eval"
                                     (runProjectRulesWithCacheWriteModules
                                         (Path.toString config.buildDirectory)
                                         targetProjectRuntimeTimed.value.baseProject
                                         reviewProject
                                         doIndices
                                         depsAffectedModules
-                                            depsMissedPaths
-                                            config.memoizedFunctions
-                                            config.memoProfile
-                                            importersEval.memoCache
-                                        )
+                                        depsMissedPaths
+                                        config.memoizedFunctions
+                                        config.memoProfile
+                                        importersEval.memoCache
                                     )
-                                <| \depsTimed ->
+                                <| \depsRaw ->
+                                Do.do BackendTask.Time.now <| \depsFreshFinish ->
                                 BackendTask.succeed
-                                    { output = depsTimed.value.output
-                                    , memoCache = depsTimed.value.memoCache
-                                    , memoStats = depsTimed.value.memoStats
+                                    { output = depsRaw.output
+                                    , memoCache = depsRaw.memoCache
+                                    , memoStats = depsRaw.memoStats
                                     , loadedRuleCaches = emptyLoadedRuleCaches
                                     , counters =
                                         Dict.fromList
-                                            [ ( "project.deps.mode.fresh", 1 )
+                                            [ ( "project.deps.fresh_eval_ms", stageMs depsFreshStart depsFreshFinish )
+                                            , ( "project.deps.mode.fresh", 1 )
                                             , ( "project.deps.mode.split", 0 )
-                                            , ( "project.deps.fresh_eval_ms", depsTimed.stage.ms )
                                             ]
                                     }
                         )
