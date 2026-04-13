@@ -77,6 +77,14 @@ task config =
         allDirectories =
             "tests" :: sourceDirectories
     in
+    -- Resolve the test files BEFORE loading the project so we can pass
+    -- their module names as normalization roots. The loader uses the
+    -- roots to compute the transitive import closure and only
+    -- normalizes user modules that are actually reachable from a test.
+    -- Modules outside the closure (e.g. `String.Diacritics` when running
+    -- `tests/BasicsTests.elm`) skip the eager fixpoint eval entirely.
+    Do.do (resolveTestFiles config) <| \testFiles ->
+    Do.do (resolveTestModuleNames testFiles) <| \testModuleNames ->
     Do.do
         (BackendTask.Extra.timed "Loading project" "Loaded project"
             (InterpreterProject.loadWith
@@ -87,11 +95,11 @@ task config =
                 , extraSourceFiles = []
                 , extraReachableImports = [ "Test", "Fuzz", "Expect", "Test.Runner" ]
                 , sourceDirectories = Just allDirectories
+                , normalizationRoots = Just testModuleNames
                 }
             )
         )
     <| \project ->
-    Do.do (resolveTestFiles config) <| \testFiles ->
     Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test file(s)") <| \_ ->
     Do.do BackendTask.Time.now <| \startTime ->
     -- Run each test file
@@ -310,6 +318,22 @@ runTestFile config project testFile =
 
 {-| Discover test files: use --test if provided, otherwise find all tests/**/*.elm that import Test.
 -}
+resolveTestModuleNames : List String -> BackendTask FatalError (List String)
+resolveTestModuleNames testFiles =
+    testFiles
+        |> List.map
+            (\filePath ->
+                File.rawFile filePath
+                    |> BackendTask.allowFatal
+                    |> BackendTask.map
+                        (\content ->
+                            DepGraph.parseModuleName content
+                        )
+            )
+        |> BackendTask.sequence
+        |> BackendTask.map (List.filterMap identity)
+
+
 resolveTestFiles : Config -> BackendTask FatalError (List String)
 resolveTestFiles config =
     case config.testFile of

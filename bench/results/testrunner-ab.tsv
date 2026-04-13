@@ -12,3 +12,17 @@ timestamp	label	runs	mean_ms	stddev_ms	min_ms	max_ms	files	env
 2026-04-13T17:16:24Z	G_subset_fixpoint_2pass	8	2599.9	28.2	2569.3	2662.3	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
 2026-04-13T17:20:27Z	F_full_fixpoint_1pass	6	10192.1	46.2	10119.4	10239.8	tests/ArrayTests.elm,tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/ListTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm,tests/TripleTests.elm	
 2026-04-13T17:23:13Z	H_subset_new_default	8	1329.4	13.2	1316.2	1353.6	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-13T18:29:25Z	I_subset_1pass_with_remove_accents	3	39398.8	332.0	39118.7	39765.5	tests/String/RemoveAccentsTest.elm	
+2026-04-13T18:30:11Z	J_subset_3pass_with_remove_accents	3	5907.0	113.9	5805.3	6030.0	tests/String/RemoveAccentsTest.elm	
+2026-04-13T18:34:43Z	K_subset_topo	8	2583.2	19.5	2557.5	2608.5	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-13T18:35:29Z	L_remove_accents_topo	3	6384.7	878.8	5874.0	7399.4	tests/String/RemoveAccentsTest.elm	
+2026-04-13T18:41:08Z	M_subset_topo_verify	8	2581.9	23.3	2550.5	2631.6	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-13T18:41:31Z	N_remove_accents_topo_verify	3	5899.0	32.4	5864.4	5928.8	tests/String/RemoveAccentsTest.elm	
+2026-04-13T18:54:13Z	O_subset_reachability	8	2630.8	25.9	2598.7	2678.5	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-13T18:55:46Z	P_subset_force_empty	5	1131.9	7.3	1122.5	1140.7	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-13T18:59:35Z	Q_basicstests_only	5	764.9	15.3	745.8	785.5	tests/BasicsTests.elm	
+2026-04-13T18:59:49Z	R_7files_no_order	5	1105.3	18.9	1073.3	1121.3	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-13T19:00:43Z	S_remove_accents_reach	3	5828.5	57.6	5790.6	5894.8	tests/String/RemoveAccentsTest.elm	
+2026-04-13T19:04:25Z	T_subset_final	8	2688.9	59.9	2615.7	2794.3	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-13T19:04:33Z	U_7files_no_order	5	1138.6	9.7	1127.1	1151.6	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-13T19:04:58Z	V_remove_accents_final	3	6116.1	38.6	6072.4	6145.3	tests/String/RemoveAccentsTest.elm	

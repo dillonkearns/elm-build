@@ -162,6 +162,7 @@ task config =
                     , extraSourceFiles = []
                     , extraReachableImports = [ "Test", "Fuzz", "Expect", "Test.Runner" ]
                     , sourceDirectories = Just allDirectories
+                    , normalizationRoots = Nothing
                     }
                 )
             )

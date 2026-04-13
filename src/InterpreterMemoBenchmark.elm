@@ -127,6 +127,7 @@ task config =
         , extraSourceFiles = []
         , extraReachableImports = []
         , sourceDirectories = Just []
+        , normalizationRoots = Nothing
         }
         |> BackendTask.andThen
             (\project ->

@@ -425,6 +425,7 @@ benchmarkPackageSummaryCacheCodecs config =
             , extraSourceFiles = config.extraSourceFiles
             , extraReachableImports = config.extraReachableImports
             , sourceDirectories = config.sourceDirectories
+            , normalizationRoots = Nothing
             , packageParseCacheDir = Just config.packageParseCacheDir
             }
         )
@@ -1260,6 +1261,7 @@ load { projectDir } =
         , extraSourceFiles = []
         , extraReachableImports = []
         , sourceDirectories = Nothing
+        , normalizationRoots = Nothing
         }
 
 
@@ -1279,6 +1281,7 @@ loadWith :
     , extraSourceFiles : List String
     , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
+    , normalizationRoots : Maybe (List String)
     }
     -> BackendTask FatalError InterpreterProject
 loadWith config =
@@ -1290,6 +1293,7 @@ loadWith config =
         , extraSourceFiles = config.extraSourceFiles
         , extraReachableImports = config.extraReachableImports
         , sourceDirectories = config.sourceDirectories
+        , normalizationRoots = config.normalizationRoots
         , packageParseCacheDir =
             -- Default to the project's `.elm-build` directory so the package
             -- summary cache (including normalized top-level constants) is
@@ -1307,6 +1311,7 @@ loadWithProfile :
     , extraSourceFiles : List String
     , extraReachableImports : List String
     , sourceDirectories : Maybe (List String)
+    , normalizationRoots : Maybe (List String)
     , packageParseCacheDir : Maybe String
     }
     -> BackendTask FatalError { project : InterpreterProject, profile : LoadProfile }
@@ -1693,6 +1698,44 @@ loadWithProfile config =
                                 |> List.filterMap (\src -> DepGraph.parseModuleName src)
                                 |> List.filterMap (\name -> Dict.get name userParsedFiles)
 
+                        -- When `normalizationRoots` is provided, only
+                        -- normalize user modules that are in the transitive
+                        -- import closure of the roots + extraReachableImports.
+                        -- Out-of-closure modules stay LOADED (their
+                        -- `extendWithFiles` entry keeps them callable from
+                        -- runtime refs) but skip the expensive fixpoint
+                        -- eager-eval pass. For a test run that only
+                        -- references `Basics.Extra`, this prunes
+                        -- `String.Diacritics.lookupArray` and friends out
+                        -- of the normalization budget entirely.
+                        normalizationReachable : Maybe (Set String)
+                        normalizationReachable =
+                            case config.normalizationRoots of
+                                Nothing ->
+                                    Nothing
+
+                                Just roots ->
+                                    Just
+                                        (reachableModules moduleGraph
+                                            (Set.fromList (roots ++ config.extraReachableImports))
+                                            |> Set.intersect userModuleNamesSet
+                                        )
+
+                        userModulesToNormalize : List File
+                        userModulesToNormalize =
+                            case normalizationReachable of
+                                Nothing ->
+                                    userModulesInOrder
+
+                                Just reachable ->
+                                    userModulesInOrder
+                                        |> List.filter
+                                            (\file ->
+                                                case Eval.Module.fileModuleName file of
+                                                    name ->
+                                                        Set.member (String.join "." name) reachable
+                                            )
+
                         envBeforeUserNormResult : Result Types.Error Eval.Module.ProjectEnv
                         envBeforeUserNormResult =
                             Eval.Module.extendWithFiles pkgEnv userModulesInOrder
@@ -1706,7 +1749,7 @@ loadWithProfile config =
                                 buildUserNormalizedEnv
                                     { cacheDir = config.packageParseCacheDir
                                     , packageKey = packageSummaryCacheKey allPackageSources
-                                    , userModules = userModulesInOrder
+                                    , userModules = userModulesToNormalize
                                     , userFileContents =
                                         userFileContents
                                             |> List.filterMap

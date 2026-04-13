@@ -123,6 +123,7 @@ task config =
                 , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
                 , extraReachableImports = []
                 , sourceDirectories = Just [ coreExtraDir ++ "/src", coreExtraDir ++ "/tests" ]
+                , normalizationRoots = Nothing
                 }
             )
         )
