@@ -35,6 +35,7 @@ import Environment
 import FastDict
 import FatalError exposing (FatalError)
 import FNV1a
+import FunctionReachability
 import Json.Decode as Decode
 import Json.Encode
 import Lamdera.Wire3
@@ -1698,28 +1699,52 @@ loadWithProfile config =
                                 |> List.filterMap (\src -> DepGraph.parseModuleName src)
                                 |> List.filterMap (\name -> Dict.get name userParsedFiles)
 
-                        -- When `normalizationRoots` is provided, only
-                        -- normalize user modules that are in the transitive
-                        -- import closure of the roots + extraReachableImports.
-                        -- Out-of-closure modules stay LOADED (their
-                        -- `extendWithFiles` entry keeps them callable from
-                        -- runtime refs) but skip the expensive fixpoint
-                        -- eager-eval pass. For a test run that only
-                        -- references `Basics.Extra`, this prunes
-                        -- `String.Diacritics.lookupArray` and friends out
-                        -- of the normalization budget entirely.
+                        -- When `normalizationRoots` is provided, only normalize
+                        -- user modules that contain a function reachable — at
+                        -- the function-call level — from the roots' top-level
+                        -- definitions. Module-level reachability is too
+                        -- coarse: for example, `tests/OrderTests.elm` imports
+                        -- `Order.Extra`, which imports `String.Extra`, which
+                        -- imports `String.Diacritics` — but `OrderTests`
+                        -- doesn't call any Order.Extra function that
+                        -- transitively touches `removeDiacritics`, so
+                        -- `String.Diacritics.lookupArray` is dead code for
+                        -- that test run. Function-level reachability walks
+                        -- each test's function bodies and tracks the
+                        -- transitive call graph.
                         normalizationReachable : Maybe (Set String)
                         normalizationReachable =
                             case config.normalizationRoots of
                                 Nothing ->
                                     Nothing
 
-                                Just roots ->
-                                    Just
-                                        (reachableModules moduleGraph
-                                            (Set.fromList (roots ++ config.extraReachableImports))
-                                            |> Set.intersect userModuleNamesSet
-                                        )
+                                Just rootModuleNamesList ->
+                                    let
+                                        seeds : Set FunctionReachability.Reference
+                                        seeds =
+                                            rootModuleNamesList
+                                                |> List.concatMap
+                                                    (\rmn ->
+                                                        case Dict.get rmn userParsedFiles of
+                                                            Just file ->
+                                                                FunctionReachability.findTopLevelNames file
+                                                                    |> Set.toList
+                                                                    |> List.map (\name -> ( rmn, name ))
+
+                                                            Nothing ->
+                                                                []
+                                                    )
+                                                |> Set.fromList
+
+                                        reachableFns : Set FunctionReachability.Reference
+                                        reachableFns =
+                                            FunctionReachability.computeReachable userParsedFiles seeds
+
+                                        liveModules : Set String
+                                        liveModules =
+                                            Set.foldl (\( mn, _ ) acc -> Set.insert mn acc) Set.empty reachableFns
+                                    in
+                                    Just (Set.intersect liveModules userModuleNamesSet)
 
                         userModulesToNormalize : List File
                         userModulesToNormalize =
