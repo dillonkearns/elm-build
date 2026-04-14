@@ -32,3 +32,4 @@ timestamp	label	runs	mean_ms	stddev_ms	min_ms	max_ms	files	env
 2026-04-14T16:28:22Z	phase0-baseline	3	778.8	13.1	763.7	786.4	tests/BasicsTests.elm,tests/CharTests.elm	
 2026-04-14T16:29:13Z	phase0-baseline	10	1127.8	30.4	1084.5	1176.6	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
 2026-04-14T18:35:31Z	phase2-after	10	1088.5	23.0	1068.3	1148.6	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
+2026-04-14T20:15:32Z	phase6-after	10	1220.8	62.1	1158.4	1329.8	tests/BasicsTests.elm,tests/CharTests.elm,tests/DictTests.elm,tests/FloatTests.elm,tests/MaybeTests.elm,tests/OrderTests.elm,tests/ResultTests.elm,tests/SetTests.elm	
