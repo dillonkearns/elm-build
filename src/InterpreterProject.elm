@@ -255,7 +255,7 @@ repeatJsonDecode iterations jsonString acc =
 
 packageSummaryCacheVersion : String
 packageSummaryCacheVersion =
-    "v7"
+    "v8"
 
 
 packageSummaryCacheBlobPath : String -> String -> String
