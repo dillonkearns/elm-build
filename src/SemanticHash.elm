@@ -323,7 +323,21 @@ hashExpression (Node _ expr) =
                         (\(Node _ letDecl) ->
                             case letDecl of
                                 LetFunction func ->
-                                    "F" ++ hashExpression (Node.value func.declaration |> .expression)
+                                    let
+                                        impl =
+                                            Node.value func.declaration
+                                    in
+                                    -- Include the binding name and argument
+                                    -- patterns, not just the body. Otherwise a
+                                    -- rename or arg-reorder mutation inside a
+                                    -- let would hash identically to baseline
+                                    -- and be falsely reported as equivalent.
+                                    "F"
+                                        ++ Node.value impl.name
+                                        ++ "("
+                                        ++ String.join "," (List.map hashPattern impl.arguments)
+                                        ++ ")="
+                                        ++ hashExpression impl.expression
 
                                 LetDestructuring pat expr_ ->
                                     "D" ++ hashPattern pat ++ "=" ++ hashExpression expr_
@@ -508,8 +522,14 @@ extractDependenciesWithRanges ((Node range expr) as expressionNode) =
         RecordExpr setters ->
             List.concatMap (\(Node _ ( _, valExpr )) -> extractDependenciesWithRanges valExpr) setters
 
-        RecordUpdateExpression _ setters ->
-            List.concatMap (\(Node _ ( _, valExpr )) -> extractDependenciesWithRanges valExpr) setters
+        RecordUpdateExpression (Node recordNameRange recordName) setters ->
+            -- `{ foo | a = 1 }` reads `foo`, so the updated record is
+            -- a real dependency — without this, a mutation to `foo`'s
+            -- definition wouldn't merkle-propagate to decls that
+            -- update `foo`, and we'd silently report those mutations
+            -- as equivalent.
+            ( recordNameRange, [], recordName )
+                :: List.concatMap (\(Node _ ( _, valExpr )) -> extractDependenciesWithRanges valExpr) setters
 
         ListExpr items ->
             List.concatMap extractDependenciesWithRanges items

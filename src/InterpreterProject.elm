@@ -1846,7 +1846,17 @@ loadWithProfile config =
                                             |> Dict.fromList
                                     }
                                     envBeforeUserNorm
-                                    |> BackendTask.map Just
+                                    |> BackendTask.map
+                                        (\normalizedEnv ->
+                                            -- Pre-resolve user modules into the resolved-IR's
+                                            -- `bodies` map. Without this, the resolved-IR
+                                            -- evaluator's `dispatchGlobalApplyStep` misses
+                                            -- on user functions and falls back to the old
+                                            -- string-keyed evaluator on every call — which
+                                            -- dominates the cold-eval profile for
+                                            -- fuzz-heavy test suites.
+                                            Just (Eval.Module.extendResolvedWithFiles userModulesInOrder normalizedEnv)
+                                        )
                         )
                     <| \baseUserEnvResult ->
                     Do.do BackendTask.Time.now <| \baseUserEnvFinish ->
@@ -2415,11 +2425,7 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                     in
                                     case replacedEnvResult of
                                         Ok updatedEnv ->
-                                            Eval.Module.evalWithEnvFromFilesAndLimit
-                                                (Just 5000000)
-                                                updatedEnv
-                                                additionalFiles
-                                                (FunctionOrValue [] "results")
+                                            evalAdditionalFiles updatedEnv additionalFiles fileOverrides
 
                                         Err e ->
                                             Err e
@@ -2433,11 +2439,7 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                                 ++ List.map .file fileOverrides
                                                 ++ wrapperFile
                                     in
-                                    Eval.Module.evalWithEnvFromFilesAndLimit
-                                        (Just 5000000)
-                                        project.packageEnv
-                                        allFiles
-                                        (FunctionOrValue [] "results")
+                                    evalAdditionalFiles project.packageEnv allFiles fileOverrides
                     in
                     case result of
                         Ok (Types.String s) ->
@@ -2454,6 +2456,56 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                 ++ evalErrorKindToString evalErr.error
         )
         k
+
+
+{-| Run the test runner's `results` expression against an extended
+project env. Routes through the resolved-IR evaluator
+(`evalWithResolvedIRFromFilesAndIntercepts`) when there are no file
+overrides — the test-runner cold path — and falls back to the old
+string-keyed evaluator when there are. The mutation-testing path uses
+file overrides + `replaceModuleInEnv` which doesn't currently refresh
+the precomputed `ResolvedProject`, so feeding it through the resolved-
+IR evaluator would see stale function bodies. The fallback is safe
+and the dev-loop scenarios it covers are already at parity with
+elm-test.
+
+-}
+evalAdditionalFiles :
+    Eval.Module.ProjectEnv
+    -> List File
+    -> List { file : File, hashKey : String }
+    -> Result Types.Error Types.Value
+evalAdditionalFiles env additionalFiles fileOverrides =
+    if List.isEmpty fileOverrides then
+        case
+            Eval.Module.evalWithResolvedIRFromFilesAndIntercepts
+                env
+                additionalFiles
+                FastDict.empty
+                FastDict.empty
+                (FunctionOrValue [] "results")
+        of
+            Types.EvOk value ->
+                Ok value
+
+            Types.EvErr errorData ->
+                Err (Types.EvalError errorData)
+
+            _ ->
+                Err
+                    (Types.EvalError
+                        { currentModule = []
+                        , callStack = []
+                        , error = Types.Unsupported "evalWithResolvedIRFromFilesAndIntercepts returned a trace/yield/memo result; not supported on the test-runner path"
+                        }
+                    )
+
+    else
+        Eval.Module.evalWithEnvFromFilesAndLimit
+            (Just 5000000)
+            env
+            additionalFiles
+            (FunctionOrValue [] "results")
 
 
 {-| Evaluate a test expression with tracing to collect coverage data.

@@ -10,6 +10,181 @@ suite : Test
 suite =
     describe "SemanticHash"
         [ importAliasTracking
+        , expressionDependencyCoverage
+        ]
+
+
+{-| Audit of expression types `extractDependencies` must track so that
+Merkle propagation doesn't miss real call-edges. Each case is written
+as a mutation that would be a silent false positive (fast-path
+EQUIVALENT) if the dependency edge is missing.
+-}
+expressionDependencyCoverage : Test
+expressionDependencyCoverage =
+    describe "extractDependencies covers every way one decl can reference another"
+        [ test "RecordUpdateExpression tracks the record-being-updated as a dependency" <|
+            \_ ->
+                let
+                    fooSource : String
+                    fooSource =
+                        String.join "\n"
+                            [ "module Foo exposing (baseConfig, myConfig)"
+                            , ""
+                            , ""
+                            , "baseConfig : { a : Int, b : Int }"
+                            , "baseConfig = { a = 1, b = 2 }"
+                            , ""
+                            , ""
+                            , "myConfig : { a : Int, b : Int }"
+                            , "myConfig = { baseConfig | a = 10 }"
+                            , ""
+                            ]
+
+                    fooMutated : String
+                    fooMutated =
+                        String.join "\n"
+                            [ "module Foo exposing (baseConfig, myConfig)"
+                            , ""
+                            , ""
+                            , "baseConfig : { a : Int, b : Int }"
+                            , "baseConfig = { a = 1, b = 3 }"
+                            , ""
+                            , ""
+                            , "myConfig : { a : Int, b : Int }"
+                            , "myConfig = { baseConfig | a = 10 }"
+                            , ""
+                            ]
+
+                    baselineRaw =
+                        SemanticHash.buildRawIndex
+                            [ { moduleName = "Foo", source = fooSource } ]
+
+                    baselineSemantic =
+                        SemanticHash.resolveRawIndex baselineRaw
+
+                    mutatedRaw =
+                        SemanticHash.replaceModuleInRawIndex baselineRaw
+                            { moduleName = "Foo", source = fooMutated }
+
+                    mutatedSemantic =
+                        SemanticHash.resolveRawIndexIncremental baselineSemantic mutatedRaw
+
+                    diff =
+                        SemanticHash.diffIndices baselineSemantic mutatedSemantic
+                in
+                diff.changed
+                    |> Expect.equal (Set.fromList [ "Foo.baseConfig", "Foo.myConfig" ])
+        , test "let-function name is part of the hash (rename should not collide)" <|
+            \_ ->
+                let
+                    -- Version A: `helper` is bound in the let.
+                    -- Version B: same body, but the let-binding is renamed to `other`.
+                    -- The outer body still references `helper` in both versions, so
+                    -- Version B is effectively broken code — its hash must differ
+                    -- from Version A or a rename mutation would look equivalent.
+                    aSource : String
+                    aSource =
+                        String.join "\n"
+                            [ "module Foo exposing (foo)"
+                            , ""
+                            , ""
+                            , "foo : Int"
+                            , "foo ="
+                            , "    let"
+                            , "        helper x = x + 1"
+                            , "    in"
+                            , "    helper 5"
+                            , ""
+                            ]
+
+                    bSource : String
+                    bSource =
+                        String.join "\n"
+                            [ "module Foo exposing (foo)"
+                            , ""
+                            , ""
+                            , "foo : Int"
+                            , "foo ="
+                            , "    let"
+                            , "        other x = x + 1"
+                            , "    in"
+                            , "    helper 5"
+                            , ""
+                            ]
+
+                    aRaw =
+                        SemanticHash.buildRawIndex
+                            [ { moduleName = "Foo", source = aSource } ]
+
+                    bRaw =
+                        SemanticHash.buildRawIndex
+                            [ { moduleName = "Foo", source = bSource } ]
+
+                    aSemantic =
+                        SemanticHash.resolveRawIndex aRaw
+
+                    bSemantic =
+                        SemanticHash.resolveRawIndex bRaw
+
+                    diff =
+                        SemanticHash.diffIndices aSemantic bSemantic
+                in
+                diff.changed
+                    |> Expect.equal (Set.fromList [ "Foo.foo" ])
+        , test "let-function argument patterns are part of the hash (reorder should not collide)" <|
+            \_ ->
+                let
+                    -- Same body (`x - y`), but argument order swapped. Semantically
+                    -- different (subtraction isn't commutative), so hash must differ.
+                    aSource : String
+                    aSource =
+                        String.join "\n"
+                            [ "module Foo exposing (foo)"
+                            , ""
+                            , ""
+                            , "foo : Int"
+                            , "foo ="
+                            , "    let"
+                            , "        sub x y = x - y"
+                            , "    in"
+                            , "    sub 1 2"
+                            , ""
+                            ]
+
+                    bSource : String
+                    bSource =
+                        String.join "\n"
+                            [ "module Foo exposing (foo)"
+                            , ""
+                            , ""
+                            , "foo : Int"
+                            , "foo ="
+                            , "    let"
+                            , "        sub y x = x - y"
+                            , "    in"
+                            , "    sub 1 2"
+                            , ""
+                            ]
+
+                    aRaw =
+                        SemanticHash.buildRawIndex
+                            [ { moduleName = "Foo", source = aSource } ]
+
+                    bRaw =
+                        SemanticHash.buildRawIndex
+                            [ { moduleName = "Foo", source = bSource } ]
+
+                    aSemantic =
+                        SemanticHash.resolveRawIndex aRaw
+
+                    bSemantic =
+                        SemanticHash.resolveRawIndex bRaw
+
+                    diff =
+                        SemanticHash.diffIndices aSemantic bSemantic
+                in
+                diff.changed
+                    |> Expect.equal (Set.fromList [ "Foo.foo" ])
         ]
 
 
