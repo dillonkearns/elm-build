@@ -5,7 +5,7 @@
     },
     "scripts": {
         "start": "bunx elm-pages run src/Build.elm",
-        "test": "npx elm-test-rs tests/DepGraphTest.elm tests/InterpreterProjectTest.elm && npx elm-pages bundle-script src/ValueWireCodecSelfTest.elm --output /tmp/elm-build-value-codec-test.mjs && node /tmp/elm-build-value-codec-test.mjs",
+        "test": "npx elm-test-rs tests/DepGraphTest.elm tests/InterpreterProjectTest.elm tests/SemanticHashTest.elm tests/TestAnalysisTest.elm && npx elm-pages bundle-script src/ValueWireCodecSelfTest.elm --output /tmp/elm-build-value-codec-test.mjs && node /tmp/elm-build-value-codec-test.mjs",
         "review": "npx elm-review",
         "bench:review-runner": "node bench/review-runner-benchmark.mjs",
         "bench:review-cli": "node bench/elm-review-cli-benchmark.mjs",

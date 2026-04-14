@@ -92,9 +92,8 @@ testModules =
     , { imports = [ "OrderTests" ], suiteExpression = "OrderTests.all" }
     , { imports = [ "SetTests" ], suiteExpression = "SetTests.all" }
     , { imports = [ "String.NonEmptyTest" ], suiteExpression = "String.NonEmptyTest.nonEmptyTest" }
-    -- String.RemoveAccentsTest and String.RemoveDiacriticsTests skipped:
-    -- they use removeDiacritics which creates a 65K-element Array via
-    -- Array.initialize, too expensive for the interpreter.
+    , { imports = [ "String.RemoveAccentsTest" ], suiteExpression = "String.RemoveAccentsTest.removeAccentsTest" }
+    , { imports = [ "String.RemoveDiacriticsTests" ], suiteExpression = "String.RemoveDiacriticsTests.removeDiacriticsTests" }
     , { imports = [ "String.ReplaceSliceTest" ], suiteExpression = "String.ReplaceSliceTest.replaceSliceTest" }
     , { imports = [ "String.UnicodeTests" ], suiteExpression = "String.UnicodeTests.unicodeTests" }
     , { imports = [ "String.UnindentTest" ], suiteExpression = "String.UnindentTest.unindentTest" }
@@ -131,7 +130,7 @@ task config =
                 , patchSource = patchSource
                 , patchUserSource = \_ source -> source
                 , extraSourceFiles = [ "src/SimpleTestRunner.elm" ]
-                , extraReachableImports = []
+                , extraReachableImports = [ "SimpleTestRunner" ]
                 , sourceDirectories = Just [ coreExtraDir ++ "/src", coreExtraDir ++ "/tests" ]
                 , normalizationRoots = Just allRoots
                 }
