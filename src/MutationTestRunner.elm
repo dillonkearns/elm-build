@@ -531,15 +531,19 @@ task config =
                                                         { file = mutation.getMutatedFile (), hashKey = Mutator.hashKey mutation }
                                                 in
                                                 if Set.isEmpty diff.changed then
-                                                    -- No declaration hashes changed — provably equivalent
-                                                    Do.log (mutationProgress ++ " " ++ Ansi.Color.fontColor Ansi.Color.yellow "EQUIVALENT" ++ " (0 changed)") <| \_ ->
+                                                    -- No declaration hashes changed — provably equivalent.
+                                                    -- The mutated AST collapses to the same semantic hash
+                                                    -- as baseline (e.g. `x + 0` → `x`), so no test can
+                                                    -- distinguish them even in principle.
                                                     BackendTask.succeed (EquivalentResult { mutation = mutation })
 
                                                 else if List.isEmpty affectedIndices then
-                                                    -- Mutation changed declarations but no test runner
-                                                    -- depends on them — equivalent
-                                                    Do.log (mutationProgress ++ " " ++ Ansi.Color.fontColor Ansi.Color.yellow "EQUIVALENT") <| \_ ->
-                                                    BackendTask.succeed (EquivalentResult { mutation = mutation })
+                                                    -- Mutation changed declarations but no runner in the
+                                                    -- current suite has a dependency on them. This is a
+                                                    -- coverage hole, not equivalence: the mutation would
+                                                    -- change observable behavior in some program, but
+                                                    -- none of this file's tests exercise that path.
+                                                    BackendTask.succeed (NoCoverageResult { mutation = mutation })
 
                                                 else
                                                     Do.do
@@ -559,25 +563,39 @@ task config =
                                                         )
                                                 <| \mutResult ->
                                                 let
-                                                    statusStr =
+                                                    -- Only log mutations the user can act on: killed
+                                                    -- (confirms the test suite works), survived (weak
+                                                    -- test), and runtime errors. EquivalentResult and
+                                                    -- NoCoverageResult are not actionable on a
+                                                    -- per-mutation basis — they roll up into the
+                                                    -- summary counts instead. Suppressing them cuts
+                                                    -- ParseTests's output from ~4200 lines to ~500.
+                                                    maybeStatus : Maybe String
+                                                    maybeStatus =
                                                         case mutResult of
                                                             Killed _ ->
-                                                                Ansi.Color.fontColor Ansi.Color.green "KILLED"
+                                                                Just (Ansi.Color.fontColor Ansi.Color.green "KILLED")
 
                                                             Survived _ ->
-                                                                Ansi.Color.fontColor Ansi.Color.red "SURVIVED"
-
-                                                            EquivalentResult _ ->
-                                                                Ansi.Color.fontColor Ansi.Color.yellow "EQUIVALENT"
-
-                                                            NoCoverageResult _ ->
-                                                                "NO COVERAGE"
+                                                                Just (Ansi.Color.fontColor Ansi.Color.red "SURVIVED")
 
                                                             ErrorResult _ ->
-                                                                Ansi.Color.fontColor Ansi.Color.yellow "ERROR"
+                                                                Just (Ansi.Color.fontColor Ansi.Color.yellow "ERROR")
+
+                                                            EquivalentResult _ ->
+                                                                Nothing
+
+                                                            NoCoverageResult _ ->
+                                                                Nothing
                                                 in
-                                                Do.log (mutationProgress ++ " " ++ statusStr) <| \_ ->
-                                                BackendTask.succeed mutResult
+                                                (case maybeStatus of
+                                                    Just status ->
+                                                        Do.log (mutationProgress ++ " " ++ status) <| \_ ->
+                                                        BackendTask.succeed mutResult
+
+                                                    Nothing ->
+                                                        BackendTask.succeed mutResult
+                                                )
                                             )
                                     )
                                 <| \mutationResults ->
@@ -915,7 +933,14 @@ classifyRunEachOutput mutation baselines output =
                         BackendTask.succeed (Survived { mutation = mutation })
 
                     else
-                        BackendTask.succeed (EquivalentResult { mutation = mutation })
+                        -- Mutation ran but every runner produced the same output
+                        -- as its baseline. Not a true equivalent (the semantic
+                        -- hash changed, so *some* program could observe this) —
+                        -- the running tests just don't distinguish it. That's a
+                        -- coverage hole in practice, so route it to
+                        -- NoCoverageResult rather than conflating with
+                        -- provably-equivalent mutants.
+                        BackendTask.succeed (NoCoverageResult { mutation = mutation })
 
 
 type TestClassification
@@ -942,12 +967,15 @@ parseMutationResult : String -> Mutation -> String -> MutationResult
 parseMutationResult baselineOutput mutation output =
     if String.startsWith "ERROR:" output then
         ErrorResult { mutation = mutation, error = String.dropLeft 7 output }
+            |> reclassifyResult
 
     else if output == baselineOutput then
-        -- Early cutoff: mutation produces identical output to unmutated code.
-        -- This is a provably equivalent mutation — syntactically different but
-        -- semantically identical. No need to propagate to dependents.
-        EquivalentResult { mutation = mutation }
+        -- Mutation changed a declaration but produced byte-identical output
+        -- to the unmutated baseline. In practice this means the tests don't
+        -- distinguish the mutant — a coverage hole, not a proof of
+        -- equivalence. classifyRunEachOutput routes the same case to
+        -- NoCoverageResult, keep them consistent.
+        NoCoverageResult { mutation = mutation }
 
     else
         case String.split "," (String.lines output |> List.head |> Maybe.withDefault "") of
@@ -994,10 +1022,21 @@ reclassifyResult result =
 
 
 {-| Errors that indicate the mutation broke the code (not a tooling issue).
+
+Interpreter `type error:` and `could not resolve '` messages correspond
+directly to what `elm make` would reject at compile time — so the
+mutation would never have shipped. Treating them as killed matches
+the contract a real compile-based mutation tester would give.
+`Parsing error` means the mutation produced invalid syntax, which is
+also a compile-time kill. `Infinite recursion` and `Debug.todo` are
+legacy entries that were already here.
 -}
 isKillableError : String -> Bool
 isKillableError error =
-    String.contains "Infinite recursion" error
+    String.contains "type error:" error
+        || String.contains "could not resolve '" error
+        || String.contains "Parsing error" error
+        || String.contains "Infinite recursion" error
         || String.contains "Debug.todo" error
 
 
@@ -1224,15 +1263,20 @@ displayMultiFileReport config allFileResults =
             <| \_ ->
             if multiFile then
                 let
+                    actionableInFile : Int
+                    actionableInFile =
+                        List.length killed + List.length survived + List.length errors
+
+                    fileScore : String
                     fileScore =
-                        if total == 0 then
+                        if actionableInFile == 0 then
                             "N/A"
 
                         else
-                            String.fromInt (round (toFloat (List.length killed) / toFloat total * 100)) ++ "%"
+                            String.fromInt (round (toFloat (List.length killed) / toFloat actionableInFile * 100)) ++ "%"
 
                     fileColor =
-                        if List.isEmpty survived && List.isEmpty errors then
+                        if List.isEmpty survived && List.isEmpty errors && actionableInFile > 0 then
                             Ansi.Color.fontColor Ansi.Color.green
 
                         else
@@ -1245,7 +1289,7 @@ displayMultiFileReport config allFileResults =
                             ++ " ("
                             ++ String.fromInt (List.length killed)
                             ++ "/"
-                            ++ String.fromInt total
+                            ++ String.fromInt actionableInFile
                             ++ " killed)"
                         )
                     )
@@ -1326,24 +1370,47 @@ displayMultiFileReport config allFileResults =
                         fKilled =
                             List.filter isKilled fileResult.results |> List.length
 
+                        fSurvived =
+                            List.filter isSurvived fileResult.results |> List.length
+
+                        fErrors =
+                            List.filter isError fileResult.results |> List.length
+
+                        fNoCoverage =
+                            List.filter isNoCoverage fileResult.results |> List.length
+
                         fTotal =
                             List.length fileResult.results
 
+                        -- Match the overall score formula: only count mutations
+                        -- that actually had a chance to be killed by a runner.
+                        -- Equivalents can't be caught; uncovered aren't reached.
+                        fActionable =
+                            fKilled + fSurvived + fErrors
+
                         fScore =
-                            if fTotal == 0 then
+                            if fActionable == 0 then
                                 "N/A"
 
                             else
-                                String.fromInt (round (toFloat fKilled / toFloat fTotal * 100)) ++ "%"
+                                String.fromInt (round (toFloat fKilled / toFloat fActionable * 100)) ++ "%"
 
                         fColor =
-                            if fKilled == fTotal then
+                            if fSurvived == 0 && fErrors == 0 && fActionable > 0 then
                                 Ansi.Color.fontColor Ansi.Color.green
 
                             else
                                 Ansi.Color.fontColor Ansi.Color.red
+
+                        coverageNote : String
+                        coverageNote =
+                            if fNoCoverage > 0 then
+                                ", " ++ String.fromInt fNoCoverage ++ " uncovered"
+
+                            else
+                                ""
                     in
-                    Script.log (fColor ("  " ++ fileResult.filePath ++ ": " ++ fScore ++ " (" ++ String.fromInt fKilled ++ "/" ++ String.fromInt fTotal ++ ")"))
+                    Script.log (fColor ("  " ++ fileResult.filePath ++ ": " ++ fScore ++ " (" ++ String.fromInt fKilled ++ "/" ++ String.fromInt fActionable ++ coverageNote ++ ")"))
                 )
                 (\_ -> BackendTask.succeed ())
 
