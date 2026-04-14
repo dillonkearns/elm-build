@@ -3,20 +3,73 @@
   "automatically created by": "elm-review suppress",
   "learn more": "elm-review suppress --help",
   "suppressions": [
-    { "count": 141, "filePath": "src/ReviewRunner.elm" },
-    { "count": 44, "filePath": "src/SemanticHash.elm" },
-    { "count": 22, "filePath": "src/AstWireCodec.elm" },
-    { "count": 17, "filePath": "src/Mutator.elm" },
-    { "count": 13, "filePath": "src/TestAnalysis.elm" },
-    { "count": 12, "filePath": "src/Cache.elm" },
-    { "count": 10, "filePath": "src/BackendTask/Extra.elm" },
-    { "count": 9, "filePath": "src/ValueWireCodec.elm" },
-    { "count": 4, "filePath": "src/InterpreterProject.elm" },
-    { "count": 3, "filePath": "src/InterpreterMemoBenchmark.elm" },
-    { "count": 2, "filePath": "src/InterpreterBenchmark.elm" },
-    { "count": 2, "filePath": "src/ResolvedIRBenchmark.elm" },
-    { "count": 1, "filePath": "src/LamderaStrictDecodeProgression.elm" },
-    { "count": 1, "filePath": "src/ProjectSources.elm" },
-    { "count": 1, "filePath": "src/RunCoreExtraTests.elm" }
+    {
+      "count": 141,
+      "filePath": "src/ReviewRunner.elm"
+    },
+    {
+      "count": 44,
+      "filePath": "src/SemanticHash.elm"
+    },
+    {
+      "count": 22,
+      "filePath": "src/AstWireCodec.elm"
+    },
+    {
+      "count": 17,
+      "filePath": "src/Mutator.elm"
+    },
+    {
+      "count": 13,
+      "filePath": "src/TestAnalysis.elm"
+    },
+    {
+      "count": 12,
+      "filePath": "src/Cache.elm"
+    },
+    {
+      "count": 10,
+      "filePath": "src/BackendTask/Extra.elm"
+    },
+    {
+      "count": 10,
+      "filePath": "src/BST.elm"
+    },
+    {
+      "count": 9,
+      "filePath": "src/ValueWireCodec.elm"
+    },
+    {
+      "count": 4,
+      "filePath": "src/InterpreterProject.elm"
+    },
+    {
+      "count": 3,
+      "filePath": "src/InterpreterMemoBenchmark.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/BuildTask.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/InterpreterBenchmark.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/ResolvedIRBenchmark.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/LamderaStrictDecodeProgression.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/ProjectSources.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/RunCoreExtraTests.elm"
+    }
   ]
 }

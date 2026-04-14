@@ -3,13 +3,41 @@
   "automatically created by": "elm-review suppress",
   "learn more": "elm-review suppress --help",
   "suppressions": [
-    { "count": 5, "filePath": "src/MutationTestRunner.elm" },
-    { "count": 3, "filePath": "src/InterpreterMemoBenchmark.elm" },
-    { "count": 3, "filePath": "src/ParseVsEvalBenchmark.elm" },
-    { "count": 3, "filePath": "src/ResolvedIRBenchmark.elm" },
-    { "count": 2, "filePath": "src/CoreExtraBenchmark.elm" },
-    { "count": 1, "filePath": "src/BuildAction.elm" },
-    { "count": 1, "filePath": "src/InterpreterBenchmark.elm" },
-    { "count": 1, "filePath": "src/ReviewRunnerTest.elm" }
+    {
+      "count": 5,
+      "filePath": "src/MutationTestRunner.elm"
+    },
+    {
+      "count": 3,
+      "filePath": "src/InterpreterMemoBenchmark.elm"
+    },
+    {
+      "count": 3,
+      "filePath": "src/ParseVsEvalBenchmark.elm"
+    },
+    {
+      "count": 3,
+      "filePath": "src/ResolvedIRBenchmark.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/CoreExtraBenchmark.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/BuildAction.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/Buildfile.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/InterpreterBenchmark.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/ReviewRunnerTest.elm"
+    }
   ]
 }

@@ -1,14 +1,10 @@
 {
     "license": "BSD-3-Clause",
     "devDependencies": {
-        "elm-pages": "^3.3.4"
+        "elm-pages": "^3.3.4",
+        "elm-test-rs": "^3.0.2-0"
     },
     "scripts": {
-        "start": "bunx elm-pages run src/Build.elm",
-        "test": "npx elm-test-rs tests/DepGraphTest.elm tests/InterpreterProjectTest.elm tests/SemanticHashTest.elm tests/TestAnalysisTest.elm && npx elm-pages bundle-script src/ValueWireCodecSelfTest.elm --output /tmp/elm-build-value-codec-test.mjs && node /tmp/elm-build-value-codec-test.mjs",
-        "review": "npx elm-review",
-        "bench:review-runner": "node bench/review-runner-benchmark.mjs",
-        "bench:review-cli": "node bench/elm-review-cli-benchmark.mjs",
-        "bench:file-summary": "node bench/file-summary-benchmark.mjs"
+        "start": "bunx elm-pages run src/Build.elm"
     }
 }

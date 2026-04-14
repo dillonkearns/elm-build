@@ -1,9 +1,14 @@
-module BuildAction exposing (buildAction, getInputs)
+module Buildfile exposing (buildAction, getInputs)
 
-import Ansi.Color
 import BackendTask exposing (BackendTask)
 import BackendTask.Glob as Glob
-import Cache exposing (FileOrDirectory)
+import BuildTask exposing (BuildTask, FileOrDirectory)
+import BuildTask.Do as Do
+import BuildTask.Elm as Elm
+import BuildTask.Font as Font
+import BuildTask.Image as Image
+import BuildTask.Unsafe as Unsafe
+import BuildTask.Unsafe.Do as Do
 import Elm
 import Elm.Annotation
 import Elm.Arg
@@ -21,13 +26,8 @@ import Gen.String
 import Json.Encode
 import List.Extra
 import Maybe.Extra
-import Parser exposing ((|.), (|=), DeadEnd, Parser)
-import Parser.Error
-import Parser.Workaround
 import Path exposing (Path)
-import Result.Extra
 import String.Extra
-import String.Multiline
 
 
 type ProcessedFile
@@ -35,75 +35,9 @@ type ProcessedFile
         { original : HashedFileWith { width : Int, height : Int }
         , converted : List (HashedFileWith { width : Int })
         }
-    | ProcessedCss Path FileOrDirectory
+    | ProcessedCss (HashedFileWith {})
     | ProcessedSvg (HashedFileWith { width : Int, height : Int })
-    | ProcessedFont { family : String, style : Style, weight : Weight } Path FileOrDirectory
-
-
-type Style
-    = StyleNormal
-    | StyleItalic
-    | StyleOblique
-
-
-styleToString : Style -> String
-styleToString style =
-    case style of
-        StyleNormal ->
-            "normal"
-
-        StyleItalic ->
-            "italic"
-
-        StyleOblique ->
-            "oblique"
-
-
-type Weight
-    = WeightThin -- (Hairline)
-    | WeightExtraLight -- (Ultra Light)
-    | WeightLight
-    | WeightNormal -- (Regular)
-    | WeightMedium
-    | WeightSemiBold -- (Demi Bold)
-    | WeightBold
-    | WeightExtraBold -- (Ultra Bold)
-    | WeightBlack -- (Heavy)
-    | WeightExtraBlack -- (Ultra Black)
-
-
-weightToNumber : Weight -> number
-weightToNumber weight =
-    case weight of
-        WeightThin ->
-            100
-
-        WeightExtraLight ->
-            200
-
-        WeightLight ->
-            300
-
-        WeightNormal ->
-            400
-
-        WeightMedium ->
-            500
-
-        WeightSemiBold ->
-            600
-
-        WeightBold ->
-            700
-
-        WeightExtraBold ->
-            800
-
-        WeightBlack ->
-            900
-
-        WeightExtraBlack ->
-            950
+    | ProcessedFont (HashedFileWith Font.Data)
 
 
 type alias HashedFileWith a =
@@ -113,7 +47,7 @@ type alias HashedFileWith a =
     }
 
 
-getInputs : { a | inputDirectory : Path } -> BackendTask FatalError (List ( Path, Cache.Monad FileOrDirectory ))
+getInputs : { a | inputDirectory : Path } -> BackendTask FatalError (List ( Path, BuildTask FileOrDirectory ))
 getInputs config =
     Glob.fromStringWithOptions
         (let
@@ -129,89 +63,133 @@ getInputs config =
                 found
                     |> List.sort
                     |> List.map Path.path
-                    |> Cache.inputs
+                    |> BuildTask.inputs
             )
 
 
-buildAction : { config | inputDirectory : Path } -> List ( Path, Cache.Monad FileOrDirectory ) -> Cache.Monad FileOrDirectory
+type T4 a b c d
+    = T4 a b c d
+
+
+buildAction : { config | inputDirectory : Path } -> List ( Path, BuildTask FileOrDirectory ) -> BuildTask FileOrDirectory
 buildAction config inputs =
     let
         inputSize : Int
         inputSize =
             List.length inputs
-
-        processFilesTask : Int -> (List ProcessedFile -> Cache.Monad a) -> Cache.Monad a
-        processFilesTask parallelism k =
-            Cache.do
-                (inputs
-                    |> List.indexedMap (processFile config inputSize)
-                    |> Cache.combineBy parallelism
-                )
-            <| \v ->
-            k (Maybe.Extra.values v)
     in
-    Cache.jobs <| \parallelism ->
-    processFilesTask parallelism <| \processedFiles ->
-    elmCodegen (imagesElmFile processedFiles) <| \imagesElm ->
-    elmCodegen (fontsElmFile processedFiles) <| \fontsElm ->
-    fontsCssFile processedFiles <| \fontsCss ->
-    Cache.do
-        (processedFiles
-            |> List.concatMap processedFileToFileList
-            |> (::) fontsCss
-            |> Cache.combine
-            |> Cache.withPrefix ("[" ++ String.fromInt inputSize ++ "/" ++ String.fromInt inputSize ++ "]")
+    BuildTask.do
+        (Do.jobs <| \parallelism ->
+        inputs
+            |> List.indexedMap (processFile config inputSize)
+            |> BuildTask.combineBy parallelism
+            |> BuildTask.map Maybe.Extra.values
         )
-    <| \public ->
-    Cache.combine
-        [ imagesElm
+    <| \processedFiles ->
+    let
+        fontFiles : List (HashedFileWith Font.Data)
+        fontFiles =
+            List.filterMap asFont processedFiles
+
+        imageFiles :
+            List
+                { original : HashedFileWith { width : Int, height : Int }
+                , converted : List (HashedFileWith { width : Int })
+                }
+        imageFiles =
+            List.filterMap asImage processedFiles
+
+        publicFolder : BuildTask FileOrDirectory
+        publicFolder =
+            Do.writeFile (Font.toCssFile fontFiles) <| \fontsCssHash ->
+            ({ filename = Path.path "fonts.css"
+             , hash = fontsCssHash
+             }
+                :: List.concatMap processedFileToFileList processedFiles
+            )
+                |> BuildTask.combine
+                |> BuildTask.withPrefix ("[" ++ String.fromInt inputSize ++ "/" ++ String.fromInt inputSize ++ "]")
+    in
+    Do.map4 T4
+        (imagesElmFile processedFiles)
+        (Elm.codegen (fontsElmFile fontFiles))
+        (imagesSizesFile imageFiles)
+        publicFolder
+    <| \(T4 imagesElm fontsElm imageSizes public) ->
+    BuildTask.combine
+        [ { filename = Path.path "generated/Images.elm", hash = imagesElm }
         , fontsElm
+        , { filename = Path.path "image-sizes", hash = imageSizes }
         , { filename = Path.path "public", hash = public }
         ]
 
 
-fontsCssFile :
-    List ProcessedFile
-    -> ({ filename : Path, hash : FileOrDirectory } -> Cache.Monad a)
-    -> Cache.Monad a
-fontsCssFile files k =
+asImage :
+    ProcessedFile
+    ->
+        Maybe
+            { original : HashedFileWith { width : Int, height : Int }
+            , converted : List (HashedFileWith { width : Int })
+            }
+asImage file =
+    case file of
+        ProcessedImage data ->
+            Just data
+
+        ProcessedCss _ ->
+            Nothing
+
+        ProcessedSvg _ ->
+            Nothing
+
+        ProcessedFont _ ->
+            Nothing
+
+
+asFont : ProcessedFile -> Maybe (HashedFileWith Font.Data)
+asFont file =
+    case file of
+        ProcessedFont data ->
+            Just data
+
+        _ ->
+            Nothing
+
+
+imagesSizesFile :
+    List
+        { a
+            | original : HashedFileWith { width : Int, height : Int }
+        }
+    -> BuildTask FileOrDirectory
+imagesSizesFile processedFiles =
     let
         content : String
         content =
-            files
-                |> List.filterMap
-                    (\file ->
-                        case file of
-                            ProcessedFont { family, style, weight } path _ ->
-                                Just (String.Multiline.here """
-                                    @font-face {
-                                        font-family: \"""" ++ family ++ """";
-                                        font-style: """ ++ styleToString style ++ """;
-                                        font-weight: """ ++ String.fromInt (weightToNumber weight) ++ """;
-                                        src: url(\"""" ++ Path.toString path ++ """");
-                                    }""")
-
-                            _ ->
-                                Nothing
+            processedFiles
+                |> List.map
+                    (\{ original } ->
+                        let
+                            name : String
+                            name =
+                                Path.toString original.filename
+                                    |> String.replace " " "_"
+                        in
+                        name
+                            ++ ": "
+                            ++ String.fromInt original.width
+                            ++ "x"
+                            ++ String.fromInt original.height
                     )
-                |> String.join "\n\n"
+                |> String.join "\n"
     in
-    Cache.writeFile content <| \hash ->
-    k { filename = Path.path "fonts.css", hash = hash }
+    BuildTask.writeFile content
 
 
-fontsElmFile : List ProcessedFile -> Elm.File
+fontsElmFile : List (HashedFileWith Font.Data) -> Elm.File
 fontsElmFile files =
     files
-        |> List.filterMap
-            (\file ->
-                case file of
-                    ProcessedFont { family } _ _ ->
-                        Just family
-
-                    _ ->
-                        Nothing
-            )
+        |> List.map .family
         |> List.Extra.unique
         |> List.map
             (\family ->
@@ -220,64 +198,111 @@ fontsElmFile files =
         |> Elm.file [ "Fonts" ]
 
 
-elmCodegen :
-    Elm.File
-    -> ({ filename : Path, hash : FileOrDirectory } -> Cache.Monad a)
-    -> Cache.Monad a
-elmCodegen file k =
-    Cache.writeFile file.contents <| \hash ->
-    Cache.pipeThrough "elm-format" [ "--stdin" ] hash <| \formatted ->
-    k { filename = Path.path ("generated/" ++ file.path), hash = formatted }
-
-
-imagesElmFile : List ProcessedFile -> Elm.File
-imagesElmFile processedFiles =
-    processedFiles
+imagesElmFile : List ProcessedFile -> BuildTask FileOrDirectory
+imagesElmFile list =
+    list
         |> List.filterMap
-            (\file ->
-                case file of
-                    ProcessedImage image ->
-                        Just (processedImageToDeclaration image)
+            (\processedFile ->
+                case processedFile of
+                    ProcessedImage { original } ->
+                        Just
+                            { svg = False
+                            , filename = original.filename
+                            , hash = original.hash
+                            , width = original.width
+                            , height = original.height
+                            }
 
-                    ProcessedSvg image ->
-                        Just (processedSvgToDeclaration image)
+                    ProcessedSvg original ->
+                        Just
+                            { svg = True
+                            , filename = original.filename
+                            , hash = original.hash
+                            , width = original.width
+                            , height = original.height
+                            }
 
-                    _ ->
+                    ProcessedCss _ ->
+                        Nothing
+
+                    ProcessedFont _ ->
                         Nothing
             )
-        |> (::) standardFormats.declaration
-        |> (::) getSizes_.declaration
-        |> (::) toSources.declaration
-        |> (::) toPicture.declaration
-        |> Elm.file [ "Images" ]
+        |> Unsafe.named "imagesElmFile"
+            encodeProcessedFiles
+            (\processedFiles ->
+                let
+                    file : Elm.File
+                    file =
+                        processedFiles
+                            |> List.map
+                                (\processedFile ->
+                                    if processedFile.svg then
+                                        processedSvgToDeclaration processedFile
+
+                                    else
+                                        processedImageToDeclaration processedFile
+                                )
+                            |> (::) standardFormats.declaration
+                            |> (::) getSizes_.declaration
+                            |> (::) toSources.declaration
+                            |> (::) (toPicture.declaration |> Elm.expose)
+                            |> Elm.file [ "Images" ]
+                in
+                Do.writeFile file.contents <| \hash ->
+                Elm.format hash
+            )
+
+
+encodeProcessedFiles :
+    List
+        { svg : Bool
+        , filename : Path
+        , hash : FileOrDirectory
+        , width : Int
+        , height : Int
+        }
+    -> { files : List FileOrDirectory, additionalData : List String }
+encodeProcessedFiles processedFiles =
+    let
+        ( files, additionalData ) =
+            processedFiles
+                |> List.map
+                    (\{ filename, hash } ->
+                        -- CORRECTNESS: if svg, width or height change then hash
+                        -- will change too so we don't need to track them separately
+                        ( hash, Path.toString filename )
+                    )
+                |> List.unzip
+    in
+    { files = files, additionalData = additionalData }
 
 
 processedFileToFileList : ProcessedFile -> List { filename : Path, hash : FileOrDirectory }
 processedFileToFileList file =
+    let
+        extract : HashedFileWith a -> HashedFileWith {}
+        extract original =
+            { filename = original.filename
+            , hash = original.hash
+            }
+    in
     case file of
         ProcessedImage image ->
-            { filename = image.original.filename
-            , hash = image.original.hash
-            }
-                :: List.map
-                    (\img ->
-                        { filename = img.filename
-                        , hash = img.hash
-                        }
-                    )
-                    image.converted
+            extract image.original
+                :: List.map extract image.converted
 
-        ProcessedCss path hash ->
-            [ { filename = path, hash = hash } ]
+        ProcessedCss data ->
+            [ extract data ]
 
-        ProcessedSvg original ->
-            [ { filename = original.filename, hash = original.hash } ]
+        ProcessedSvg data ->
+            [ extract data ]
 
-        ProcessedFont _ path hash ->
-            [ { filename = path, hash = hash } ]
+        ProcessedFont data ->
+            [ extract data ]
 
 
-processFile : { config | inputDirectory : Path } -> Int -> Int -> ( Path, Cache.Monad FileOrDirectory ) -> Cache.Monad (Maybe ProcessedFile)
+processFile : { config | inputDirectory : Path } -> Int -> Int -> ( Path, BuildTask FileOrDirectory ) -> BuildTask (Maybe ProcessedFile)
 processFile config total index ( path, copyFile ) =
     let
         relative : Path
@@ -293,14 +318,14 @@ processFile config total index ( path, copyFile ) =
                 ++ String.fromInt total
                 ++ "]"
 
-        image : String -> Cache.Monad (Maybe ProcessedFile)
+        image : String -> BuildTask (Maybe ProcessedFile)
         image originalExtension =
-            Cache.do copyFile <| \copied ->
-            Cache.pipeThrough "exiftool" [ "-all=", "-", "-o", "-" ] copied <| \stripped ->
-            Cache.pipeThrough "identify" [ "-ping", "-format", "%w %h", "-" ] stripped <| \sizeFile ->
-            Cache.withFile sizeFile parseSizeFile <| \sizeData ->
-            Cache.each standardFormats.list (convertAndResize ( stripped, originalExtension ) sizeData) <| \converted ->
-            Cache.succeed
+            BuildTask.do copyFile <| \copied ->
+            BuildTask.do (Image.stripMetadata copied) <| \stripped ->
+            BuildTask.do (Image.getSize stripped) <| \sizeFile ->
+            Do.withFile sizeFile parseSizeFile <| \sizeData ->
+            Do.each standardFormats.list (convertAndResize ( stripped, originalExtension ) sizeData) <| \converted ->
+            BuildTask.succeed
                 ({ original =
                     { width = sizeData.width
                     , height = sizeData.height
@@ -313,7 +338,7 @@ processFile config total index ( path, copyFile ) =
                     |> Just
                 )
 
-        parseSizeFile : String -> Cache.Monad { width : Int, height : Int, sizes : List Int }
+        parseSizeFile : String -> BuildTask { width : Int, height : Int, sizes : List Int }
         parseSizeFile sizeString =
             case String.split " " sizeString |> List.map String.toInt of
                 [ Just width, Just height ] ->
@@ -322,7 +347,7 @@ processFile config total index ( path, copyFile ) =
                         sizes =
                             getSizes width
                     in
-                    Cache.succeed
+                    BuildTask.succeed
                         { width = width
                         , height = height
                         , sizes = sizes
@@ -334,7 +359,7 @@ processFile config total index ( path, copyFile ) =
                         msg =
                             "Could not parse size file: " ++ Json.Encode.encode 0 (Json.Encode.string sizeString)
                     in
-                    Cache.fail msg
+                    BuildTask.fail msg
 
         convertAndResize :
             ( FileOrDirectory, String )
@@ -344,7 +369,7 @@ processFile config total index ( path, copyFile ) =
                 , sizes : List Int
                 }
             -> { a | extension : String }
-            -> Cache.Monad (List (HashedFileWith { width : Int }))
+            -> BuildTask (List (HashedFileWith { width : Int }))
         convertAndResize ( stripped, originalExtension ) sizeData { extension } =
             let
                 convertedFilename : Path
@@ -353,24 +378,41 @@ processFile config total index ( path, copyFile ) =
             in
             convertTo extension ( stripped, originalExtension ) <| \converted ->
             let
-                doResize : Int -> Cache.Monad (HashedFileWith { width : Int })
+                doResize : Int -> BuildTask (HashedFileWith { width : Int })
                 doResize w =
                     (if w == sizeData.width then
-                        Cache.do (Cache.succeed converted)
+                        BuildTask.succeed converted
 
                      else
-                        Cache.pipeThrough "magick" [ "-", "-resize", String.fromInt w ++ "x" ++ String.fromInt sizeData.height, "-" ] converted
+                        Unsafe.pipeThrough "magick" [ "-", "-resize", String.fromInt w ++ "x" ++ String.fromInt sizeData.height, "-" ] converted
                     )
-                    <| \resized ->
-                    Cache.succeed
-                        { width = w
-                        , filename =
-                            convertedFilename
-                                |> Path.appendToFilename ("-" ++ String.fromInt w)
-                        , hash = resized
-                        }
+                        |> BuildTask.map
+                            (\resized ->
+                                { width = w
+                                , filename =
+                                    convertedFilename
+                                        |> Path.appendToFilename ("-" ++ String.fromInt w)
+                                , hash = resized
+                                }
+                            )
             in
-            Cache.each sizeData.sizes doResize Cache.succeed
+            BuildTask.each sizeData.sizes doResize
+
+        font () =
+            BuildTask.do copyFile <| \hash ->
+            BuildTask.map
+                (\fontData ->
+                    Just
+                        (ProcessedFont
+                            { style = fontData.style
+                            , weight = fontData.weight
+                            , family = fontData.family
+                            , filename = relative
+                            , hash = hash
+                            }
+                        )
+                )
+                (Font.parse hash)
     in
     (case Path.extension path of
         Just "webp" ->
@@ -386,17 +428,15 @@ processFile config total index ( path, copyFile ) =
             image "png"
 
         Just "ttf" ->
-            Cache.do copyFile <| \hash ->
-            processFont relative hash
+            font ()
 
         Just "otf" ->
-            Cache.do copyFile <| \hash ->
-            processFont relative hash
+            font ()
 
         Just "svg" ->
-            Cache.do copyFile <| \hash ->
-            Cache.withFile hash getSvgSize <| \size ->
-            Cache.succeed
+            BuildTask.do copyFile <| \hash ->
+            BuildTask.do (Image.getSvgSize hash) <| \size ->
+            BuildTask.succeed
                 (Just
                     (ProcessedSvg
                         { filename = relative
@@ -409,159 +449,28 @@ processFile config total index ( path, copyFile ) =
 
         Just "zip" ->
             -- Ignore
-            Cache.succeed Nothing
+            BuildTask.succeed Nothing
 
         Just "txt" ->
             -- Ignore
-            Cache.succeed Nothing
+            BuildTask.succeed Nothing
 
         Just "md" ->
             -- Ignore
-            Cache.succeed Nothing
+            BuildTask.succeed Nothing
 
         Just "css" ->
-            Cache.do copyFile <| \hash ->
-            Cache.succeed (Just (ProcessedCss relative hash))
+            BuildTask.do copyFile <| \hash ->
+            BuildTask.succeed (Just (ProcessedCss { filename = relative, hash = hash }))
 
         _ ->
-            Cache.succeed Nothing
-     -- Cache.fail ("Don't know how to process " ++ Path.toString path)
+            -- Cache.fail ("Don't know how to process " ++ Path.toString path)
+            BuildTask.succeed Nothing
     )
-        |> Cache.timed
+        |> BuildTask.timed
             ("Processing " ++ Path.toString path)
             ("Processed  " ++ Path.toString path)
-        |> Cache.withPrefix prefix
-
-
-getSvgSize : String -> Cache.Monad { width : Int, height : Int }
-getSvgSize input =
-    case Parser.run viewBoxParser input of
-        Ok { width, height } ->
-            Cache.succeed { width = width, height = height }
-
-        Err e ->
-            Cache.fail (errorToString input e)
-
-
-viewBoxParser : Parser { x : Int, y : Int, width : Int, height : Int }
-viewBoxParser =
-    Parser.succeed (\x y w h -> { x = x, y = y, width = w, height = h })
-        |. doctypeParser
-        |. Parser.spaces
-        |. Parser.symbol "<svg"
-        |. Parser.Workaround.chompUntilAfter "viewBox=\""
-        |= Parser.int
-        |. Parser.spaces
-        |= Parser.int
-        |. Parser.spaces
-        |= Parser.int
-        |. Parser.spaces
-        |= Parser.int
-        |. Parser.symbol "\""
-
-
-doctypeParser : Parser ()
-doctypeParser =
-    Parser.oneOf
-        [ Parser.succeed ()
-            |. Parser.symbol "<?xml"
-            |. Parser.Workaround.chompUntilAfter "?>"
-        , Parser.succeed ()
-        ]
-
-
-errorToString :
-    String
-    -> List DeadEnd
-    -> String
-errorToString src deadEnds =
-    Parser.Error.renderError
-        { text = identity
-        , formatContext = Ansi.Color.fontColor Ansi.Color.cyan
-        , formatCaret = Ansi.Color.fontColor Ansi.Color.red
-        , newline = "\n"
-        , linesOfExtraContext = 3
-        }
-        Parser.Error.forParser
-        src
-        deadEnds
-        |> String.concat
-
-
-processFont : Path -> FileOrDirectory -> Cache.Monad (Maybe ProcessedFile)
-processFont relative hash =
-    let
-        readFontData : String -> Cache.Monad ( String, { style : Style, weight : Weight } )
-        readFontData familyAndStyle =
-            case String.split " || " familyAndStyle of
-                [ family, styleAndWeight ] ->
-                    parseStyleAndWeight styleAndWeight
-                        |> Result.map
-                            (\parsed ->
-                                ( family, parsed )
-                                    |> Cache.succeed
-                            )
-                        |> Result.mapError Cache.fail
-                        |> Result.Extra.merge
-
-                _ ->
-                    Cache.fail ("Failed to parse family and style: " ++ familyAndStyle)
-    in
-    Cache.commandWithFile "fc-scan" [ "--format", "%{family[0]} || %{style[0]}" ] hash <| \familyAndStyleFile ->
-    Cache.withFile familyAndStyleFile readFontData <| \( family, { style, weight } ) ->
-    Cache.succeed (Just (ProcessedFont { family = family, style = style, weight = weight } relative hash))
-
-
-parseStyleAndWeight : String -> Result String { style : Style, weight : Weight }
-parseStyleAndWeight styleAndWeight =
-    styleAndWeight
-        |> String.split " "
-        |> List.foldl
-            (\e ->
-                Result.andThen
-                    (\a ->
-                        case e of
-                            "Normal" ->
-                                Ok a
-
-                            "Italic" ->
-                                Ok { a | style = StyleItalic }
-
-                            "Oblique" ->
-                                Ok { a | style = StyleOblique }
-
-                            "Black" ->
-                                Ok { a | weight = WeightBlack }
-
-                            "Bold" ->
-                                Ok { a | weight = WeightBold }
-
-                            "ExtraBold" ->
-                                Ok { a | weight = WeightExtraBold }
-
-                            "ExtraLight" ->
-                                Ok { a | weight = WeightExtraLight }
-
-                            "Light" ->
-                                Ok { a | weight = WeightLight }
-
-                            "Medium" ->
-                                Ok { a | weight = WeightMedium }
-
-                            "Regular" ->
-                                Ok a
-
-                            "SemiBold" ->
-                                Ok { a | weight = WeightSemiBold }
-
-                            "Thin" ->
-                                Ok { a | weight = WeightThin }
-
-                            _ ->
-                                Err ("Failed to parse style fragment: \"" ++ e ++ "\"")
-                    )
-            )
-            (Ok { style = StyleNormal, weight = WeightNormal })
+        |> BuildTask.withPrefix prefix
 
 
 minSize : number
@@ -616,14 +525,14 @@ getSizes_ =
 convertTo :
     String
     -> ( FileOrDirectory, String )
-    -> (FileOrDirectory -> Cache.Monad a)
-    -> Cache.Monad a
+    -> (FileOrDirectory -> BuildTask a)
+    -> BuildTask a
 convertTo format ( cached, originalExtension ) k =
     if originalExtension == format then
         k cached
 
     else
-        Cache.pipeThrough "magick" [ "-", format ++ ":-" ] cached k
+        Do.pipeThrough "magick" [ "-", format ++ ":-" ] cached k
 
 
 standardFormats :
@@ -661,11 +570,9 @@ standardFormats =
 
 
 processedImageToDeclaration :
-    { image
-        | original : HashedFileWith { width : Int, height : Int }
-    }
+    HashedFileWith { a | width : Int, height : Int }
     -> Elm.Declaration
-processedImageToDeclaration { original } =
+processedImageToDeclaration original =
     let
         name : String
         name =
@@ -711,7 +618,7 @@ processedImageToDeclaration { original } =
 
 
 processedSvgToDeclaration :
-    HashedFileWith { width : Int, height : Int }
+    HashedFileWith { a | width : Int, height : Int }
     -> Elm.Declaration
 processedSvgToDeclaration original =
     let
