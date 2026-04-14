@@ -23,6 +23,9 @@ const srcRoot = path.join(repoRoot, "src");
 const reviewDir = path.join(repoRoot, "bench", "review");
 const distRunnerPath = path.join(repoRoot, "dist", "review-runner-bench.mjs");
 const jobs = String(os.cpus().length);
+const envMode = process.argv.includes("--env-mode")
+  ? process.argv[process.argv.indexOf("--env-mode") + 1]
+  : "legacy-ast";
 
 const fixtureFiles = [
   "Coverage.elm",
@@ -74,6 +77,7 @@ function runReviewer(workspace, traceName, extraNodeArgs = []) {
       "--jobs", jobs,
       "--importers-cache-mode", "auto",
       "--deps-cache-mode", "auto",
+      "--env-mode", envMode,
       "--perf-trace-json", tracePath,
     ],
     { cwd: repoRoot, encoding: "utf8" }
@@ -99,6 +103,7 @@ function mutateImportGraph(fixtureSrcDir) {
 
 const workspace = prepareWorkspace();
 
+console.log("=== env-mode:", envMode);
 console.log("=== workspace:", workspace.root);
 console.log("=== Step 1: Cold run (priming caches)...");
 const cold = runReviewer(workspace, "cold-trace.json");
