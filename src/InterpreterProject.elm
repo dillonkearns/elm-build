@@ -1809,7 +1809,17 @@ loadWithProfile config =
                                             |> Dict.fromList
                                     }
                                     envBeforeUserNorm
-                                    |> BackendTask.map Just
+                                    |> BackendTask.map
+                                        (\normalizedEnv ->
+                                            -- Pre-resolve user modules into the resolved-IR's
+                                            -- `bodies` map. Without this, the resolved-IR
+                                            -- evaluator's `dispatchGlobalApplyStep` misses
+                                            -- on user functions and falls back to the old
+                                            -- string-keyed evaluator on every call — which
+                                            -- dominates the cold-eval profile for
+                                            -- fuzz-heavy test suites.
+                                            Just (Eval.Module.extendResolvedWithFiles userModulesInOrder normalizedEnv)
+                                        )
                         )
                     <| \baseUserEnvResult ->
                     Do.do BackendTask.Time.now <| \baseUserEnvFinish ->
