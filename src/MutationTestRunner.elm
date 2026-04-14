@@ -24,6 +24,7 @@ import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import DepGraph
 import Dict
+import Elm.Parser
 import Elm.Syntax.Expression exposing (Expression(..))
 import Elm.Syntax.File exposing (File)
 import Eval.Module
@@ -354,10 +355,35 @@ task config =
                 String.toInt countResultStr |> Maybe.withDefault 0
         in
         -- Count runners per child to build child→runner index mapping.
-        -- Only works when children are named references (e.g., "TestModule.testName"),
-        -- not inline expressions. For inline expressions, fall back to coarse mode.
+        -- Two strategies, in order:
+        --
+        --   1. Static counting via `TestAnalysis.countRunnersStatically` —
+        --      walks the child AST and infers counts for the common shapes
+        --      (`test`, `fuzz*`, `describe`, `<|`/`|>` pipes, nested
+        --      describes). Pure, fast, no interpreter round-trip, and it's
+        --      the only option for inline children like
+        --      `test "foo" <| \() -> ...` where there's no top-level name
+        --      to pass to `SimpleTestRunner.countTests`.
+        --
+        --   2. Interpreter probe — only fires when the children are bare
+        --      named references (`Mod.namedTest`). Used when static counting
+        --      can't cover the shape (e.g. a helper function returning Test).
+        --
+        -- Either strategy failing drops the runner into coarse mode.
         Do.do
             (let
+                staticCounts : Maybe (List Int)
+                staticCounts =
+                    case childExpressions of
+                        [] ->
+                            Nothing
+
+                        _ ->
+                            childExpressions
+                                |> List.map TestAnalysis.countRunnersStatically
+                                |> sequenceMaybes
+
+                childStrings : List String
                 childStrings =
                     case testValues of
                         [ single ] ->
@@ -367,26 +393,32 @@ task config =
                         _ ->
                             List.map (\v -> testModuleName ++ "." ++ v) testValues
 
+                allNamed : Bool
                 allNamed =
                     childStrings
                         |> List.all (\s -> not (String.contains " " s))
              in
-             if allNamed && not (List.isEmpty childStrings) then
-                childStrings
-                    |> BackendTask.Extra.mapSequence
-                        (\childExpr ->
-                            InterpreterProject.evalSimple project
-                                { imports = evalConfig.imports
-                                , expression = "SimpleTestRunner.countTests (" ++ childExpr ++ ")"
-                                , sourceOverrides = [ simpleTestRunnerSource ]
-                                }
-                                |> BackendTask.map (\s -> String.toInt s |> Maybe.withDefault 0)
-                        )
+             case staticCounts of
+                Just counts ->
+                    BackendTask.succeed counts
 
-             else
-                -- Inline expressions can't be evaluated for counting —
-                -- skip per-child counting, will use coarse mode
-                BackendTask.succeed []
+                Nothing ->
+                    if allNamed && not (List.isEmpty childStrings) then
+                        childStrings
+                            |> BackendTask.Extra.mapSequence
+                                (\childExpr ->
+                                    InterpreterProject.evalSimple project
+                                        { imports = evalConfig.imports
+                                        , expression = "SimpleTestRunner.countTests (" ++ childExpr ++ ")"
+                                        , sourceOverrides = [ simpleTestRunnerSource ]
+                                        }
+                                        |> BackendTask.map (\s -> String.toInt s |> Maybe.withDefault 0)
+                                )
+
+                    else
+                        -- Neither static counting nor interpreter probing
+                        -- can cover these children — fall back to coarse mode.
+                        BackendTask.succeed []
             )
         <| \perChildRunnerCounts ->
         let
@@ -445,11 +477,26 @@ task config =
             baselineSemanticIndex =
                 SemanticHash.resolveRawIndex baselineRawIndex
 
+            -- Build an import resolver for the test module so inline
+            -- children that reference aliased/exposed imports resolve
+            -- to their real qualified names. Without this, tests using
+            -- `import Foo.Bar as Bar` would compute empty dep sets for
+            -- `Bar.baz`, silently classifying every mutation on
+            -- `Foo.Bar` as no-coverage.
+            testImportResolver : SemanticHash.ImportResolver
+            testImportResolver =
+                case Elm.Parser.parseToFile testSource of
+                    Ok testFileAst ->
+                        SemanticHash.buildImportResolver testFileAst.imports
+
+                    Err _ ->
+                        SemanticHash.emptyImportResolver
+
             -- Per-child dependency sets for precise runner selection.
             -- Each child expression's transitive deps are computed from the index.
             perChildDeps =
                 childExpressions
-                    |> List.map (SemanticHash.depsForExpression baselineSemanticIndex testModuleName)
+                    |> List.map (SemanticHash.depsForExpression baselineSemanticIndex testImportResolver testModuleName)
         in
         -- Run mutations for each file and collect per-file results
         Do.do
@@ -1479,6 +1526,26 @@ pluralS n =
 
     else
         "s"
+
+
+{-| `List.map f xs |> sequenceMaybes` → `Just ys` if every call
+returned `Just`, otherwise `Nothing`. Used by the runner-count
+fast path to short-circuit the moment any child expression can't be
+counted statically.
+-}
+sequenceMaybes : List (Maybe a) -> Maybe (List a)
+sequenceMaybes items =
+    List.foldr
+        (\mItem acc ->
+            case ( mItem, acc ) of
+                ( Just item, Just tail ) ->
+                    Just (item :: tail)
+
+                _ ->
+                    Nothing
+        )
+        (Just [])
+        items
 
 
 isKilled : MutationResult -> Bool

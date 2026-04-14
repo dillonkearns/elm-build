@@ -1,4 +1,4 @@
-module TestAnalysis exposing (discoverTestValues, discoverTestValuesViaInterpreter, extractDescribeChildren, extractDescribeChildrenAsExpressions, getCandidateNames, probeCandidate, usesFuzz)
+module TestAnalysis exposing (countRunnersStatically, discoverTestValues, discoverTestValuesViaInterpreter, extractDescribeChildren, extractDescribeChildrenAsExpressions, getCandidateNames, probeCandidate, usesFuzz)
 
 {-| Static analysis for Elm test modules.
 
@@ -562,6 +562,151 @@ findListExpr (Node _ expr) =
 
         _ ->
             Nothing
+
+
+{-| Count how many test runners a child expression will produce, by
+walking the AST. Returns `Nothing` when the expression involves patterns
+we can't count statically (a helper function call, a bare reference,
+anything we don't recognize), so the caller can fall back to the
+coarse mode.
+
+Used by `MutationTestRunner` for per-child precision on inline test
+children — previously that fast path required children to be named
+references (`Mod.namedTest`) so we could pass each child to
+`SimpleTestRunner.countTests` through the interpreter. Most real-world
+elm-test suites use inline `test "..." <| \() -> ...` shapes, so the
+fast path never fired. Static counting fills that gap for the common
+shapes without a round trip through the interpreter.
+
+Handles:
+
+  - `test label fn` → 1
+  - `fuzz`, `fuzz2`, `fuzz3`, `fuzzWith` → 1
+  - `todo label` → 1
+  - `describe label [children]` → sum of child counts
+  - `skip child` → same count as child
+  - `only child` → same count as child
+  - `concat [children]` → sum of child counts
+  - `<|` and `|>` operator applications (normalized to plain `Application`)
+  - parenthesized expressions
+
+-}
+countRunnersStatically : Node Expression -> Maybe Int
+countRunnersStatically node =
+    case normalizeTestExpr node of
+        Node _ (Application ((Node _ (FunctionOrValue _ name)) :: args)) ->
+            countByName name args
+
+        _ ->
+            Nothing
+
+
+countByName : String -> List (Node Expression) -> Maybe Int
+countByName name args =
+    case name of
+        "test" ->
+            Just 1
+
+        "fuzz" ->
+            Just 1
+
+        "fuzz2" ->
+            Just 1
+
+        "fuzz3" ->
+            Just 1
+
+        "fuzzWith" ->
+            Just 1
+
+        "todo" ->
+            Just 1
+
+        "describe" ->
+            case args of
+                [ _, listNode ] ->
+                    findListExpr listNode
+                        |> Maybe.andThen sumCounts
+
+                _ ->
+                    Nothing
+
+        "concat" ->
+            case args of
+                [ listNode ] ->
+                    findListExpr listNode
+                        |> Maybe.andThen sumCounts
+
+                _ ->
+                    Nothing
+
+        "skip" ->
+            case args of
+                [ child ] ->
+                    countRunnersStatically child
+
+                _ ->
+                    Nothing
+
+        "only" ->
+            case args of
+                [ child ] ->
+                    countRunnersStatically child
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+{-| Normalize pipe/paren wrappers so the caller just needs to pattern-match
+on `Application`. `f a b <| c` becomes `f a b c`; `c |> f a b` becomes
+`f a b c`; `(x)` becomes `x`.
+-}
+normalizeTestExpr : Node Expression -> Node Expression
+normalizeTestExpr (Node r e) =
+    case e of
+        ParenthesizedExpression inner ->
+            normalizeTestExpr inner
+
+        OperatorApplication "<|" _ left right ->
+            case normalizeTestExpr left of
+                Node _ (Application nodes) ->
+                    normalizeTestExpr (Node r (Application (nodes ++ [ right ])))
+
+                normalizedLeft ->
+                    Node r (Application [ normalizedLeft, right ])
+
+        OperatorApplication "|>" _ left right ->
+            case normalizeTestExpr right of
+                Node _ (Application nodes) ->
+                    normalizeTestExpr (Node r (Application (nodes ++ [ left ])))
+
+                normalizedRight ->
+                    Node r (Application [ normalizedRight, left ])
+
+        _ ->
+            Node r e
+
+
+{-| Map `countRunnersStatically` over a list, summing counts; short-circuit
+to `Nothing` as soon as any child isn't statically countable.
+-}
+sumCounts : List (Node Expression) -> Maybe Int
+sumCounts children =
+    List.foldl
+        (\child acc ->
+            case acc of
+                Nothing ->
+                    Nothing
+
+                Just total ->
+                    countRunnersStatically child
+                        |> Maybe.map ((+) total)
+        )
+        (Just 0)
+        children
 
 
 {-| Extract the source text for an AST node using its Range.

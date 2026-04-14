@@ -571,7 +571,7 @@ suite =
                         Just e ->
                             let
                                 deps =
-                                    SemanticHash.depsForExpression index "T" e
+                                    SemanticHash.depsForExpression index SemanticHash.emptyImportResolver "T" e
                             in
                             Expect.all
                                 [ \d -> Set.member "A.public" d |> Expect.equal True |> Expect.onFail "Should include A.public"

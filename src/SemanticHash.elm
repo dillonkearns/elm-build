@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, FileAspectHashes, RawIndex, affectedRunnerIndices, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, buildRawIndex, computeAspectHashesFromFile, computeAspectHashesFromSource, declarationHash, depsForExpression, diffIndices, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, replaceModuleInRawIndex, resolveRawIndex, resolveRawIndexIncremental, semanticHashForEntry, transitiveDepsOf)
+module SemanticHash exposing (DeclarationIndex, FileAspectHashes, ImportResolver, RawIndex, affectedRunnerIndices, buildImportResolver, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, buildRawIndex, computeAspectHashesFromFile, computeAspectHashesFromSource, declarationHash, depsForExpression, diffIndices, emptyImportResolver, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, replaceModuleInRawIndex, resolveRawIndex, resolveRawIndexIncremental, semanticHashForEntry, transitiveDepsOf)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -1352,10 +1352,24 @@ transitiveDepsHelp index queue visited =
 {-| Compute dependency set for an expression AST node, resolved against
 the semantic index. Returns qualified names of all declarations the
 expression transitively depends on.
+
+Takes an `ImportResolver` for the module the expression came from so
+aliased and re-exposed imports resolve to their real module name.
+Without the resolver, `Bar.baz` from `import Foo.Bar as Bar` would
+stay as `Bar.baz`, fail the `Dict.member` lookup, and silently drop
+the dep — exactly the kind of silent false-NoCoverage the rest of
+the codebase's alias handling was added to prevent.
+
+Pass `emptyImportResolver` if the expression has no imports to honour.
+
 -}
-depsForExpression : DeclarationIndex -> String -> Node Expression -> Set String
-depsForExpression index moduleName expr =
+depsForExpression : DeclarationIndex -> ImportResolver -> String -> Node Expression -> Set String
+depsForExpression index resolver moduleName expr =
     let
+        allDeclNames : Set String
+        allDeclNames =
+            Dict.keys index |> Set.fromList
+
         directRefs =
             extractDependencies expr
                 |> List.filterMap
@@ -1366,11 +1380,7 @@ depsForExpression index moduleName expr =
                         else
                             let
                                 qualRef =
-                                    if List.isEmpty modName then
-                                        moduleName ++ "." ++ funcName
-
-                                    else
-                                        String.join "." modName ++ "." ++ funcName
+                                    resolveImport resolver allDeclNames moduleName ( modName, funcName )
                             in
                             if Dict.member qualRef index then
                                 Just qualRef
@@ -1384,3 +1394,14 @@ depsForExpression index moduleName expr =
     directRefs
         |> Set.toList
         |> List.foldl (\ref acc -> Set.union acc (transitiveDepsOf index ref)) directRefs
+
+
+{-| Empty resolver for the "no imports to worry about" case (e.g. the
+expression lives in the same module as the callers it references).
+-}
+emptyImportResolver : ImportResolver
+emptyImportResolver =
+    { aliasMap = Dict.empty
+    , exposedMap = Dict.empty
+    , openImports = []
+    }

@@ -1,5 +1,9 @@
 module SemanticHashTest exposing (suite)
 
+import Elm.Parser
+import Elm.Syntax.Declaration
+import Elm.Syntax.Expression
+import Elm.Syntax.Node
 import Expect
 import SemanticHash
 import Set
@@ -11,6 +15,91 @@ suite =
     describe "SemanticHash"
         [ importAliasTracking
         , expressionDependencyCoverage
+        , depsForExpressionHonoursAliases
+        ]
+
+
+{-| `MutationTestRunner` uses `depsForExpression` to compute per-test-child
+dependency sets for runner-index precision. If that computation ignores
+import aliases, children that use `import Foo.Bar as Bar` + `Bar.baz`
+end up with empty dep sets — and every mutation on `Foo.Bar` gets
+silently classified as no-coverage. This surfaced as a 282-mutation
+drop in FeedTests kills the moment #8 (per-child precision for inline
+children) turned the previously-dormant bug on.
+-}
+depsForExpressionHonoursAliases : Test
+depsForExpressionHonoursAliases =
+    describe "depsForExpression resolves import aliases"
+        [ test "`Bar.baz` via `import Foo.Bar as Bar` resolves to Foo.Bar.baz" <|
+            \_ ->
+                let
+                    fooBarSource : String
+                    fooBarSource =
+                        String.join "\n"
+                            [ "module Foo.Bar exposing (baz)"
+                            , ""
+                            , ""
+                            , "baz : Int"
+                            , "baz = 1"
+                            , ""
+                            ]
+
+                    testSource : String
+                    testSource =
+                        String.join "\n"
+                            [ "module MyTests exposing (probe)"
+                            , ""
+                            , "import Foo.Bar as Bar"
+                            , ""
+                            , ""
+                            , "probe : Int"
+                            , "probe = Bar.baz"
+                            , ""
+                            ]
+
+                    index =
+                        SemanticHash.buildRawIndex
+                            [ { moduleName = "Foo.Bar", source = fooBarSource }
+                            , { moduleName = "MyTests", source = testSource }
+                            ]
+                            |> SemanticHash.resolveRawIndex
+
+                    resolver : SemanticHash.ImportResolver
+                    resolver =
+                        case Elm.Parser.parseToFile testSource of
+                            Ok file ->
+                                SemanticHash.buildImportResolver file.imports
+
+                            Err _ ->
+                                SemanticHash.emptyImportResolver
+
+                    -- Parse the probe expression (Bar.baz) out of the test module.
+                    probeExpr : Maybe (Elm.Syntax.Node.Node Elm.Syntax.Expression.Expression)
+                    probeExpr =
+                        case Elm.Parser.parseToFile testSource of
+                            Ok file ->
+                                file.declarations
+                                    |> List.filterMap
+                                        (\(Elm.Syntax.Node.Node _ decl) ->
+                                            case decl of
+                                                Elm.Syntax.Declaration.FunctionDeclaration func ->
+                                                    Just (Elm.Syntax.Node.value func.declaration |> .expression)
+
+                                                _ ->
+                                                    Nothing
+                                        )
+                                    |> List.head
+
+                            Err _ ->
+                                Nothing
+                in
+                case probeExpr of
+                    Just expr ->
+                        SemanticHash.depsForExpression index resolver "MyTests" expr
+                            |> Expect.equal (Set.singleton "Foo.Bar.baz")
+
+                    Nothing ->
+                        Expect.fail "failed to parse test source"
         ]
 
 
