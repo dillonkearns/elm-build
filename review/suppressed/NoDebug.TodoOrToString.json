@@ -3,8 +3,21 @@
   "automatically created by": "elm-review suppress",
   "learn more": "elm-review suppress --help",
   "suppressions": [
-    { "count": 3, "filePath": "src/InterpreterTestRunner.elm" },
-    { "count": 2, "filePath": "src/CoreExtraBenchmark.elm" },
-    { "count": 2, "filePath": "src/InterpreterBenchmark.elm" }
+    {
+      "count": 3,
+      "filePath": "src/InterpreterTestRunner.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/CoreExtraBenchmark.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/InterpreterBenchmark.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/Path.elm"
+    }
   ]
 }

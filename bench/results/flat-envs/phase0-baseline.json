@@ -1,0 +1,290 @@
+{
+  "label": "phase0-slot-envs",
+  "fixture": "small-12",
+  "n": 5,
+  "elapsed_seconds": 1710.3410840034485,
+  "samples": [
+    {
+      "cold": {
+        "wall": 281.67,
+        "internal": 254.46
+      },
+      "warm": {
+        "wall": 0.47,
+        "internal": 0.05
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.27,
+        "internal": 1.19
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.06,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 55.14,
+        "internal": 54.04
+      }
+    },
+    {
+      "cold": {
+        "wall": 292.88,
+        "internal": 264.88
+      },
+      "warm": {
+        "wall": 0.47,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.34,
+        "internal": 1.28
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.03,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 55.43,
+        "internal": 54.2
+      }
+    },
+    {
+      "cold": {
+        "wall": 290.73,
+        "internal": 261.58
+      },
+      "warm": {
+        "wall": 0.44,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.19,
+        "internal": 1.16
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.01,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 50.82,
+        "internal": 49.76
+      }
+    },
+    {
+      "cold": {
+        "wall": 273.76,
+        "internal": 247.58
+      },
+      "warm": {
+        "wall": 0.44,
+        "internal": 0.05
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.21,
+        "internal": 1.17
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.02,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 48.91,
+        "internal": 47.84
+      }
+    },
+    {
+      "cold": {
+        "wall": 274.69,
+        "internal": 249.16
+      },
+      "warm": {
+        "wall": 0.44,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.19,
+        "internal": 1.16
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.04,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 52.02,
+        "internal": 50.92
+      }
+    }
+  ],
+  "aggregate": {
+    "cold": {
+      "wall": {
+        "n": 5,
+        "median": 281.67,
+        "mad": 7.910000000000025,
+        "min": 273.76,
+        "max": 292.88,
+        "range": 19.120000000000005,
+        "range_pct": 6.78808534810239,
+        "samples": [
+          273.76,
+          274.69,
+          281.67,
+          290.73,
+          292.88
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 254.46,
+        "mad": 6.8799999999999955,
+        "min": 247.58,
+        "max": 264.88,
+        "range": 17.299999999999983,
+        "range_pct": 6.798710995834309,
+        "samples": [
+          247.58,
+          249.16,
+          254.46,
+          261.58,
+          264.88
+        ]
+      }
+    },
+    "warm": {
+      "wall": {
+        "n": 5,
+        "median": 0.44,
+        "mad": 0.0,
+        "min": 0.44,
+        "max": 0.47,
+        "range": 0.02999999999999997,
+        "range_pct": 6.818181818181812,
+        "samples": [
+          0.44,
+          0.44,
+          0.44,
+          0.47,
+          0.47
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 0.04,
+        "mad": 0.0,
+        "min": 0.04,
+        "max": 0.05,
+        "range": 0.010000000000000002,
+        "range_pct": 25.000000000000007,
+        "samples": [
+          0.04,
+          0.04,
+          0.04,
+          0.05,
+          0.05
+        ]
+      }
+    },
+    "warm_1_file_body_edit": {
+      "wall": {
+        "n": 5,
+        "median": 2.21,
+        "mad": 0.020000000000000018,
+        "min": 2.19,
+        "max": 2.34,
+        "range": 0.1499999999999999,
+        "range_pct": 6.787330316742078,
+        "samples": [
+          2.19,
+          2.19,
+          2.21,
+          2.27,
+          2.34
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 1.17,
+        "mad": 0.010000000000000009,
+        "min": 1.16,
+        "max": 1.28,
+        "range": 0.1200000000000001,
+        "range_pct": 10.256410256410266,
+        "samples": [
+          1.16,
+          1.16,
+          1.17,
+          1.19,
+          1.28
+        ]
+      }
+    },
+    "warm_1_file_comment_only": {
+      "wall": {
+        "n": 5,
+        "median": 1.03,
+        "mad": 0.010000000000000009,
+        "min": 1.01,
+        "max": 1.06,
+        "range": 0.050000000000000044,
+        "range_pct": 4.854368932038839,
+        "samples": [
+          1.01,
+          1.02,
+          1.03,
+          1.04,
+          1.06
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 0.1,
+        "mad": 0.0,
+        "min": 0.1,
+        "max": 0.1,
+        "range": 0.0,
+        "range_pct": 0.0,
+        "samples": [
+          0.1,
+          0.1,
+          0.1,
+          0.1,
+          0.1
+        ]
+      }
+    },
+    "warm_import_graph_change": {
+      "wall": {
+        "n": 5,
+        "median": 52.02,
+        "mad": 3.1100000000000065,
+        "min": 48.91,
+        "max": 55.43,
+        "range": 6.520000000000003,
+        "range_pct": 12.533640907343335,
+        "samples": [
+          48.91,
+          50.82,
+          52.02,
+          55.14,
+          55.43
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 50.92,
+        "mad": 3.0799999999999983,
+        "min": 47.84,
+        "max": 54.2,
+        "range": 6.359999999999999,
+        "range_pct": 12.490180675569519,
+        "samples": [
+          47.84,
+          49.76,
+          50.92,
+          54.04,
+          54.2
+        ]
+      }
+    }
+  }
+}

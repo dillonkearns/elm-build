@@ -3,15 +3,57 @@
   "automatically created by": "elm-review suppress",
   "learn more": "elm-review suppress --help",
   "suppressions": [
-    { "count": 198, "filePath": "src/MutatorTests.elm" },
-    { "count": 57, "filePath": "src/ReviewRunner.elm" },
-    { "count": 52, "filePath": "src/MutationTestRunner.elm" },
-    { "count": 21, "filePath": "src/Mutator.elm" },
-    { "count": 8, "filePath": "src/BuildAction.elm" },
-    { "count": 6, "filePath": "src/Cache.elm" },
-    { "count": 6, "filePath": "src/ResolvedIRBenchmark.elm" },
-    { "count": 5, "filePath": "src/InterpreterProject.elm" },
-    { "count": 2, "filePath": "src/InterpreterBenchmark.elm" },
-    { "count": 1, "filePath": "src/SemanticHash.elm" }
+    {
+      "count": 198,
+      "filePath": "src/MutatorTests.elm"
+    },
+    {
+      "count": 57,
+      "filePath": "src/ReviewRunner.elm"
+    },
+    {
+      "count": 52,
+      "filePath": "src/MutationTestRunner.elm"
+    },
+    {
+      "count": 21,
+      "filePath": "src/Mutator.elm"
+    },
+    {
+      "count": 8,
+      "filePath": "src/BuildAction.elm"
+    },
+    {
+      "count": 8,
+      "filePath": "src/BuildTask/Font.elm"
+    },
+    {
+      "count": 6,
+      "filePath": "src/Cache.elm"
+    },
+    {
+      "count": 6,
+      "filePath": "src/ResolvedIRBenchmark.elm"
+    },
+    {
+      "count": 5,
+      "filePath": "src/InterpreterProject.elm"
+    },
+    {
+      "count": 4,
+      "filePath": "src/BuildTask/Internal.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/InterpreterBenchmark.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/BackendTask/Extra.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/SemanticHash.elm"
+    }
   ]
 }

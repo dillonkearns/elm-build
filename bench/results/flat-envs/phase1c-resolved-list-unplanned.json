@@ -1,0 +1,291 @@
+{
+  "label": "phase1c-resolved-list-unplanned",
+  "fixture": "small-12",
+  "env_mode": "resolved-list-unplanned",
+  "n": 5,
+  "elapsed_seconds": 1578.774827003479,
+  "samples": [
+    {
+      "cold": {
+        "wall": 250.25,
+        "internal": 221.76
+      },
+      "warm": {
+        "wall": 0.42,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.21,
+        "internal": 1.18
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.0,
+        "internal": 0.11
+      },
+      "warm_import_graph_change": {
+        "wall": 58.5,
+        "internal": 57.43
+      }
+    },
+    {
+      "cold": {
+        "wall": 250.77,
+        "internal": 221.73
+      },
+      "warm": {
+        "wall": 0.41,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.23,
+        "internal": 1.2
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.0,
+        "internal": 0.11
+      },
+      "warm_import_graph_change": {
+        "wall": 57.77,
+        "internal": 56.71
+      }
+    },
+    {
+      "cold": {
+        "wall": 257.83,
+        "internal": 228.49
+      },
+      "warm": {
+        "wall": 0.42,
+        "internal": 0.05
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.32,
+        "internal": 1.25
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.0,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 59.99,
+        "internal": 58.91
+      }
+    },
+    {
+      "cold": {
+        "wall": 252.4,
+        "internal": 223.51
+      },
+      "warm": {
+        "wall": 0.43,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.2,
+        "internal": 1.19
+      },
+      "warm_1_file_comment_only": {
+        "wall": 0.99,
+        "internal": 0.1
+      },
+      "warm_import_graph_change": {
+        "wall": 57.48,
+        "internal": 56.36
+      }
+    },
+    {
+      "cold": {
+        "wall": 248.15,
+        "internal": 221.0
+      },
+      "warm": {
+        "wall": 0.41,
+        "internal": 0.04
+      },
+      "warm_1_file_body_edit": {
+        "wall": 2.24,
+        "internal": 1.2
+      },
+      "warm_1_file_comment_only": {
+        "wall": 1.01,
+        "internal": 0.12
+      },
+      "warm_import_graph_change": {
+        "wall": 51.58,
+        "internal": 50.53
+      }
+    }
+  ],
+  "aggregate": {
+    "cold": {
+      "wall": {
+        "n": 5,
+        "median": 250.77,
+        "mad": 1.6299999999999955,
+        "min": 248.15,
+        "max": 257.83,
+        "range": 9.679999999999978,
+        "range_pct": 3.8601108585556396,
+        "samples": [
+          248.15,
+          250.25,
+          250.77,
+          252.4,
+          257.83
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 221.76,
+        "mad": 0.7599999999999909,
+        "min": 221.0,
+        "max": 228.49,
+        "range": 7.490000000000009,
+        "range_pct": 3.377525252525257,
+        "samples": [
+          221.0,
+          221.73,
+          221.76,
+          223.51,
+          228.49
+        ]
+      }
+    },
+    "warm": {
+      "wall": {
+        "n": 5,
+        "median": 0.42,
+        "mad": 0.010000000000000009,
+        "min": 0.41,
+        "max": 0.43,
+        "range": 0.020000000000000018,
+        "range_pct": 4.761904761904766,
+        "samples": [
+          0.41,
+          0.41,
+          0.42,
+          0.42,
+          0.43
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 0.04,
+        "mad": 0.0,
+        "min": 0.04,
+        "max": 0.05,
+        "range": 0.010000000000000002,
+        "range_pct": 25.000000000000007,
+        "samples": [
+          0.04,
+          0.04,
+          0.04,
+          0.04,
+          0.05
+        ]
+      }
+    },
+    "warm_1_file_body_edit": {
+      "wall": {
+        "n": 5,
+        "median": 2.23,
+        "mad": 0.020000000000000018,
+        "min": 2.2,
+        "max": 2.32,
+        "range": 0.11999999999999966,
+        "range_pct": 5.3811659192824965,
+        "samples": [
+          2.2,
+          2.21,
+          2.23,
+          2.24,
+          2.32
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 1.2,
+        "mad": 0.010000000000000009,
+        "min": 1.18,
+        "max": 1.25,
+        "range": 0.07000000000000006,
+        "range_pct": 5.833333333333339,
+        "samples": [
+          1.18,
+          1.19,
+          1.2,
+          1.2,
+          1.25
+        ]
+      }
+    },
+    "warm_1_file_comment_only": {
+      "wall": {
+        "n": 5,
+        "median": 1.0,
+        "mad": 0.0,
+        "min": 0.99,
+        "max": 1.01,
+        "range": 0.020000000000000018,
+        "range_pct": 2.0000000000000018,
+        "samples": [
+          0.99,
+          1.0,
+          1.0,
+          1.0,
+          1.01
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 0.11,
+        "mad": 0.009999999999999995,
+        "min": 0.1,
+        "max": 0.12,
+        "range": 0.01999999999999999,
+        "range_pct": 18.181818181818173,
+        "samples": [
+          0.1,
+          0.1,
+          0.11,
+          0.11,
+          0.12
+        ]
+      }
+    },
+    "warm_import_graph_change": {
+      "wall": {
+        "n": 5,
+        "median": 57.77,
+        "mad": 0.7299999999999969,
+        "min": 51.58,
+        "max": 59.99,
+        "range": 8.410000000000004,
+        "range_pct": 14.55772892504761,
+        "samples": [
+          51.58,
+          57.48,
+          57.77,
+          58.5,
+          59.99
+        ]
+      },
+      "internal": {
+        "n": 5,
+        "median": 56.71,
+        "mad": 0.7199999999999989,
+        "min": 50.53,
+        "max": 58.91,
+        "range": 8.379999999999995,
+        "range_pct": 14.776935284782217,
+        "samples": [
+          50.53,
+          56.36,
+          56.71,
+          57.43,
+          58.91
+        ]
+      }
+    }
+  }
+}

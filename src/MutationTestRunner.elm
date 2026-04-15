@@ -434,22 +434,21 @@ task config =
                     |> Tuple.second
         in
         Do.log ("  " ++ String.fromInt runnerCount ++ " runners (" ++ String.fromInt (List.length perChildRunnerCounts) ++ " test groups), collecting per-runner baselines...") <| \_ ->
-        -- Collect per-runner baselines (no coverage — just run each runner once)
+        -- Collect per-runner baselines in ONE interpreter call via `runEach`,
+        -- which decomposes the suite once (Test.Runner.fromTest) and runs each
+        -- runner, returning a "---TEST_SEP---"-joined string. Previously this
+        -- was a `runNth`×N loop, which re-decomposed the suite on every call.
         Do.do
-            (List.range 0 (runnerCount - 1)
-                |> BackendTask.Extra.mapSequence
-                    (\runnerIndex ->
-                        InterpreterProject.evalSimple project
-                            { imports = evalConfig.imports
-                            , expression =
-                                "SimpleTestRunner.runNth "
-                                    ++ String.fromInt runnerIndex
-                                    ++ " ("
-                                    ++ suiteExpr
-                                    ++ ")"
-                            , sourceOverrides = [ simpleTestRunnerSource ]
-                            }
-                    )
+            (if runnerCount == 0 then
+                BackendTask.succeed []
+
+             else
+                InterpreterProject.evalSimple project
+                    { imports = evalConfig.imports
+                    , expression = "SimpleTestRunner.runEach (" ++ suiteExpr ++ ")"
+                    , sourceOverrides = [ simpleTestRunnerSource ]
+                    }
+                    |> BackendTask.map (String.split "---TEST_SEP---")
             )
         <| \perRunnerBaselines ->
         Do.log ("  Baselines collected. " ++ String.fromInt (List.length perChildRunnerRanges) ++ " test groups with per-runner precision.") <| \_ ->

@@ -3,12 +3,41 @@
   "automatically created by": "elm-review suppress",
   "learn more": "elm-review suppress --help",
   "suppressions": [
-    { "count": 5, "filePath": "src/InterpreterProject.elm" },
-    { "count": 2, "filePath": "src/BackendTask/Extra.elm" },
-    { "count": 2, "filePath": "src/Cache.elm" },
-    { "count": 2, "filePath": "src/ReviewRunner.elm" },
-    { "count": 2, "filePath": "src/SemanticHashTests.elm" },
-    { "count": 1, "filePath": "src/Build.elm" },
-    { "count": 1, "filePath": "src/BuildAction.elm" }
+    {
+      "count": 5,
+      "filePath": "src/InterpreterProject.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/BackendTask/Extra.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/Cache.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/ReviewRunner.elm"
+    },
+    {
+      "count": 2,
+      "filePath": "src/SemanticHashTests.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/Build.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/BuildAction.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/Buildfile.elm"
+    },
+    {
+      "count": 1,
+      "filePath": "src/BuildTask.elm"
+    }
   ]
 }
