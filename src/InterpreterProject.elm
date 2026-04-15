@@ -84,6 +84,105 @@ type alias LoadProfile =
     , buildGraphMs : Int
     , parsePackageSourcesMs : Int
     , buildPackageSummariesFromParsedMs : Int
+    , packageSummaryFunctionsVisited : Int
+    , packageSummaryFunctionsRewritten : Int
+    , packageSummaryInlineCandidates : Int
+    , packageSummaryInlineSuccesses : Int
+    , packageSummaryInlineRejectedPattern : Int
+    , packageSummaryInlineRejectedArity : Int
+    , packageSummaryInlineRejectedSelfCall : Int
+    , packageSummaryInlineRejectedBodyTooLarge : Int
+    , packageSummaryInlineRejectedUnsafe : Int
+    , packageSummaryInlineRejectedUnsafeApplication : Int
+    , packageSummaryInlineRejectedUnsafeIf : Int
+    , packageSummaryInlineRejectedUnsafeCase : Int
+    , packageSummaryInlineRejectedUnsafeLet : Int
+    , packageSummaryInlineRejectedUnsafeLambda : Int
+    , packageSummaryInlineRejectedUnsafeOther : Int
+    , packageSummaryInlineRejectedInternalHelper : Int
+    , packageSummaryInlineBodyLt30 : Int
+    , packageSummaryInlineBody30To59 : Int
+    , packageSummaryInlineBody60Plus : Int
+    , packageSummaryInlineShapeLeaf : Int
+    , packageSummaryInlineShapeConstructor : Int
+    , packageSummaryInlineShapeOperator : Int
+    , packageSummaryInlineShapeRecordAccess : Int
+    , packageSummaryInlineShapeCollection : Int
+    , packageSummaryInlineShapeOther : Int
+    , packageSummaryInlinePayoffChanged : Int
+    , packageSummaryInlinePayoffChangedShapeLeaf : Int
+    , packageSummaryInlinePayoffChangedShapeConstructor : Int
+    , packageSummaryInlinePayoffChangedShapeOperator : Int
+    , packageSummaryInlinePayoffChangedShapeRecordAccess : Int
+    , packageSummaryInlinePayoffChangedShapeCollection : Int
+    , packageSummaryInlinePayoffChangedShapeOther : Int
+    , packageSummaryInlinePayoffChangedBodyLt30 : Int
+    , packageSummaryInlinePayoffChangedBody30To59 : Int
+    , packageSummaryInlinePayoffChangedBody60Plus : Int
+    , packageSummaryInlinePayoffInline : Int
+    , packageSummaryInlinePayoffInlineShapeLeaf : Int
+    , packageSummaryInlinePayoffInlineShapeConstructor : Int
+    , packageSummaryInlinePayoffInlineShapeOperator : Int
+    , packageSummaryInlinePayoffInlineShapeRecordAccess : Int
+    , packageSummaryInlinePayoffInlineShapeCollection : Int
+    , packageSummaryInlinePayoffInlineShapeOther : Int
+    , packageSummaryInlinePayoffInlineBodyLt30 : Int
+    , packageSummaryInlinePayoffInlineBody30To59 : Int
+    , packageSummaryInlinePayoffInlineBody60Plus : Int
+    , packageSummaryInlinePayoffConstantFold : Int
+    , packageSummaryInlinePayoffConstantFoldShapeLeaf : Int
+    , packageSummaryInlinePayoffConstantFoldShapeConstructor : Int
+    , packageSummaryInlinePayoffConstantFoldShapeOperator : Int
+    , packageSummaryInlinePayoffConstantFoldShapeRecordAccess : Int
+    , packageSummaryInlinePayoffConstantFoldShapeCollection : Int
+    , packageSummaryInlinePayoffConstantFoldShapeOther : Int
+    , packageSummaryInlinePayoffConstantFoldBodyLt30 : Int
+    , packageSummaryInlinePayoffConstantFoldBody30To59 : Int
+    , packageSummaryInlinePayoffConstantFoldBody60Plus : Int
+    , packageSummaryInlinePayoffPrecomputedRef : Int
+    , packageSummaryInlinePayoffPrecomputedRefShapeLeaf : Int
+    , packageSummaryInlinePayoffPrecomputedRefShapeConstructor : Int
+    , packageSummaryInlinePayoffPrecomputedRefShapeOperator : Int
+    , packageSummaryInlinePayoffPrecomputedRefShapeRecordAccess : Int
+    , packageSummaryInlinePayoffPrecomputedRefShapeCollection : Int
+    , packageSummaryInlinePayoffPrecomputedRefShapeOther : Int
+    , packageSummaryInlinePayoffPrecomputedRefBodyLt30 : Int
+    , packageSummaryInlinePayoffPrecomputedRefBody30To59 : Int
+    , packageSummaryInlinePayoffPrecomputedRefBody60Plus : Int
+    , packageSummaryInlineShadowRejectCollection : Int
+    , packageSummaryInlineShadowRejectCollectionPayoffChanged : Int
+    , packageSummaryInlineShadowRejectCollectionPayoffInline : Int
+    , packageSummaryInlineShadowRejectCollectionPayoffPrecomputedRef : Int
+    , packageSummaryInlineShadowRejectCollectionFinalShrinks : Int
+    , packageSummaryInlineShadowRejectCollectionFinalNonApplication : Int
+    , packageSummaryInlineShadowRejectCollectionFinalDirectRootWin : Int
+    , packageSummaryInlineShadowRejectCollectionFinalConstructorApplication : Int
+    , packageSummaryInlineShadowRejectCollectionNoPayoffNoDirectBenefit : Int
+    , packageSummaryInlineShadowRejectGrowth0 : Int
+    , packageSummaryInlineShadowRejectGrowth0PayoffChanged : Int
+    , packageSummaryInlineShadowRejectGrowth0PayoffInline : Int
+    , packageSummaryInlineShadowRejectGrowth0PayoffPrecomputedRef : Int
+    , packageSummaryInlineShadowRejectGrowth0FinalShrinks : Int
+    , packageSummaryInlineShadowRejectGrowth0FinalNonApplication : Int
+    , packageSummaryInlineShadowRejectGrowth0FinalDirectRootWin : Int
+    , packageSummaryInlineShadowRejectGrowth0FinalConstructorApplication : Int
+    , packageSummaryInlineShadowRejectGrowth0NoPayoffNoDirectBenefit : Int
+    , packageSummaryInlineShadowRejectGrowth1 : Int
+    , packageSummaryInlineShadowRejectGrowth1PayoffChanged : Int
+    , packageSummaryInlineShadowRejectGrowth1PayoffInline : Int
+    , packageSummaryInlineShadowRejectGrowth1PayoffPrecomputedRef : Int
+    , packageSummaryInlineShadowRejectGrowth1FinalShrinks : Int
+    , packageSummaryInlineShadowRejectGrowth1FinalNonApplication : Int
+    , packageSummaryInlineShadowRejectGrowth1FinalDirectRootWin : Int
+    , packageSummaryInlineShadowRejectGrowth1FinalConstructorApplication : Int
+    , packageSummaryInlineShadowRejectGrowth1NoPayoffNoDirectBenefit : Int
+    , packageSummaryListFusionChanges : Int
+    , packageSummaryListFusionPipelineNormalizations : Int
+    , packageSummaryListFusionHeadFlattenRewrites : Int
+    , packageSummaryListFusionRuleRewrites : Int
+    , packageSummaryPrecomputedRefSubstitutions : Int
+    , packageSummaryConstantFolds : Int
+    , packageSummaryRejectSamples : List String
     , buildPackageEnvFromSummariesMs : Int
     , buildPackageEnvMs : Int
     , buildBaseUserEnvMs : Int
@@ -97,6 +196,11 @@ type alias LoadProfile =
     , buildSemanticIndexMs : Int
     , cacheInputsMs : Int
     }
+
+
+emptyPackageSummaryStats : Eval.Module.DependencySummaryStats
+emptyPackageSummaryStats =
+    Eval.Module.emptyDependencySummaryStats
 
 
 type alias Timed a =
@@ -266,7 +370,7 @@ repeatJsonDecode iterations jsonString acc =
 
 packageSummaryCacheVersion : String
 packageSummaryCacheVersion =
-    "v9"
+    "v21"
 
 
 packageSummaryCacheBlobPath : String -> String -> String
@@ -1840,6 +1944,7 @@ loadWithProfile config =
                                                                         BackendTask
                                                                             FatalError
                                                                             { packageSummaries : List CachedPackageModuleSummary
+                                                                            , dependencySummaryStats : Eval.Module.DependencySummaryStats
                                                                             , packageSummaryCacheHit : Int
                                                                             , packageSummaryCacheRoundtripOk : Int
                                                                             , packageSummaryCacheBytes : Int
@@ -1871,13 +1976,16 @@ loadWithProfile config =
                                                                                             Do.do BackendTask.Time.now <|
                                                                                                 \buildPackageSummariesStart ->
                                                                                                     let
-                                                                                                        packageSummaries =
+                                                                                                        normalizationResult =
                                                                                                             -- Normalize top-level constants here so the cache
                                                                                                             -- stores the rewritten bodies. Subsequent project
                                                                                                             -- loads hit the summary cache and skip both the
                                                                                                             -- normalization pass AND its re-evaluation cost.
-                                                                                                            Eval.Module.normalizeSummaries
+                                                                                                            Eval.Module.normalizeSummariesWithStats
                                                                                                                 (Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources)
+
+                                                                                                        packageSummaries =
+                                                                                                            normalizationResult.summaries
                                                                                                     in
                                                                                                     Do.do BackendTask.Time.now <|
                                                                                                         \buildPackageSummariesFinish ->
@@ -1902,6 +2010,7 @@ loadWithProfile config =
                                                                                                                                     let
                                                                                                                                         baseInfo =
                                                                                                                                             { packageSummaries = packageSummaries
+                                                                                                                                            , dependencySummaryStats = normalizationResult.stats
                                                                                                                                             , packageSummaryCacheHit = cacheMetrics.packageSummaryCacheHit
                                                                                                                                             , packageSummaryCacheRoundtripOk =
                                                                                                                                                 if cacheRoundtripOk then
@@ -1938,6 +2047,7 @@ loadWithProfile config =
                                                                                                                 Nothing ->
                                                                                                                     BackendTask.succeed
                                                                                                                         { packageSummaries = packageSummaries
+                                                                                                                        , dependencySummaryStats = normalizationResult.stats
                                                                                                                         , packageSummaryCacheHit = cacheMetrics.packageSummaryCacheHit
                                                                                                                         , packageSummaryCacheRoundtripOk = 0
                                                                                                                         , packageSummaryCacheBytes = 0
@@ -1969,6 +2079,7 @@ loadWithProfile config =
                                                                                                                 Just packageSummaries ->
                                                                                                                     BackendTask.succeed
                                                                                                                         { packageSummaries = packageSummaries
+                                                                                                                        , dependencySummaryStats = emptyPackageSummaryStats
                                                                                                                         , packageSummaryCacheHit = 1
                                                                                                                         , packageSummaryCacheRoundtripOk = 1
                                                                                                                         , packageSummaryCacheBytes = Bytes.width readCacheTimed.value
@@ -2242,6 +2353,105 @@ loadWithProfile config =
                                                                                                                                                     , buildGraphMs = buildGraphMs
                                                                                                                                                     , parsePackageSourcesMs = packageSummariesInfo.parsePackageSourcesMs
                                                                                                                                                     , buildPackageSummariesFromParsedMs = packageSummariesInfo.buildPackageSummariesFromParsedMs
+                                                                                                                                                    , packageSummaryFunctionsVisited = packageSummariesInfo.dependencySummaryStats.functionsVisited
+                                                                                                                                                    , packageSummaryFunctionsRewritten = packageSummariesInfo.dependencySummaryStats.functionsRewritten
+                                                                                                                                                    , packageSummaryInlineCandidates = packageSummariesInfo.dependencySummaryStats.inlineCandidates
+                                                                                                                                                    , packageSummaryInlineSuccesses = packageSummariesInfo.dependencySummaryStats.inlineSuccesses
+                                                                                                                                                    , packageSummaryInlineRejectedPattern = packageSummariesInfo.dependencySummaryStats.inlineRejectedPattern
+                                                                                                                                                    , packageSummaryInlineRejectedArity = packageSummariesInfo.dependencySummaryStats.inlineRejectedArity
+                                                                                                                                                    , packageSummaryInlineRejectedSelfCall = packageSummariesInfo.dependencySummaryStats.inlineRejectedSelfCall
+                                                                                                                                                    , packageSummaryInlineRejectedBodyTooLarge = packageSummariesInfo.dependencySummaryStats.inlineRejectedBodyTooLarge
+                                                                                                                                                    , packageSummaryInlineRejectedUnsafe = packageSummariesInfo.dependencySummaryStats.inlineRejectedUnsafe
+                                                                                                                                                    , packageSummaryInlineRejectedUnsafeApplication = packageSummariesInfo.dependencySummaryStats.inlineRejectedUnsafeApplication
+                                                                                                                                                    , packageSummaryInlineRejectedUnsafeIf = packageSummariesInfo.dependencySummaryStats.inlineRejectedUnsafeIf
+                                                                                                                                                    , packageSummaryInlineRejectedUnsafeCase = packageSummariesInfo.dependencySummaryStats.inlineRejectedUnsafeCase
+                                                                                                                                                    , packageSummaryInlineRejectedUnsafeLet = packageSummariesInfo.dependencySummaryStats.inlineRejectedUnsafeLet
+                                                                                                                                                    , packageSummaryInlineRejectedUnsafeLambda = packageSummariesInfo.dependencySummaryStats.inlineRejectedUnsafeLambda
+                                                                                                                                                    , packageSummaryInlineRejectedUnsafeOther = packageSummariesInfo.dependencySummaryStats.inlineRejectedUnsafeOther
+                                                                                                                                                    , packageSummaryInlineRejectedInternalHelper = packageSummariesInfo.dependencySummaryStats.inlineRejectedInternalHelper
+                                                                                                                                                    , packageSummaryInlineBodyLt30 = packageSummariesInfo.dependencySummaryStats.inlineBodyLt30
+                                                                                                                                                    , packageSummaryInlineBody30To59 = packageSummariesInfo.dependencySummaryStats.inlineBody30To59
+                                                                                                                                                    , packageSummaryInlineBody60Plus = packageSummariesInfo.dependencySummaryStats.inlineBody60Plus
+                                                                                                                                                    , packageSummaryInlineShapeLeaf = packageSummariesInfo.dependencySummaryStats.inlineShapeLeaf
+                                                                                                                                                    , packageSummaryInlineShapeConstructor = packageSummariesInfo.dependencySummaryStats.inlineShapeConstructor
+                                                                                                                                                    , packageSummaryInlineShapeOperator = packageSummariesInfo.dependencySummaryStats.inlineShapeOperator
+                                                                                                                                                    , packageSummaryInlineShapeRecordAccess = packageSummariesInfo.dependencySummaryStats.inlineShapeRecordAccess
+                                                                                                                                                    , packageSummaryInlineShapeCollection = packageSummariesInfo.dependencySummaryStats.inlineShapeCollection
+                                                                                                                                                    , packageSummaryInlineShapeOther = packageSummariesInfo.dependencySummaryStats.inlineShapeOther
+                                                                                                                                                    , packageSummaryInlinePayoffChanged = packageSummariesInfo.dependencySummaryStats.inlinePayoffChanged
+                                                                                                                                                    , packageSummaryInlinePayoffChangedShapeLeaf = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedShapeLeaf
+                                                                                                                                                    , packageSummaryInlinePayoffChangedShapeConstructor = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedShapeConstructor
+                                                                                                                                                    , packageSummaryInlinePayoffChangedShapeOperator = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedShapeOperator
+                                                                                                                                                    , packageSummaryInlinePayoffChangedShapeRecordAccess = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedShapeRecordAccess
+                                                                                                                                                    , packageSummaryInlinePayoffChangedShapeCollection = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedShapeCollection
+                                                                                                                                                    , packageSummaryInlinePayoffChangedShapeOther = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedShapeOther
+                                                                                                                                                    , packageSummaryInlinePayoffChangedBodyLt30 = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedBodyLt30
+                                                                                                                                                    , packageSummaryInlinePayoffChangedBody30To59 = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedBody30To59
+                                                                                                                                                    , packageSummaryInlinePayoffChangedBody60Plus = packageSummariesInfo.dependencySummaryStats.inlinePayoffChangedBody60Plus
+                                                                                                                                                    , packageSummaryInlinePayoffInline = packageSummariesInfo.dependencySummaryStats.inlinePayoffInline
+                                                                                                                                                    , packageSummaryInlinePayoffInlineShapeLeaf = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineShapeLeaf
+                                                                                                                                                    , packageSummaryInlinePayoffInlineShapeConstructor = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineShapeConstructor
+                                                                                                                                                    , packageSummaryInlinePayoffInlineShapeOperator = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineShapeOperator
+                                                                                                                                                    , packageSummaryInlinePayoffInlineShapeRecordAccess = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineShapeRecordAccess
+                                                                                                                                                    , packageSummaryInlinePayoffInlineShapeCollection = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineShapeCollection
+                                                                                                                                                    , packageSummaryInlinePayoffInlineShapeOther = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineShapeOther
+                                                                                                                                                    , packageSummaryInlinePayoffInlineBodyLt30 = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineBodyLt30
+                                                                                                                                                    , packageSummaryInlinePayoffInlineBody30To59 = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineBody30To59
+                                                                                                                                                    , packageSummaryInlinePayoffInlineBody60Plus = packageSummariesInfo.dependencySummaryStats.inlinePayoffInlineBody60Plus
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFold = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFold
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldShapeLeaf = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldShapeLeaf
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldShapeConstructor = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldShapeConstructor
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldShapeOperator = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldShapeOperator
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldShapeRecordAccess = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldShapeRecordAccess
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldShapeCollection = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldShapeCollection
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldShapeOther = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldShapeOther
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldBodyLt30 = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldBodyLt30
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldBody30To59 = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldBody30To59
+                                                                                                                                                    , packageSummaryInlinePayoffConstantFoldBody60Plus = packageSummariesInfo.dependencySummaryStats.inlinePayoffConstantFoldBody60Plus
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRef = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRef
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefShapeLeaf = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefShapeLeaf
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefShapeConstructor = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefShapeConstructor
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefShapeOperator = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefShapeOperator
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefShapeRecordAccess = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefShapeRecordAccess
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefShapeCollection = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefShapeCollection
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefShapeOther = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefShapeOther
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefBodyLt30 = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefBodyLt30
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefBody30To59 = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefBody30To59
+                                                                                                                                                    , packageSummaryInlinePayoffPrecomputedRefBody60Plus = packageSummariesInfo.dependencySummaryStats.inlinePayoffPrecomputedRefBody60Plus
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollection = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollection
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollectionPayoffChanged = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollectionPayoffChanged
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollectionPayoffInline = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollectionPayoffInline
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollectionPayoffPrecomputedRef = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollectionPayoffPrecomputedRef
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollectionFinalShrinks = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollectionFinalShrinks
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollectionFinalNonApplication = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollectionFinalNonApplication
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollectionFinalDirectRootWin = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollectionFinalDirectRootWin
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollectionFinalConstructorApplication = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollectionFinalConstructorApplication
+                                                                                                                                                    , packageSummaryInlineShadowRejectCollectionNoPayoffNoDirectBenefit = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectCollectionNoPayoffNoDirectBenefit
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0 = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0PayoffChanged = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0PayoffChanged
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0PayoffInline = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0PayoffInline
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0PayoffPrecomputedRef = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0PayoffPrecomputedRef
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0FinalShrinks = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0FinalShrinks
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0FinalNonApplication = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0FinalNonApplication
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0FinalDirectRootWin = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0FinalDirectRootWin
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0FinalConstructorApplication = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0FinalConstructorApplication
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth0NoPayoffNoDirectBenefit = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth0NoPayoffNoDirectBenefit
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1 = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1PayoffChanged = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1PayoffChanged
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1PayoffInline = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1PayoffInline
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1PayoffPrecomputedRef = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1PayoffPrecomputedRef
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1FinalShrinks = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1FinalShrinks
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1FinalNonApplication = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1FinalNonApplication
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1FinalDirectRootWin = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1FinalDirectRootWin
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1FinalConstructorApplication = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1FinalConstructorApplication
+                                                                                                                                                    , packageSummaryInlineShadowRejectGrowth1NoPayoffNoDirectBenefit = packageSummariesInfo.dependencySummaryStats.inlineShadowRejectGrowth1NoPayoffNoDirectBenefit
+                                                                                                                                                    , packageSummaryListFusionChanges = packageSummariesInfo.dependencySummaryStats.listFusionChanges
+                                                                                                                                                    , packageSummaryListFusionPipelineNormalizations = packageSummariesInfo.dependencySummaryStats.listFusionPipelineNormalizations
+                                                                                                                                                    , packageSummaryListFusionHeadFlattenRewrites = packageSummariesInfo.dependencySummaryStats.listFusionHeadFlattenRewrites
+                                                                                                                                                    , packageSummaryListFusionRuleRewrites = packageSummariesInfo.dependencySummaryStats.listFusionRuleRewrites
+                                                                                                                                                    , packageSummaryPrecomputedRefSubstitutions = packageSummariesInfo.dependencySummaryStats.precomputedRefSubstitutions
+                                                                                                                                                    , packageSummaryConstantFolds = packageSummariesInfo.dependencySummaryStats.constantFolds
+                                                                                                                                                    , packageSummaryRejectSamples = packageSummariesInfo.dependencySummaryStats.rejectSamples
                                                                                                                                                     , buildPackageEnvFromSummariesMs = buildPackageEnvFromSummariesMs
                                                                                                                                                     , buildPackageEnvMs = buildPackageEnvMs
                                                                                                                                                     , buildBaseUserEnvMs = buildBaseUserEnvMs

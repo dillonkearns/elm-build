@@ -1425,6 +1425,7 @@ type alias PerfTrace =
     , cacheDecision : String
     , counters : Dict String Int
     , stages : List PerfStage
+    , samples : List String
     }
 
 
@@ -7482,6 +7483,7 @@ type alias RuleInfo =
 type alias LoadedReviewProject =
     { project : InterpreterProject
     , counters : Dict String Int
+    , samples : List String
     }
 
 
@@ -9910,6 +9912,7 @@ encodePerfTrace trace =
                     << List.map (\( key, value ) -> ( key, Json.Encode.int value ))
           )
         , ( "stages", Json.Encode.list perfStageEncoder trace.stages )
+        , ( "samples", Json.Encode.list Json.Encode.string trace.samples )
         ]
         |> Json.Encode.encode 2
 
@@ -10831,6 +10834,7 @@ task config =
             , cacheDecision = "startup_only"
             , counters = Dict.empty
             , stages = [ preparedConfigTimed.stage ]
+            , samples = []
             }
 
     else
@@ -10893,7 +10897,7 @@ task config =
                     , ( "ast_json.bytes", analyzedTargetFiles.astJsonBytes )
                     ]
 
-            finishWithTrace errors extraStages extraCounters =
+            finishWithTrace errors extraStages extraCounters extraSamples =
                 Do.do
                     (writePerfTrace
                         preparedConfig.perfTraceJson
@@ -10902,6 +10906,7 @@ task config =
                         , cacheDecision = cacheDecisionToString decision
                         , counters = mergeCounterDicts [ baseCounters, extraCounters, errorCounters errors ]
                         , stages = baseStages ++ extraStages
+                        , samples = extraSamples
                         }
                     )
                 <| \_ ->
@@ -10919,6 +10924,7 @@ task config =
                     , ( "decl_cache.stored_bytes", 0 )
                     ]
                 )
+                []
 
         ColdMiss _ ->
             -- No cache — treat all files as stale (same code path as PartialMiss)
@@ -10972,6 +10978,7 @@ task config =
                         ]
                     ]
                 )
+                reviewProjectTimed.value.samples
 
         PartialMiss { cachedErrors, staleFiles } ->
             -- Some files changed. Module rules on unchanged files use cachedErrors.
@@ -11029,6 +11036,7 @@ task config =
                         ]
                     ]
                 )
+                reviewProjectTimed.value.samples
 
 
 prepareConfig : Config -> BackendTask FatalError Config
@@ -15524,6 +15532,104 @@ loadReviewProjectDetailed config =
                         , ( "load_review_project.build_graph_ms", loaded.profile.buildGraphMs )
                         , ( "load_review_project.parse_package_sources_ms", loaded.profile.parsePackageSourcesMs )
                         , ( "load_review_project.build_package_summaries_from_parsed_ms", loaded.profile.buildPackageSummariesFromParsedMs )
+                        , ( "load_review_project.package_summary_functions_visited", loaded.profile.packageSummaryFunctionsVisited )
+                        , ( "load_review_project.package_summary_functions_rewritten", loaded.profile.packageSummaryFunctionsRewritten )
+                        , ( "load_review_project.package_summary_inline_candidates", loaded.profile.packageSummaryInlineCandidates )
+                        , ( "load_review_project.package_summary_inline_successes", loaded.profile.packageSummaryInlineSuccesses )
+                        , ( "load_review_project.package_summary_inline_rejected_pattern", loaded.profile.packageSummaryInlineRejectedPattern )
+                        , ( "load_review_project.package_summary_inline_rejected_arity", loaded.profile.packageSummaryInlineRejectedArity )
+                        , ( "load_review_project.package_summary_inline_rejected_self_call", loaded.profile.packageSummaryInlineRejectedSelfCall )
+                        , ( "load_review_project.package_summary_inline_rejected_body_too_large", loaded.profile.packageSummaryInlineRejectedBodyTooLarge )
+                        , ( "load_review_project.package_summary_inline_rejected_unsafe", loaded.profile.packageSummaryInlineRejectedUnsafe )
+                        , ( "load_review_project.package_summary_inline_rejected_unsafe_application", loaded.profile.packageSummaryInlineRejectedUnsafeApplication )
+                        , ( "load_review_project.package_summary_inline_rejected_unsafe_if", loaded.profile.packageSummaryInlineRejectedUnsafeIf )
+                        , ( "load_review_project.package_summary_inline_rejected_unsafe_case", loaded.profile.packageSummaryInlineRejectedUnsafeCase )
+                        , ( "load_review_project.package_summary_inline_rejected_unsafe_let", loaded.profile.packageSummaryInlineRejectedUnsafeLet )
+                        , ( "load_review_project.package_summary_inline_rejected_unsafe_lambda", loaded.profile.packageSummaryInlineRejectedUnsafeLambda )
+                        , ( "load_review_project.package_summary_inline_rejected_unsafe_other", loaded.profile.packageSummaryInlineRejectedUnsafeOther )
+                        , ( "load_review_project.package_summary_inline_rejected_internal_helper", loaded.profile.packageSummaryInlineRejectedInternalHelper )
+                        , ( "load_review_project.package_summary_inline_body_lt30", loaded.profile.packageSummaryInlineBodyLt30 )
+                        , ( "load_review_project.package_summary_inline_body_30_to_59", loaded.profile.packageSummaryInlineBody30To59 )
+                        , ( "load_review_project.package_summary_inline_body_60_plus", loaded.profile.packageSummaryInlineBody60Plus )
+                        , ( "load_review_project.package_summary_inline_shape_leaf", loaded.profile.packageSummaryInlineShapeLeaf )
+                        , ( "load_review_project.package_summary_inline_shape_constructor", loaded.profile.packageSummaryInlineShapeConstructor )
+                        , ( "load_review_project.package_summary_inline_shape_operator", loaded.profile.packageSummaryInlineShapeOperator )
+                        , ( "load_review_project.package_summary_inline_shape_record_access", loaded.profile.packageSummaryInlineShapeRecordAccess )
+                        , ( "load_review_project.package_summary_inline_shape_collection", loaded.profile.packageSummaryInlineShapeCollection )
+                        , ( "load_review_project.package_summary_inline_shape_other", loaded.profile.packageSummaryInlineShapeOther )
+                        , ( "load_review_project.package_summary_inline_payoff_changed", loaded.profile.packageSummaryInlinePayoffChanged )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_shape_leaf", loaded.profile.packageSummaryInlinePayoffChangedShapeLeaf )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_shape_constructor", loaded.profile.packageSummaryInlinePayoffChangedShapeConstructor )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_shape_operator", loaded.profile.packageSummaryInlinePayoffChangedShapeOperator )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_shape_record_access", loaded.profile.packageSummaryInlinePayoffChangedShapeRecordAccess )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_shape_collection", loaded.profile.packageSummaryInlinePayoffChangedShapeCollection )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_shape_other", loaded.profile.packageSummaryInlinePayoffChangedShapeOther )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_body_lt30", loaded.profile.packageSummaryInlinePayoffChangedBodyLt30 )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_body_30_to_59", loaded.profile.packageSummaryInlinePayoffChangedBody30To59 )
+                        , ( "load_review_project.package_summary_inline_payoff_changed_body_60_plus", loaded.profile.packageSummaryInlinePayoffChangedBody60Plus )
+                        , ( "load_review_project.package_summary_inline_payoff_inline", loaded.profile.packageSummaryInlinePayoffInline )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_shape_leaf", loaded.profile.packageSummaryInlinePayoffInlineShapeLeaf )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_shape_constructor", loaded.profile.packageSummaryInlinePayoffInlineShapeConstructor )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_shape_operator", loaded.profile.packageSummaryInlinePayoffInlineShapeOperator )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_shape_record_access", loaded.profile.packageSummaryInlinePayoffInlineShapeRecordAccess )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_shape_collection", loaded.profile.packageSummaryInlinePayoffInlineShapeCollection )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_shape_other", loaded.profile.packageSummaryInlinePayoffInlineShapeOther )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_body_lt30", loaded.profile.packageSummaryInlinePayoffInlineBodyLt30 )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_body_30_to_59", loaded.profile.packageSummaryInlinePayoffInlineBody30To59 )
+                        , ( "load_review_project.package_summary_inline_payoff_inline_body_60_plus", loaded.profile.packageSummaryInlinePayoffInlineBody60Plus )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold", loaded.profile.packageSummaryInlinePayoffConstantFold )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_shape_leaf", loaded.profile.packageSummaryInlinePayoffConstantFoldShapeLeaf )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_shape_constructor", loaded.profile.packageSummaryInlinePayoffConstantFoldShapeConstructor )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_shape_operator", loaded.profile.packageSummaryInlinePayoffConstantFoldShapeOperator )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_shape_record_access", loaded.profile.packageSummaryInlinePayoffConstantFoldShapeRecordAccess )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_shape_collection", loaded.profile.packageSummaryInlinePayoffConstantFoldShapeCollection )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_shape_other", loaded.profile.packageSummaryInlinePayoffConstantFoldShapeOther )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_body_lt30", loaded.profile.packageSummaryInlinePayoffConstantFoldBodyLt30 )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_body_30_to_59", loaded.profile.packageSummaryInlinePayoffConstantFoldBody30To59 )
+                        , ( "load_review_project.package_summary_inline_payoff_constant_fold_body_60_plus", loaded.profile.packageSummaryInlinePayoffConstantFoldBody60Plus )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref", loaded.profile.packageSummaryInlinePayoffPrecomputedRef )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_shape_leaf", loaded.profile.packageSummaryInlinePayoffPrecomputedRefShapeLeaf )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_shape_constructor", loaded.profile.packageSummaryInlinePayoffPrecomputedRefShapeConstructor )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_shape_operator", loaded.profile.packageSummaryInlinePayoffPrecomputedRefShapeOperator )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_shape_record_access", loaded.profile.packageSummaryInlinePayoffPrecomputedRefShapeRecordAccess )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_shape_collection", loaded.profile.packageSummaryInlinePayoffPrecomputedRefShapeCollection )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_shape_other", loaded.profile.packageSummaryInlinePayoffPrecomputedRefShapeOther )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_body_lt30", loaded.profile.packageSummaryInlinePayoffPrecomputedRefBodyLt30 )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_body_30_to_59", loaded.profile.packageSummaryInlinePayoffPrecomputedRefBody30To59 )
+                        , ( "load_review_project.package_summary_inline_payoff_precomputed_ref_body_60_plus", loaded.profile.packageSummaryInlinePayoffPrecomputedRefBody60Plus )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection", loaded.profile.packageSummaryInlineShadowRejectCollection )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection_payoff_changed", loaded.profile.packageSummaryInlineShadowRejectCollectionPayoffChanged )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection_payoff_inline", loaded.profile.packageSummaryInlineShadowRejectCollectionPayoffInline )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection_payoff_precomputed_ref", loaded.profile.packageSummaryInlineShadowRejectCollectionPayoffPrecomputedRef )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection_final_shrinks", loaded.profile.packageSummaryInlineShadowRejectCollectionFinalShrinks )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection_final_non_application", loaded.profile.packageSummaryInlineShadowRejectCollectionFinalNonApplication )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection_final_direct_root_win", loaded.profile.packageSummaryInlineShadowRejectCollectionFinalDirectRootWin )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection_final_constructor_application", loaded.profile.packageSummaryInlineShadowRejectCollectionFinalConstructorApplication )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_collection_no_payoff_no_direct_benefit", loaded.profile.packageSummaryInlineShadowRejectCollectionNoPayoffNoDirectBenefit )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0", loaded.profile.packageSummaryInlineShadowRejectGrowth0 )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0_payoff_changed", loaded.profile.packageSummaryInlineShadowRejectGrowth0PayoffChanged )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0_payoff_inline", loaded.profile.packageSummaryInlineShadowRejectGrowth0PayoffInline )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0_payoff_precomputed_ref", loaded.profile.packageSummaryInlineShadowRejectGrowth0PayoffPrecomputedRef )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0_final_shrinks", loaded.profile.packageSummaryInlineShadowRejectGrowth0FinalShrinks )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0_final_non_application", loaded.profile.packageSummaryInlineShadowRejectGrowth0FinalNonApplication )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0_final_direct_root_win", loaded.profile.packageSummaryInlineShadowRejectGrowth0FinalDirectRootWin )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0_final_constructor_application", loaded.profile.packageSummaryInlineShadowRejectGrowth0FinalConstructorApplication )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_0_no_payoff_no_direct_benefit", loaded.profile.packageSummaryInlineShadowRejectGrowth0NoPayoffNoDirectBenefit )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1", loaded.profile.packageSummaryInlineShadowRejectGrowth1 )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1_payoff_changed", loaded.profile.packageSummaryInlineShadowRejectGrowth1PayoffChanged )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1_payoff_inline", loaded.profile.packageSummaryInlineShadowRejectGrowth1PayoffInline )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1_payoff_precomputed_ref", loaded.profile.packageSummaryInlineShadowRejectGrowth1PayoffPrecomputedRef )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1_final_shrinks", loaded.profile.packageSummaryInlineShadowRejectGrowth1FinalShrinks )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1_final_non_application", loaded.profile.packageSummaryInlineShadowRejectGrowth1FinalNonApplication )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1_final_direct_root_win", loaded.profile.packageSummaryInlineShadowRejectGrowth1FinalDirectRootWin )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1_final_constructor_application", loaded.profile.packageSummaryInlineShadowRejectGrowth1FinalConstructorApplication )
+                        , ( "load_review_project.package_summary_inline_shadow_reject_growth_1_no_payoff_no_direct_benefit", loaded.profile.packageSummaryInlineShadowRejectGrowth1NoPayoffNoDirectBenefit )
+                        , ( "load_review_project.package_summary_list_fusion_changes", loaded.profile.packageSummaryListFusionChanges )
+                        , ( "load_review_project.package_summary_list_fusion_pipeline_normalizations", loaded.profile.packageSummaryListFusionPipelineNormalizations )
+                        , ( "load_review_project.package_summary_list_fusion_head_flatten_rewrites", loaded.profile.packageSummaryListFusionHeadFlattenRewrites )
+                        , ( "load_review_project.package_summary_list_fusion_rule_rewrites", loaded.profile.packageSummaryListFusionRuleRewrites )
+                        , ( "load_review_project.package_summary_precomputed_ref_substitutions", loaded.profile.packageSummaryPrecomputedRefSubstitutions )
+                        , ( "load_review_project.package_summary_constant_folds", loaded.profile.packageSummaryConstantFolds )
                         , ( "load_review_project.build_package_env_from_summaries_ms", loaded.profile.buildPackageEnvFromSummariesMs )
                         , ( "load_review_project.build_package_env_ms", loaded.profile.buildPackageEnvMs )
                         , ( "load_review_project.build_base_user_env_ms", loaded.profile.buildBaseUserEnvMs )
@@ -15539,6 +15645,7 @@ loadReviewProjectDetailed config =
                         , ( "load_review_project.rule_info_cache_exists", boolToInt ruleInfoCacheExists )
                         , ( "load_review_project.pruned_host_backed_rules", boolToInt pruneHostBackedRules )
                         ]
+                , samples = loaded.profile.packageSummaryRejectSamples
                 }
             )
 

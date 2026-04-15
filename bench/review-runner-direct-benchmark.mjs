@@ -207,6 +207,7 @@ function runRunner({ fixtureSrcDir, buildDir, root }, name) {
     module_rule_eval_ms: stage("module_rule_eval"),
     project_rule_eval_ms: stage("project_rule_eval"),
     counters: trace.counters,
+    samples: trace.samples ?? [],
   };
 }
 
