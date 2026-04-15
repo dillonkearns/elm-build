@@ -1,4 +1,4 @@
-module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
+module InterpreterProject exposing (InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithFileOverridesAndDelegateCallCounter, evalWithFileOverridesAndLogDelegateCalls, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalRawWithDelegateCallCounter, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -7,6 +7,7 @@ Mirrors `ElmProject` structurally but replaces `elm make` + `node` with
 
 -}
 
+import AstWireCodec
 import BackendTask exposing (BackendTask)
 import BackendTask.Custom
 import BackendTask.Do as Do
@@ -14,7 +15,6 @@ import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
 import BackendTask.Time
-import AstWireCodec
 import Bytes
 import Cache exposing (FileOrDirectory)
 import Coverage
@@ -25,16 +25,16 @@ import Elm.Parser
 import Elm.Syntax.Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression exposing (Expression(..), FunctionImplementation)
 import Elm.Syntax.File exposing (File)
-import Elm.Syntax.Infix as Infix
+import Elm.Syntax.Infix as Infix exposing (InfixDirection(..))
 import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
-import Elm.Syntax.Infix exposing (InfixDirection(..))
-import Eval.Module
 import Environment
+import Eval.DelegateCounter as DelegateCounter
+import Eval.Module
+import FNV1a
 import FastDict
 import FatalError exposing (FatalError)
-import FNV1a
 import FunctionReachability
 import Json.Decode as Decode
 import Json.Encode
@@ -42,13 +42,13 @@ import Lamdera.Wire3
 import MemoRuntime
 import Path exposing (Path)
 import ProjectRoots
-import ValueWireCodec
 import ProjectSources
 import SemanticHash
 import Set exposing (Set)
 import Syntax exposing (fakeNode)
 import Time
 import Types
+import ValueWireCodec
 
 
 type alias ModuleGraph =
@@ -88,6 +88,9 @@ type alias LoadProfile =
     , buildPackageEnvFromSummariesMs : Int
     , buildPackageEnvMs : Int
     , buildBaseUserEnvMs : Int
+    , extendUserModulesMs : Int
+    , normalizeUserModulesMs : Int
+    , extendResolvedUserModulesMs : Int
     , buildSemanticIndexMs : Int
     , cacheInputsMs : Int
     }
@@ -106,27 +109,32 @@ stageMs start finish =
 
 withTiming : BackendTask FatalError a -> BackendTask FatalError (Timed a)
 withTiming work =
-    Do.do BackendTask.Time.now <| \start ->
-    Do.do work <| \value ->
-    Do.do BackendTask.Time.now <| \finish ->
-    BackendTask.succeed
-        { value = value
-        , ms = stageMs start finish
-        }
+    Do.do BackendTask.Time.now <|
+        \start ->
+            Do.do work <|
+                \value ->
+                    Do.do BackendTask.Time.now <|
+                        \finish ->
+                            BackendTask.succeed
+                                { value = value
+                                , ms = stageMs start finish
+                                }
 
 
 benchmarkThunk : (() -> a) -> BackendTask FatalError (Timed a)
 benchmarkThunk thunk =
-    Do.do BackendTask.Time.now <| \start ->
-    let
-        value =
-            thunk ()
-    in
-    Do.do BackendTask.Time.now <| \finish ->
-    BackendTask.succeed
-        { value = value
-        , ms = stageMs start finish
-        }
+    Do.do BackendTask.Time.now <|
+        \start ->
+            let
+                value =
+                    thunk ()
+            in
+            Do.do BackendTask.Time.now <|
+                \finish ->
+                    BackendTask.succeed
+                        { value = value
+                        , ms = stageMs start finish
+                        }
 
 
 readFilesTask : List String -> BackendTask FatalError (List String)
@@ -253,9 +261,13 @@ repeatJsonDecode iterations jsonString acc =
                 -1
 
 
+{-| Cache version for normalized package module summaries. Bump whenever
+package-summary generation or downstream resolved-eval semantics change in a
+way that would make a previously serialized summary blob observably stale.
+-}
 packageSummaryCacheVersion : String
 packageSummaryCacheVersion =
-    "v7"
+    "v8"
 
 
 packageSummaryCacheBlobPath : String -> String -> String
@@ -278,7 +290,7 @@ changes in a way that would make old blobs incorrect.
 -}
 userNormCacheVersion : String
 userNormCacheVersion =
-    "v4"
+    "v5"
 
 
 {-| Disk path for the combined user-normalization cache blob.
@@ -288,22 +300,37 @@ environment fingerprint. Any user or package change invalidates the whole
 blob and triggers a full re-normalize — coarser than per-file caching but
 dramatically faster on the common "nothing changed" warm path (one binary
 read + decode instead of dozens of stat/read round-trips).
+
 -}
 userNormCacheBlobPath : String -> String -> String -> String
 userNormCacheBlobPath cacheDir packageKey userKey =
     cacheDir ++ "/user-normalized-" ++ userNormCacheVersion ++ "-" ++ packageKey ++ "-" ++ userKey ++ ".blob"
 
 
-{-| Combined hash over every user file's source content, independent of
-iteration order. Any byte change in any user file invalidates the blob.
+{-| Combined hash over every user file's source content PLUS the exact set
+of user modules chosen for eager normalization.
+
+Any byte change in any user file invalidates the blob. Including the module
+set keeps bundles for different `normalizationRoots` plans from colliding.
 -}
-userNormBundleKey : List String -> String
-userNormBundleKey userFileContents =
-    userFileContents
-        |> List.map (FNV1a.hash >> String.fromInt)
-        |> List.sort
-        |> String.join "|"
-        |> FNV1a.hash
+userNormBundleKey : Dict String String -> List File -> String
+userNormBundleKey userFileContents userModules =
+    let
+        sourceHashPart : String
+        sourceHashPart =
+            userFileContents
+                |> Dict.toList
+                |> List.map (Tuple.second >> FNV1a.hash >> String.fromInt)
+                |> String.join "|"
+
+        moduleScopePart : String
+        moduleScopePart =
+            userModules
+                |> List.map (Eval.Module.fileModuleName >> String.join ".")
+                |> List.sort
+                |> String.join "|"
+    in
+    FNV1a.hash (sourceHashPart ++ "||" ++ moduleScopePart)
         |> String.fromInt
 
 
@@ -392,30 +419,32 @@ benchmarkPackageSummaryCacheCodecs :
     , packageParseCacheDir : String
     , iterations : Int
     }
-    -> BackendTask FatalError
-        { iterations : Int
-        , summaryCount : Int
-        , binaryBytes : Int
-        , metadataOnlyBinaryBytes : Int
-        , topFunctionPayloadModules : List { moduleKey : String, functionCount : Int, functionBytes : Int }
-        , envSeedBinaryBytes : Int
-        , shardedBinaryBytes : Int
-        , jsonChars : Int
-        , seedCacheHit : Int
-        , seedParsePackageSourcesMs : Int
-        , seedBuildPackageSummariesFromParsedMs : Int
-        , seedDecodePackageSummaryCacheMs : Int
-        , binaryEncodeMs : Int
-        , binaryDecodeMs : Int
-        , metadataOnlyBinaryEncodeMs : Int
-        , metadataOnlyBinaryDecodeMs : Int
-        , envSeedBinaryEncodeMs : Int
-        , envSeedBinaryDecodeMs : Int
-        , shardedBinaryEncodeMs : Int
-        , shardedBinaryDecodeMs : Int
-        , jsonEncodeMs : Int
-        , jsonDecodeMs : Int
-        }
+    ->
+        BackendTask
+            FatalError
+            { iterations : Int
+            , summaryCount : Int
+            , binaryBytes : Int
+            , metadataOnlyBinaryBytes : Int
+            , topFunctionPayloadModules : List { moduleKey : String, functionCount : Int, functionBytes : Int }
+            , envSeedBinaryBytes : Int
+            , shardedBinaryBytes : Int
+            , jsonChars : Int
+            , seedCacheHit : Int
+            , seedParsePackageSourcesMs : Int
+            , seedBuildPackageSummariesFromParsedMs : Int
+            , seedDecodePackageSummaryCacheMs : Int
+            , binaryEncodeMs : Int
+            , binaryDecodeMs : Int
+            , metadataOnlyBinaryEncodeMs : Int
+            , metadataOnlyBinaryDecodeMs : Int
+            , envSeedBinaryEncodeMs : Int
+            , envSeedBinaryDecodeMs : Int
+            , shardedBinaryEncodeMs : Int
+            , shardedBinaryDecodeMs : Int
+            , jsonEncodeMs : Int
+            , jsonDecodeMs : Int
+            }
 benchmarkPackageSummaryCacheCodecs config =
     Do.do
         (loadWithProfile
@@ -430,100 +459,113 @@ benchmarkPackageSummaryCacheCodecs config =
             , packageParseCacheDir = Just config.packageParseCacheDir
             }
         )
-    <| \seedLoad ->
-    Do.do
-        (Glob.fromStringWithOptions
-            (let
-                options : Glob.Options
-                options =
-                    Glob.defaultOptions
-             in
-             { options | include = Glob.OnlyFiles }
-            )
-            (config.packageParseCacheDir ++ "/package-module-summaries-" ++ packageSummaryCacheVersion ++ "-*.blob")
-        )
-    <| \cacheCandidates ->
-    case List.head (List.sort cacheCandidates) of
-        Nothing ->
-            BackendTask.fail (FatalError.fromString "Failed to find package summary cache blob for codec benchmark")
+    <|
+        \seedLoad ->
+            Do.do
+                (Glob.fromStringWithOptions
+                    (let
+                        options : Glob.Options
+                        options =
+                            Glob.defaultOptions
+                     in
+                     { options | include = Glob.OnlyFiles }
+                    )
+                    (config.packageParseCacheDir ++ "/package-module-summaries-" ++ packageSummaryCacheVersion ++ "-*.blob")
+                )
+            <|
+                \cacheCandidates ->
+                    case List.head (List.sort cacheCandidates) of
+                        Nothing ->
+                            BackendTask.fail (FatalError.fromString "Failed to find package summary cache blob for codec benchmark")
 
-        Just cachePath ->
-            Do.do (File.binaryFile cachePath |> BackendTask.allowFatal) <| \cacheBytes ->
-                case decodePackageSummaryCache cacheBytes of
-                    Nothing ->
-                        BackendTask.fail (FatalError.fromString "Failed to decode package summary cache blob for codec benchmark")
+                        Just cachePath ->
+                            Do.do (File.binaryFile cachePath |> BackendTask.allowFatal) <|
+                                \cacheBytes ->
+                                    case decodePackageSummaryCache cacheBytes of
+                                        Nothing ->
+                                            BackendTask.fail (FatalError.fromString "Failed to decode package summary cache blob for codec benchmark")
 
-                    Just summaries ->
-                        let
-                            metadataOnlySummaries =
-                                summaries
-                                    |> List.map (\summary -> { summary | functions = [] })
+                                        Just summaries ->
+                                            let
+                                                metadataOnlySummaries =
+                                                    summaries
+                                                        |> List.map (\summary -> { summary | functions = [] })
 
-                            envSeed =
-                                packageEnvSeedFromSummaries summaries
+                                                envSeed =
+                                                    packageEnvSeedFromSummaries summaries
 
-                            envSeedBytes =
-                                encodePackageEnvSeed envSeed
+                                                envSeedBytes =
+                                                    encodePackageEnvSeed envSeed
 
-                            metadataOnlyBytes =
-                                encodePackageSummaryCache metadataOnlySummaries
+                                                metadataOnlyBytes =
+                                                    encodePackageSummaryCache metadataOnlySummaries
 
-                            topFunctionPayloadModules =
-                                summaries
-                                    |> List.map
-                                    (\summary ->
-                                        { moduleKey = Environment.moduleKey summary.moduleName
-                                        , functionCount = List.length summary.functions
-                                        , functionBytes =
-                                            summary.functions
-                                                |> Lamdera.Wire3.encodeList encodeFunctionImplementationNoRanges
-                                                |> Lamdera.Wire3.bytesEncode
-                                                |> Bytes.width
-                                        }
-                                    )
-                                |> List.sortBy (.functionBytes >> negate)
-                                |> List.take 12
+                                                topFunctionPayloadModules =
+                                                    summaries
+                                                        |> List.map
+                                                            (\summary ->
+                                                                { moduleKey = Environment.moduleKey summary.moduleName
+                                                                , functionCount = List.length summary.functions
+                                                                , functionBytes =
+                                                                    summary.functions
+                                                                        |> Lamdera.Wire3.encodeList encodeFunctionImplementationNoRanges
+                                                                        |> Lamdera.Wire3.bytesEncode
+                                                                        |> Bytes.width
+                                                                }
+                                                            )
+                                                        |> List.sortBy (.functionBytes >> negate)
+                                                        |> List.take 12
 
-                            jsonString =
-                                encodePackageSummaryCacheJson summaries
+                                                jsonString =
+                                                    encodePackageSummaryCacheJson summaries
 
-                            shardedBytes =
-                                encodePackageSummaryCacheSharded summaries
-                        in
-                        Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations summaries 0)) <| \binaryEncodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations cacheBytes 0)) <| \binaryDecodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations metadataOnlySummaries 0)) <| \metadataOnlyBinaryEncodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations metadataOnlyBytes 0)) <| \metadataOnlyBinaryDecodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryEncode config.iterations envSeed 0)) <| \envSeedBinaryEncodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryDecode config.iterations envSeedBytes 0)) <| \envSeedBinaryDecodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatShardedBinaryEncode config.iterations summaries 0)) <| \shardedBinaryEncodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatShardedBinaryDecode config.iterations shardedBytes 0)) <| \shardedBinaryDecodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatJsonEncode config.iterations summaries 0)) <| \jsonEncodeTimed ->
-                        Do.do (benchmarkThunk (\_ -> repeatJsonDecode config.iterations jsonString 0)) <| \jsonDecodeTimed ->
-                        BackendTask.succeed
-                            { iterations = config.iterations
-                            , summaryCount = List.length summaries
-                            , binaryBytes = Bytes.width cacheBytes
-                            , metadataOnlyBinaryBytes = Bytes.width metadataOnlyBytes
-                            , topFunctionPayloadModules = topFunctionPayloadModules
-                        , envSeedBinaryBytes = Bytes.width envSeedBytes
-                        , shardedBinaryBytes = List.foldl (\bytes total -> total + Bytes.width bytes) 0 shardedBytes
-                        , jsonChars = String.length jsonString
-                        , seedCacheHit = seedLoad.profile.packageSummaryCacheHit
-                        , seedParsePackageSourcesMs = seedLoad.profile.parsePackageSourcesMs
-                        , seedBuildPackageSummariesFromParsedMs = seedLoad.profile.buildPackageSummariesFromParsedMs
-                        , seedDecodePackageSummaryCacheMs = seedLoad.profile.decodePackageSummaryCacheMs
-                        , binaryEncodeMs = binaryEncodeTimed.ms
-                        , binaryDecodeMs = binaryDecodeTimed.ms
-                        , metadataOnlyBinaryEncodeMs = metadataOnlyBinaryEncodeTimed.ms
-                        , metadataOnlyBinaryDecodeMs = metadataOnlyBinaryDecodeTimed.ms
-                        , envSeedBinaryEncodeMs = envSeedBinaryEncodeTimed.ms
-                        , envSeedBinaryDecodeMs = envSeedBinaryDecodeTimed.ms
-                        , shardedBinaryEncodeMs = shardedBinaryEncodeTimed.ms
-                        , shardedBinaryDecodeMs = shardedBinaryDecodeTimed.ms
-                        , jsonEncodeMs = jsonEncodeTimed.ms
-                        , jsonDecodeMs = jsonDecodeTimed.ms
-                        }
+                                                shardedBytes =
+                                                    encodePackageSummaryCacheSharded summaries
+                                            in
+                                            Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations summaries 0)) <|
+                                                \binaryEncodeTimed ->
+                                                    Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations cacheBytes 0)) <|
+                                                        \binaryDecodeTimed ->
+                                                            Do.do (benchmarkThunk (\_ -> repeatBinaryEncode config.iterations metadataOnlySummaries 0)) <|
+                                                                \metadataOnlyBinaryEncodeTimed ->
+                                                                    Do.do (benchmarkThunk (\_ -> repeatBinaryDecode config.iterations metadataOnlyBytes 0)) <|
+                                                                        \metadataOnlyBinaryDecodeTimed ->
+                                                                            Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryEncode config.iterations envSeed 0)) <|
+                                                                                \envSeedBinaryEncodeTimed ->
+                                                                                    Do.do (benchmarkThunk (\_ -> repeatEnvSeedBinaryDecode config.iterations envSeedBytes 0)) <|
+                                                                                        \envSeedBinaryDecodeTimed ->
+                                                                                            Do.do (benchmarkThunk (\_ -> repeatShardedBinaryEncode config.iterations summaries 0)) <|
+                                                                                                \shardedBinaryEncodeTimed ->
+                                                                                                    Do.do (benchmarkThunk (\_ -> repeatShardedBinaryDecode config.iterations shardedBytes 0)) <|
+                                                                                                        \shardedBinaryDecodeTimed ->
+                                                                                                            Do.do (benchmarkThunk (\_ -> repeatJsonEncode config.iterations summaries 0)) <|
+                                                                                                                \jsonEncodeTimed ->
+                                                                                                                    Do.do (benchmarkThunk (\_ -> repeatJsonDecode config.iterations jsonString 0)) <|
+                                                                                                                        \jsonDecodeTimed ->
+                                                                                                                            BackendTask.succeed
+                                                                                                                                { iterations = config.iterations
+                                                                                                                                , summaryCount = List.length summaries
+                                                                                                                                , binaryBytes = Bytes.width cacheBytes
+                                                                                                                                , metadataOnlyBinaryBytes = Bytes.width metadataOnlyBytes
+                                                                                                                                , topFunctionPayloadModules = topFunctionPayloadModules
+                                                                                                                                , envSeedBinaryBytes = Bytes.width envSeedBytes
+                                                                                                                                , shardedBinaryBytes = List.foldl (\bytes total -> total + Bytes.width bytes) 0 shardedBytes
+                                                                                                                                , jsonChars = String.length jsonString
+                                                                                                                                , seedCacheHit = seedLoad.profile.packageSummaryCacheHit
+                                                                                                                                , seedParsePackageSourcesMs = seedLoad.profile.parsePackageSourcesMs
+                                                                                                                                , seedBuildPackageSummariesFromParsedMs = seedLoad.profile.buildPackageSummariesFromParsedMs
+                                                                                                                                , seedDecodePackageSummaryCacheMs = seedLoad.profile.decodePackageSummaryCacheMs
+                                                                                                                                , binaryEncodeMs = binaryEncodeTimed.ms
+                                                                                                                                , binaryDecodeMs = binaryDecodeTimed.ms
+                                                                                                                                , metadataOnlyBinaryEncodeMs = metadataOnlyBinaryEncodeTimed.ms
+                                                                                                                                , metadataOnlyBinaryDecodeMs = metadataOnlyBinaryDecodeTimed.ms
+                                                                                                                                , envSeedBinaryEncodeMs = envSeedBinaryEncodeTimed.ms
+                                                                                                                                , envSeedBinaryDecodeMs = envSeedBinaryDecodeTimed.ms
+                                                                                                                                , shardedBinaryEncodeMs = shardedBinaryEncodeTimed.ms
+                                                                                                                                , shardedBinaryDecodeMs = shardedBinaryDecodeTimed.ms
+                                                                                                                                , jsonEncodeMs = jsonEncodeTimed.ms
+                                                                                                                                , jsonDecodeMs = jsonDecodeTimed.ms
+                                                                                                                                }
 
 
 encodePackageSummaryCache : List CachedPackageModuleSummary -> Bytes.Bytes
@@ -633,12 +675,13 @@ ensureDirTask dirPath =
         |> BackendTask.allowFatal
 
 
-{-| Normalize every user module in topological order with per-file caching.
+{-| Normalize every user module in topological order with a hybrid cache.
 
-Each module gets its own cache blob keyed on `(packageKey, moduleContentHash)`.
-On a code change, only changed files are re-normalized; unchanged files load
-from their individual cache. This makes the code-change scenario nearly as fast
-as the fully-warm case.
+Warm exact hits use a single combined blob for the whole normalization plan.
+Cache misses fall back to the existing per-file cache keyed on
+`(packageKey, moduleContentHash)`, so code-change scenarios still only
+re-normalize changed files.
+
 -}
 buildUserNormalizedEnv :
     { cacheDir : Maybe String
@@ -654,7 +697,56 @@ buildUserNormalizedEnv config envBeforeNorm =
             BackendTask.succeed (normalizeAllUserModulesFresh config.userModules envBeforeNorm |> Tuple.first)
 
         Just cacheDir ->
-            normalizePerFile cacheDir config.packageKey config.userModules config.userFileContents envBeforeNorm
+            normalizeWithBundle cacheDir config.packageKey config.userModules config.userFileContents envBeforeNorm
+
+
+normalizeWithBundle :
+    String
+    -> String
+    -> List File
+    -> Dict String String
+    -> Eval.Module.ProjectEnv
+    -> BackendTask FatalError Eval.Module.ProjectEnv
+normalizeWithBundle cacheDir packageKey userModules userFileContents envBeforeNorm =
+    let
+        bundlePath : String
+        bundlePath =
+            userNormCacheBlobPath cacheDir packageKey (userNormBundleKey userFileContents userModules)
+
+        fallback : BackendTask FatalError Eval.Module.ProjectEnv
+        fallback =
+            normalizePerFile cacheDir packageKey userModules userFileContents envBeforeNorm
+                |> BackendTask.andThen
+                    (\normalizedEnv ->
+                        writeBinaryFile
+                            { path = bundlePath
+                            , bytes = encodeUserNormBundle (buildUserNormBundleEntries userModules normalizedEnv)
+                            }
+                            |> BackendTask.map (\_ -> normalizedEnv)
+                    )
+    in
+    Do.do (ensureDirTask cacheDir) <|
+        \_ ->
+            File.exists bundlePath
+                |> BackendTask.allowFatal
+                |> BackendTask.andThen
+                    (\exists ->
+                        if exists then
+                            File.binaryFile bundlePath
+                                |> BackendTask.allowFatal
+                                |> BackendTask.andThen
+                                    (\bytes ->
+                                        case decodeUserNormBundle bytes of
+                                            Just entries ->
+                                                BackendTask.succeed (applyUserNormBundle entries envBeforeNorm)
+
+                                            Nothing ->
+                                                fallback
+                                    )
+
+                        else
+                            fallback
+                    )
 
 
 normalizePerFile :
@@ -665,69 +757,90 @@ normalizePerFile :
     -> Eval.Module.ProjectEnv
     -> BackendTask FatalError Eval.Module.ProjectEnv
 normalizePerFile cacheDir packageKey userModules userFileContents envBeforeNorm =
-    Do.do (ensureDirTask cacheDir) <| \_ ->
     userModules
         |> List.foldl
             (\userFile envTask ->
-                Do.do envTask <| \envAcc ->
+                Do.do envTask <|
+                    \envAcc ->
+                        let
+                            moduleName : List String
+                            moduleName =
+                                Eval.Module.fileModuleName userFile
+
+                            moduleKey : String
+                            moduleKey =
+                                String.join "." moduleName
+
+                            contentHash : String
+                            contentHash =
+                                Dict.get moduleKey userFileContents
+                                    |> Maybe.map (FNV1a.hash >> String.fromInt)
+                                    |> Maybe.withDefault "0"
+
+                            perFilePath : String
+                            perFilePath =
+                                cacheDir
+                                    ++ "/user-norm-"
+                                    ++ userNormCacheVersion
+                                    ++ "-"
+                                    ++ packageKey
+                                    ++ "-"
+                                    ++ moduleKey
+                                    ++ "-"
+                                    ++ contentHash
+                                    ++ ".blob"
+                        in
+                        File.exists perFilePath
+                            |> BackendTask.allowFatal
+                            |> BackendTask.andThen
+                                (\exists ->
+                                    if exists then
+                                        File.binaryFile perFilePath
+                                            |> BackendTask.allowFatal
+                                            |> BackendTask.map
+                                                (\bytes ->
+                                                    case decodeUserNormBundle bytes of
+                                                        Just [ entry ] ->
+                                                            applyUserNormBundle [ entry ] envAcc
+
+                                                        _ ->
+                                                            Tuple.first (normalizeOneAndCache cacheDir perFilePath moduleName envAcc)
+                                                )
+
+                                    else
+                                        let
+                                            ( env, entry ) =
+                                                normalizeOneAndCache cacheDir perFilePath moduleName envAcc
+                                        in
+                                        writeBinaryFile
+                                            { path = perFilePath
+                                            , bytes = encodeUserNormBundle [ entry ]
+                                            }
+                                            |> BackendTask.map (\_ -> env)
+                                )
+            )
+            (BackendTask.succeed envBeforeNorm)
+
+
+buildUserNormBundleEntries : List File -> Eval.Module.ProjectEnv -> List UserNormCacheEntry
+buildUserNormBundleEntries userModules env =
+    userModules
+        |> List.map
+            (\userFile ->
                 let
                     moduleName : List String
                     moduleName =
                         Eval.Module.fileModuleName userFile
-
-                    moduleKey : String
-                    moduleKey =
-                        String.join "." moduleName
-
-                    contentHash : String
-                    contentHash =
-                        Dict.get moduleKey userFileContents
-                            |> Maybe.map (FNV1a.hash >> String.fromInt)
-                            |> Maybe.withDefault "0"
-
-                    perFilePath : String
-                    perFilePath =
-                        cacheDir
-                            ++ "/user-norm-"
-                            ++ userNormCacheVersion
-                            ++ "-"
-                            ++ packageKey
-                            ++ "-"
-                            ++ moduleKey
-                            ++ "-"
-                            ++ contentHash
-                            ++ ".blob"
                 in
-                File.exists perFilePath
-                    |> BackendTask.allowFatal
-                    |> BackendTask.andThen
-                        (\exists ->
-                            if exists then
-                                File.binaryFile perFilePath
-                                    |> BackendTask.allowFatal
-                                    |> BackendTask.map
-                                        (\bytes ->
-                                            case decodeUserNormBundle bytes of
-                                                Just [ entry ] ->
-                                                    applyUserNormBundle [ entry ] envAcc
-
-                                                _ ->
-                                                    Tuple.first (normalizeOneAndCache cacheDir perFilePath moduleName envAcc)
-                                        )
-
-                            else
-                                let
-                                    ( env, entry ) =
-                                        normalizeOneAndCache cacheDir perFilePath moduleName envAcc
-                                in
-                                writeBinaryFile
-                                    { path = perFilePath
-                                    , bytes = encodeUserNormBundle [ entry ]
-                                    }
-                                    |> BackendTask.map (\_ -> env)
-                        )
+                { moduleName = moduleName
+                , functions =
+                    Eval.Module.getModuleFunctions moduleName env
+                        |> FastDict.values
+                , precomputedValues =
+                    Eval.Module.getModulePrecomputedValues moduleName env
+                        |> FastDict.toList
+                }
             )
-            (BackendTask.succeed envBeforeNorm)
 
 
 normalizeOneAndCache : String -> String -> List String -> Eval.Module.ProjectEnv -> ( Eval.Module.ProjectEnv, UserNormCacheEntry )
@@ -790,25 +903,20 @@ onto the originals) AND the precomputed constant values.
 -}
 applyUserNormBundle : List UserNormCacheEntry -> Eval.Module.ProjectEnv -> Eval.Module.ProjectEnv
 applyUserNormBundle entries env =
-    List.foldl
-        (\entry currentEnv ->
-            let
-                deltaDict : FastDict.Dict String FunctionImplementation
-                deltaDict =
+    entries
+        |> List.map
+            (\entry ->
+                { moduleName = entry.moduleName
+                , functions =
                     entry.functions
                         |> List.map (\f -> ( Node.value f.name, f ))
                         |> FastDict.fromList
-
-                precomputedDict : FastDict.Dict String Types.Value
-                precomputedDict =
-                    FastDict.fromList entry.precomputedValues
-            in
-            currentEnv
-                |> Eval.Module.mergeModuleFunctionsIntoEnv entry.moduleName deltaDict
-                |> Eval.Module.setModulePrecomputedValues entry.moduleName precomputedDict
-        )
-        env
-        entries
+                , precomputedValues = FastDict.fromList entry.precomputedValues
+                }
+            )
+        |> (\normalizedEntries ->
+                Eval.Module.mergeNormalizedModulesIntoEnv normalizedEntries env
+           )
 
 
 writeBinaryFile : { path : String, bytes : Bytes.Bytes } -> BackendTask FatalError ()
@@ -1244,6 +1352,11 @@ type InterpreterProject
         }
 
 
+interpreterResultCacheVersion : String
+interpreterResultCacheVersion =
+    "v2"
+
+
 {-| Initialize an InterpreterProject with default settings.
 
 Reads elm.json for source directories, loads all package dependencies,
@@ -1269,9 +1382,13 @@ load { projectDir } =
 {-| Initialize an InterpreterProject with advanced options.
 
   - `skipPackages` — package names to exclude (e.g. those with kernel code)
+
   - `patchSource` — transform applied to each package source after loading
+
   - `extraSourceFiles` — additional source files to include
+
   - `sourceDirectories` — `Nothing` reads from elm.json, `Just` overrides
+
   - `normalizationRoots` — list of user module names whose top-level
     functions are the evaluation entry points. When `Just`, the loader
     runs a function-level reachability walk (see
@@ -1351,552 +1468,603 @@ loadWithProfile config =
                     readSourceDirectories config.projectDir
             )
         )
-    <| \sourceDirectoriesTimed ->
-    let
-        sourceDirectories =
-            sourceDirectoriesTimed.value
-    in
-    Do.do
-        (withTiming
-            (ProjectSources.loadPackageDepsCached
-                { projectDir = config.projectDir
-                , skipPackages = config.skipPackages
-                }
-            )
-        )
-    <| \packageSourcesTimed ->
-    let
-        patchedPackageSources : List String
-        patchedPackageSources =
-            List.map config.patchSource packageSourcesTimed.value
-
-        userSourceGlobs : List String
-        userSourceGlobs =
-            sourceDirectories
-                |> List.map (\dir -> dir ++ "/**/*.elm")
-    in
-    Do.do
-        (withTiming
-            (userSourceGlobs
-                |> List.map
-                    (\globPattern ->
-                        Glob.fromStringWithOptions
-                            (let
-                                o : Glob.Options
-                                o =
-                                    Glob.defaultOptions
-                             in
-                             { o | include = Glob.OnlyFiles }
-                            )
-                            globPattern
-                    )
-                |> BackendTask.Extra.combine
-                |> BackendTask.map (List.concat >> List.sort)
-            )
-        )
-    <| \elmFilesTimed ->
-    let
-        elmFiles =
-            elmFilesTimed.value
-    in
-    Do.do
-        (withTiming
-            (readFilesTask elmFiles
-                |> BackendTask.map (List.map2 Tuple.pair elmFiles)
-            )
-        )
-    <| \userFileContentsTimed ->
-    let
-        userFileContents =
-            userFileContentsTimed.value
-                |> List.map
-                    (\( filePath, content ) ->
-                        ( filePath
-                        , config.patchUserSource filePath content
-                        )
-                    )
-    in
-    Do.do
-        (withTiming
-            (readFilesTask config.extraSourceFiles
-                |> BackendTask.map (List.map2 Tuple.pair config.extraSourceFiles)
-            )
-        )
-    <| \extraFileContentsTimed ->
-    let
-        extraFileContents =
-            extraFileContentsTimed.value
-    in
-    Do.do BackendTask.Time.now <| \graphStart ->
-    let
-        depGraph : DepGraph.Graph
-        depGraph =
-            DepGraph.buildGraph
-                { sourceDirectories = sourceDirectories
-                , files =
-                    userFileContents
-                        |> List.map
-                            (\( filePath, content ) ->
-                                { filePath = filePath
-                                , content = content
-                                }
-                            )
-                }
-
-        allUserPaths : List Path
-        allUserPaths =
-            elmFiles
-                |> List.map Path.path
-
-        allSourceStrings : List String
-        allSourceStrings =
-            patchedPackageSources
-                ++ List.map Tuple.second extraFileContents
-                ++ List.map Tuple.second userFileContents
-
-        allModules : List ( String, String )
-        allModules =
-            List.filterMap
-                (\src ->
-                    DepGraph.parseModuleName src
-                        |> Maybe.map (\name -> ( name, src ))
-                )
-                allSourceStrings
-
-        userParsedFiles : Dict String File
-        userParsedFiles =
-            userFileContents
-                |> List.filterMap
-                    (\( _, content ) ->
-                        case Elm.Parser.parseToFile content of
-                            Ok file ->
-                                DepGraph.parseModuleName content
-                                    |> Maybe.map (\name -> ( name, file ))
-
-                            Err _ ->
-                                Nothing
-                    )
-                |> Dict.fromList
-
-        moduleGraph : ModuleGraph
-        moduleGraph =
-            { moduleToSource = Dict.fromList allModules
-            , moduleToFile = userParsedFiles
-            , imports =
-                allModules
-                    |> List.map
-                        (\( name, src ) ->
-                            ( name, DepGraph.parseImports src |> Set.fromList )
-                        )
-                    |> Dict.fromList
-            }
-
-        allStableSources : List String
-        allStableSources =
-            patchedPackageSources ++ List.map Tuple.second extraFileContents
-
-        pkgModuleNames : Set String
-        pkgModuleNames =
-            allStableSources
-                |> List.filterMap DepGraph.parseModuleName
-                |> Set.fromList
-
-        rootModuleNames : Set String
-        rootModuleNames =
-            ProjectRoots.computeRootModuleNames
-                { allModuleNames = moduleGraph.moduleToSource |> Dict.keys |> Set.fromList
-                , pkgModuleNames = pkgModuleNames
-                , extraReachableImports = config.extraReachableImports
-                }
-
-        reachablePackageModuleNames : Set String
-        reachablePackageModuleNames =
-            reachableModules moduleGraph rootModuleNames
-                |> Set.intersect pkgModuleNames
-
-        allPackageSources : List String
-        allPackageSources =
-            topoSortModules moduleGraph reachablePackageModuleNames
-    in
-    Do.do BackendTask.Time.now <| \graphFinish ->
-    let
-        buildGraphMs =
-            stageMs graphStart graphFinish
-
-        packageSummaryCachePath : Maybe String
-        packageSummaryCachePath =
-            config.packageParseCacheDir
-                |> Maybe.map (\cacheDir -> packageSummaryCacheBlobPath cacheDir (packageSummaryCacheKey allPackageSources))
-
-        parseAndSeedPackageSummaries :
-            { packageSummaryCacheHit : Int
-            , loadPackageSummaryCacheMs : Int
-            , decodePackageSummaryCacheMs : Int
-            }
-            -> BackendTask FatalError
-                { packageSummaries : List CachedPackageModuleSummary
-                , packageSummaryCacheHit : Int
-                , packageSummaryCacheRoundtripOk : Int
-                , packageSummaryCacheBytes : Int
-                , loadPackageSummaryCacheMs : Int
-                , decodePackageSummaryCacheMs : Int
-                , validatePackageSummaryCacheMs : Int
-                , parsePackageSourcesMs : Int
-                , buildPackageSummariesFromParsedMs : Int
-                , writePackageSummaryCacheMs : Int
-                }
-        parseAndSeedPackageSummaries cacheMetrics =
-            Do.do BackendTask.Time.now <| \parsePackageSourcesStart ->
+    <|
+        \sourceDirectoriesTimed ->
             let
-                parsedPackageSourcesResult =
-                    Eval.Module.parseProjectSources allPackageSources
+                sourceDirectories =
+                    sourceDirectoriesTimed.value
             in
-            Do.do BackendTask.Time.now <| \parsePackageSourcesFinish ->
-            let
-                parsePackageSourcesMs =
-                    stageMs parsePackageSourcesStart parsePackageSourcesFinish
-            in
-            case parsedPackageSourcesResult of
-                Err _ ->
-                    BackendTask.fail (FatalError.fromString "Failed to build package environment")
-
-                Ok parsedPackageSources ->
-                    Do.do BackendTask.Time.now <| \buildPackageSummariesStart ->
-                    let
-                        packageSummaries =
-                            -- Normalize top-level constants here so the cache
-                            -- stores the rewritten bodies. Subsequent project
-                            -- loads hit the summary cache and skip both the
-                            -- normalization pass AND its re-evaluation cost.
-                            Eval.Module.normalizeSummaries
-                                (Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources)
-                    in
-                    Do.do BackendTask.Time.now <| \buildPackageSummariesFinish ->
-                    let
-                        buildPackageSummariesFromParsedMs =
-                            stageMs buildPackageSummariesStart buildPackageSummariesFinish
-                    in
-                    case packageSummaryCachePath of
-                        Just cachePath ->
-                            let
-                                cacheBytes =
-                                    encodePackageSummaryCache packageSummaries
-                            in
-                            Do.do BackendTask.Time.now <| \validateCacheStart ->
-                            let
-                                cacheRoundtripOk =
-                                    decodePackageSummaryCache cacheBytes /= Nothing
-                            in
-                            Do.do BackendTask.Time.now <| \validateCacheFinish ->
-                            let
-                                baseInfo =
-                                    { packageSummaries = packageSummaries
-                                    , packageSummaryCacheHit = cacheMetrics.packageSummaryCacheHit
-                                    , packageSummaryCacheRoundtripOk =
-                                        if cacheRoundtripOk then
-                                            1
-
-                                        else
-                                            0
-                                    , packageSummaryCacheBytes = Bytes.width cacheBytes
-                                    , loadPackageSummaryCacheMs = cacheMetrics.loadPackageSummaryCacheMs
-                                    , decodePackageSummaryCacheMs = cacheMetrics.decodePackageSummaryCacheMs
-                                    , validatePackageSummaryCacheMs = stageMs validateCacheStart validateCacheFinish
-                                    , parsePackageSourcesMs = parsePackageSourcesMs
-                                    , buildPackageSummariesFromParsedMs = buildPackageSummariesFromParsedMs
-                                    , writePackageSummaryCacheMs = 0
-                                    }
-                            in
-                            if cacheRoundtripOk then
-                                Do.do
-                                    (withTiming
-                                        (writeBinaryFile
-                                            { path = cachePath
-                                            , bytes = cacheBytes
-                                            }
-                                        )
-                                    )
-                                <| \writeCacheTimed ->
-                                BackendTask.succeed
-                                    { baseInfo | writePackageSummaryCacheMs = writeCacheTimed.ms }
-
-                            else
-                                BackendTask.succeed baseInfo
-
-                        Nothing ->
-                            BackendTask.succeed
-                                { packageSummaries = packageSummaries
-                                , packageSummaryCacheHit = cacheMetrics.packageSummaryCacheHit
-                                , packageSummaryCacheRoundtripOk = 0
-                                , packageSummaryCacheBytes = 0
-                                , loadPackageSummaryCacheMs = cacheMetrics.loadPackageSummaryCacheMs
-                                , decodePackageSummaryCacheMs = cacheMetrics.decodePackageSummaryCacheMs
-                                , validatePackageSummaryCacheMs = 0
-                                , parsePackageSourcesMs = parsePackageSourcesMs
-                                , buildPackageSummariesFromParsedMs = buildPackageSummariesFromParsedMs
-                                , writePackageSummaryCacheMs = 0
-                                }
-    in
-    Do.do
-        (case packageSummaryCachePath of
-            Just cachePath ->
-                Do.do (File.exists cachePath |> BackendTask.allowFatal) <| \cacheExists ->
-                if cacheExists then
-                    Do.do (withTiming (File.binaryFile cachePath |> BackendTask.allowFatal)) <| \readCacheTimed ->
-                    Do.do BackendTask.Time.now <| \decodeCacheStart ->
-                    let
-                        decodedCache =
-                            decodePackageSummaryCache readCacheTimed.value
-                    in
-                    Do.do BackendTask.Time.now <| \decodeCacheFinish ->
-                    case decodedCache of
-                        Just packageSummaries ->
-                            BackendTask.succeed
-                                { packageSummaries = packageSummaries
-                                , packageSummaryCacheHit = 1
-                                , packageSummaryCacheRoundtripOk = 1
-                                , packageSummaryCacheBytes = Bytes.width readCacheTimed.value
-                                , loadPackageSummaryCacheMs = readCacheTimed.ms
-                                , decodePackageSummaryCacheMs = stageMs decodeCacheStart decodeCacheFinish
-                                , validatePackageSummaryCacheMs = 0
-                                , parsePackageSourcesMs = 0
-                                , buildPackageSummariesFromParsedMs = 0
-                                , writePackageSummaryCacheMs = 0
-                                }
-
-                        Nothing ->
-                            parseAndSeedPackageSummaries
-                                { packageSummaryCacheHit = 0
-                                , loadPackageSummaryCacheMs = readCacheTimed.ms
-                                , decodePackageSummaryCacheMs = stageMs decodeCacheStart decodeCacheFinish
-                                }
-
-                else
-                    parseAndSeedPackageSummaries
-                        { packageSummaryCacheHit = 0
-                        , loadPackageSummaryCacheMs = 0
-                        , decodePackageSummaryCacheMs = 0
+            Do.do
+                (withTiming
+                    (ProjectSources.loadPackageDepsCached
+                        { projectDir = config.projectDir
+                        , skipPackages = config.skipPackages
                         }
-
-            Nothing ->
-                parseAndSeedPackageSummaries
-                    { packageSummaryCacheHit = 0
-                    , loadPackageSummaryCacheMs = 0
-                    , decodePackageSummaryCacheMs = 0
-                    }
-        )
-    <| \packageSummariesInfo ->
-    let
-        packageSummaries =
-            packageSummariesInfo.packageSummaries
-    in
-            Do.do BackendTask.Time.now <| \buildPackageEnvStart ->
-            let
-                pkgEnvResult : Result Types.Error Eval.Module.ProjectEnv
-                pkgEnvResult =
-                    Eval.Module.buildProjectEnvFromSummaries packageSummaries
-            in
-            Do.do BackendTask.Time.now <| \buildPackageEnvFinish ->
-            let
-                buildPackageEnvFromSummariesMs =
-                    stageMs buildPackageEnvStart buildPackageEnvFinish
-
-                buildPackageEnvMs =
-                    packageSummariesInfo.parsePackageSourcesMs
-                        + packageSummariesInfo.buildPackageSummariesFromParsedMs
-                        + buildPackageEnvFromSummariesMs
-            in
-            case pkgEnvResult of
-                Err _ ->
-                    BackendTask.fail (FatalError.fromString "Failed to build package environment")
-
-                Ok pkgEnv ->
-                    Do.do BackendTask.Time.now <| \baseUserEnvStart ->
+                    )
+                )
+            <|
+                \packageSourcesTimed ->
                     let
-                        userModuleNamesSet : Set String
-                        userModuleNamesSet =
-                            userParsedFiles |> Dict.keys |> Set.fromList
+                        patchedPackageSources : List String
+                        patchedPackageSources =
+                            List.map config.patchSource packageSourcesTimed.value
 
-                        userModulesInOrder : List File
-                        userModulesInOrder =
-                            topoSortModules moduleGraph userModuleNamesSet
-                                |> List.filterMap (\src -> DepGraph.parseModuleName src)
-                                |> List.filterMap (\name -> Dict.get name userParsedFiles)
-
-                        -- When `normalizationRoots` is provided, only normalize
-                        -- user modules that contain a function reachable — at
-                        -- the function-call level — from the roots' top-level
-                        -- definitions. Module-level reachability is too
-                        -- coarse: for example, `tests/OrderTests.elm` imports
-                        -- `Order.Extra`, which imports `String.Extra`, which
-                        -- imports `String.Diacritics` — but `OrderTests`
-                        -- doesn't call any Order.Extra function that
-                        -- transitively touches `removeDiacritics`, so
-                        -- `String.Diacritics.lookupArray` is dead code for
-                        -- that test run. Function-level reachability walks
-                        -- each test's function bodies and tracks the
-                        -- transitive call graph.
-                        normalizationReachable : Maybe (Set String)
-                        normalizationReachable =
-                            case config.normalizationRoots of
-                                Nothing ->
-                                    Nothing
-
-                                Just rootModuleNamesList ->
-                                    let
-                                        seeds : Set FunctionReachability.Reference
-                                        seeds =
-                                            rootModuleNamesList
-                                                |> List.concatMap
-                                                    (\rmn ->
-                                                        case Dict.get rmn userParsedFiles of
-                                                            Just file ->
-                                                                FunctionReachability.findTopLevelNames file
-                                                                    |> Set.toList
-                                                                    |> List.map (\name -> ( rmn, name ))
-
-                                                            Nothing ->
-                                                                []
-                                                    )
-                                                |> Set.fromList
-
-                                        reachableFns : Set FunctionReachability.Reference
-                                        reachableFns =
-                                            FunctionReachability.computeReachable userParsedFiles seeds
-
-                                        liveModules : Set String
-                                        liveModules =
-                                            Set.foldl (\( mn, _ ) acc -> Set.insert mn acc) Set.empty reachableFns
-                                    in
-                                    Just (Set.intersect liveModules userModuleNamesSet)
-
-                        userModulesToNormalize : List File
-                        userModulesToNormalize =
-                            case normalizationReachable of
-                                Nothing ->
-                                    userModulesInOrder
-
-                                Just reachable ->
-                                    userModulesInOrder
-                                        |> List.filter
-                                            (\file ->
-                                                case Eval.Module.fileModuleName file of
-                                                    name ->
-                                                        Set.member (String.join "." name) reachable
-                                            )
-
-                        envBeforeUserNormResult : Result Types.Error Eval.Module.ProjectEnv
-                        envBeforeUserNormResult =
-                            Eval.Module.extendWithFiles pkgEnv userModulesInOrder
+                        userSourceGlobs : List String
+                        userSourceGlobs =
+                            sourceDirectories
+                                |> List.map (\dir -> dir ++ "/**/*.elm")
                     in
                     Do.do
-                        (case envBeforeUserNormResult of
-                            Err _ ->
-                                BackendTask.succeed Nothing
-
-                            Ok envBeforeUserNorm ->
-                                buildUserNormalizedEnv
-                                    { cacheDir = config.packageParseCacheDir
-                                    , packageKey = packageSummaryCacheKey allPackageSources
-                                    , userModules = userModulesToNormalize
-                                    , userFileContents =
-                                        userFileContents
-                                            |> List.filterMap
-                                                (\( _, content ) ->
-                                                    DepGraph.parseModuleName content
-                                                        |> Maybe.map (\name -> ( name, content ))
-                                                )
-                                            |> Dict.fromList
-                                    }
-                                    envBeforeUserNorm
-                                    |> BackendTask.map
-                                        (\normalizedEnv ->
-                                            -- Pre-resolve user modules into the resolved-IR's
-                                            -- `bodies` map. Without this, the resolved-IR
-                                            -- evaluator's `dispatchGlobalApplyStep` misses
-                                            -- on user functions and falls back to the old
-                                            -- string-keyed evaluator on every call — which
-                                            -- dominates the cold-eval profile for
-                                            -- fuzz-heavy test suites.
-                                            Just (Eval.Module.extendResolvedWithFiles userModulesInOrder normalizedEnv)
-                                        )
-                        )
-                    <| \baseUserEnvResult ->
-                    Do.do BackendTask.Time.now <| \baseUserEnvFinish ->
-                    let
-                        buildBaseUserEnvMs =
-                            stageMs baseUserEnvStart baseUserEnvFinish
-                    in
-                    Do.do BackendTask.Time.now <| \semanticIndexStart ->
-                    let
-                        semanticIndex =
-                            userFileContents
+                        (withTiming
+                            (userSourceGlobs
                                 |> List.map
-                                    (\( filePath, content ) ->
-                                        { moduleName =
-                                            DepGraph.parseModuleName content
-                                                |> Maybe.withDefault filePath
-                                        , source = content
-                                        }
-                                    )
-                                |> SemanticHash.buildMultiModuleIndex
-                    in
-                    Do.do BackendTask.Time.now <| \semanticIndexFinish ->
-                    let
-                        buildSemanticIndexMs =
-                            stageMs semanticIndexStart semanticIndexFinish
-                    in
-                    Do.do (withTiming (Cache.inputs allUserPaths)) <| \sourceInputsTimed ->
-                    BackendTask.succeed
-                        { project =
-                            InterpreterProject
-                                { sourceDirectories = sourceDirectories
-                                , inputsByPath =
-                                    sourceInputsTimed.value
-                                        |> List.map
-                                            (\( pathVal, monad ) ->
-                                                ( Path.toString pathVal
-                                                , ( pathVal, monad )
-                                                )
+                                    (\globPattern ->
+                                        Glob.fromStringWithOptions
+                                            (let
+                                                o : Glob.Options
+                                                o =
+                                                    Glob.defaultOptions
+                                             in
+                                             { o | include = Glob.OnlyFiles }
                                             )
-                                        |> Dict.fromList
-                                , userFileContents =
-                                    userFileContents
-                                        |> Dict.fromList
-                                , depGraph = depGraph
-                                , patchedPackageSources = patchedPackageSources
-                                , extraSources =
-                                    extraFileContents
-                                        |> List.map Tuple.second
-                                , moduleGraph = moduleGraph
-                                , packageModuleNames = pkgModuleNames
-                                , packageEnv = pkgEnv
-                                , baseUserEnv = baseUserEnvResult
-                                , semanticIndex = semanticIndex
-                                }
-                        , profile =
-                            { resolveSourceDirectoriesMs = sourceDirectoriesTimed.ms
-                            , loadPackageSourcesMs = packageSourcesTimed.ms
-                            , globUserSourcesMs = elmFilesTimed.ms
-                            , readUserSourcesMs = userFileContentsTimed.ms
-                            , readExtraSourcesMs = extraFileContentsTimed.ms
-                            , packageSummaryCacheHit = packageSummariesInfo.packageSummaryCacheHit
-                            , packageSummaryCacheRoundtripOk = packageSummariesInfo.packageSummaryCacheRoundtripOk
-                            , packageSummaryCacheBytes = packageSummariesInfo.packageSummaryCacheBytes
-                            , loadPackageSummaryCacheMs = packageSummariesInfo.loadPackageSummaryCacheMs
-                            , decodePackageSummaryCacheMs = packageSummariesInfo.decodePackageSummaryCacheMs
-                            , validatePackageSummaryCacheMs = packageSummariesInfo.validatePackageSummaryCacheMs
-                            , writePackageSummaryCacheMs = packageSummariesInfo.writePackageSummaryCacheMs
-                            , buildGraphMs = buildGraphMs
-                            , parsePackageSourcesMs = packageSummariesInfo.parsePackageSourcesMs
-                            , buildPackageSummariesFromParsedMs = packageSummariesInfo.buildPackageSummariesFromParsedMs
-                            , buildPackageEnvFromSummariesMs = buildPackageEnvFromSummariesMs
-                            , buildPackageEnvMs = buildPackageEnvMs
-                            , buildBaseUserEnvMs = buildBaseUserEnvMs
-                            , buildSemanticIndexMs = buildSemanticIndexMs
-                            , cacheInputsMs = sourceInputsTimed.ms
-                            }
-                        }
+                                            globPattern
+                                    )
+                                |> BackendTask.Extra.combine
+                                |> BackendTask.map (List.concat >> List.sort)
+                            )
+                        )
+                    <|
+                        \elmFilesTimed ->
+                            let
+                                elmFiles =
+                                    elmFilesTimed.value
+                            in
+                            Do.do
+                                (withTiming
+                                    (readFilesTask elmFiles
+                                        |> BackendTask.map (List.map2 Tuple.pair elmFiles)
+                                    )
+                                )
+                            <|
+                                \userFileContentsTimed ->
+                                    let
+                                        userFileContents =
+                                            userFileContentsTimed.value
+                                                |> List.map
+                                                    (\( filePath, content ) ->
+                                                        ( filePath
+                                                        , config.patchUserSource filePath content
+                                                        )
+                                                    )
+                                    in
+                                    Do.do
+                                        (withTiming
+                                            (readFilesTask config.extraSourceFiles
+                                                |> BackendTask.map (List.map2 Tuple.pair config.extraSourceFiles)
+                                            )
+                                        )
+                                    <|
+                                        \extraFileContentsTimed ->
+                                            let
+                                                extraFileContents =
+                                                    extraFileContentsTimed.value
+                                            in
+                                            Do.do BackendTask.Time.now <|
+                                                \graphStart ->
+                                                    let
+                                                        depGraph : DepGraph.Graph
+                                                        depGraph =
+                                                            DepGraph.buildGraph
+                                                                { sourceDirectories = sourceDirectories
+                                                                , files =
+                                                                    userFileContents
+                                                                        |> List.map
+                                                                            (\( filePath, content ) ->
+                                                                                { filePath = filePath
+                                                                                , content = content
+                                                                                }
+                                                                            )
+                                                                }
+
+                                                        allUserPaths : List Path
+                                                        allUserPaths =
+                                                            elmFiles
+                                                                |> List.map Path.path
+
+                                                        allSourceStrings : List String
+                                                        allSourceStrings =
+                                                            patchedPackageSources
+                                                                ++ List.map Tuple.second extraFileContents
+                                                                ++ List.map Tuple.second userFileContents
+
+                                                        allModules : List ( String, String )
+                                                        allModules =
+                                                            List.filterMap
+                                                                (\src ->
+                                                                    DepGraph.parseModuleName src
+                                                                        |> Maybe.map (\name -> ( name, src ))
+                                                                )
+                                                                allSourceStrings
+
+                                                        userParsedFiles : Dict String File
+                                                        userParsedFiles =
+                                                            userFileContents
+                                                                |> List.filterMap
+                                                                    (\( _, content ) ->
+                                                                        case Elm.Parser.parseToFile content of
+                                                                            Ok file ->
+                                                                                DepGraph.parseModuleName content
+                                                                                    |> Maybe.map (\name -> ( name, file ))
+
+                                                                            Err _ ->
+                                                                                Nothing
+                                                                    )
+                                                                |> Dict.fromList
+
+                                                        moduleGraph : ModuleGraph
+                                                        moduleGraph =
+                                                            { moduleToSource = Dict.fromList allModules
+                                                            , moduleToFile = userParsedFiles
+                                                            , imports =
+                                                                allModules
+                                                                    |> List.map
+                                                                        (\( name, src ) ->
+                                                                            ( name, DepGraph.parseImports src |> Set.fromList )
+                                                                        )
+                                                                    |> Dict.fromList
+                                                            }
+
+                                                        allStableSources : List String
+                                                        allStableSources =
+                                                            patchedPackageSources ++ List.map Tuple.second extraFileContents
+
+                                                        pkgModuleNames : Set String
+                                                        pkgModuleNames =
+                                                            allStableSources
+                                                                |> List.filterMap DepGraph.parseModuleName
+                                                                |> Set.fromList
+
+                                                        rootModuleNames : Set String
+                                                        rootModuleNames =
+                                                            ProjectRoots.computeRootModuleNames
+                                                                { allModuleNames = moduleGraph.moduleToSource |> Dict.keys |> Set.fromList
+                                                                , pkgModuleNames = pkgModuleNames
+                                                                , extraReachableImports = config.extraReachableImports
+                                                                }
+
+                                                        reachablePackageModuleNames : Set String
+                                                        reachablePackageModuleNames =
+                                                            reachableModules moduleGraph rootModuleNames
+                                                                |> Set.intersect pkgModuleNames
+
+                                                        allPackageSources : List String
+                                                        allPackageSources =
+                                                            topoSortModules moduleGraph reachablePackageModuleNames
+                                                    in
+                                                    Do.do BackendTask.Time.now <|
+                                                        \graphFinish ->
+                                                            let
+                                                                buildGraphMs =
+                                                                    stageMs graphStart graphFinish
+
+                                                                packageSummaryCachePath : Maybe String
+                                                                packageSummaryCachePath =
+                                                                    config.packageParseCacheDir
+                                                                        |> Maybe.map (\cacheDir -> packageSummaryCacheBlobPath cacheDir (packageSummaryCacheKey allPackageSources))
+
+                                                                parseAndSeedPackageSummaries :
+                                                                    { packageSummaryCacheHit : Int
+                                                                    , loadPackageSummaryCacheMs : Int
+                                                                    , decodePackageSummaryCacheMs : Int
+                                                                    }
+                                                                    ->
+                                                                        BackendTask
+                                                                            FatalError
+                                                                            { packageSummaries : List CachedPackageModuleSummary
+                                                                            , packageSummaryCacheHit : Int
+                                                                            , packageSummaryCacheRoundtripOk : Int
+                                                                            , packageSummaryCacheBytes : Int
+                                                                            , loadPackageSummaryCacheMs : Int
+                                                                            , decodePackageSummaryCacheMs : Int
+                                                                            , validatePackageSummaryCacheMs : Int
+                                                                            , parsePackageSourcesMs : Int
+                                                                            , buildPackageSummariesFromParsedMs : Int
+                                                                            , writePackageSummaryCacheMs : Int
+                                                                            }
+                                                                parseAndSeedPackageSummaries cacheMetrics =
+                                                                    Do.do BackendTask.Time.now <|
+                                                                        \parsePackageSourcesStart ->
+                                                                            let
+                                                                                parsedPackageSourcesResult =
+                                                                                    Eval.Module.parseProjectSources allPackageSources
+                                                                            in
+                                                                            Do.do BackendTask.Time.now <|
+                                                                                \parsePackageSourcesFinish ->
+                                                                                    let
+                                                                                        parsePackageSourcesMs =
+                                                                                            stageMs parsePackageSourcesStart parsePackageSourcesFinish
+                                                                                    in
+                                                                                    case parsedPackageSourcesResult of
+                                                                                        Err _ ->
+                                                                                            BackendTask.fail (FatalError.fromString "Failed to build package environment")
+
+                                                                                        Ok parsedPackageSources ->
+                                                                                            Do.do BackendTask.Time.now <|
+                                                                                                \buildPackageSummariesStart ->
+                                                                                                    let
+                                                                                                        packageSummaries =
+                                                                                                            -- Normalize top-level constants here so the cache
+                                                                                                            -- stores the rewritten bodies. Subsequent project
+                                                                                                            -- loads hit the summary cache and skip both the
+                                                                                                            -- normalization pass AND its re-evaluation cost.
+                                                                                                            Eval.Module.normalizeSummaries
+                                                                                                                (Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources)
+                                                                                                    in
+                                                                                                    Do.do BackendTask.Time.now <|
+                                                                                                        \buildPackageSummariesFinish ->
+                                                                                                            let
+                                                                                                                buildPackageSummariesFromParsedMs =
+                                                                                                                    stageMs buildPackageSummariesStart buildPackageSummariesFinish
+                                                                                                            in
+                                                                                                            case packageSummaryCachePath of
+                                                                                                                Just cachePath ->
+                                                                                                                    let
+                                                                                                                        cacheBytes =
+                                                                                                                            encodePackageSummaryCache packageSummaries
+                                                                                                                    in
+                                                                                                                    Do.do BackendTask.Time.now <|
+                                                                                                                        \validateCacheStart ->
+                                                                                                                            let
+                                                                                                                                cacheRoundtripOk =
+                                                                                                                                    decodePackageSummaryCache cacheBytes /= Nothing
+                                                                                                                            in
+                                                                                                                            Do.do BackendTask.Time.now <|
+                                                                                                                                \validateCacheFinish ->
+                                                                                                                                    let
+                                                                                                                                        baseInfo =
+                                                                                                                                            { packageSummaries = packageSummaries
+                                                                                                                                            , packageSummaryCacheHit = cacheMetrics.packageSummaryCacheHit
+                                                                                                                                            , packageSummaryCacheRoundtripOk =
+                                                                                                                                                if cacheRoundtripOk then
+                                                                                                                                                    1
+
+                                                                                                                                                else
+                                                                                                                                                    0
+                                                                                                                                            , packageSummaryCacheBytes = Bytes.width cacheBytes
+                                                                                                                                            , loadPackageSummaryCacheMs = cacheMetrics.loadPackageSummaryCacheMs
+                                                                                                                                            , decodePackageSummaryCacheMs = cacheMetrics.decodePackageSummaryCacheMs
+                                                                                                                                            , validatePackageSummaryCacheMs = stageMs validateCacheStart validateCacheFinish
+                                                                                                                                            , parsePackageSourcesMs = parsePackageSourcesMs
+                                                                                                                                            , buildPackageSummariesFromParsedMs = buildPackageSummariesFromParsedMs
+                                                                                                                                            , writePackageSummaryCacheMs = 0
+                                                                                                                                            }
+                                                                                                                                    in
+                                                                                                                                    if cacheRoundtripOk then
+                                                                                                                                        Do.do
+                                                                                                                                            (withTiming
+                                                                                                                                                (writeBinaryFile
+                                                                                                                                                    { path = cachePath
+                                                                                                                                                    , bytes = cacheBytes
+                                                                                                                                                    }
+                                                                                                                                                )
+                                                                                                                                            )
+                                                                                                                                        <|
+                                                                                                                                            \writeCacheTimed ->
+                                                                                                                                                BackendTask.succeed
+                                                                                                                                                    { baseInfo | writePackageSummaryCacheMs = writeCacheTimed.ms }
+
+                                                                                                                                    else
+                                                                                                                                        BackendTask.succeed baseInfo
+
+                                                                                                                Nothing ->
+                                                                                                                    BackendTask.succeed
+                                                                                                                        { packageSummaries = packageSummaries
+                                                                                                                        , packageSummaryCacheHit = cacheMetrics.packageSummaryCacheHit
+                                                                                                                        , packageSummaryCacheRoundtripOk = 0
+                                                                                                                        , packageSummaryCacheBytes = 0
+                                                                                                                        , loadPackageSummaryCacheMs = cacheMetrics.loadPackageSummaryCacheMs
+                                                                                                                        , decodePackageSummaryCacheMs = cacheMetrics.decodePackageSummaryCacheMs
+                                                                                                                        , validatePackageSummaryCacheMs = 0
+                                                                                                                        , parsePackageSourcesMs = parsePackageSourcesMs
+                                                                                                                        , buildPackageSummariesFromParsedMs = buildPackageSummariesFromParsedMs
+                                                                                                                        , writePackageSummaryCacheMs = 0
+                                                                                                                        }
+                                                            in
+                                                            Do.do
+                                                                (case packageSummaryCachePath of
+                                                                    Just cachePath ->
+                                                                        Do.do (File.exists cachePath |> BackendTask.allowFatal) <|
+                                                                            \cacheExists ->
+                                                                                if cacheExists then
+                                                                                    Do.do (withTiming (File.binaryFile cachePath |> BackendTask.allowFatal)) <|
+                                                                                        \readCacheTimed ->
+                                                                                            Do.do BackendTask.Time.now <|
+                                                                                                \decodeCacheStart ->
+                                                                                                    let
+                                                                                                        decodedCache =
+                                                                                                            decodePackageSummaryCache readCacheTimed.value
+                                                                                                    in
+                                                                                                    Do.do BackendTask.Time.now <|
+                                                                                                        \decodeCacheFinish ->
+                                                                                                            case decodedCache of
+                                                                                                                Just packageSummaries ->
+                                                                                                                    BackendTask.succeed
+                                                                                                                        { packageSummaries = packageSummaries
+                                                                                                                        , packageSummaryCacheHit = 1
+                                                                                                                        , packageSummaryCacheRoundtripOk = 1
+                                                                                                                        , packageSummaryCacheBytes = Bytes.width readCacheTimed.value
+                                                                                                                        , loadPackageSummaryCacheMs = readCacheTimed.ms
+                                                                                                                        , decodePackageSummaryCacheMs = stageMs decodeCacheStart decodeCacheFinish
+                                                                                                                        , validatePackageSummaryCacheMs = 0
+                                                                                                                        , parsePackageSourcesMs = 0
+                                                                                                                        , buildPackageSummariesFromParsedMs = 0
+                                                                                                                        , writePackageSummaryCacheMs = 0
+                                                                                                                        }
+
+                                                                                                                Nothing ->
+                                                                                                                    parseAndSeedPackageSummaries
+                                                                                                                        { packageSummaryCacheHit = 0
+                                                                                                                        , loadPackageSummaryCacheMs = readCacheTimed.ms
+                                                                                                                        , decodePackageSummaryCacheMs = stageMs decodeCacheStart decodeCacheFinish
+                                                                                                                        }
+
+                                                                                else
+                                                                                    parseAndSeedPackageSummaries
+                                                                                        { packageSummaryCacheHit = 0
+                                                                                        , loadPackageSummaryCacheMs = 0
+                                                                                        , decodePackageSummaryCacheMs = 0
+                                                                                        }
+
+                                                                    Nothing ->
+                                                                        parseAndSeedPackageSummaries
+                                                                            { packageSummaryCacheHit = 0
+                                                                            , loadPackageSummaryCacheMs = 0
+                                                                            , decodePackageSummaryCacheMs = 0
+                                                                            }
+                                                                )
+                                                            <|
+                                                                \packageSummariesInfo ->
+                                                                    let
+                                                                        packageSummaries =
+                                                                            packageSummariesInfo.packageSummaries
+                                                                    in
+                                                                    Do.do BackendTask.Time.now <|
+                                                                        \buildPackageEnvStart ->
+                                                                            let
+                                                                                pkgEnvResult : Result Types.Error Eval.Module.ProjectEnv
+                                                                                pkgEnvResult =
+                                                                                    Eval.Module.buildProjectEnvFromSummaries packageSummaries
+                                                                            in
+                                                                            Do.do BackendTask.Time.now <|
+                                                                                \buildPackageEnvFinish ->
+                                                                                    let
+                                                                                        buildPackageEnvFromSummariesMs =
+                                                                                            stageMs buildPackageEnvStart buildPackageEnvFinish
+
+                                                                                        buildPackageEnvMs =
+                                                                                            packageSummariesInfo.parsePackageSourcesMs
+                                                                                                + packageSummariesInfo.buildPackageSummariesFromParsedMs
+                                                                                                + buildPackageEnvFromSummariesMs
+                                                                                    in
+                                                                                    case pkgEnvResult of
+                                                                                        Err _ ->
+                                                                                            BackendTask.fail (FatalError.fromString "Failed to build package environment")
+
+                                                                                        Ok pkgEnv ->
+                                                                                            Do.do BackendTask.Time.now <|
+                                                                                                \baseUserEnvStart ->
+                                                                                                    let
+                                                                                                        userModuleNamesSet : Set String
+                                                                                                        userModuleNamesSet =
+                                                                                                            userParsedFiles |> Dict.keys |> Set.fromList
+
+                                                                                                        userModulesInOrder : List File
+                                                                                                        userModulesInOrder =
+                                                                                                            topoSortModules moduleGraph userModuleNamesSet
+                                                                                                                |> List.filterMap (\src -> DepGraph.parseModuleName src)
+                                                                                                                |> List.filterMap (\name -> Dict.get name userParsedFiles)
+
+                                                                                                        -- When `normalizationRoots` is provided, only normalize
+                                                                                                        -- user modules that contain a function reachable — at
+                                                                                                        -- the function-call level — from the roots' top-level
+                                                                                                        -- definitions. Module-level reachability is too
+                                                                                                        -- coarse: for example, `tests/OrderTests.elm` imports
+                                                                                                        -- `Order.Extra`, which imports `String.Extra`, which
+                                                                                                        -- imports `String.Diacritics` — but `OrderTests`
+                                                                                                        -- doesn't call any Order.Extra function that
+                                                                                                        -- transitively touches `removeDiacritics`, so
+                                                                                                        -- `String.Diacritics.lookupArray` is dead code for
+                                                                                                        -- that test run. Function-level reachability walks
+                                                                                                        -- each test's function bodies and tracks the
+                                                                                                        -- transitive call graph.
+                                                                                                        normalizationReachable : Maybe (Set String)
+                                                                                                        normalizationReachable =
+                                                                                                            case config.normalizationRoots of
+                                                                                                                Nothing ->
+                                                                                                                    Nothing
+
+                                                                                                                Just rootModuleNamesList ->
+                                                                                                                    let
+                                                                                                                        seeds : Set FunctionReachability.Reference
+                                                                                                                        seeds =
+                                                                                                                            rootModuleNamesList
+                                                                                                                                |> List.concatMap
+                                                                                                                                    (\rmn ->
+                                                                                                                                        case Dict.get rmn userParsedFiles of
+                                                                                                                                            Just file ->
+                                                                                                                                                FunctionReachability.findTopLevelNames file
+                                                                                                                                                    |> Set.toList
+                                                                                                                                                    |> List.map (\name -> ( rmn, name ))
+
+                                                                                                                                            Nothing ->
+                                                                                                                                                []
+                                                                                                                                    )
+                                                                                                                                |> Set.fromList
+
+                                                                                                                        reachableFns : Set FunctionReachability.Reference
+                                                                                                                        reachableFns =
+                                                                                                                            FunctionReachability.computeReachable userParsedFiles seeds
+
+                                                                                                                        liveModules : Set String
+                                                                                                                        liveModules =
+                                                                                                                            Set.foldl (\( mn, _ ) acc -> Set.insert mn acc) Set.empty reachableFns
+                                                                                                                    in
+                                                                                                                    Just (Set.intersect liveModules userModuleNamesSet)
+
+                                                                                                        userModulesToNormalize : List File
+                                                                                                        userModulesToNormalize =
+                                                                                                            case normalizationReachable of
+                                                                                                                Nothing ->
+                                                                                                                    userModulesInOrder
+
+                                                                                                                Just reachable ->
+                                                                                                                    userModulesInOrder
+                                                                                                                        |> List.filter
+                                                                                                                            (\file ->
+                                                                                                                                case Eval.Module.fileModuleName file of
+                                                                                                                                    name ->
+                                                                                                                                        Set.member (String.join "." name) reachable
+                                                                                                                            )
+
+                                                                                                    in
+                                                                                                    Do.do
+                                                                                                        (benchmarkThunk (\() -> Eval.Module.extendWithFiles pkgEnv userModulesInOrder))
+                                                                                                    <|
+                                                                                                        \extendUserModulesTimed ->
+                                                                                                            Do.do
+                                                                                                                (case extendUserModulesTimed.value of
+                                                                                                                    Err _ ->
+                                                                                                                        BackendTask.succeed
+                                                                                                                            { baseUserEnvResult = Nothing
+                                                                                                                            , normalizeUserModulesMs = 0
+                                                                                                                            , extendResolvedUserModulesMs = 0
+                                                                                                                            }
+
+                                                                                                                    Ok envBeforeUserNorm ->
+                                                                                                                        Do.do
+                                                                                                                            (withTiming
+                                                                                                                                (buildUserNormalizedEnv
+                                                                                                                                    { cacheDir = config.packageParseCacheDir
+                                                                                                                                    , packageKey = packageSummaryCacheKey allPackageSources
+                                                                                                                                    , userModules = userModulesToNormalize
+                                                                                                                                    , userFileContents =
+                                                                                                                                        userFileContents
+                                                                                                                                            |> List.filterMap
+                                                                                                                                                (\( _, content ) ->
+                                                                                                                                                    DepGraph.parseModuleName content
+                                                                                                                                                        |> Maybe.map (\name -> ( name, content ))
+                                                                                                                                                )
+                                                                                                                                            |> Dict.fromList
+                                                                                                                                    }
+                                                                                                                                    envBeforeUserNorm
+                                                                                                                                )
+                                                                                                                            )
+                                                                                                                        <|
+                                                                                                                            \normalizeUserModulesTimed ->
+                                                                                                                                Do.do
+                                                                                                                                    (benchmarkThunk
+                                                                                                                                        (\() ->
+                                                                                                                                            -- Pre-resolve user modules into the resolved-IR's
+                                                                                                                                            -- `bodies` map. Without this, the resolved-IR
+                                                                                                                                            -- evaluator's `dispatchGlobalApplyStep` misses
+                                                                                                                                            -- on user functions and falls back to the old
+                                                                                                                                            -- string-keyed evaluator on every call — which
+                                                                                                                                            -- dominates the cold-eval profile for
+                                                                                                                                            -- fuzz-heavy test suites.
+                                                                                                                                            Eval.Module.extendResolvedWithFiles userModulesInOrder normalizeUserModulesTimed.value
+                                                                                                                                        )
+                                                                                                                                    )
+                                                                                                                                <|
+                                                                                                                                    \extendResolvedUserModulesTimed ->
+                                                                                                                                        BackendTask.succeed
+                                                                                                                                            { baseUserEnvResult = Just extendResolvedUserModulesTimed.value
+                                                                                                                                            , normalizeUserModulesMs = normalizeUserModulesTimed.ms
+                                                                                                                                            , extendResolvedUserModulesMs = extendResolvedUserModulesTimed.ms
+                                                                                                                                            }
+                                                                                                                )
+                                                                                                            <|
+                                                                                                                \baseUserEnvTimed ->
+                                                                                                            Do.do BackendTask.Time.now <|
+                                                                                                                \baseUserEnvFinish ->
+                                                                                                                    let
+                                                                                                                        buildBaseUserEnvMs =
+                                                                                                                            stageMs baseUserEnvStart baseUserEnvFinish
+                                                                                                                    in
+                                                                                                                    Do.do BackendTask.Time.now <|
+                                                                                                                        \semanticIndexStart ->
+                                                                                                                            let
+                                                                                                                                semanticIndex =
+                                                                                                                                    userParsedFiles
+                                                                                                                                        |> Dict.toList
+                                                                                                                                        |> List.map
+                                                                                                                                            (\( moduleName, file ) ->
+                                                                                                                                                { moduleName = moduleName
+                                                                                                                                                , file = file
+                                                                                                                                                }
+                                                                                                                                            )
+                                                                                                                                        |> SemanticHash.buildMultiModuleIndexFromFiles
+                                                                                                                            in
+                                                                                                                            Do.do BackendTask.Time.now <|
+                                                                                                                                \semanticIndexFinish ->
+                                                                                                                                    let
+                                                                                                                                        buildSemanticIndexMs =
+                                                                                                                                            stageMs semanticIndexStart semanticIndexFinish
+                                                                                                                                    in
+                                                                                                                                    Do.do (withTiming (Cache.inputs allUserPaths)) <|
+                                                                                                                                        \sourceInputsTimed ->
+                                                                                                                                            BackendTask.succeed
+                                                                                                                                                { project =
+                                                                                                                                                    InterpreterProject
+                                                                                                                                                        { sourceDirectories = sourceDirectories
+                                                                                                                                                        , inputsByPath =
+                                                                                                                                                            sourceInputsTimed.value
+                                                                                                                                                                |> List.map
+                                                                                                                                                                    (\( pathVal, monad ) ->
+                                                                                                                                                                        ( Path.toString pathVal
+                                                                                                                                                                        , ( pathVal, monad )
+                                                                                                                                                                        )
+                                                                                                                                                                    )
+                                                                                                                                                                |> Dict.fromList
+                                                                                                                                                        , userFileContents =
+                                                                                                                                                            userFileContents
+                                                                                                                                                                |> Dict.fromList
+                                                                                                                                                        , depGraph = depGraph
+                                                                                                                                                        , patchedPackageSources = patchedPackageSources
+                                                                                                                                                        , extraSources =
+                                                                                                                                                            extraFileContents
+                                                                                                                                                                |> List.map Tuple.second
+                                                                                                                                                        , moduleGraph = moduleGraph
+                                                                                                                                                        , packageModuleNames = pkgModuleNames
+                                                                                                                                                        , packageEnv = pkgEnv
+                                                                                                                                                        , baseUserEnv = baseUserEnvTimed.baseUserEnvResult
+                                                                                                                                                        , semanticIndex = semanticIndex
+                                                                                                                                                        }
+                                                                                                                                                , profile =
+                                                                                                                                                    { resolveSourceDirectoriesMs = sourceDirectoriesTimed.ms
+                                                                                                                                                    , loadPackageSourcesMs = packageSourcesTimed.ms
+                                                                                                                                                    , globUserSourcesMs = elmFilesTimed.ms
+                                                                                                                                                    , readUserSourcesMs = userFileContentsTimed.ms
+                                                                                                                                                    , readExtraSourcesMs = extraFileContentsTimed.ms
+                                                                                                                                                    , packageSummaryCacheHit = packageSummariesInfo.packageSummaryCacheHit
+                                                                                                                                                    , packageSummaryCacheRoundtripOk = packageSummariesInfo.packageSummaryCacheRoundtripOk
+                                                                                                                                                    , packageSummaryCacheBytes = packageSummariesInfo.packageSummaryCacheBytes
+                                                                                                                                                    , loadPackageSummaryCacheMs = packageSummariesInfo.loadPackageSummaryCacheMs
+                                                                                                                                                    , decodePackageSummaryCacheMs = packageSummariesInfo.decodePackageSummaryCacheMs
+                                                                                                                                                    , validatePackageSummaryCacheMs = packageSummariesInfo.validatePackageSummaryCacheMs
+                                                                                                                                                    , writePackageSummaryCacheMs = packageSummariesInfo.writePackageSummaryCacheMs
+                                                                                                                                                    , buildGraphMs = buildGraphMs
+                                                                                                                                                    , parsePackageSourcesMs = packageSummariesInfo.parsePackageSourcesMs
+                                                                                                                                                    , buildPackageSummariesFromParsedMs = packageSummariesInfo.buildPackageSummariesFromParsedMs
+                                                                                                                                                    , buildPackageEnvFromSummariesMs = buildPackageEnvFromSummariesMs
+                                                                                                                                                    , buildPackageEnvMs = buildPackageEnvMs
+                                                                                                                                                    , buildBaseUserEnvMs = buildBaseUserEnvMs
+                                                                                                                                                    , extendUserModulesMs = extendUserModulesTimed.ms
+                                                                                                                                                    , normalizeUserModulesMs = baseUserEnvTimed.normalizeUserModulesMs
+                                                                                                                                                    , extendResolvedUserModulesMs = baseUserEnvTimed.extendResolvedUserModulesMs
+                                                                                                                                                    , buildSemanticIndexMs = buildSemanticIndexMs
+                                                                                                                                                    , cacheInputsMs = sourceInputsTimed.ms
+                                                                                                                                                    }
+                                                                                                                                                }
 
 
 {-| Read the "source-directories" field from elm.json in the given project directory.
@@ -2009,61 +2177,64 @@ evalWith (InterpreterProject project) { imports, expression } k =
             String.join "\n---MODULE_SEPARATOR---\n" allFilteredSources
     in
     -- Hash the filtered blob
-    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <| \filteredHash ->
-    -- Resolve all relevant user file hashes
-    Cache.do
-        (relevantInputs
-            |> List.map
-                (\( path, monad ) ->
-                    Cache.do monad <| \hash ->
-                    Cache.succeed { filename = Path.path path, hash = hash }
+    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <|
+        \filteredHash ->
+            -- Resolve all relevant user file hashes
+            Cache.do
+                (relevantInputs
+                    |> List.map
+                        (\( path, monad ) ->
+                            Cache.do monad <|
+                                \hash ->
+                                    Cache.succeed { filename = Path.path path, hash = hash }
+                        )
+                    |> Cache.sequence
                 )
-            |> Cache.sequence
-        )
-    <| \sourceFiles ->
-    -- Combine all hashes into a single combined hash
-    Cache.do
-        (Cache.combine
-            (sourceFiles
-                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash }
-                   ]
-            )
-        )
-    <| \combinedHash ->
-    -- Cache the interpreter computation
-    Cache.compute [ "interpret" ]
-        combinedHash
-        (\() ->
-            let
-                -- Only parse user sources + wrapper; reuse the pre-built package env
-                result : Result Types.Error Types.Value
-                result =
-                    Eval.Module.evalWithEnv
-                        project.packageEnv
-                        (userFilteredSources ++ [ wrapperSource ])
-                        (FunctionOrValue [] "results")
-            in
-            case result of
-                Ok (Types.String s) ->
-                    s
+            <|
+                \sourceFiles ->
+                    -- Combine all hashes into a single combined hash
+                    Cache.do
+                        (Cache.combine
+                            (sourceFiles
+                                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash }
+                                   ]
+                            )
+                        )
+                    <|
+                        \combinedHash ->
+                            -- Cache the interpreter computation
+                            Cache.compute [ "interpret", interpreterResultCacheVersion ]
+                                combinedHash
+                                (\() ->
+                                    let
+                                        -- Only parse user sources + wrapper; reuse the pre-built package env
+                                        result : Result Types.Error Types.Value
+                                        result =
+                                            Eval.Module.evalWithEnv
+                                                project.packageEnv
+                                                (userFilteredSources ++ [ wrapperSource ])
+                                                (FunctionOrValue [] "results")
+                                    in
+                                    case result of
+                                        Ok (Types.String s) ->
+                                            s
 
-                Ok other ->
-                    "ERROR: Expected String result"
+                                        Ok other ->
+                                            "ERROR: Expected String result"
 
-                Err (Types.ParsingError _) ->
-                    "ERROR: Parsing error"
+                                        Err (Types.ParsingError _) ->
+                                            "ERROR: Parsing error"
 
-                Err (Types.EvalError evalErr) ->
-                    "ERROR: Eval error: "
-                        ++ evalErrorKindToString evalErr.error
-                        ++ " [module: "
-                        ++ String.join "." evalErr.currentModule
-                        ++ "] [stack: "
-                        ++ (evalErr.callStack |> List.take 10 |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name) |> String.join " <- ")
-                        ++ "]"
-        )
-        k
-
+                                        Err (Types.EvalError evalErr) ->
+                                            "ERROR: Eval error: "
+                                                ++ evalErrorKindToString evalErr.error
+                                                ++ " [module: "
+                                                ++ String.join "." evalErr.currentModule
+                                                ++ "] [stack: "
+                                                ++ (evalErr.callStack |> List.take 10 |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name) |> String.join " <- ")
+                                                ++ "]"
+                                )
+                                k
 
 
 {-| Evaluate an expression with source overrides.
@@ -2132,59 +2303,62 @@ evalWithSourceOverrides (InterpreterProject project) { imports, expression, sour
         filteredBlob =
             String.join "\n---MODULE_SEPARATOR---\n" allFilteredSources
     in
-    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <| \filteredHash ->
-    Cache.do
-        (relevantInputs
-            |> List.map
-                (\( path, monad ) ->
-                    Cache.do monad <| \hash ->
-                    Cache.succeed { filename = Path.path path, hash = hash }
+    Cache.do (Cache.writeFile filteredBlob Cache.succeed) <|
+        \filteredHash ->
+            Cache.do
+                (relevantInputs
+                    |> List.map
+                        (\( path, monad ) ->
+                            Cache.do monad <|
+                                \hash ->
+                                    Cache.succeed { filename = Path.path path, hash = hash }
+                        )
+                    |> Cache.sequence
                 )
-            |> Cache.sequence
-        )
-    <| \sourceFiles ->
-    Cache.do
-        (Cache.combine
-            (sourceFiles
-                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash } ]
-            )
-        )
-    <| \combinedHash ->
-    Cache.compute [ "interpret-with-overrides" ]
-        combinedHash
-        (\() ->
-            let
-                -- User sources first, then overrides (which replace same-named
-                -- modules since evalWithEnv processes in order, last wins).
-                -- Wrapper goes last for import resolution.
-                result : Result Types.Error Types.Value
-                result =
-                    Eval.Module.evalWithEnv
-                        project.packageEnv
-                        (userFilteredSources ++ sourceOverrides ++ [ wrapperSource ])
-                        (FunctionOrValue [] "results")
-            in
-            case result of
-                Ok (Types.String s) ->
-                    s
+            <|
+                \sourceFiles ->
+                    Cache.do
+                        (Cache.combine
+                            (sourceFiles
+                                ++ [ { filename = Path.path "filtered.blob", hash = filteredHash } ]
+                            )
+                        )
+                    <|
+                        \combinedHash ->
+                            Cache.compute [ "interpret-with-overrides", interpreterResultCacheVersion ]
+                                combinedHash
+                                (\() ->
+                                    let
+                                        -- User sources first, then overrides (which replace same-named
+                                        -- modules since evalWithEnv processes in order, last wins).
+                                        -- Wrapper goes last for import resolution.
+                                        result : Result Types.Error Types.Value
+                                        result =
+                                            Eval.Module.evalWithEnv
+                                                project.packageEnv
+                                                (userFilteredSources ++ sourceOverrides ++ [ wrapperSource ])
+                                                (FunctionOrValue [] "results")
+                                    in
+                                    case result of
+                                        Ok (Types.String s) ->
+                                            s
 
-                Ok _ ->
-                    "ERROR: Expected String result"
+                                        Ok _ ->
+                                            "ERROR: Expected String result"
 
-                Err (Types.ParsingError _) ->
-                    "ERROR: Parsing error"
+                                        Err (Types.ParsingError _) ->
+                                            "ERROR: Parsing error"
 
-                Err (Types.EvalError evalErr) ->
-                    "ERROR: Eval error: "
-                        ++ evalErrorKindToString evalErr.error
-                        ++ " [module: "
-                        ++ String.join "." evalErr.currentModule
-                        ++ "] [stack: "
-                        ++ (evalErr.callStack |> List.take 10 |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name) |> String.join " <- ")
-                        ++ "]"
-        )
-        k
-
+                                        Err (Types.EvalError evalErr) ->
+                                            "ERROR: Eval error: "
+                                                ++ evalErrorKindToString evalErr.error
+                                                ++ " [module: "
+                                                ++ String.join "." evalErr.currentModule
+                                                ++ "] [stack: "
+                                                ++ (evalErr.callStack |> List.take 10 |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name) |> String.join " <- ")
+                                                ++ "]"
+                                )
+                                k
 
 
 {-| Evaluate an expression with pre-parsed File AST overrides.
@@ -2318,101 +2492,368 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
             String.join "\n"
                 (entryPointHashes ++ [ overrideKey, sourceOverrideKey, wrapperSource ])
     in
-    Cache.do (Cache.writeFile semanticCacheKey Cache.succeed) <| \semanticHash ->
-    Cache.compute [ "interpret-with-file-overrides" ]
-        semanticHash
-        (\() ->
-            let
-                -- Only parse sourceOverrides and wrapper (small/new);
-                -- user sources are pre-parsed in moduleGraph.moduleToFile
-                parsedOverrides : Result Types.Error (List File)
-                parsedOverrides =
-                    (sourceOverrides ++ [ wrapperSource ])
-                        |> List.map
-                            (\src ->
-                                Elm.Parser.parseToFile src
-                                    |> Result.mapError Types.ParsingError
-                            )
-                        |> combineFileResults
-            in
-            case parsedOverrides of
-                Err err ->
-                    case err of
-                        Types.ParsingError _ ->
-                            "ERROR: Parsing error"
-
-                        Types.EvalError evalErr ->
-                            "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
-
-                Ok overrideFiles ->
+    Cache.do (Cache.writeFile semanticCacheKey Cache.succeed) <|
+        \semanticHash ->
+            Cache.compute [ "interpret-with-file-overrides", interpreterResultCacheVersion ]
+                semanticHash
+                (\() ->
                     let
-                        overridesButWrapper =
-                            List.take (List.length overrideFiles - 1) overrideFiles
-
-                        wrapperFile =
-                            List.drop (List.length overrideFiles - 1) overrideFiles
-
-                        -- Incremental env: if baseUserEnv is available, replace only
-                        -- the mutated module(s) instead of rebuilding from all user files.
-                        result : Result Types.Error Types.Value
-                        result =
-                            case project.baseUserEnv of
-                                Just baseEnv ->
-                                    let
-                                        -- Replace each file override in the base env
-                                        replacedEnvResult =
-                                            fileOverrides
-                                                |> List.foldl
-                                                    (\override envRes ->
-                                                        envRes
-                                                            |> Result.andThen
-                                                                (\env ->
-                                                                    Eval.Module.replaceModuleInEnv env
-                                                                        { file = override.file
-                                                                        , moduleName = Eval.Module.fileModuleName override.file
-                                                                        , interface = Eval.Module.buildInterfaceFromFile override.file
-                                                                        }
-                                                                )
-                                                    )
-                                                    (Ok baseEnv)
-
-                                        -- Only need sourceOverrides + wrapper as additional files
-                                        additionalFiles =
-                                            overridesButWrapper ++ wrapperFile
-                                    in
-                                    case replacedEnvResult of
-                                        Ok updatedEnv ->
-                                            evalAdditionalFiles updatedEnv additionalFiles fileOverrides
-
-                                        Err e ->
-                                            Err e
-
-                                Nothing ->
-                                    -- Fallback: original path (all user files)
-                                    let
-                                        allFiles =
-                                            userFilteredFiles
-                                                ++ overridesButWrapper
-                                                ++ List.map .file fileOverrides
-                                                ++ wrapperFile
-                                    in
-                                    evalAdditionalFiles project.packageEnv allFiles fileOverrides
+                        -- Only parse sourceOverrides and wrapper (small/new);
+                        -- user sources are pre-parsed in moduleGraph.moduleToFile
+                        parsedOverrides : Result Types.Error (List File)
+                        parsedOverrides =
+                            (sourceOverrides ++ [ wrapperSource ])
+                                |> List.map
+                                    (\src ->
+                                        Elm.Parser.parseToFile src
+                                            |> Result.mapError Types.ParsingError
+                                    )
+                                |> combineFileResults
                     in
-                    case result of
-                        Ok (Types.String s) ->
-                            s
+                    case parsedOverrides of
+                        Err err ->
+                            formatError err
 
-                        Ok _ ->
-                            "ERROR: Expected String result"
+                        Ok overrideFiles ->
+                            let
+                                overridesButWrapper =
+                                    List.take (List.length overrideFiles - 1) overrideFiles
 
-                        Err (Types.ParsingError _) ->
-                            "ERROR: Parsing error"
+                                wrapperFile =
+                                    List.drop (List.length overrideFiles - 1) overrideFiles
 
-                        Err (Types.EvalError evalErr) ->
-                            "ERROR: Eval error: "
-                                ++ evalErrorKindToString evalErr.error
-        )
-        k
+                                -- Incremental env: if baseUserEnv is available, replace only
+                                -- the mutated module(s) instead of rebuilding from all user files.
+                                result : Result Types.Error Types.Value
+                                result =
+                                    case project.baseUserEnv of
+                                        Just baseEnv ->
+                                            let
+                                                -- Replace each file override in the base env
+                                                replacedEnvResult =
+                                                    fileOverrides
+                                                        |> List.foldl
+                                                            (\override envRes ->
+                                                                envRes
+                                                                    |> Result.andThen
+                                                                        (\env ->
+                                                                            Eval.Module.replaceModuleInEnv env
+                                                                                { file = override.file
+                                                                                , moduleName = Eval.Module.fileModuleName override.file
+                                                                                , interface = Eval.Module.buildInterfaceFromFile override.file
+                                                                                }
+                                                                        )
+                                                            )
+                                                            (Ok baseEnv)
+
+                                                -- Only need sourceOverrides + wrapper as additional files
+                                                additionalFiles =
+                                                    overridesButWrapper ++ wrapperFile
+                                            in
+                                            case replacedEnvResult of
+                                                Ok updatedEnv ->
+                                                    evalAdditionalFiles updatedEnv additionalFiles fileOverrides
+
+                                                Err e ->
+                                                    Err e
+
+                                        Nothing ->
+                                            -- Fallback: original path (all user files)
+                                            let
+                                                allFiles =
+                                                    userFilteredFiles
+                                                        ++ overridesButWrapper
+                                                        ++ List.map .file fileOverrides
+                                                        ++ wrapperFile
+                                            in
+                                            evalAdditionalFiles project.packageEnv allFiles fileOverrides
+                            in
+                            case result of
+                                Ok (Types.String s) ->
+                                    s
+
+                                Ok _ ->
+                                    "ERROR: Expected String result"
+
+                                Err (Types.ParsingError _) ->
+                                    "ERROR: Parsing error"
+
+                                Err (Types.EvalError evalErr) ->
+                                    formatError (Types.EvalError evalErr)
+                )
+                k
+
+
+{-| Diagnostic companion to `evalWithFileOverrides`.
+
+Runs the same wrapper + file-override path as the test runner, but
+returns the rendered string result together with the resolved evaluator's
+delegate counter when the resolved-IR path is used.
+
+-}
+evalWithFileOverridesAndDelegateCallCounter :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , fileOverrides : List { file : File, hashKey : String }
+        }
+    ->
+        Result
+            String
+            { output : String
+            , delegateCallCounter : DelegateCounter.DelegateCallCounter
+            }
+evalWithFileOverridesAndDelegateCallCounter (InterpreterProject project) { imports, expression, sourceOverrides, fileOverrides } =
+    let
+        wrapperSource : String
+        wrapperSource =
+            generateWrapper imports expression
+
+        wrapperImports : Set String
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules : Set String
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        userFilteredFiles : List File
+        userFilteredFiles =
+            neededModules
+                |> Set.toList
+                |> List.filter (\name -> not (Set.member name project.packageModuleNames))
+                |> List.filterMap (\name -> Dict.get name project.moduleGraph.moduleToFile)
+
+        parsedOverrides : Result Types.Error (List File)
+        parsedOverrides =
+            (sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parsedOverrides of
+        Err err ->
+            Err (formatError err)
+
+        Ok overrideFiles ->
+            let
+                overridesButWrapper =
+                    List.take (List.length overrideFiles - 1) overrideFiles
+
+                wrapperFile =
+                    List.drop (List.length overrideFiles - 1) overrideFiles
+
+                withEmptyCounter :
+                    Result Types.Error Types.Value
+                    ->
+                        Result
+                            Types.Error
+                            { value : Types.Value
+                            , delegateCallCounter : DelegateCounter.DelegateCallCounter
+                            }
+                withEmptyCounter rawResult =
+                    rawResult
+                        |> Result.map
+                            (\value ->
+                                { value = value
+                                , delegateCallCounter = DelegateCounter.empty
+                                }
+                            )
+
+                result :
+                    Result
+                        Types.Error
+                        { value : Types.Value
+                        , delegateCallCounter : DelegateCounter.DelegateCallCounter
+                        }
+                result =
+                    case project.baseUserEnv of
+                        Just baseEnv ->
+                            let
+                                replacedEnvResult =
+                                    fileOverrides
+                                        |> List.foldl
+                                            (\override envRes ->
+                                                envRes
+                                                    |> Result.andThen
+                                                        (\env ->
+                                                            Eval.Module.replaceModuleInEnv env
+                                                                { file = override.file
+                                                                , moduleName = Eval.Module.fileModuleName override.file
+                                                                , interface = Eval.Module.buildInterfaceFromFile override.file
+                                                                }
+                                                        )
+                                            )
+                                            (Ok baseEnv)
+
+                                additionalFiles =
+                                    overridesButWrapper ++ wrapperFile
+                            in
+                            case replacedEnvResult of
+                                Ok updatedEnv ->
+                                    if List.isEmpty fileOverrides then
+                                        evalResolvedAdditionalFilesWithDelegateCallCounter updatedEnv additionalFiles
+
+                                    else
+                                        evalAdditionalFiles updatedEnv additionalFiles fileOverrides
+                                            |> withEmptyCounter
+
+                                Err e ->
+                                    Err e
+
+                        Nothing ->
+                            let
+                                allFiles =
+                                    userFilteredFiles
+                                        ++ overridesButWrapper
+                                        ++ List.map .file fileOverrides
+                                        ++ wrapperFile
+                            in
+                            if List.isEmpty fileOverrides then
+                                evalResolvedAdditionalFilesWithDelegateCallCounter project.packageEnv allFiles
+
+                            else
+                                evalAdditionalFiles project.packageEnv allFiles fileOverrides
+                                    |> withEmptyCounter
+            in
+            case result of
+                Ok okResult ->
+                    case okResult.value of
+                        Types.String output ->
+                            Ok
+                                { output = output
+                                , delegateCallCounter = okResult.delegateCallCounter
+                                }
+
+                        _ ->
+                            Err "ERROR: Expected String result"
+
+                Err err ->
+                    Err (formatError err)
+
+
+{-| Diagnostic companion to `evalWithFileOverrides` that preserves the
+normal evaluation result but emits delegate-fallback debug logs from the
+resolved evaluator while it runs.
+
+The emitted log prefix is `Eval.DelegateCounter.logPrefix`.
+
+-}
+evalWithFileOverridesAndLogDelegateCalls :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , fileOverrides : List { file : File, hashKey : String }
+        }
+    -> Result String String
+evalWithFileOverridesAndLogDelegateCalls (InterpreterProject project) { imports, expression, sourceOverrides, fileOverrides } =
+    let
+        wrapperSource : String
+        wrapperSource =
+            generateWrapper imports expression
+
+        wrapperImports : Set String
+        wrapperImports =
+            DepGraph.parseImports wrapperSource |> Set.fromList
+
+        neededModules : Set String
+        neededModules =
+            transitiveModuleDeps project.moduleGraph.imports wrapperImports
+
+        userFilteredFiles : List File
+        userFilteredFiles =
+            neededModules
+                |> Set.toList
+                |> List.filter (\name -> not (Set.member name project.packageModuleNames))
+                |> List.filterMap (\name -> Dict.get name project.moduleGraph.moduleToFile)
+
+        parsedOverrides : Result Types.Error (List File)
+        parsedOverrides =
+            (sourceOverrides ++ [ wrapperSource ])
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parsedOverrides of
+        Err err ->
+            Err (formatError err)
+
+        Ok overrideFiles ->
+            let
+                overridesButWrapper =
+                    List.take (List.length overrideFiles - 1) overrideFiles
+
+                wrapperFile =
+                    List.drop (List.length overrideFiles - 1) overrideFiles
+
+                result : Result Types.Error Types.Value
+                result =
+                    case project.baseUserEnv of
+                        Just baseEnv ->
+                            let
+                                replacedEnvResult =
+                                    fileOverrides
+                                        |> List.foldl
+                                            (\override envRes ->
+                                                envRes
+                                                    |> Result.andThen
+                                                        (\env ->
+                                                            Eval.Module.replaceModuleInEnv env
+                                                                { file = override.file
+                                                                , moduleName = Eval.Module.fileModuleName override.file
+                                                                , interface = Eval.Module.buildInterfaceFromFile override.file
+                                                                }
+                                                        )
+                                            )
+                                            (Ok baseEnv)
+
+                                additionalFiles =
+                                    overridesButWrapper ++ wrapperFile
+                            in
+                            case replacedEnvResult of
+                                Ok updatedEnv ->
+                                    if List.isEmpty fileOverrides then
+                                        evalResolvedAdditionalFilesWithDelegateLogging updatedEnv additionalFiles
+
+                                    else
+                                        evalAdditionalFiles updatedEnv additionalFiles fileOverrides
+
+                                Err e ->
+                                    Err e
+
+                        Nothing ->
+                            let
+                                allFiles =
+                                    userFilteredFiles
+                                        ++ overridesButWrapper
+                                        ++ List.map .file fileOverrides
+                                        ++ wrapperFile
+                            in
+                            if List.isEmpty fileOverrides then
+                                evalResolvedAdditionalFilesWithDelegateLogging project.packageEnv allFiles
+
+                            else
+                                evalAdditionalFiles project.packageEnv allFiles fileOverrides
+            in
+            case result of
+                Ok (Types.String output) ->
+                    Ok output
+
+                Ok _ ->
+                    Err "ERROR: Expected String result"
+
+                Err err ->
+                    Err (formatError err)
 
 
 {-| Run the test runner's `results` expression against an extended
@@ -2425,7 +2866,6 @@ the precomputed `ResolvedProject`, so feeding it through the resolved-
 IR evaluator would see stale function bodies. The fallback is safe
 and the dev-loop scenarios it covers are already at parity with
 elm-test.
-
 -}
 evalAdditionalFiles :
     Eval.Module.ProjectEnv
@@ -2463,6 +2903,124 @@ evalAdditionalFiles env additionalFiles fileOverrides =
             env
             additionalFiles
             (FunctionOrValue [] "results")
+
+
+evalResolvedAdditionalFilesWithDelegateCallCounter :
+    Eval.Module.ProjectEnv
+    -> List File
+    ->
+        Result
+            Types.Error
+            { value : Types.Value
+            , delegateCallCounter : DelegateCounter.DelegateCallCounter
+            }
+evalResolvedAdditionalFilesWithDelegateCallCounter env additionalFiles =
+    Eval.Module.evalWithResolvedIRFromFilesAndInterceptsAndDelegateCallCounter
+        env
+        additionalFiles
+        FastDict.empty
+        FastDict.empty
+        (FunctionOrValue [] "results")
+        |> delegateCallCounterResultToResult
+
+
+delegateCallCounterResultToResult :
+    DelegateCounter.CollectedDelegateCalls Types.Value
+    ->
+        Result
+            Types.Error
+            { value : Types.Value
+            , delegateCallCounter : DelegateCounter.DelegateCallCounter
+            }
+delegateCallCounterResultToResult collected =
+    case collected.result of
+        Types.EvOk value ->
+            Ok
+                { value = value
+                , delegateCallCounter = collected.delegateCallCounter
+                }
+
+        Types.EvErr errorData ->
+            Err (Types.EvalError errorData)
+
+        Types.EvOkTrace value _ _ ->
+            Ok
+                { value = value
+                , delegateCallCounter = collected.delegateCallCounter
+                }
+
+        Types.EvErrTrace errorData _ _ ->
+            Err (Types.EvalError errorData)
+
+        Types.EvOkCoverage value _ ->
+            Ok
+                { value = value
+                , delegateCallCounter = collected.delegateCallCounter
+                }
+
+        Types.EvErrCoverage errorData _ ->
+            Err (Types.EvalError errorData)
+
+        Types.EvYield tag _ _ ->
+            Err
+                (Types.EvalError
+                    { currentModule = []
+                    , callStack = []
+                    , error =
+                        Types.Unsupported
+                            ("Unexpected EvYield '"
+                                ++ tag
+                                ++ "' from delegate-counter eval path"
+                            )
+                    }
+                )
+
+        Types.EvMemoLookup _ _ ->
+            Err
+                (Types.EvalError
+                    { currentModule = []
+                    , callStack = []
+                    , error = Types.Unsupported "Unexpected EvMemoLookup from delegate-counter eval path"
+                    }
+                )
+
+        Types.EvMemoStore _ _ ->
+            Err
+                (Types.EvalError
+                    { currentModule = []
+                    , callStack = []
+                    , error = Types.Unsupported "Unexpected EvMemoStore from delegate-counter eval path"
+                    }
+                )
+
+
+evalResolvedAdditionalFilesWithDelegateLogging :
+    Eval.Module.ProjectEnv
+    -> List File
+    -> Result Types.Error Types.Value
+evalResolvedAdditionalFilesWithDelegateLogging env additionalFiles =
+    case
+        Eval.Module.evalWithResolvedIRFromFilesAndInterceptsAndLogDelegateCalls
+            env
+            additionalFiles
+            FastDict.empty
+            FastDict.empty
+            (FunctionOrValue [] "results")
+    of
+        Types.EvOk value ->
+            Ok value
+
+        Types.EvErr errorData ->
+            Err (Types.EvalError errorData)
+
+        _ ->
+            Err
+                (Types.EvalError
+                    { currentModule = []
+                    , callStack = []
+                    , error = Types.Unsupported "evalWithResolvedIRFromFilesAndInterceptsAndLogDelegateCalls returned a trace/yield/memo result; not supported on the test-runner path"
+                    }
+                )
 
 
 {-| Evaluate a test expression with tracing to collect coverage data.
@@ -2527,7 +3085,7 @@ evalSimple (InterpreterProject project) { imports, expression, sourceOverrides }
                 "ERROR: Parsing error"
 
             Err (Types.EvalError evalErr) ->
-                "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+                formatError (Types.EvalError evalErr)
         )
 
 
@@ -2594,7 +3152,7 @@ evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverr
                     "ERROR: Parsing error"
 
                 Err (Types.EvalError evalErr) ->
-                    "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+                    formatError (Types.EvalError evalErr)
     in
     BackendTask.succeed { result = resultString, coveredRanges = coveredRanges }
 
@@ -2626,6 +3184,9 @@ evalErrorKindToString kind =
 
         Types.TailCall _ ->
             "internal TCO signal (should not be user-visible)"
+
+        Types.TailCallLocals _ ->
+            "internal resolved TCO signal (should not be user-visible)"
 
 
 {-| Get the pre-built package environment. Useful for direct eval calls
@@ -2825,6 +3386,73 @@ prepareAndEvalRaw (InterpreterProject project) { imports, expression, sourceOver
                         |> Result.mapError formatError
 
 
+{-| Diagnostic-only companion to `prepareAndEvalRaw`.
+
+Mirrors the resolved-IR test-runner fast path and returns a counter of
+every time the resolved evaluator delegated back to the old evaluator.
+
+-}
+prepareAndEvalRawWithDelegateCallCounter :
+    InterpreterProject
+    -> { imports : List String, expression : String, sourceOverrides : List String }
+    ->
+        Result
+            String
+            { value : Types.Value
+            , delegateCallCounter : DelegateCounter.DelegateCallCounter
+            }
+prepareAndEvalRawWithDelegateCallCounter (InterpreterProject project) { imports, expression, sourceOverrides } =
+    let
+        wrapperSource =
+            generateWrapper imports expression
+
+        parseSources : List String -> Result Types.Error (List File)
+        parseSources sources =
+            sources
+                |> List.map
+                    (\src ->
+                        Elm.Parser.parseToFile src
+                            |> Result.mapError Types.ParsingError
+                    )
+                |> combineFileResults
+    in
+    case parseSources (sourceOverrides ++ [ wrapperSource ]) of
+        Err err ->
+            Err (formatError err)
+
+        Ok newFiles ->
+            case project.baseUserEnv of
+                Just baseEnv ->
+                    evalResolvedAdditionalFilesWithDelegateCallCounter baseEnv newFiles
+                        |> Result.mapError formatError
+
+                Nothing ->
+                    let
+                        { userSources } =
+                            prepareEvalSources (InterpreterProject project) { imports = imports, expression = expression }
+
+                        allSources =
+                            let
+                                len =
+                                    List.length userSources
+
+                                beforeWrapper =
+                                    List.take (len - 1) userSources
+
+                                wrapper =
+                                    List.drop (len - 1) userSources
+                            in
+                            beforeWrapper ++ sourceOverrides ++ wrapper
+                    in
+                    case parseSources allSources of
+                        Err err ->
+                            Err (formatError err)
+
+                        Ok allFiles ->
+                            evalResolvedAdditionalFilesWithDelegateCallCounter project.packageEnv allFiles
+                                |> Result.mapError formatError
+
+
 {-| Like prepareAndEval but with injected Values available in the expression.
 
 The injected values are available as local variables. Used to pass
@@ -2881,7 +3509,8 @@ prepareAndEvalWithMemoizedFunctions :
         , collectMemoStats : Bool
         }
     ->
-        Result String
+        Result
+            String
             { value : Types.Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -2944,7 +3573,8 @@ prepareAndEvalWithValuesAndMemoizedFunctions :
         , collectMemoStats : Bool
         }
     ->
-        Result String
+        Result
+            String
             { value : Types.Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -3002,6 +3632,7 @@ BackendTask runs with (tag, payload), producing a Value. The eval then
 resumes with that Value via the continuation.
 
 This is the BackendTask driver loop: eval → yield → handle → resume → repeat.
+
 -}
 prepareRawEvalWithYield :
     InterpreterProject
@@ -3142,7 +3773,6 @@ translated directly; an intercept that returns `EvYield` / `EvMemoLookup`
 / `EvMemoStore` through this synchronous path would be a programming
 error (no yield handler is installed), so we surface it as a formatted
 error string to make it obvious if it happens.
-
 -}
 resolvedEvalResultToResult : Types.EvalResult Types.Value -> Result String Types.Value
 resolvedEvalResultToResult result =
@@ -3185,6 +3815,7 @@ BackendTask runs with (tag, payload), producing a Value. The eval then
 resumes with that Value via the continuation.
 
 This is the BackendTask driver loop: eval → yield → handle → resume → repeat.
+
 -}
 prepareAndEvalWithYield :
     InterpreterProject
@@ -3209,7 +3840,8 @@ prepareAndEvalWithYieldAndMemoizedFunctions :
         }
     -> (String -> Types.Value -> BackendTask FatalError Types.Value)
     ->
-        BackendTask FatalError
+        BackendTask
+            FatalError
             { result : Result String Types.Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -3335,7 +3967,8 @@ driveYieldsAndMemo :
     -> (String -> Types.Value -> BackendTask FatalError Types.Value)
     -> Types.EvalResult Types.Value
     ->
-        BackendTask FatalError
+        BackendTask
+            FatalError
             { result : Result String Types.Value
             , memoCache : MemoRuntime.MemoCache
             , memoStats : MemoRuntime.MemoStats
@@ -3415,6 +4048,7 @@ driveYieldsAndMemo memoCache memoStats yieldHandler evalResult =
 
 Intercepts are checked before normal function evaluation. Used for
 elm-review cache markers, memoization, and framework callbacks.
+
 -}
 prepareAndEvalWithIntercepts :
     InterpreterProject

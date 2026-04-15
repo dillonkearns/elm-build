@@ -16,7 +16,6 @@ import Elm.Syntax.Expression exposing (Expression(..), LetDeclaration(..))
 import Elm.Syntax.File exposing (File)
 import Elm.Syntax.Import exposing (Import)
 import Elm.Syntax.Module exposing (Module(..))
-import Elm.Syntax.Module exposing (Module(..))
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Signature exposing (Signature)
 import Elm.Syntax.TypeAnnotation exposing (TypeAnnotation(..))
@@ -260,6 +259,9 @@ evalErrorToString err =
 
         Types.TailCall _ ->
             "internal TCO signal"
+
+        Types.TailCallLocals _ ->
+            "internal resolved TCO signal"
 
 
 {-| Detect whether an Elm source file uses fuzz tests by checking for references

@@ -1,4 +1,4 @@
-module SemanticHash exposing (DeclarationIndex, FileAspectHashes, ImportResolver, RawIndex, affectedRunnerIndices, buildImportResolver, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexWithPackages, buildRawIndex, computeAspectHashesFromFile, computeAspectHashesFromSource, declarationHash, depsForExpression, diffIndices, emptyImportResolver, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, replaceModuleInRawIndex, resolveRawIndex, resolveRawIndexIncremental, semanticHashForEntry, transitiveDepsOf)
+module SemanticHash exposing (DeclarationIndex, FileAspectHashes, ImportResolver, RawIndex, affectedRunnerIndices, buildImportResolver, buildIndexFromFile, buildIndexFromSource, buildMultiModuleIndex, buildMultiModuleIndexFromFiles, buildMultiModuleIndexWithPackages, buildRawIndex, computeAspectHashesFromFile, computeAspectHashesFromSource, declarationHash, depsForExpression, diffIndices, emptyImportResolver, extractDependencies, extractDependenciesWithRanges, getSemanticHash, hashExpression, replaceModuleInRawIndex, resolveRawIndex, resolveRawIndexIncremental, semanticHashForEntry, transitiveDepsOf)
 
 {-| Unison-style semantic hashing for Elm declarations.
 
@@ -694,6 +694,11 @@ buildMultiModuleIndex modules =
     buildMultiModuleIndexWithPackages { packageVersions = [], modules = modules }
 
 
+buildMultiModuleIndexFromFiles : List { moduleName : String, file : File } -> DeclarationIndex
+buildMultiModuleIndexFromFiles modules =
+    buildMultiModuleIndexFromFilesWithPackages { packageVersions = [], modules = modules }
+
+
 {-| Build a semantic hash index with package version info.
 Package references are hashed as `packageVersion.ModuleName.functionName`.
 -}
@@ -703,6 +708,33 @@ buildMultiModuleIndexWithPackages :
     }
     -> DeclarationIndex
 buildMultiModuleIndexWithPackages { packageVersions, modules } =
+    modules
+        |> List.filterMap
+            (\mod ->
+                case Elm.Parser.parseToFile mod.source of
+                    Ok file ->
+                        Just
+                            { moduleName = mod.moduleName
+                            , file = file
+                            }
+
+                    Err _ ->
+                        Nothing
+            )
+        |> (\parsedModules ->
+                buildMultiModuleIndexFromFilesWithPackages
+                    { packageVersions = packageVersions
+                    , modules = parsedModules
+                    }
+           )
+
+
+buildMultiModuleIndexFromFilesWithPackages :
+    { packageVersions : List ( String, String )
+    , modules : List { moduleName : String, file : File }
+    }
+    -> DeclarationIndex
+buildMultiModuleIndexFromFilesWithPackages { packageVersions, modules } =
     let
         packageVersionDict : Dict String String
         packageVersionDict =
@@ -714,28 +746,23 @@ buildMultiModuleIndexWithPackages { packageVersions, modules } =
             modules
                 |> List.concatMap
                     (\mod ->
-                        case Elm.Parser.parseToFile mod.source of
-                            Ok file ->
-                                file.declarations
-                                    |> List.filterMap
-                                        (\(Node _ decl) ->
-                                            case decl of
-                                                FunctionDeclaration func ->
-                                                    let
-                                                        impl =
-                                                            Node.value func.declaration
-                                                    in
-                                                    Just
-                                                        ( mod.moduleName ++ "." ++ Node.value impl.name
-                                                        , { expr = impl.expression, moduleName = mod.moduleName }
-                                                        )
+                        mod.file.declarations
+                            |> List.filterMap
+                                (\(Node _ decl) ->
+                                    case decl of
+                                        FunctionDeclaration func ->
+                                            let
+                                                impl =
+                                                    Node.value func.declaration
+                                            in
+                                            Just
+                                                ( mod.moduleName ++ "." ++ Node.value impl.name
+                                                , { expr = impl.expression, moduleName = mod.moduleName }
+                                                )
 
-                                                _ ->
-                                                    Nothing
-                                        )
-
-                            Err _ ->
-                                []
+                                        _ ->
+                                            Nothing
+                                )
                     )
 
         -- All qualified declaration names
