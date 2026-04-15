@@ -343,7 +343,16 @@ function parseElmTestJson(stdout) {
 }
 
 function parseInterpreterJson(stdout) {
-  return JSON.parse(stdout.trim());
+  const firstNonEmptyLine = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+
+  if (firstNonEmptyLine == null) {
+    throw new Error("Interpreter stdout did not contain a JSON summary line");
+  }
+
+  return JSON.parse(firstNonEmptyLine);
 }
 
 function summarizeCommandResult(result, parsed, parseError) {
