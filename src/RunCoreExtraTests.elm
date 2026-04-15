@@ -32,6 +32,10 @@ run =
 
 type alias Config =
     { buildDirectory : Path
+    , onlyModules : List String
+    , onlyValues : List String
+    , countOnly : Bool
+    , runnerIndex : Maybe Int
     }
 
 
@@ -44,6 +48,25 @@ programConfig =
                     (Option.requiredKeywordArg "build"
                         |> Option.map Path.path
                         |> Option.withDescription "Build folder for the test cache"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "only"
+                        |> Option.map (Maybe.map (String.split ",") >> Maybe.withDefault [])
+                        |> Option.withDescription "Only run these test modules (comma-separated)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "values"
+                        |> Option.map (Maybe.map (String.split ",") >> Maybe.withDefault [])
+                        |> Option.withDescription "For a single module, only run these exported Test values (comma-separated)"
+                    )
+                |> OptionsParser.with
+                    (Option.flag "count-only"
+                        |> Option.withDescription "Count runners without executing them"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "runner-index"
+                        |> Option.map (Maybe.andThen String.toInt)
+                        |> Option.withDescription "Run only the given flattened runner index"
                     )
             )
 
@@ -71,7 +94,8 @@ skipPackages =
 
 
 type alias TestModule =
-    { imports : List String
+    { name : String
+    , imports : List String
     , suiteExpression : String
     }
 
@@ -80,45 +104,89 @@ type alias TestModule =
 -}
 testModules : List TestModule
 testModules =
-    [ { imports = [ "ArrayTests" ], suiteExpression = "ArrayTests.suite" }
-    , { imports = [ "BasicsTests" ], suiteExpression = "BasicsTests.suite" }
-    , { imports = [ "CharTests" ], suiteExpression = "CharTests.suite" }
-    , { imports = [ "DictTests" ], suiteExpression = "DictTests.suite" }
-    , { imports = [ "FloatTests", "Utils" ]
+    [ { name = "ArrayTests", imports = [ "ArrayTests" ], suiteExpression = "ArrayTests.suite" }
+    , { name = "BasicsTests", imports = [ "BasicsTests" ], suiteExpression = "BasicsTests.suite" }
+    , { name = "CharTests", imports = [ "CharTests" ], suiteExpression = "CharTests.suite" }
+    , { name = "DictTests", imports = [ "DictTests" ], suiteExpression = "DictTests.suite" }
+    , { name = "FloatTests", imports = [ "FloatTests", "Utils" ]
       , suiteExpression = "Test.describe \"Float.Extra\" [FloatTests.modByTests, FloatTests.testAboutEqual, FloatTests.testBoundaryValuesAsUnicode, FloatTests.testEqualWithin, FloatTests.testInterpolateFrom, FloatTests.testRange, FloatTests.testToFixedDecimalPlaces, FloatTests.testToFixedSignificantDigits]"
       }
-    , { imports = [ "ListTests" ], suiteExpression = "ListTests.all" }
-    , { imports = [ "MaybeTests" ], suiteExpression = "MaybeTests.suite" }
-    , { imports = [ "OrderTests" ], suiteExpression = "OrderTests.all" }
-    , { imports = [ "SetTests" ], suiteExpression = "SetTests.all" }
-    , { imports = [ "String.NonEmptyTest" ], suiteExpression = "String.NonEmptyTest.nonEmptyTest" }
-    , { imports = [ "String.RemoveAccentsTest" ], suiteExpression = "String.RemoveAccentsTest.removeAccentsTest" }
-    , { imports = [ "String.RemoveDiacriticsTests" ], suiteExpression = "String.RemoveDiacriticsTests.removeDiacriticsTests" }
-    , { imports = [ "String.ReplaceSliceTest" ], suiteExpression = "String.ReplaceSliceTest.replaceSliceTest" }
-    , { imports = [ "String.UnicodeTests" ], suiteExpression = "String.UnicodeTests.unicodeTests" }
-    , { imports = [ "String.UnindentTest" ], suiteExpression = "String.UnindentTest.unindentTest" }
-    , { imports = [ "TripleTests" ], suiteExpression = "TripleTests.suite" }
+    , { name = "ListTests", imports = [ "ListTests" ], suiteExpression = "ListTests.all" }
+    , { name = "MaybeTests", imports = [ "MaybeTests" ], suiteExpression = "MaybeTests.suite" }
+    , { name = "OrderTests", imports = [ "OrderTests" ], suiteExpression = "OrderTests.all" }
+    , { name = "SetTests", imports = [ "SetTests" ], suiteExpression = "SetTests.all" }
+    , { name = "String.NonEmptyTest", imports = [ "String.NonEmptyTest" ], suiteExpression = "String.NonEmptyTest.nonEmptyTest" }
+    , { name = "String.RemoveAccentsTest", imports = [ "String.RemoveAccentsTest" ], suiteExpression = "String.RemoveAccentsTest.removeAccentsTest" }
+    , { name = "String.RemoveDiacriticsTests", imports = [ "String.RemoveDiacriticsTests" ], suiteExpression = "String.RemoveDiacriticsTests.removeDiacriticsTests" }
+    , { name = "String.ReplaceSliceTest", imports = [ "String.ReplaceSliceTest" ], suiteExpression = "String.ReplaceSliceTest.replaceSliceTest" }
+    , { name = "String.UnicodeTests", imports = [ "String.UnicodeTests" ], suiteExpression = "String.UnicodeTests.unicodeTests" }
+    , { name = "String.UnindentTest", imports = [ "String.UnindentTest" ], suiteExpression = "String.UnindentTest.unindentTest" }
+    , { name = "TripleTests", imports = [ "TripleTests" ], suiteExpression = "TripleTests.suite" }
     ]
 
 
 {-| Build the expression and imports for a single test module.
 -}
-buildModuleEval : TestModule -> { imports : List String, expression : String }
-buildModuleEval mod =
+buildModuleEval : Config -> TestModule -> { imports : List String, expression : String }
+buildModuleEval config mod =
+    let
+        selectedSuiteExpression : String
+        selectedSuiteExpression =
+            if List.isEmpty config.onlyValues then
+                mod.suiteExpression
+
+            else
+                case config.onlyValues of
+                    [ single ] ->
+                        mod.name ++ "." ++ single
+
+                    multiple ->
+                        "Test.describe \""
+                            ++ mod.name
+                            ++ "\" ["
+                            ++ String.join ", " (List.map (\valueName -> mod.name ++ "." ++ valueName) multiple)
+                            ++ "]"
+
+        wrapperExpression : String
+        wrapperExpression =
+            case config.runnerIndex of
+                Just index ->
+                    "SimpleTestRunner.runNth "
+                        ++ String.fromInt index
+                        ++ " ("
+                        ++ selectedSuiteExpression
+                        ++ ")"
+
+                Nothing ->
+                    if config.countOnly then
+                        "SimpleTestRunner.countTests (" ++ selectedSuiteExpression ++ ")"
+
+                    else
+                        "SimpleTestRunner.runToString (" ++ selectedSuiteExpression ++ ")"
+    in
     { imports = mod.imports ++ [ "SimpleTestRunner", "Test" ]
-    , expression = "SimpleTestRunner.runToString (" ++ mod.suiteExpression ++ ")"
+    , expression = wrapperExpression
     }
 
 
 task : Config -> BackendTask FatalError ()
 task config =
     let
+        selectedModules : List TestModule
+        selectedModules =
+            if List.isEmpty config.onlyModules then
+                testModules
+
+            else
+                testModules
+                    |> List.filter (\mod -> List.member mod.name config.onlyModules)
+
         -- Union of every test module name evaluated by this runner, so
         -- the function-level reachability walk only normalizes user
         -- modules actually called from one of these entry points.
         allRoots : List String
         allRoots =
-            testModules
+            selectedModules
                 |> List.concatMap .imports
                 |> (::) "SimpleTestRunner"
     in
@@ -137,8 +205,15 @@ task config =
             )
         )
     <| \project ->
+    Do.log
+        ("Running "
+            ++ String.fromInt (List.length selectedModules)
+            ++ " core-extra module(s): "
+            ++ String.join ", " (List.map .name selectedModules)
+        )
+    <| \_ ->
     Do.exec "mkdir" [ "-p", Path.toString config.buildDirectory ] <| \_ ->
-    evalModulesWithGC project config testModules { passed = 0, failed = 0, total = 0, failLines = [] }
+    evalModulesWithGC project config selectedModules { passed = 0, failed = 0, total = 0, failLines = [] }
     <| \combined ->
     Do.each combined.failLines
         (\line ->
@@ -189,6 +264,7 @@ evalModulesWithGC project config modules acc continuation =
             continuation acc
 
         mod :: rest ->
+            Do.log ("Running module " ++ mod.name) <| \_ ->
             Do.do (evalModule project config mod) <| \result ->
             let
                 newAcc =
@@ -198,6 +274,18 @@ evalModulesWithGC project config modules acc continuation =
                     , failLines = acc.failLines ++ result.failLines
                     }
             in
+            Do.log
+                ("Finished "
+                    ++ mod.name
+                    ++ " (passed="
+                    ++ String.fromInt result.passed
+                    ++ ", failed="
+                    ++ String.fromInt result.failed
+                    ++ ", total="
+                    ++ String.fromInt result.total
+                    ++ ")"
+                )
+            <| \_ ->
             Do.do forceGC <| \_ ->
             evalModulesWithGC project config rest newAcc continuation
 
@@ -214,7 +302,7 @@ evalModule : InterpreterProject -> Config -> TestModule -> BackendTask FatalErro
 evalModule project config mod =
     let
         evalConfig =
-            buildModuleEval mod
+            buildModuleEval config mod
     in
     Do.do
         (Cache.run { jobs = Nothing } config.buildDirectory
@@ -222,7 +310,17 @@ evalModule project config mod =
         )
     <| \result ->
     Do.allowFatal (File.rawFile (Path.toString result.output)) <| \output ->
-    BackendTask.succeed (parseOutput output)
+    if config.countOnly || config.runnerIndex /= Nothing then
+        Do.log ("Raw output for " ++ mod.name ++ ": " ++ output) <| \_ ->
+        BackendTask.succeed
+            { passed = 0
+            , failed = 0
+            , total = 0
+            , failLines = []
+            }
+
+    else
+        BackendTask.succeed (parseOutput output)
 
 
 parseOutput : String -> ModuleResult

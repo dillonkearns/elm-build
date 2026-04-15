@@ -198,9 +198,248 @@ type alias LoadProfile =
     }
 
 
-emptyPackageSummaryStats : Eval.Module.DependencySummaryStats
+type alias DependencySummaryStats =
+    { functionsVisited : Int
+    , functionsRewritten : Int
+    , inlineCandidates : Int
+    , inlineSuccesses : Int
+    , inlineRejectedPattern : Int
+    , inlineRejectedArity : Int
+    , inlineRejectedSelfCall : Int
+    , inlineRejectedBodyTooLarge : Int
+    , inlineRejectedUnsafe : Int
+    , inlineRejectedUnsafeApplication : Int
+    , inlineRejectedUnsafeIf : Int
+    , inlineRejectedUnsafeCase : Int
+    , inlineRejectedUnsafeLet : Int
+    , inlineRejectedUnsafeLambda : Int
+    , inlineRejectedUnsafeOther : Int
+    , inlineRejectedInternalHelper : Int
+    , inlineBodyLt30 : Int
+    , inlineBody30To59 : Int
+    , inlineBody60Plus : Int
+    , inlineShapeLeaf : Int
+    , inlineShapeConstructor : Int
+    , inlineShapeOperator : Int
+    , inlineShapeRecordAccess : Int
+    , inlineShapeCollection : Int
+    , inlineShapeOther : Int
+    , inlinePayoffChanged : Int
+    , inlinePayoffChangedShapeLeaf : Int
+    , inlinePayoffChangedShapeConstructor : Int
+    , inlinePayoffChangedShapeOperator : Int
+    , inlinePayoffChangedShapeRecordAccess : Int
+    , inlinePayoffChangedShapeCollection : Int
+    , inlinePayoffChangedShapeOther : Int
+    , inlinePayoffChangedBodyLt30 : Int
+    , inlinePayoffChangedBody30To59 : Int
+    , inlinePayoffChangedBody60Plus : Int
+    , inlinePayoffInline : Int
+    , inlinePayoffInlineShapeLeaf : Int
+    , inlinePayoffInlineShapeConstructor : Int
+    , inlinePayoffInlineShapeOperator : Int
+    , inlinePayoffInlineShapeRecordAccess : Int
+    , inlinePayoffInlineShapeCollection : Int
+    , inlinePayoffInlineShapeOther : Int
+    , inlinePayoffInlineBodyLt30 : Int
+    , inlinePayoffInlineBody30To59 : Int
+    , inlinePayoffInlineBody60Plus : Int
+    , inlinePayoffConstantFold : Int
+    , inlinePayoffConstantFoldShapeLeaf : Int
+    , inlinePayoffConstantFoldShapeConstructor : Int
+    , inlinePayoffConstantFoldShapeOperator : Int
+    , inlinePayoffConstantFoldShapeRecordAccess : Int
+    , inlinePayoffConstantFoldShapeCollection : Int
+    , inlinePayoffConstantFoldShapeOther : Int
+    , inlinePayoffConstantFoldBodyLt30 : Int
+    , inlinePayoffConstantFoldBody30To59 : Int
+    , inlinePayoffConstantFoldBody60Plus : Int
+    , inlinePayoffPrecomputedRef : Int
+    , inlinePayoffPrecomputedRefShapeLeaf : Int
+    , inlinePayoffPrecomputedRefShapeConstructor : Int
+    , inlinePayoffPrecomputedRefShapeOperator : Int
+    , inlinePayoffPrecomputedRefShapeRecordAccess : Int
+    , inlinePayoffPrecomputedRefShapeCollection : Int
+    , inlinePayoffPrecomputedRefShapeOther : Int
+    , inlinePayoffPrecomputedRefBodyLt30 : Int
+    , inlinePayoffPrecomputedRefBody30To59 : Int
+    , inlinePayoffPrecomputedRefBody60Plus : Int
+    , inlineShadowRejectCollection : Int
+    , inlineShadowRejectCollectionPayoffChanged : Int
+    , inlineShadowRejectCollectionPayoffInline : Int
+    , inlineShadowRejectCollectionPayoffPrecomputedRef : Int
+    , inlineShadowRejectCollectionFinalShrinks : Int
+    , inlineShadowRejectCollectionFinalNonApplication : Int
+    , inlineShadowRejectCollectionFinalDirectRootWin : Int
+    , inlineShadowRejectCollectionFinalConstructorApplication : Int
+    , inlineShadowRejectCollectionNoPayoffNoDirectBenefit : Int
+    , inlineShadowRejectGrowth0 : Int
+    , inlineShadowRejectGrowth0PayoffChanged : Int
+    , inlineShadowRejectGrowth0PayoffInline : Int
+    , inlineShadowRejectGrowth0PayoffPrecomputedRef : Int
+    , inlineShadowRejectGrowth0FinalShrinks : Int
+    , inlineShadowRejectGrowth0FinalNonApplication : Int
+    , inlineShadowRejectGrowth0FinalDirectRootWin : Int
+    , inlineShadowRejectGrowth0FinalConstructorApplication : Int
+    , inlineShadowRejectGrowth0NoPayoffNoDirectBenefit : Int
+    , inlineShadowRejectGrowth1 : Int
+    , inlineShadowRejectGrowth1PayoffChanged : Int
+    , inlineShadowRejectGrowth1PayoffInline : Int
+    , inlineShadowRejectGrowth1PayoffPrecomputedRef : Int
+    , inlineShadowRejectGrowth1FinalShrinks : Int
+    , inlineShadowRejectGrowth1FinalNonApplication : Int
+    , inlineShadowRejectGrowth1FinalDirectRootWin : Int
+    , inlineShadowRejectGrowth1FinalConstructorApplication : Int
+    , inlineShadowRejectGrowth1NoPayoffNoDirectBenefit : Int
+    , listFusionChanges : Int
+    , listFusionPipelineNormalizations : Int
+    , listFusionHeadFlattenRewrites : Int
+    , listFusionRuleRewrites : Int
+    , precomputedRefSubstitutions : Int
+    , constantFolds : Int
+    , rejectSamples : List String
+    }
+
+
+emptyPackageSummaryStats : DependencySummaryStats
 emptyPackageSummaryStats =
-    Eval.Module.emptyDependencySummaryStats
+    { functionsVisited = 0
+    , functionsRewritten = 0
+    , inlineCandidates = 0
+    , inlineSuccesses = 0
+    , inlineRejectedPattern = 0
+    , inlineRejectedArity = 0
+    , inlineRejectedSelfCall = 0
+    , inlineRejectedBodyTooLarge = 0
+    , inlineRejectedUnsafe = 0
+    , inlineRejectedUnsafeApplication = 0
+    , inlineRejectedUnsafeIf = 0
+    , inlineRejectedUnsafeCase = 0
+    , inlineRejectedUnsafeLet = 0
+    , inlineRejectedUnsafeLambda = 0
+    , inlineRejectedUnsafeOther = 0
+    , inlineRejectedInternalHelper = 0
+    , inlineBodyLt30 = 0
+    , inlineBody30To59 = 0
+    , inlineBody60Plus = 0
+    , inlineShapeLeaf = 0
+    , inlineShapeConstructor = 0
+    , inlineShapeOperator = 0
+    , inlineShapeRecordAccess = 0
+    , inlineShapeCollection = 0
+    , inlineShapeOther = 0
+    , inlinePayoffChanged = 0
+    , inlinePayoffChangedShapeLeaf = 0
+    , inlinePayoffChangedShapeConstructor = 0
+    , inlinePayoffChangedShapeOperator = 0
+    , inlinePayoffChangedShapeRecordAccess = 0
+    , inlinePayoffChangedShapeCollection = 0
+    , inlinePayoffChangedShapeOther = 0
+    , inlinePayoffChangedBodyLt30 = 0
+    , inlinePayoffChangedBody30To59 = 0
+    , inlinePayoffChangedBody60Plus = 0
+    , inlinePayoffInline = 0
+    , inlinePayoffInlineShapeLeaf = 0
+    , inlinePayoffInlineShapeConstructor = 0
+    , inlinePayoffInlineShapeOperator = 0
+    , inlinePayoffInlineShapeRecordAccess = 0
+    , inlinePayoffInlineShapeCollection = 0
+    , inlinePayoffInlineShapeOther = 0
+    , inlinePayoffInlineBodyLt30 = 0
+    , inlinePayoffInlineBody30To59 = 0
+    , inlinePayoffInlineBody60Plus = 0
+    , inlinePayoffConstantFold = 0
+    , inlinePayoffConstantFoldShapeLeaf = 0
+    , inlinePayoffConstantFoldShapeConstructor = 0
+    , inlinePayoffConstantFoldShapeOperator = 0
+    , inlinePayoffConstantFoldShapeRecordAccess = 0
+    , inlinePayoffConstantFoldShapeCollection = 0
+    , inlinePayoffConstantFoldShapeOther = 0
+    , inlinePayoffConstantFoldBodyLt30 = 0
+    , inlinePayoffConstantFoldBody30To59 = 0
+    , inlinePayoffConstantFoldBody60Plus = 0
+    , inlinePayoffPrecomputedRef = 0
+    , inlinePayoffPrecomputedRefShapeLeaf = 0
+    , inlinePayoffPrecomputedRefShapeConstructor = 0
+    , inlinePayoffPrecomputedRefShapeOperator = 0
+    , inlinePayoffPrecomputedRefShapeRecordAccess = 0
+    , inlinePayoffPrecomputedRefShapeCollection = 0
+    , inlinePayoffPrecomputedRefShapeOther = 0
+    , inlinePayoffPrecomputedRefBodyLt30 = 0
+    , inlinePayoffPrecomputedRefBody30To59 = 0
+    , inlinePayoffPrecomputedRefBody60Plus = 0
+    , inlineShadowRejectCollection = 0
+    , inlineShadowRejectCollectionPayoffChanged = 0
+    , inlineShadowRejectCollectionPayoffInline = 0
+    , inlineShadowRejectCollectionPayoffPrecomputedRef = 0
+    , inlineShadowRejectCollectionFinalShrinks = 0
+    , inlineShadowRejectCollectionFinalNonApplication = 0
+    , inlineShadowRejectCollectionFinalDirectRootWin = 0
+    , inlineShadowRejectCollectionFinalConstructorApplication = 0
+    , inlineShadowRejectCollectionNoPayoffNoDirectBenefit = 0
+    , inlineShadowRejectGrowth0 = 0
+    , inlineShadowRejectGrowth0PayoffChanged = 0
+    , inlineShadowRejectGrowth0PayoffInline = 0
+    , inlineShadowRejectGrowth0PayoffPrecomputedRef = 0
+    , inlineShadowRejectGrowth0FinalShrinks = 0
+    , inlineShadowRejectGrowth0FinalNonApplication = 0
+    , inlineShadowRejectGrowth0FinalDirectRootWin = 0
+    , inlineShadowRejectGrowth0FinalConstructorApplication = 0
+    , inlineShadowRejectGrowth0NoPayoffNoDirectBenefit = 0
+    , inlineShadowRejectGrowth1 = 0
+    , inlineShadowRejectGrowth1PayoffChanged = 0
+    , inlineShadowRejectGrowth1PayoffInline = 0
+    , inlineShadowRejectGrowth1PayoffPrecomputedRef = 0
+    , inlineShadowRejectGrowth1FinalShrinks = 0
+    , inlineShadowRejectGrowth1FinalNonApplication = 0
+    , inlineShadowRejectGrowth1FinalDirectRootWin = 0
+    , inlineShadowRejectGrowth1FinalConstructorApplication = 0
+    , inlineShadowRejectGrowth1NoPayoffNoDirectBenefit = 0
+    , listFusionChanges = 0
+    , listFusionPipelineNormalizations = 0
+    , listFusionHeadFlattenRewrites = 0
+    , listFusionRuleRewrites = 0
+    , precomputedRefSubstitutions = 0
+    , constantFolds = 0
+    , rejectSamples = []
+    }
+
+
+normalizeSummariesWithStats :
+    List CachedPackageModuleSummary
+    -> { summaries : List CachedPackageModuleSummary, stats : DependencySummaryStats }
+normalizeSummariesWithStats summaries =
+    { summaries = Eval.Module.normalizeSummaries summaries
+    , stats = emptyPackageSummaryStats
+    }
+
+
+normalizeOneModuleInEnvSelected :
+    Maybe (Set String)
+    -> ModuleName
+    -> Eval.Module.ProjectEnv
+    -> ( Eval.Module.ProjectEnv, FastDict.Dict String FunctionImplementation, FastDict.Dict String Types.Value )
+normalizeOneModuleInEnvSelected targetFunctions moduleName envBeforeNorm =
+    let
+        ( updatedEnv, normalizedFns ) =
+            Eval.Module.normalizeOneModuleInEnv moduleName envBeforeNorm
+
+        filterSelected dict =
+            case targetFunctions of
+                Nothing ->
+                    dict
+
+                Just selected ->
+                    dict
+                        |> FastDict.toList
+                        |> List.filter (\( name, _ ) -> Set.member name selected)
+                        |> FastDict.fromList
+    in
+    ( updatedEnv
+    , filterSelected normalizedFns
+    , Eval.Module.getModulePrecomputedValues moduleName updatedEnv
+        |> filterSelected
+    )
 
 
 type alias Timed a =
@@ -1099,7 +1338,7 @@ normalizeOneAndCache userModulePlan envAcc =
             userNormPlanModuleName userModulePlan
 
         ( updatedEnv, normalizedFns, modulePrecomputed ) =
-            Eval.Module.normalizeOneModuleInEnvSelected userModulePlan.targetFunctions moduleName envAcc
+            normalizeOneModuleInEnvSelected userModulePlan.targetFunctions moduleName envAcc
 
         entry =
             { moduleName = moduleName
@@ -1603,6 +1842,11 @@ type InterpreterProject
         }
 
 
+interpreterResultCacheVersion : String
+interpreterResultCacheVersion =
+    "v2"
+
+
 {-| Selects the interpreter environment representation for this project's
 evaluations.
 
@@ -1944,7 +2188,7 @@ loadWithProfile config =
                                                                         BackendTask
                                                                             FatalError
                                                                             { packageSummaries : List CachedPackageModuleSummary
-                                                                            , dependencySummaryStats : Eval.Module.DependencySummaryStats
+                                                                            , dependencySummaryStats : DependencySummaryStats
                                                                             , packageSummaryCacheHit : Int
                                                                             , packageSummaryCacheRoundtripOk : Int
                                                                             , packageSummaryCacheBytes : Int
@@ -1981,7 +2225,7 @@ loadWithProfile config =
                                                                                                             -- stores the rewritten bodies. Subsequent project
                                                                                                             -- loads hit the summary cache and skip both the
                                                                                                             -- normalization pass AND its re-evaluation cost.
-                                                                                                            Eval.Module.normalizeSummariesWithStats
+                                                                                                            normalizeSummariesWithStats
                                                                                                                 (Eval.Module.buildCachedModuleSummariesFromParsed parsedPackageSources)
 
                                                                                                         packageSummaries =
@@ -2604,7 +2848,7 @@ evalWith (InterpreterProject project) { imports, expression } k =
                     <|
                         \combinedHash ->
                             -- Cache the interpreter computation
-                            Cache.compute [ "interpret" ]
+                            Cache.compute [ "interpret", interpreterResultCacheVersion ]
                                 combinedHash
                                 (\() ->
                                     let
@@ -2726,7 +2970,7 @@ evalWithSourceOverrides (InterpreterProject project) { imports, expression, sour
                         )
                     <|
                         \combinedHash ->
-                            Cache.compute [ "interpret-with-overrides" ]
+                            Cache.compute [ "interpret-with-overrides", interpreterResultCacheVersion ]
                                 combinedHash
                                 (\() ->
                                     let
@@ -2900,7 +3144,7 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
     in
     Cache.do (Cache.writeFile semanticCacheKey Cache.succeed) <|
         \semanticHash ->
-            Cache.compute [ "interpret-with-file-overrides" ]
+            Cache.compute [ "interpret-with-file-overrides", interpreterResultCacheVersion ]
                 semanticHash
                 (\() ->
                     let
@@ -3272,6 +3516,9 @@ evalErrorKindToString kind =
 
         Types.TailCall _ ->
             "internal TCO signal (should not be user-visible)"
+
+        Types.TailCallLocals _ ->
+            "internal resolved TCO signal (should not be user-visible)"
 
 
 {-| Get the pre-built package environment. Useful for direct eval calls
