@@ -370,7 +370,7 @@ repeatJsonDecode iterations jsonString acc =
 
 packageSummaryCacheVersion : String
 packageSummaryCacheVersion =
-    "v21"
+    "v22"
 
 
 packageSummaryCacheBlobPath : String -> String -> String
@@ -2923,7 +2923,17 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                     "ERROR: Parsing error"
 
                                 Types.EvalError evalErr ->
-                                    "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+                                    "ERROR: Eval error: "
+                                        ++ evalErrorKindToString evalErr.error
+                                        ++ " [module: "
+                                        ++ String.join "." evalErr.currentModule
+                                        ++ "] [stack: "
+                                        ++ (evalErr.callStack
+                                                |> List.take 10
+                                                |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name)
+                                                |> String.join " <- "
+                                           )
+                                        ++ "]"
 
                         Ok overrideFiles ->
                             let
@@ -2992,6 +3002,15 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                 Err (Types.EvalError evalErr) ->
                                     "ERROR: Eval error: "
                                         ++ evalErrorKindToString evalErr.error
+                                        ++ " [module: "
+                                        ++ String.join "." evalErr.currentModule
+                                        ++ "] [stack: "
+                                        ++ (evalErr.callStack
+                                                |> List.take 10
+                                                |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name)
+                                                |> String.join " <- "
+                                           )
+                                        ++ "]"
                 )
                 k
 
@@ -3124,7 +3143,17 @@ evalSimple (InterpreterProject project) { imports, expression, sourceOverrides }
                 "ERROR: Parsing error"
 
             Err (Types.EvalError evalErr) ->
-                "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+                "ERROR: Eval error: "
+                    ++ evalErrorKindToString evalErr.error
+                    ++ " [module: "
+                    ++ String.join "." evalErr.currentModule
+                    ++ "] [stack: "
+                    ++ (evalErr.callStack
+                            |> List.take 10
+                            |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name)
+                            |> String.join " <- "
+                       )
+                    ++ "]"
         )
 
 
@@ -3201,7 +3230,17 @@ evalWithCoverage (InterpreterProject project) { imports, expression, sourceOverr
                     "ERROR: Parsing error"
 
                 Err (Types.EvalError evalErr) ->
-                    "ERROR: Eval error: " ++ evalErrorKindToString evalErr.error
+                    "ERROR: Eval error: "
+                        ++ evalErrorKindToString evalErr.error
+                        ++ " [module: "
+                        ++ String.join "." evalErr.currentModule
+                        ++ "] [stack: "
+                        ++ (evalErr.callStack
+                                |> List.take 10
+                                |> List.map (\ref -> String.join "." ref.moduleName ++ "." ++ ref.name)
+                                |> String.join " <- "
+                           )
+                        ++ "]"
     in
     BackendTask.succeed { result = resultString, coveredRanges = coveredRanges }
 

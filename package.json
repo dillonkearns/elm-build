@@ -5,6 +5,8 @@
         "elm-test-rs": "^3.0.2-0"
     },
     "scripts": {
-        "start": "bunx elm-pages run src/Build.elm"
+        "start": "bunx elm-pages run src/Build.elm",
+        "bench:external-suites": "node bench/external-test-oracle.mjs",
+        "bench:external-suites:sync": "node bench/external-test-oracle.mjs --sync-only"
     }
 }

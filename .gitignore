@@ -17,3 +17,5 @@ bun.lockb
 reports/
 dist/
 bench/profiles/
+bench/external-suites/checkouts/
+bench/external-suites/results/

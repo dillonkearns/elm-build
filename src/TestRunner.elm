@@ -21,21 +21,29 @@ import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import DepGraph
-import Elm.Syntax.Expression exposing (Expression(..))
 import FatalError exposing (FatalError)
 import InterpreterProject exposing (InterpreterProject)
+import Json.Encode
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
 import TestAnalysis
 import Time
-import Types exposing (Value(..))
+import Types
+
+
+type ReportFormat
+    = ReportConsole
+    | ReportJson
 
 
 type alias Config =
     { testFile : Maybe String
     , sourceDirs : List String
     , buildDirectory : Path
+    , reportFormat : ReportFormat
+    , fuzzRuns : Int
+    , seed : Int
     }
 
 
@@ -58,6 +66,35 @@ programConfig =
                         |> Option.map (Maybe.withDefault ".elm-build" >> Path.path)
                         |> Option.withDescription "Build/cache directory (default: .elm-build)"
                     )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "report"
+                        |> Option.map
+                            (Maybe.map parseReportFormat
+                                >> Maybe.withDefault ReportConsole
+                            )
+                        |> Option.withDescription "Output format: console or json (default: console)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "fuzz"
+                        |> Option.map
+                            (\maybeFuzz ->
+                                maybeFuzz
+                                    |> Maybe.andThen String.toInt
+                                    |> Maybe.map (max 1)
+                                    |> Maybe.withDefault 1
+                            )
+                        |> Option.withDescription "Fuzz runs per fuzz test (default: 1)"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "seed"
+                        |> Option.map
+                            (\maybeSeed ->
+                                maybeSeed
+                                    |> Maybe.andThen String.toInt
+                                    |> Maybe.withDefault 42
+                            )
+                        |> Option.withDescription "Random seed for fuzz tests (default: 42)"
+                    )
             )
 
 
@@ -68,7 +105,7 @@ run =
 
 task : Config -> BackendTask FatalError ()
 task config =
-    Do.log (Ansi.Color.fontColor Ansi.Color.brightBlue "Running tests via interpreter") <| \_ ->
+    Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.brightBlue "Running tests via interpreter")) <| \_ ->
     Do.do ensureDeps <| \_ ->
     let
         sourceDirectories =
@@ -77,17 +114,58 @@ task config =
         allDirectories =
             "tests" :: sourceDirectories
     in
-    -- Resolve the test files BEFORE loading the project so we can pass
-    -- their module names as normalization roots. The loader uses the
-    -- roots to compute the transitive import closure and only
-    -- normalizes user modules that are actually reachable from a test.
-    -- Modules outside the closure (e.g. `String.Diacritics` when running
-    -- `tests/BasicsTests.elm`) skip the eager fixpoint eval entirely.
     Do.do (resolveTestFiles config) <| \testFiles ->
     Do.do (resolveTestModuleNames testFiles) <| \testModuleNames ->
+    Do.do (loadProject config allDirectories testModuleNames) <| \project ->
+    Do.do (logIfConsole config ("Found " ++ String.fromInt (List.length testFiles) ++ " test file(s)")) <| \_ ->
+    Do.do BackendTask.Time.now <| \startTime ->
     Do.do
-        (BackendTask.Extra.timed "Loading project" "Loaded project"
-            (InterpreterProject.loadWith
+        (testFiles
+            |> List.map (\testFile -> runTestFile config project testFile)
+            |> BackendTask.Extra.sequence
+        )
+    <| \allResults ->
+    Do.do BackendTask.Time.now <| \endTime ->
+    let
+        summary =
+            { durationMs = Time.posixToMillis endTime - Time.posixToMillis startTime
+            , seed = config.seed
+            , fuzzRuns = config.fuzzRuns
+            , totalPassed = List.sum (List.map .passed allResults)
+            , totalFailed = List.sum (List.map .failed allResults)
+            , totalSkipped = List.sum (List.map .skipped allResults)
+            , files = allResults
+            }
+    in
+    Do.do (emitRunSummary config summary) <| \_ ->
+    if summary.totalFailed > 0 then
+        BackendTask.fail
+            (FatalError.build
+                { title = "Tests Failed"
+                , body = String.fromInt summary.totalFailed ++ " tests failed"
+                }
+            )
+
+    else
+        Do.noop
+
+
+type alias RunSummary =
+    { durationMs : Int
+    , seed : Int
+    , fuzzRuns : Int
+    , totalPassed : Int
+    , totalFailed : Int
+    , totalSkipped : Int
+    , files : List TestFileResult
+    }
+
+
+loadProject : Config -> List String -> List String -> BackendTask FatalError InterpreterProject
+loadProject config allDirectories testModuleNames =
+    let
+        loadTask =
+            InterpreterProject.loadWith
                 { projectDir = Path.path "."
                 , skipPackages = kernelPackages
                 , patchSource = patchSource
@@ -97,77 +175,206 @@ task config =
                 , sourceDirectories = Just allDirectories
                 , normalizationRoots = Just testModuleNames
                 }
-            )
-        )
-    <| \project ->
-    Do.log ("Found " ++ String.fromInt (List.length testFiles) ++ " test file(s)") <| \_ ->
-    Do.do BackendTask.Time.now <| \startTime ->
-    -- Run each test file
-    Do.do
-        (testFiles
-            |> List.map (\testFile -> runTestFile config project testFile)
-            |> BackendTask.Extra.sequence
-        )
-    <| \allResults ->
-    Do.do BackendTask.Time.now <| \endTime ->
-    let
-        totalPassed =
-            List.sum (List.map .passed allResults)
-
-        totalFailed =
-            List.sum (List.map .failed allResults)
-
-        totalSkipped =
-            List.sum (List.map .skipped allResults)
-
-        evalMs =
-            Time.posixToMillis endTime - Time.posixToMillis startTime
-
-        summaryColor =
-            if totalFailed == 0 && totalSkipped == 0 then
-                Ansi.Color.fontColor Ansi.Color.brightGreen
-
-            else if totalFailed > 0 then
-                Ansi.Color.fontColor Ansi.Color.brightRed
-
-            else
-                Ansi.Color.fontColor Ansi.Color.yellow
     in
-    Do.log
-        (summaryColor
-            ("\nDuration: "
-                ++ String.fromInt evalMs
-                ++ "ms\nPassed:   "
-                ++ String.fromInt totalPassed
-                ++ "\nFailed:   "
-                ++ String.fromInt totalFailed
-                ++ (if totalSkipped > 0 then
-                        "\nSkipped:  " ++ String.fromInt totalSkipped ++ " (interpreter limitations)"
+    case config.reportFormat of
+        ReportConsole ->
+            BackendTask.Extra.timed "Loading project" "Loaded project" loadTask
+
+        ReportJson ->
+            loadTask
+
+
+logIfConsole : Config -> String -> BackendTask FatalError ()
+logIfConsole config message =
+    case config.reportFormat of
+        ReportConsole ->
+            Script.log message
+
+        ReportJson ->
+            BackendTask.succeed ()
+
+
+emitRunSummary : Config -> RunSummary -> BackendTask FatalError ()
+emitRunSummary config summary =
+    case config.reportFormat of
+        ReportConsole ->
+            let
+                summaryColor =
+                    if summary.totalFailed == 0 && summary.totalSkipped == 0 then
+                        Ansi.Color.fontColor Ansi.Color.brightGreen
+
+                    else if summary.totalFailed > 0 then
+                        Ansi.Color.fontColor Ansi.Color.brightRed
 
                     else
-                        ""
-                   )
-            )
-        )
-    <| \_ ->
-    if totalFailed > 0 then
-        BackendTask.fail
-            (FatalError.build
-                { title = "Tests Failed"
-                , body = String.fromInt totalFailed ++ " tests failed"
-                }
-            )
+                        Ansi.Color.fontColor Ansi.Color.yellow
+            in
+            Script.log
+                (summaryColor
+                    ("\nDuration: "
+                        ++ String.fromInt summary.durationMs
+                        ++ "ms\nPassed:   "
+                        ++ String.fromInt summary.totalPassed
+                        ++ "\nFailed:   "
+                        ++ String.fromInt summary.totalFailed
+                        ++ (if summary.totalSkipped > 0 then
+                                "\nSkipped:  " ++ String.fromInt summary.totalSkipped ++ " (interpreter limitations)"
 
-    else
-        Do.noop
+                            else
+                                ""
+                           )
+                    )
+                )
+
+        ReportJson ->
+            encodeRunSummary summary
+                |> Json.Encode.encode 0
+                |> Script.log
+
+
+encodeRunSummary : RunSummary -> Json.Encode.Value
+encodeRunSummary summary =
+    Json.Encode.object
+        [ ( "runner", Json.Encode.string "elm-build-test-runner" )
+        , ( "complete", Json.Encode.bool (summary.totalSkipped == 0) )
+        , ( "durationMs", Json.Encode.int summary.durationMs )
+        , ( "seed", Json.Encode.int summary.seed )
+        , ( "fuzzRuns", Json.Encode.int summary.fuzzRuns )
+        , ( "totalPassed", Json.Encode.int summary.totalPassed )
+        , ( "totalFailed", Json.Encode.int summary.totalFailed )
+        , ( "totalSkipped", Json.Encode.int summary.totalSkipped )
+        , ( "files", Json.Encode.list encodeTestFileResult summary.files )
+        ]
+
+
+type alias TestCaseResult =
+    { label : String
+    , passed : Bool
+    , message : String
+    }
+
+
+encodeTestCaseResult : TestCaseResult -> Json.Encode.Value
+encodeTestCaseResult result =
+    Json.Encode.object
+        [ ( "label", Json.Encode.string result.label )
+        , ( "status"
+          , Json.Encode.string
+                (if result.passed then
+                    "pass"
+
+                 else
+                    "fail"
+                )
+          )
+        , ( "message", Json.Encode.string result.message )
+        ]
 
 
 type alias TestFileResult =
     { file : String
+    , moduleName : String
+    , status : String
+    , message : String
     , passed : Int
     , failed : Int
     , skipped : Int
+    , tests : List TestCaseResult
     }
+
+
+encodeTestFileResult : TestFileResult -> Json.Encode.Value
+encodeTestFileResult result =
+    Json.Encode.object
+        [ ( "file", Json.Encode.string result.file )
+        , ( "moduleName", Json.Encode.string result.moduleName )
+        , ( "status", Json.Encode.string result.status )
+        , ( "message", Json.Encode.string result.message )
+        , ( "passed", Json.Encode.int result.passed )
+        , ( "failed", Json.Encode.int result.failed )
+        , ( "skipped", Json.Encode.int result.skipped )
+        , ( "tests", Json.Encode.list encodeTestCaseResult result.tests )
+        ]
+
+
+type alias ParsedTestOutput =
+    { passed : Int
+    , failed : Int
+    , total : Int
+    , tests : List TestCaseResult
+    }
+
+
+parseTestOutput : String -> Maybe ParsedTestOutput
+parseTestOutput output =
+    case String.lines output |> List.head |> Maybe.withDefault "" |> String.split "," of
+        [ passStr, failStr, totalStr ] ->
+            case ( String.toInt passStr, String.toInt failStr, String.toInt totalStr ) of
+                ( Just passed, Just failed, Just total ) ->
+                    Just
+                        { passed = passed
+                        , failed = failed
+                        , total = total
+                        , tests = parseTestCaseLines (String.lines output |> List.drop 1)
+                        }
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+parseTestCaseLines : List String -> List TestCaseResult
+parseTestCaseLines lines =
+    lines
+        |> List.filterMap parseTestCaseLine
+
+
+prefixTestModuleLabel : String -> TestCaseResult -> TestCaseResult
+prefixTestModuleLabel testModuleName result =
+    let
+        expectedPrefix =
+            testModuleName ++ " > "
+    in
+    if result.label == testModuleName || String.startsWith expectedPrefix result.label then
+        result
+
+    else
+        { result | label = expectedPrefix ++ result.label }
+
+
+parseTestCaseLine : String -> Maybe TestCaseResult
+parseTestCaseLine line =
+    if String.startsWith "PASS:" line then
+        Just
+            { label = String.dropLeft 5 line
+            , passed = True
+            , message = ""
+            }
+
+    else if String.startsWith "FAIL:" line then
+        let
+            body =
+                String.dropLeft 5 line
+        in
+        case String.indexes " | " body |> List.head of
+            Just separatorIndex ->
+                Just
+                    { label = String.left separatorIndex body
+                    , passed = False
+                    , message = String.dropLeft (separatorIndex + 3) body
+                    }
+
+            Nothing ->
+                Just
+                    { label = body
+                    , passed = False
+                    , message = ""
+                    }
+
+    else
+        Nothing
 
 
 runTestFile : Config -> InterpreterProject -> String -> BackendTask FatalError TestFileResult
@@ -177,11 +384,9 @@ runTestFile config project testFile =
         testModuleName =
             DepGraph.parseModuleName testSource |> Maybe.withDefault "Tests"
 
-        -- Fast path: use type annotations to discover Test values (no eval needed)
         staticTestValues =
             TestAnalysis.discoverTestValues testSource
 
-        -- Slow path: probe all zero-arg exposed values via interpreter
         probeTestValues () =
             let
                 candidateNames =
@@ -198,7 +403,7 @@ runTestFile config project testFile =
                                 , expression = "\"probe\""
                                 }
                     in
-                    simpleTestRunnerSource :: userSources
+                    simpleTestRunnerSource config :: userSources
 
                 probeResults =
                     candidateNames
@@ -233,9 +438,19 @@ runTestFile config project testFile =
             , candidateCount = List.length candidateNames
             }
 
+        skippedResult reason skippedCount =
+            { file = testFile
+            , moduleName = testModuleName
+            , status = "skipped"
+            , message = reason
+            , passed = 0
+            , failed = 0
+            , skipped = skippedCount
+            , tests = []
+            }
+
         { testValues, rejections, candidateCount } =
             if List.isEmpty staticTestValues then
-                -- No type annotations found — fall back to probing
                 probeTestValues ()
 
             else
@@ -245,9 +460,8 @@ runTestFile config project testFile =
                 }
     in
     if List.isEmpty testValues then
-        -- Can't run this test file (interpreter limitation)
-        Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (skipped: " ++ rejections ++ ")")) <| \_ ->
-        BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = candidateCount }
+        Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (skipped: " ++ rejections ++ ")"))) <| \_ ->
+        BackendTask.succeed (skippedResult rejections (max 1 candidateCount))
 
     else
         let
@@ -267,7 +481,7 @@ runTestFile config project testFile =
                 (InterpreterProject.evalWithFileOverrides project
                     { imports = [ "SimpleTestRunner", "Test", testModuleName ]
                     , expression = evalExpression
-                    , sourceOverrides = [ simpleTestRunnerSource ]
+                    , sourceOverrides = [ simpleTestRunnerSource config ]
                     , fileOverrides = []
                     }
                     Cache.succeed
@@ -276,44 +490,70 @@ runTestFile config project testFile =
         <| \cacheResult ->
         Do.allowFatal (File.rawFile (Path.toString cacheResult.output)) <| \output ->
         if String.startsWith "ERROR:" output then
-            Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 500 output ++ ")")) <| \_ ->
-            BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = 1 }
+            let
+                message =
+                    String.trim output
+            in
+            Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 500 message ++ ")"))) <| \_ ->
+            BackendTask.succeed (skippedResult message 1)
 
         else
-            case String.split "," (String.lines output |> List.head |> Maybe.withDefault "") of
-                [ passStr, failStr, _ ] ->
+            case parseTestOutput output of
+                Just parsedOutput ->
                     let
-                        passCount =
-                            String.toInt passStr |> Maybe.withDefault 0
-
-                        failCount =
-                            String.toInt failStr |> Maybe.withDefault 0
+                        normalizedTests =
+                            parsedOutput.tests
+                                |> List.map (prefixTestModuleLabel testModuleName)
 
                         failures =
-                            String.lines output
-                                |> List.drop 1
-                                |> List.filter (String.startsWith "FAIL:")
+                            normalizedTests
+                                |> List.filter (not << .passed)
                     in
                     Do.do
-                        (if failCount == 0 then
-                            Script.log (Ansi.Color.fontColor Ansi.Color.green ("  ✓ " ++ testModuleName ++ " (" ++ String.fromInt passCount ++ " passed)"))
+                        (if parsedOutput.failed == 0 then
+                            logIfConsole config (Ansi.Color.fontColor Ansi.Color.green ("  ✓ " ++ testModuleName ++ " (" ++ String.fromInt parsedOutput.passed ++ " passed)"))
 
                          else
                             Do.do
-                                (Script.log (Ansi.Color.fontColor Ansi.Color.red ("  ✗ " ++ testModuleName ++ " (" ++ String.fromInt failCount ++ " failed, " ++ String.fromInt passCount ++ " passed)")))
+                                (logIfConsole config (Ansi.Color.fontColor Ansi.Color.red ("  ✗ " ++ testModuleName ++ " (" ++ String.fromInt parsedOutput.failed ++ " failed, " ++ String.fromInt parsedOutput.passed ++ " passed)")))
                             <| \_ ->
                             Do.each failures
-                                (\line ->
-                                    Script.log (Ansi.Color.fontColor Ansi.Color.red ("      " ++ line))
+                                (\failure ->
+                                    logIfConsole config
+                                        (Ansi.Color.fontColor Ansi.Color.red
+                                            ("      FAIL:"
+                                                ++ failure.label
+                                                ++ (if String.isEmpty failure.message then
+                                                        ""
+
+                                                    else
+                                                        " | " ++ failure.message
+                                                   )
+                                            )
+                                        )
                                 )
                                 (\_ -> BackendTask.succeed ())
                         )
                     <| \_ ->
-                    BackendTask.succeed { file = testFile, passed = passCount, failed = failCount, skipped = 0 }
+                    BackendTask.succeed
+                        { file = testFile
+                        , moduleName = testModuleName
+                        , status =
+                            if parsedOutput.failed == 0 then
+                                "passed"
 
-                _ ->
-                    Do.log (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (unexpected output)")) <| \_ ->
-                    BackendTask.succeed { file = testFile, passed = 0, failed = 0, skipped = 1 }
+                            else
+                                "failed"
+                        , message = ""
+                        , passed = parsedOutput.passed
+                        , failed = parsedOutput.failed
+                        , skipped = 0
+                        , tests = normalizedTests
+                        }
+
+                Nothing ->
+                    Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (unexpected output)"))) <| \_ ->
+                    BackendTask.succeed (skippedResult "unexpected output" 1)
 
 
 {-| Discover test files: use --test if provided, otherwise find all tests/**/*.elm that import Test.
@@ -413,8 +653,18 @@ ensureDeps =
             )
 
 
-simpleTestRunnerSource : String
-simpleTestRunnerSource =
+parseReportFormat : String -> ReportFormat
+parseReportFormat rawValue =
+    case String.toLower (String.trim rawValue) of
+        "json" ->
+            ReportJson
+
+        _ ->
+            ReportConsole
+
+
+simpleTestRunnerSource : Config -> String
+simpleTestRunnerSource config =
     String.join "\n"
         [ "module SimpleTestRunner exposing (runToString)"
         , "import Expect"
@@ -423,7 +673,11 @@ simpleTestRunnerSource =
         , "import Test.Runner"
         , "runToString suite ="
         , "    let"
-        , "        runners = case Test.Runner.fromTest 1 (Random.initialSeed 42) suite of"
+        , "        runners = case Test.Runner.fromTest "
+            ++ String.fromInt config.fuzzRuns
+            ++ " (Random.initialSeed "
+            ++ String.fromInt config.seed
+            ++ ") suite of"
         , "            Test.Runner.Plain list -> Ok list"
         , "            Test.Runner.Only list -> Ok list"
         , "            Test.Runner.Skipping list -> Ok list"

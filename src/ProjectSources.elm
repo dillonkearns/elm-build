@@ -19,6 +19,7 @@ import Dict exposing (Dict)
 import FatalError exposing (FatalError)
 import Json.Decode as Decode
 import Json.Encode
+import PackageVersion
 import Pages.Script as Script
 import Path exposing (Path)
 import Result.Extra
@@ -132,19 +133,7 @@ loadPackageDeps { projectDir, skipPackages } =
     Do.allowFatal (File.rawFile (projectPath ++ "/elm.json")) <| \elmJsonRaw ->
     Do.do (decodeElmJson elmJsonRaw) <| \elmJson ->
     Do.do resolveElmHome <| \elmHome ->
-    Do.do
-        (resolvePackageVersions elmHome
-            (Dict.union elmJson.directDeps elmJson.indirectDeps
-                |> Dict.remove "elm/core"
-            )
-        )
-    <| \directDeps ->
-    Do.do (resolveTransitiveDeps elmHome directDeps) <| \allDepsWithKernel ->
-    let
-        allDeps =
-            allDepsWithKernel
-                |> Dict.filter (\name _ -> not (Set.member name skipPackages))
-    in
+    Do.do (resolvePackageDeps elmHome elmJson skipPackages) <| \allDeps ->
     Do.do (loadPackageDepGraphs elmHome allDeps) <| \pkgDepGraphs ->
     let
         sortedPackageNames : List String
@@ -157,8 +146,9 @@ loadPackageDeps { projectDir, skipPackages } =
 
 {-| Like `loadPackageDeps` but caches raw package sources on disk.
 
-Cache key is elm.json content + sorted skipPackages. On hit, reads the
-cached blob (~5ms) instead of re-globbing ELM\_HOME (~150ms).
+Cache key is elm.json content + sorted skipPackages + resolved exact package
+versions. On hit, reads the cached blob (~5ms) instead of re-globbing ELM\_HOME
+(~150ms).
 
 -}
 loadPackageDepsCached :
@@ -187,10 +177,17 @@ loadPackageDepsCached { projectDir, skipPackages } =
             "\n---PKG_SEPARATOR---\n"
     in
     Do.allowFatal (File.rawFile (projectPath ++ "/elm.json")) <| \elmJsonContent ->
+    Do.do (decodeElmJson elmJsonContent) <| \elmJson ->
+    Do.do resolveElmHome <| \elmHome ->
+    Do.do (resolvePackageDeps elmHome elmJson skipPackages) <| \resolvedDeps ->
     let
         expectedKey : String
         expectedKey =
-            elmJsonContent ++ "\n---SKIP---\n" ++ (skipPackages |> Set.toList |> String.join ",")
+            elmJsonContent
+                ++ "\n---SKIP---\n"
+                ++ (skipPackages |> Set.toList |> String.join ",")
+                ++ "\n---RESOLVED---\n"
+                ++ resolvedDepsCacheKey resolvedDeps
     in
     File.rawFile cacheKeyPath
         |> BackendTask.toResult
@@ -225,6 +222,15 @@ loadAndWriteCache expectedKey separator cacheDir cacheKeyPath cacheBlobPath proj
     Do.allowFatal (Script.writeFile { path = cacheKeyPath, body = expectedKey }) <| \_ ->
     Do.allowFatal (Script.writeFile { path = cacheBlobPath, body = String.join separator sources }) <| \_ ->
     BackendTask.succeed sources
+
+
+resolvedDepsCacheKey : Dict String String -> String
+resolvedDepsCacheKey resolvedDeps =
+    resolvedDeps
+        |> Dict.toList
+        |> List.sortBy Tuple.first
+        |> List.map (\( name, version ) -> name ++ "@" ++ version)
+        |> String.join "\n"
 
 
 {-| Decoded fields from the project elm.json.
@@ -331,23 +337,40 @@ resolvePackageVersions elmHome deps =
                         )
                         (pkgDir ++ "/*")
                         |> BackendTask.andThen
-                            (\versions ->
-                                case versions |> List.sort |> List.reverse |> List.head of
-                                    Just latestPath ->
+                            (\versionPaths ->
+                                let
+                                    installedVersions =
+                                        versionPaths
+                                            |> List.filterMap
+                                                (\path ->
+                                                    path
+                                                        |> String.split "/"
+                                                        |> List.reverse
+                                                        |> List.head
+                                                )
+                                in
+                                case PackageVersion.chooseLatestCompatibleVersion versionOrRange installedVersions of
+                                    Just latestVersion ->
                                         let
-                                            version =
-                                                latestPath
-                                                    |> String.split "/"
-                                                    |> List.reverse
-                                                    |> List.head
-                                                    |> Maybe.withDefault versionOrRange
+                                            resolvedVersion =
+                                                latestVersion
                                         in
-                                        BackendTask.succeed ( pkgName, version )
+                                        BackendTask.succeed ( pkgName, resolvedVersion )
 
                                     Nothing ->
                                         BackendTask.fail
                                             (FatalError.fromString
-                                                ("Package " ++ pkgName ++ " not installed. Run elm install first.")
+                                                ("Package "
+                                                    ++ pkgName
+                                                    ++ " has no installed version matching "
+                                                    ++ (if String.isEmpty versionOrRange then
+                                                            "the requested range"
+
+                                                        else
+                                                            versionOrRange
+                                                       )
+                                                    ++ ". Run elm install first."
+                                                )
                                             )
                             )
 
@@ -357,6 +380,20 @@ resolvePackageVersions elmHome deps =
             )
         |> BackendTask.Extra.combine
         |> BackendTask.map Dict.fromList
+
+
+resolvePackageDeps : String -> ElmJsonDeps -> Set String -> BackendTask FatalError (Dict String String)
+resolvePackageDeps elmHome elmJson skipPackages =
+    resolvePackageVersions elmHome
+        (Dict.union elmJson.directDeps elmJson.indirectDeps
+            |> Dict.remove "elm/core"
+        )
+        |> BackendTask.andThen (resolveTransitiveDeps elmHome)
+        |> BackendTask.map
+            (\allDepsWithKernel ->
+                allDepsWithKernel
+                    |> Dict.filter (\name _ -> not (Set.member name skipPackages))
+            )
 
 
 {-| Recursively discover transitive package dependencies.
