@@ -1797,24 +1797,18 @@ encodeImportedNames importedNames =
         [ encodeQualifiedMapping importedNames.aliases
         , encodeQualifiedMapping importedNames.exposedValues
         , encodeQualifiedMapping importedNames.exposedConstructors
-        , encodeQualifiedMapping importedNames.qualifiedValues
-        , encodeQualifiedMapping importedNames.qualifiedConstructors
         ]
 
 
 decodeImportedNames : Lamdera.Wire3.Decoder Types.ImportedNames
 decodeImportedNames =
     Lamdera.Wire3.succeedDecode
-        (\aliases exposedValues exposedConstructors qualifiedValues qualifiedConstructors ->
+        (\aliases exposedValues exposedConstructors ->
             { aliases = aliases
             , exposedValues = exposedValues
             , exposedConstructors = exposedConstructors
-            , qualifiedValues = qualifiedValues
-            , qualifiedConstructors = qualifiedConstructors
             }
         )
-        |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
-        |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
         |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
         |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
         |> Lamdera.Wire3.andMapDecode decodeQualifiedMapping
@@ -1826,35 +1820,21 @@ encodeImportedNamesJson importedNames =
         [ ( "aliases", encodeQualifiedMappingJson importedNames.aliases )
         , ( "exposedValues", encodeQualifiedMappingJson importedNames.exposedValues )
         , ( "exposedConstructors", encodeQualifiedMappingJson importedNames.exposedConstructors )
-        , ( "qualifiedValues", encodeQualifiedMappingJson importedNames.qualifiedValues )
-        , ( "qualifiedConstructors", encodeQualifiedMappingJson importedNames.qualifiedConstructors )
         ]
 
 
 decodeImportedNamesJson : Decode.Decoder Types.ImportedNames
 decodeImportedNamesJson =
-    Decode.map5
-        (\aliases exposedValues exposedConstructors qualifiedValues qualifiedConstructors ->
+    Decode.map3
+        (\aliases exposedValues exposedConstructors ->
             { aliases = aliases
             , exposedValues = exposedValues
             , exposedConstructors = exposedConstructors
-            , qualifiedValues = qualifiedValues
-            , qualifiedConstructors = qualifiedConstructors
             }
         )
         (Decode.field "aliases" decodeQualifiedMappingJson)
         (Decode.field "exposedValues" decodeQualifiedMappingJson)
         (Decode.field "exposedConstructors" decodeQualifiedMappingJson)
-        (Decode.oneOf
-            [ Decode.field "qualifiedValues" decodeQualifiedMappingJson
-            , Decode.succeed FastDict.empty
-            ]
-        )
-        (Decode.oneOf
-            [ Decode.field "qualifiedConstructors" decodeQualifiedMappingJson
-            , Decode.succeed FastDict.empty
-            ]
-        )
 
 
 encodeQualifiedMapping : FastDict.Dict String ( ModuleName, String ) -> Lamdera.Wire3.Encoder
@@ -3775,9 +3755,6 @@ evalErrorKindToString kind =
 
         Types.TailCall _ ->
             "internal TCO signal (should not be user-visible)"
-
-        Types.TailCallLocals _ ->
-            "internal resolved TCO signal (should not be user-visible)"
 
 
 {-| Get the pre-built package environment. Useful for direct eval calls

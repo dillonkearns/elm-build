@@ -1058,9 +1058,6 @@ evalErrorKindToString kind =
         Types.TailCall _ ->
             "internal TCO signal"
 
-        Types.TailCallLocals _ ->
-            "internal resolved TCO signal"
-
 
 patchSource : String -> String
 patchSource source =
