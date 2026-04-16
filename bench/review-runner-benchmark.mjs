@@ -27,6 +27,12 @@ const hostImportersExperiments = process.argv.includes("--host-importers-experim
 const envMode = process.argv.includes("--env-mode")
   ? process.argv[process.argv.indexOf("--env-mode") + 1]
   : "legacy-ast";
+const userNormalizationExperiment = process.argv.includes("--user-normalization-experiment")
+  ? process.argv[process.argv.indexOf("--user-normalization-experiment") + 1]
+  : null;
+const coldCombineFreshProjectRuleSlicesExperiment = process.argv.includes(
+  "--cold-combine-fresh-project-rule-slices-experiment"
+);
 
 function hostExperimentArgs() {
   if (!hostImportersExperiments) {
@@ -145,6 +151,12 @@ function bundleRunner() {
 }
 
 function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersCacheMode, depsCacheMode }) {
+  const experimentArgs = userNormalizationExperiment
+    ? ["--user-normalization-experiment", userNormalizationExperiment]
+    : [];
+  const projectGroupingArgs = coldCombineFreshProjectRuleSlicesExperiment
+    ? ["--cold-combine-fresh-project-rule-slices-experiment"]
+    : [];
   const start = performance.now();
   const result = spawnSync(
     "node",
@@ -166,6 +178,8 @@ function runBundledReviewRunner({ fixtureSrcDir, buildDir, tracePath, importersC
       envMode,
       "--perf-trace-json",
       tracePath,
+      ...experimentArgs,
+      ...projectGroupingArgs,
       ...hostExperimentArgs(),
     ],
     {
@@ -206,6 +220,9 @@ function scenarioResult(name, runResult) {
     importers_cache_mode: importersCacheMode,
     deps_cache_mode: depsCacheMode,
     host_importers_experiments: hostImportersExperiments,
+    user_normalization_experiment: userNormalizationExperiment,
+    cold_combine_fresh_project_rule_slices_experiment:
+      coldCombineFreshProjectRuleSlicesExperiment,
     wall_ms: Math.round(runResult.wallMs),
     internal_ms: sumStageMs(runResult.trace),
     exit_code: runResult.exitCode,
@@ -336,6 +353,9 @@ function main() {
     runner: path.relative(repoRoot, distRunnerPath),
     importers_cache_mode: importersCacheMode,
     deps_cache_mode: depsCacheMode,
+    user_normalization_experiment: userNormalizationExperiment,
+    cold_combine_fresh_project_rule_slices_experiment:
+      coldCombineFreshProjectRuleSlicesExperiment,
     fixtures: selectedFixtures.map((fixture) => fixtureResult(fixture.name, fixture.fileNames)),
   };
 

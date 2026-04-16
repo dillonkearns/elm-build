@@ -7,6 +7,8 @@ Usage:
 
 Or with no args to auto-discover test files.
 
+Add `--load-profile` to print user-normalization rewrite stats after load.
+
 -}
 
 import Ansi.Color
@@ -24,6 +26,7 @@ import DepGraph
 import FatalError exposing (FatalError)
 import InterpreterProject exposing (InterpreterProject)
 import Json.Encode
+import NormalizationFlags
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
@@ -44,6 +47,21 @@ type alias Config =
     , reportFormat : ReportFormat
     , fuzzRuns : Int
     , seed : Int
+    , loadProfile : Bool
+    , userNormalizationExperiment : Maybe String
+    }
+
+
+type alias UserNormalizationExperiment =
+    { label : String
+    , flags : NormalizationFlags.NormalizationFlags
+    }
+
+
+type alias LoadedProject =
+    { project : InterpreterProject
+    , profile : Maybe InterpreterProject.LoadProfile
+    , experimentLabel : Maybe String
     }
 
 
@@ -95,6 +113,14 @@ programConfig =
                             )
                         |> Option.withDescription "Random seed for fuzz tests (default: 42)"
                     )
+                |> OptionsParser.with
+                    (Option.flag "load-profile"
+                        |> Option.withDescription "Print load-time user normalization and rewrite counters"
+                    )
+                |> OptionsParser.with
+                    (Option.optionalKeywordArg "user-normalization-experiment"
+                        |> Option.withDescription "Opt-in user-source normalization preset (for example: none, default, inline-5, precomputed-refs, list-fusion-off)"
+                    )
             )
 
 
@@ -105,49 +131,67 @@ run =
 
 task : Config -> BackendTask FatalError ()
 task config =
-    Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.brightBlue "Running tests via interpreter")) <| \_ ->
-    Do.do ensureDeps <| \_ ->
-    let
-        sourceDirectories =
-            "src" :: config.sourceDirs
+    case resolveUserNormalizationExperiment config.userNormalizationExperiment of
+        Err message ->
+            BackendTask.fail (FatalError.fromString message)
 
-        allDirectories =
-            "tests" :: sourceDirectories
-    in
-    Do.do (resolveTestFiles config) <| \testFiles ->
-    Do.do (resolveTestModuleNames testFiles) <| \testModuleNames ->
-    Do.do (loadProject config allDirectories testModuleNames) <| \project ->
-    Do.do (logIfConsole config ("Found " ++ String.fromInt (List.length testFiles) ++ " test file(s)")) <| \_ ->
-    Do.do BackendTask.Time.now <| \startTime ->
-    Do.do
-        (testFiles
-            |> List.map (\testFile -> runTestFile config project testFile)
-            |> BackendTask.Extra.sequence
-        )
-    <| \allResults ->
-    Do.do BackendTask.Time.now <| \endTime ->
-    let
-        summary =
-            { durationMs = Time.posixToMillis endTime - Time.posixToMillis startTime
-            , seed = config.seed
-            , fuzzRuns = config.fuzzRuns
-            , totalPassed = List.sum (List.map .passed allResults)
-            , totalFailed = List.sum (List.map .failed allResults)
-            , totalSkipped = List.sum (List.map .skipped allResults)
-            , files = allResults
-            }
-    in
-    Do.do (emitRunSummary config summary) <| \_ ->
-    if summary.totalFailed > 0 then
-        BackendTask.fail
-            (FatalError.build
-                { title = "Tests Failed"
-                , body = String.fromInt summary.totalFailed ++ " tests failed"
-                }
-            )
+        Ok maybeExperiment ->
+            Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.brightBlue "Running tests via interpreter")) <| \_ ->
+            Do.do ensureDeps <| \_ ->
+            let
+                sourceDirectories =
+                    "src" :: config.sourceDirs
 
-    else
-        Do.noop
+                allDirectories =
+                    "tests" :: sourceDirectories
+            in
+            Do.do (resolveTestFiles config) <| \testFiles ->
+            Do.do (resolveTestModuleNames testFiles) <| \testModuleNames ->
+            Do.do (loadProject config maybeExperiment allDirectories testModuleNames) <| \loaded ->
+            Do.do
+                (case loaded.profile of
+                    Just profile ->
+                        if config.loadProfile then
+                            logIfConsole config (formatLoadProfile loaded.experimentLabel profile)
+
+                        else
+                            BackendTask.succeed ()
+
+                    Nothing ->
+                        BackendTask.succeed ()
+                )
+            <| \_ ->
+            Do.do (logIfConsole config ("Found " ++ String.fromInt (List.length testFiles) ++ " test file(s)")) <| \_ ->
+            Do.do BackendTask.Time.now <| \startTime ->
+            Do.do
+                (testFiles
+                    |> List.map (\testFile -> runTestFile config loaded.project testFile)
+                    |> BackendTask.Extra.sequence
+                )
+            <| \allResults ->
+            Do.do BackendTask.Time.now <| \endTime ->
+            let
+                summary =
+                    { durationMs = Time.posixToMillis endTime - Time.posixToMillis startTime
+                    , seed = config.seed
+                    , fuzzRuns = config.fuzzRuns
+                    , totalPassed = List.sum (List.map .passed allResults)
+                    , totalFailed = List.sum (List.map .failed allResults)
+                    , totalSkipped = List.sum (List.map .skipped allResults)
+                    , files = allResults
+                    }
+            in
+            Do.do (emitRunSummary config summary) <| \_ ->
+            if summary.totalFailed > 0 then
+                BackendTask.fail
+                    (FatalError.build
+                        { title = "Tests Failed"
+                        , body = String.fromInt summary.totalFailed ++ " tests failed"
+                        }
+                    )
+
+            else
+                Do.noop
 
 
 type alias RunSummary =
@@ -161,20 +205,74 @@ type alias RunSummary =
     }
 
 
-loadProject : Config -> List String -> List String -> BackendTask FatalError InterpreterProject
-loadProject config allDirectories testModuleNames =
+loadProject : Config -> Maybe UserNormalizationExperiment -> List String -> List String -> BackendTask FatalError LoadedProject
+loadProject config maybeExperiment allDirectories testModuleNames =
     let
+        baseLoadConfig =
+            { projectDir = Path.path "."
+            , skipPackages = kernelPackages
+            , patchSource = patchSource
+            , patchUserSource = \_ source -> source
+            , extraSourceFiles = []
+            , extraReachableImports = [ "Test", "Fuzz", "Expect", "Test.Runner" ]
+            , sourceDirectories = Just allDirectories
+            , normalizationRoots = Just testModuleNames
+            }
+
+        profileLoadConfig =
+            { projectDir = Path.path "."
+            , skipPackages = kernelPackages
+            , patchSource = patchSource
+            , patchUserSource = \_ source -> source
+            , extraSourceFiles = []
+            , extraReachableImports = [ "Test", "Fuzz", "Expect", "Test.Runner" ]
+            , sourceDirectories = Just allDirectories
+            , normalizationRoots = Just testModuleNames
+            , packageParseCacheDir = Just ".elm-build"
+            }
+
+        loadTask : BackendTask FatalError LoadedProject
         loadTask =
-            InterpreterProject.loadWith
-                { projectDir = Path.path "."
-                , skipPackages = kernelPackages
-                , patchSource = patchSource
-                , patchUserSource = \_ source -> source
-                , extraSourceFiles = []
-                , extraReachableImports = [ "Test", "Fuzz", "Expect", "Test.Runner" ]
-                , sourceDirectories = Just allDirectories
-                , normalizationRoots = Just testModuleNames
-                }
+            case ( config.loadProfile, maybeExperiment ) of
+                ( True, Just experiment ) ->
+                    InterpreterProject.loadWithProfileUserNormalizationFlags experiment.flags profileLoadConfig
+                        |> BackendTask.map
+                            (\loaded ->
+                                { project = loaded.project
+                                , profile = Just loaded.profile
+                                , experimentLabel = Just experiment.label
+                                }
+                            )
+
+                ( True, Nothing ) ->
+                    InterpreterProject.loadWithProfile profileLoadConfig
+                        |> BackendTask.map
+                            (\loaded ->
+                                { project = loaded.project
+                                , profile = Just loaded.profile
+                                , experimentLabel = Nothing
+                                }
+                            )
+
+                ( False, Just experiment ) ->
+                    InterpreterProject.loadWithUserNormalizationFlags experiment.flags baseLoadConfig
+                        |> BackendTask.map
+                            (\project ->
+                                { project = project
+                                , profile = Nothing
+                                , experimentLabel = Just experiment.label
+                                }
+                            )
+
+                ( False, Nothing ) ->
+                    InterpreterProject.loadWith baseLoadConfig
+                        |> BackendTask.map
+                            (\project ->
+                                { project = project
+                                , profile = Nothing
+                                , experimentLabel = Nothing
+                                }
+                            )
     in
     case config.reportFormat of
         ReportConsole ->
@@ -269,6 +367,228 @@ encodeTestCaseResult result =
           )
         , ( "message", Json.Encode.string result.message )
         ]
+
+
+formatLoadProfile : Maybe String -> InterpreterProject.LoadProfile -> String
+formatLoadProfile maybeExperimentLabel profile =
+    let
+        userNormStats =
+            profile.userNormDependencySummaryStats
+
+        experimentLabel =
+            Maybe.withDefault "current-default" maybeExperimentLabel
+
+        rejectSummary =
+            formatNonZeroCounters
+                [ ( "pattern", userNormStats.inlineRejectedPattern )
+                , ( "arity", userNormStats.inlineRejectedArity )
+                , ( "self_call", userNormStats.inlineRejectedSelfCall )
+                , ( "body_too_large", userNormStats.inlineRejectedBodyTooLarge )
+                , ( "unsafe", userNormStats.inlineRejectedUnsafe )
+                , ( "internal_helper", userNormStats.inlineRejectedInternalHelper )
+                ]
+
+        payoffSummary =
+            formatNonZeroCounters
+                [ ( "changed", userNormStats.inlinePayoffChanged )
+                , ( "inline", userNormStats.inlinePayoffInline )
+                , ( "constant_fold", userNormStats.inlinePayoffConstantFold )
+                , ( "precomputed_ref", userNormStats.inlinePayoffPrecomputedRef )
+                ]
+
+        shadowRejectSummary =
+            formatNonZeroCounters
+                [ ( "collection", userNormStats.inlineShadowRejectCollection )
+                , ( "growth0", userNormStats.inlineShadowRejectGrowth0 )
+                , ( "growth1", userNormStats.inlineShadowRejectGrowth1 )
+                ]
+
+        sampleLines =
+            userNormStats.rejectSamples
+                |> List.take 6
+                |> List.indexedMap
+                    (\index sample ->
+                        "  reject_sample_" ++ String.fromInt (index + 1) ++ "=" ++ sample
+                    )
+    in
+    String.join "\n"
+        ([ "Load profile:"
+         , "  user_norm_experiment=" ++ experimentLabel
+         , "  build_base_user_env_ms=" ++ String.fromInt profile.buildBaseUserEnvMs
+         , "  user_norm_modules_planned=" ++ String.fromInt profile.userNormModulesPlanned
+            ++ " target_functions="
+            ++ String.fromInt profile.userNormTargetFunctions
+         , "  user_norm_cache_hit_modules=" ++ String.fromInt profile.userNormCacheHitModules
+            ++ " cache_miss_modules="
+            ++ String.fromInt profile.userNormCacheMissModules
+            ++ " cache_extended_modules="
+            ++ String.fromInt profile.userNormCacheExtendedModules
+         , "  user_norm_functions_visited=" ++ String.fromInt userNormStats.functionsVisited
+            ++ " rewritten_functions="
+            ++ String.fromInt profile.userNormRewrittenFunctions
+            ++ " precomputed_values="
+            ++ String.fromInt profile.userNormPrecomputedValues
+         , "  inline_candidates=" ++ String.fromInt userNormStats.inlineCandidates
+            ++ " inline_successes="
+            ++ String.fromInt userNormStats.inlineSuccesses
+         , "  inline_rejects=" ++ rejectSummary
+         , "  inline_payoff=" ++ payoffSummary
+         , "  inline_shadow_rejects=" ++ shadowRejectSummary
+         , "  list_fusion_changes=" ++ String.fromInt userNormStats.listFusionChanges
+            ++ " pipeline_normalizations="
+            ++ String.fromInt userNormStats.listFusionPipelineNormalizations
+            ++ " head_flatten_rewrites="
+            ++ String.fromInt userNormStats.listFusionHeadFlattenRewrites
+            ++ " rule_rewrites="
+            ++ String.fromInt userNormStats.listFusionRuleRewrites
+         , "  constant_folds=" ++ String.fromInt userNormStats.constantFolds
+            ++ " precomputed_ref_substitutions="
+            ++ String.fromInt userNormStats.precomputedRefSubstitutions
+         ]
+            ++ sampleLines
+        )
+
+
+resolveUserNormalizationExperiment : Maybe String -> Result String (Maybe UserNormalizationExperiment)
+resolveUserNormalizationExperiment maybeExperimentName =
+    case maybeExperimentName of
+        Nothing ->
+            Ok Nothing
+
+        Just experimentName ->
+            parseUserNormalizationExperiment experimentName
+                |> Maybe.map Just
+                |> Result.fromMaybe
+                    ("Unknown user normalization experiment `"
+                        ++ experimentName
+                        ++ "`. Expected one of: "
+                        ++ String.join ", " knownUserNormalizationExperiments
+                    )
+
+
+parseUserNormalizationExperiment : String -> Maybe UserNormalizationExperiment
+parseUserNormalizationExperiment rawName =
+    let
+        name =
+            String.toLower rawName
+
+        defaultFlags =
+            NormalizationFlags.default
+
+        mk label flags =
+            { label = label, flags = flags }
+    in
+    case name of
+        "default" ->
+            Just (mk "default" NormalizationFlags.default)
+
+        "experimental" ->
+            Just (mk "experimental" NormalizationFlags.experimental)
+
+        "none" ->
+            Just (mk "none" NormalizationFlags.none)
+
+        "precomputed-refs" ->
+            Just
+                (mk "precomputed-refs"
+                    { defaultFlags
+                        | inlinePrecomputedRefs = True
+                    }
+                )
+
+        "inline-5" ->
+            Just
+                (mk "inline-5"
+                    { defaultFlags
+                        | inlineFunctions = True
+                        , inlineFunctionMaxSize = 5
+                    }
+                )
+
+        "inline-20" ->
+            Just
+                (mk "inline-20"
+                    { defaultFlags
+                        | inlineFunctions = True
+                        , inlineFunctionMaxSize = 20
+                    }
+                )
+
+        "inline-5-precomputed-refs" ->
+            Just
+                (mk "inline-5-precomputed-refs"
+                    { defaultFlags
+                        | inlinePrecomputedRefs = True
+                        , inlineFunctions = True
+                        , inlineFunctionMaxSize = 5
+                    }
+                )
+
+        "inline-20-precomputed-refs" ->
+            Just
+                (mk "inline-20-precomputed-refs"
+                    { defaultFlags
+                        | inlinePrecomputedRefs = True
+                        , inlineFunctions = True
+                        , inlineFunctionMaxSize = 20
+                    }
+                )
+
+        "fixpoint-off" ->
+            Just
+                (mk "fixpoint-off"
+                    { defaultFlags
+                        | runFixpoint = False
+                        , fixpointPasses = 0
+                        , tryNormalizeMaxSteps = 0
+                    }
+                )
+
+        "list-fusion-off" ->
+            Just
+                (mk "list-fusion-off"
+                    { defaultFlags
+                        | runListFusion = False
+                        , fuseListMaps = False
+                    }
+                )
+
+        "all" ->
+            Just (mk "all" NormalizationFlags.all)
+
+        _ ->
+            Nothing
+
+
+knownUserNormalizationExperiments : List String
+knownUserNormalizationExperiments =
+    [ "default"
+    , "experimental"
+    , "none"
+    , "precomputed-refs"
+    , "inline-5"
+    , "inline-20"
+    , "inline-5-precomputed-refs"
+    , "inline-20-precomputed-refs"
+    , "fixpoint-off"
+    , "list-fusion-off"
+    , "all"
+    ]
+
+
+formatNonZeroCounters : List ( String, Int ) -> String
+formatNonZeroCounters counters =
+    let
+        nonZeroCounters =
+            counters
+                |> List.filter (\( _, count ) -> count > 0)
+                |> List.map (\( label, count ) -> label ++ "=" ++ String.fromInt count)
+    in
+    if List.isEmpty nonZeroCounters then
+        "none"
+
+    else
+        String.join ", " nonZeroCounters
 
 
 type alias TestFileResult =

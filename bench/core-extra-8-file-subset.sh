@@ -9,19 +9,16 @@
 # Usage:
 #   bash bench/core-extra-8-file-subset.sh /abs/path/to/elmcraft/core-extra
 #
-# Prereqs on $PATH: hyperfine, elm-test, node.
-# The current repo's myscript.mjs must already be built (npx elm-pages
-# bundle-script src/TestRunner.elm writes it to the repo root).
+# Prereqs on $PATH: hyperfine, elm-test, npx.
 
 set -euo pipefail
 
 CORE_EXTRA_DIR=${1:?"usage: $0 /abs/path/to/elmcraft/core-extra"}
 BUILD_DIR=$(cd "$(dirname "$0")/.." && pwd)
-SCRIPT="$BUILD_DIR/myscript.mjs"
+RUNNER_ELM="$BUILD_DIR/src/TestRunner.elm"
 
-if [ ! -f "$SCRIPT" ]; then
-  echo "myscript.mjs not found at $SCRIPT. Run:" >&2
-  echo "  cd $BUILD_DIR && npx elm-pages bundle-script src/TestRunner.elm" >&2
+if [ ! -f "$RUNNER_ELM" ]; then
+  echo "TestRunner.elm not found at $RUNNER_ELM" >&2
   exit 1
 fi
 
@@ -50,7 +47,7 @@ hyperfine \
   --min-runs 12 \
   --prepare "find .elm-build -maxdepth 1 -type f ! -name 'package-*' -delete" \
   -n "TestRunner (warm pkgs, cold user)" \
-  "node --stack-size=8192 $SCRIPT --test $TESTS_COMMA" \
+  "npx elm-pages run \"$RUNNER_ELM\" --test $TESTS_COMMA" \
   --prepare "rm -rf elm-stuff" \
   -n "elm-test (cold elm-stuff)" \
   "elm-test $TESTS_SPACED"

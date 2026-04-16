@@ -7,11 +7,13 @@
 # timeouts instead of assuming every run completes.
 #
 # Usage:
-#   bash bench/elm-markdown-ab.sh /abs/path/to/elm-markdown [runs] [test-file] [timeout-secs]
+#   bash bench/elm-markdown-ab.sh /abs/path/to/elm-markdown [runs] [test-file|auto] [timeout-secs] [runner-args...]
 #
 # Examples:
 #   bash bench/elm-markdown-ab.sh /tmp/elm-markdown-fresh-2026-04-15
 #   bash bench/elm-markdown-ab.sh /tmp/elm-markdown-fresh-2026-04-15 3 tests/Tests.elm 60
+#   bash bench/elm-markdown-ab.sh /tmp/elm-markdown-fresh-2026-04-15 3 auto 60
+#   bash bench/elm-markdown-ab.sh /tmp/elm-markdown-fresh-2026-04-15 3 tests/Tests.elm 60 --user-normalization-experiment fixpoint-off
 
 set -euo pipefail
 
@@ -19,14 +21,18 @@ MARKDOWN_DIR=${1:?"usage: $0 /abs/path/to/elm-markdown [runs] [test-file] [timeo
 RUNS=${2:-1}
 TEST_FILE=${3:-tests/HelpersTests.elm}
 TIMEOUT_SECS=${4:-60}
+if [ $# -gt 4 ]; then
+  RUNNER_EXTRA_ARGS=("${@:5}")
+else
+  RUNNER_EXTRA_ARGS=()
+fi
 
 BUILD_DIR=$(cd "$(dirname "$0")/.." && pwd)
-SCRIPT="$BUILD_DIR/myscript.mjs"
+RUNNER_ELM="$BUILD_DIR/src/TestRunner.elm"
 RESULTS_FILE="$BUILD_DIR/bench/results/elm-markdown-ab.tsv"
 
-if [ ! -f "$SCRIPT" ]; then
-  echo "myscript.mjs not found at $SCRIPT. Run:" >&2
-  echo "  cd $BUILD_DIR && npx elm-pages bundle-script src/TestRunner.elm --output myscript.mjs" >&2
+if [ ! -f "$RUNNER_ELM" ]; then
+  echo "TestRunner.elm not found at $RUNNER_ELM" >&2
   exit 1
 fi
 
@@ -59,7 +65,10 @@ try:
         check=False,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
-    print(f"{label}\tok\t{elapsed_ms:.1f}\t{completed.returncode}")
+    if completed.returncode == 0:
+        print(f"{label}\tok\t{elapsed_ms:.1f}\t{completed.returncode}")
+    else:
+        print(f"{label}\terror\t{elapsed_ms:.1f}\t{completed.returncode}")
 except subprocess.TimeoutExpired:
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"{label}\ttimeout\t{elapsed_ms:.1f}\t124")
@@ -132,22 +141,47 @@ TEST_RUNNER_SAMPLES=$(mktemp)
 ELM_TEST_SAMPLES=$(mktemp)
 trap 'rm -f "$TEST_RUNNER_SAMPLES" "$ELM_TEST_SAMPLES"' EXIT
 
-TEST_RUNNER_CMD=$(python3 - "$SCRIPT" "$TEST_FILE" <<'PY'
+if [ ${#RUNNER_EXTRA_ARGS[@]} -gt 0 ]; then
+TEST_RUNNER_CMD=$(python3 - "$RUNNER_ELM" "$TEST_FILE" "${RUNNER_EXTRA_ARGS[@]}" <<'PY'
 import json
 import os
 import sys
 
-script = os.path.abspath(sys.argv[1])
+runner = os.path.abspath(sys.argv[1])
 test_file = sys.argv[2]
-print(json.dumps(["node", "--stack-size=8192", script, "--test", test_file]))
+extra_args = sys.argv[3:]
+cmd = ["npx", "elm-pages", "run", runner]
+cmd.extend(extra_args)
+if test_file != "auto":
+    cmd.extend(["--test", test_file])
+print(json.dumps(cmd))
 PY
 )
+else
+TEST_RUNNER_CMD=$(python3 - "$RUNNER_ELM" "$TEST_FILE" <<'PY'
+import json
+import os
+import sys
+
+runner = os.path.abspath(sys.argv[1])
+test_file = sys.argv[2]
+cmd = ["npx", "elm-pages", "run", runner]
+if test_file != "auto":
+    cmd.extend(["--test", test_file])
+print(json.dumps(cmd))
+PY
+)
+fi
 
 ELM_TEST_CMD=$(python3 - "$TEST_FILE" <<'PY'
 import json
 import sys
 
-print(json.dumps(["elm-test", sys.argv[1]]))
+test_file = sys.argv[1]
+cmd = ["elm-test"]
+if test_file != "auto":
+    cmd.append(test_file)
+print(json.dumps(cmd))
 PY
 )
 
@@ -172,6 +206,11 @@ for i in $(seq 1 "$RUNS"); do
   printf '%s\n' "$result" >> "$ELM_TEST_SAMPLES"
   printf '%s\n' "$result" >&2
 done
+
+if grep -q $'\terror\t' "$TEST_RUNNER_SAMPLES" "$ELM_TEST_SAMPLES"; then
+  echo "Benchmark command failed; refusing to record results." >&2
+  exit 1
+fi
 
 summarize_samples "TestRunner" "$TEST_RUNNER_SAMPLES" >&2
 summarize_samples "elm-test" "$ELM_TEST_SAMPLES" >&2

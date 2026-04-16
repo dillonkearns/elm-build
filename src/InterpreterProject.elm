@@ -1,4 +1,4 @@
-module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
+module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -31,6 +31,7 @@ import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range exposing (Range)
 import Environment
 import Eval.Module
+import Eval.Resolver as Resolver
 import FNV1a
 import FastDict
 import FatalError exposing (FatalError)
@@ -39,6 +40,7 @@ import Json.Decode as Decode
 import Json.Encode
 import Lamdera.Wire3
 import MemoRuntime
+import NormalizationFlags
 import Path exposing (Path)
 import ProjectRoots
 import ProjectSources
@@ -185,6 +187,14 @@ type alias LoadProfile =
     , packageSummaryRejectSamples : List String
     , buildPackageEnvFromSummariesMs : Int
     , buildPackageEnvMs : Int
+    , packageResolvedErrorsCount : Int
+    , packageResolvedBodiesCount : Int
+    , packageResolvedGlobalsCount : Int
+    , packageResolvedErrorSummary : ResolveErrorSummary
+    , resolvedErrorsCount : Int
+    , resolvedBodiesCount : Int
+    , resolvedGlobalsCount : Int
+    , resolvedErrorSummary : ResolveErrorSummary
     , buildBaseUserEnvMs : Int
     , userNormModulesPlanned : Int
     , userNormTargetFunctions : Int
@@ -193,6 +203,7 @@ type alias LoadProfile =
     , userNormCacheExtendedModules : Int
     , userNormRewrittenFunctions : Int
     , userNormPrecomputedValues : Int
+    , userNormDependencySummaryStats : Eval.Module.DependencySummaryStats
     , buildSemanticIndexMs : Int
     , cacheInputsMs : Int
     }
@@ -448,6 +459,106 @@ type alias Timed a =
     }
 
 
+type alias ResolveErrorSummary =
+    { totalCount : Int
+    , unknownNameCount : Int
+    , unknownOperatorCount : Int
+    , unsupportedExpressionCount : Int
+    , invalidRecordUpdateTargetCount : Int
+    , unexpectedTupleArityCount : Int
+    , samples : List String
+    }
+
+
+emptyResolveErrorSummary : ResolveErrorSummary
+emptyResolveErrorSummary =
+    { totalCount = 0
+    , unknownNameCount = 0
+    , unknownOperatorCount = 0
+    , unsupportedExpressionCount = 0
+    , invalidRecordUpdateTargetCount = 0
+    , unexpectedTupleArityCount = 0
+    , samples = []
+    }
+
+
+resolveErrorSampleLimit : Int
+resolveErrorSampleLimit =
+    12
+
+
+summarizeResolveErrors : List Eval.Module.ResolveErrorEntry -> ResolveErrorSummary
+summarizeResolveErrors entries =
+    entries
+        |> List.foldl
+            (\entry acc ->
+                let
+                    counted =
+                        case entry.error of
+                            Resolver.UnknownName _ ->
+                                { acc | totalCount = acc.totalCount + 1, unknownNameCount = acc.unknownNameCount + 1 }
+
+                            Resolver.UnknownOperator _ ->
+                                { acc | totalCount = acc.totalCount + 1, unknownOperatorCount = acc.unknownOperatorCount + 1 }
+
+                            Resolver.UnsupportedExpression _ ->
+                                { acc | totalCount = acc.totalCount + 1, unsupportedExpressionCount = acc.unsupportedExpressionCount + 1 }
+
+                            Resolver.InvalidRecordUpdateTarget _ ->
+                                { acc | totalCount = acc.totalCount + 1, invalidRecordUpdateTargetCount = acc.invalidRecordUpdateTargetCount + 1 }
+
+                            Resolver.UnexpectedTupleArity _ ->
+                                { acc | totalCount = acc.totalCount + 1, unexpectedTupleArityCount = acc.unexpectedTupleArityCount + 1 }
+                in
+                { counted | samples = addResolveErrorSample (renderResolveErrorSample entry) counted.samples }
+            )
+            emptyResolveErrorSummary
+
+
+addResolveErrorSample : String -> List String -> List String
+addResolveErrorSample sample samples =
+    if List.member sample samples || List.length samples >= resolveErrorSampleLimit then
+        samples
+
+    else
+        samples ++ [ sample ]
+
+
+renderResolveErrorSample : Eval.Module.ResolveErrorEntry -> String
+renderResolveErrorSample entry =
+    qualifiedNameString entry.moduleName entry.name
+        ++ " -> "
+        ++ resolveErrorToString entry.error
+
+
+qualifiedNameString : ModuleName -> String -> String
+qualifiedNameString moduleName name =
+    if List.isEmpty moduleName then
+        name
+
+    else
+        String.join "." moduleName ++ "." ++ name
+
+
+resolveErrorToString : Resolver.ResolveError -> String
+resolveErrorToString err =
+    case err of
+        Resolver.UnknownName { moduleName, name } ->
+            "UnknownName " ++ qualifiedNameString moduleName name
+
+        Resolver.UnknownOperator op ->
+            "UnknownOperator " ++ op
+
+        Resolver.UnsupportedExpression msg ->
+            "UnsupportedExpression " ++ msg
+
+        Resolver.InvalidRecordUpdateTarget name ->
+            "InvalidRecordUpdateTarget " ++ name
+
+        Resolver.UnexpectedTupleArity n ->
+            "UnexpectedTupleArity " ++ String.fromInt n
+
+
 stageMs : Time.Posix -> Time.Posix -> Int
 stageMs start finish =
     Time.posixToMillis finish - Time.posixToMillis start
@@ -662,6 +773,47 @@ userNormBundleKey userFileContents =
         |> String.fromInt
 
 
+userNormalizationFlagsKey : NormalizationFlags.NormalizationFlags -> String
+userNormalizationFlagsKey flags =
+    [ if flags.foldConstantApplications then
+        "1"
+
+      else
+        "0"
+    , if flags.inlinePrecomputedRefs then
+        "1"
+
+      else
+        "0"
+    , if flags.inlineFunctions then
+        "1"
+
+      else
+        "0"
+    , String.fromInt flags.inlineFunctionMaxSize
+    , if flags.fuseListMaps then
+        "1"
+
+      else
+        "0"
+    , if flags.runFixpoint then
+        "1"
+
+      else
+        "0"
+    , if flags.runListFusion then
+        "1"
+
+      else
+        "0"
+    , String.fromInt flags.fixpointPasses
+    , String.fromInt flags.tryNormalizeMaxSteps
+    ]
+        |> String.join "|"
+        |> FNV1a.hash
+        |> String.fromInt
+
+
 {-| Entry in the combined user-normalization blob: one per module, carrying
 the module name, the list of normalized function implementations, and any
 precomputed constant values (zero-arg functions evaluated to concrete Values
@@ -689,6 +841,7 @@ type alias UserNormStats =
     , cacheExtendedModules : Int
     , rewrittenFunctions : Int
     , precomputedValues : Int
+    , dependencySummaryStats : Eval.Module.DependencySummaryStats
     }
 
 
@@ -1043,17 +1196,18 @@ buildUserNormalizedEnv :
     , packageKey : String
     , userModulePlans : List UserNormModulePlan
     , userFileContents : Dict String String
+    , userNormalizationFlags : NormalizationFlags.NormalizationFlags
     }
     -> Eval.Module.ProjectEnv
     -> BackendTask FatalError UserNormBuildResult
 buildUserNormalizedEnv config envBeforeNorm =
     case config.cacheDir of
         Nothing ->
-            normalizeAllUserModulesFresh config.userModulePlans envBeforeNorm
+            normalizeAllUserModulesFresh config.userNormalizationFlags config.userModulePlans envBeforeNorm
                 |> BackendTask.succeed
 
         Just cacheDir ->
-            normalizePerFile cacheDir config.packageKey config.userModulePlans config.userFileContents envBeforeNorm
+            normalizePerFile cacheDir config.packageKey config.userNormalizationFlags config.userModulePlans config.userFileContents envBeforeNorm
 
 
 userNormPlanModuleName : UserNormModulePlan -> ModuleName
@@ -1142,6 +1296,7 @@ emptyUserNormStats =
     , cacheExtendedModules = 0
     , rewrittenFunctions = 0
     , precomputedValues = 0
+    , dependencySummaryStats = Eval.Module.emptyDependencySummaryStats
     }
 
 
@@ -1154,6 +1309,8 @@ combineUserNormStats left right =
     , cacheExtendedModules = left.cacheExtendedModules + right.cacheExtendedModules
     , rewrittenFunctions = left.rewrittenFunctions + right.rewrittenFunctions
     , precomputedValues = left.precomputedValues + right.precomputedValues
+    , dependencySummaryStats =
+        Eval.Module.mergeDependencySummaryStats left.dependencySummaryStats right.dependencySummaryStats
     }
 
 
@@ -1165,24 +1322,30 @@ userNormPlanStats plan =
     }
 
 
-userNormEntryStats : UserNormCacheEntry -> UserNormStats
-userNormEntryStats entry =
+userNormEntryStats : UserNormCacheEntry -> Eval.Module.DependencySummaryStats -> UserNormStats
+userNormEntryStats entry dependencySummaryStats =
     { emptyUserNormStats
         | rewrittenFunctions = List.length entry.functions
         , precomputedValues = List.length entry.precomputedValues
+        , dependencySummaryStats = dependencySummaryStats
     }
 
 
 normalizePerFile :
     String
     -> String
+    -> NormalizationFlags.NormalizationFlags
     -> List UserNormModulePlan
     -> Dict String String
     -> Eval.Module.ProjectEnv
     -> BackendTask FatalError UserNormBuildResult
-normalizePerFile cacheDir packageKey userModulePlans userFileContents envBeforeNorm =
+normalizePerFile cacheDir packageKey userNormalizationFlags userModulePlans userFileContents envBeforeNorm =
     Do.do (ensureDirTask cacheDir) <|
         \_ ->
+            let
+                flagsKey =
+                    userNormalizationFlagsKey userNormalizationFlags
+            in
             userModulePlans
                 |> List.foldl
                     (\userModulePlan resultTask ->
@@ -1214,6 +1377,8 @@ normalizePerFile cacheDir packageKey userModulePlans userFileContents envBeforeN
                                             ++ userNormCacheVersion
                                             ++ "-"
                                             ++ packageKey
+                                            ++ "-"
+                                            ++ flagsKey
                                             ++ "-"
                                             ++ moduleKey
                                             ++ "-"
@@ -1256,23 +1421,23 @@ normalizePerFile cacheDir packageKey userModulePlans userFileContents envBeforeN
                                                                                 , targetFunctions = Just missingTargets
                                                                                 }
 
-                                                                            ( updatedEnv, extensionEntry ) =
-                                                                                normalizeOneAndCache extensionPlan envFromCache
+                                                                            extensionResult =
+                                                                                normalizeOneAndCache userNormalizationFlags extensionPlan envFromCache
 
                                                                             mergedEntry : UserNormCacheEntry
                                                                             mergedEntry =
                                                                                 extendUserNormCacheEntry entry
-                                                                                    (extensionEntry.functions
+                                                                                    (extensionResult.entry.functions
                                                                                         |> List.map (\functionImplementation -> ( Node.value functionImplementation.name, functionImplementation ))
                                                                                         |> FastDict.fromList
                                                                                     )
-                                                                                    (extensionEntry.precomputedValues |> FastDict.fromList)
+                                                                                    (extensionResult.entry.precomputedValues |> FastDict.fromList)
                                                                                     missingTargets
                                                                         in
                                                                         writeUserNormEntry perFilePath mergedEntry
                                                                             |> BackendTask.map
                                                                                 (\_ ->
-                                                                                    { env = updatedEnv
+                                                                                    { env = extensionResult.env
                                                                                     , stats =
                                                                                         combineUserNormStats resultAcc.stats
                                                                                             (combineUserNormStats
@@ -1280,25 +1445,25 @@ normalizePerFile cacheDir packageKey userModulePlans userFileContents envBeforeN
                                                                                                     | cacheHitModules = 1
                                                                                                     , cacheExtendedModules = 1
                                                                                                 }
-                                                                                                (userNormEntryStats extensionEntry)
+                                                                                                (userNormEntryStats extensionResult.entry extensionResult.dependencySummaryStats)
                                                                                             )
                                                                                     }
                                                                                 )
 
                                                                 _ ->
                                                                     let
-                                                                        ( env, entry ) =
-                                                                            normalizeOneAndCache userModulePlan resultAcc.env
+                                                                        normalizeResult =
+                                                                            normalizeOneAndCache userNormalizationFlags userModulePlan resultAcc.env
                                                                     in
-                                                                    writeUserNormEntry perFilePath entry
+                                                                    writeUserNormEntry perFilePath normalizeResult.entry
                                                                         |> BackendTask.map
                                                                             (\_ ->
-                                                                                { env = env
+                                                                                { env = normalizeResult.env
                                                                                 , stats =
                                                                                     combineUserNormStats resultAcc.stats
                                                                                         (combineUserNormStats
                                                                                             { planStats | cacheMissModules = 1 }
-                                                                                            (userNormEntryStats entry)
+                                                                                            (userNormEntryStats normalizeResult.entry normalizeResult.dependencySummaryStats)
                                                                                         )
                                                                                 }
                                                                             )
@@ -1306,18 +1471,18 @@ normalizePerFile cacheDir packageKey userModulePlans userFileContents envBeforeN
 
                                             else
                                                 let
-                                                    ( env, entry ) =
-                                                        normalizeOneAndCache userModulePlan resultAcc.env
+                                                    normalizeResult =
+                                                        normalizeOneAndCache userNormalizationFlags userModulePlan resultAcc.env
                                                 in
-                                                writeUserNormEntry perFilePath entry
+                                                writeUserNormEntry perFilePath normalizeResult.entry
                                                     |> BackendTask.map
                                                         (\_ ->
-                                                            { env = env
+                                                            { env = normalizeResult.env
                                                             , stats =
                                                                 combineUserNormStats resultAcc.stats
                                                                     (combineUserNormStats
                                                                         { planStats | cacheMissModules = 1 }
-                                                                        (userNormEntryStats entry)
+                                                                        (userNormEntryStats normalizeResult.entry normalizeResult.dependencySummaryStats)
                                                                     )
                                                             }
                                                         )
@@ -1330,32 +1495,47 @@ normalizePerFile cacheDir packageKey userModulePlans userFileContents envBeforeN
                     )
 
 
-normalizeOneAndCache : UserNormModulePlan -> Eval.Module.ProjectEnv -> ( Eval.Module.ProjectEnv, UserNormCacheEntry )
-normalizeOneAndCache userModulePlan envAcc =
+normalizeOneAndCache :
+    NormalizationFlags.NormalizationFlags
+    -> UserNormModulePlan
+    -> Eval.Module.ProjectEnv
+    ->
+        { env : Eval.Module.ProjectEnv
+        , entry : UserNormCacheEntry
+        , dependencySummaryStats : Eval.Module.DependencySummaryStats
+        }
+normalizeOneAndCache userNormalizationFlags userModulePlan envAcc =
     let
         moduleName : ModuleName
         moduleName =
             userNormPlanModuleName userModulePlan
 
-        ( updatedEnv, normalizedFns, modulePrecomputed ) =
-            normalizeOneModuleInEnvSelected userModulePlan.targetFunctions moduleName envAcc
+        normalizationResult =
+            Eval.Module.normalizeOneModuleInEnvSelectedWithFlags userNormalizationFlags userModulePlan.targetFunctions moduleName envAcc
 
         entry =
             { moduleName = moduleName
-            , functions = FastDict.values normalizedFns
-            , precomputedValues = FastDict.toList modulePrecomputed
+            , functions = FastDict.values normalizationResult.delta
+            , precomputedValues = FastDict.toList normalizationResult.precomputed
             , attemptedFunctions = userNormPlanAttemptedFunctions userModulePlan |> Set.toList
             }
     in
-    ( updatedEnv, entry )
+    { env = normalizationResult.env
+    , entry = entry
+    , dependencySummaryStats = normalizationResult.stats
+    }
 
 
 {-| Normalize every user module in topo order without consulting a cache.
 Returns the updated env alongside the list of `UserNormCacheEntry` records
 we can feed to the encoder.
 -}
-normalizeAllUserModulesFresh : List UserNormModulePlan -> Eval.Module.ProjectEnv -> UserNormBuildResult
-normalizeAllUserModulesFresh userModulePlans envBeforeNorm =
+normalizeAllUserModulesFresh :
+    NormalizationFlags.NormalizationFlags
+    -> List UserNormModulePlan
+    -> Eval.Module.ProjectEnv
+    -> UserNormBuildResult
+normalizeAllUserModulesFresh userNormalizationFlags userModulePlans envBeforeNorm =
     userModulePlans
         |> List.foldl
             (\userModulePlan resultAcc ->
@@ -1364,15 +1544,15 @@ normalizeAllUserModulesFresh userModulePlans envBeforeNorm =
                     planStats =
                         userNormPlanStats userModulePlan
 
-                    ( updatedEnv, entry ) =
-                        normalizeOneAndCache userModulePlan resultAcc.env
+                    normalizeResult =
+                        normalizeOneAndCache userNormalizationFlags userModulePlan resultAcc.env
                 in
-                { env = updatedEnv
+                { env = normalizeResult.env
                 , stats =
                     combineUserNormStats resultAcc.stats
                         (combineUserNormStats
                             { planStats | cacheMissModules = 1 }
-                            (userNormEntryStats entry)
+                            (userNormEntryStats normalizeResult.entry normalizeResult.dependencySummaryStats)
                         )
                 }
             )
@@ -1974,7 +2154,24 @@ loadWith :
     }
     -> BackendTask FatalError InterpreterProject
 loadWith config =
-    loadWithProfile
+    loadWithUserNormalizationFlags NormalizationFlags.experimental config
+
+
+loadWithUserNormalizationFlags :
+    NormalizationFlags.NormalizationFlags
+    ->
+        { projectDir : Path
+        , skipPackages : Set String
+        , patchSource : String -> String
+        , patchUserSource : String -> String -> String
+        , extraSourceFiles : List String
+        , extraReachableImports : List String
+        , sourceDirectories : Maybe (List String)
+        , normalizationRoots : Maybe (List String)
+        }
+    -> BackendTask FatalError InterpreterProject
+loadWithUserNormalizationFlags userNormalizationFlags config =
+    loadWithProfileUserNormalizationFlags userNormalizationFlags
         { projectDir = config.projectDir
         , skipPackages = config.skipPackages
         , patchSource = config.patchSource
@@ -2005,6 +2202,24 @@ loadWithProfile :
     }
     -> BackendTask FatalError { project : InterpreterProject, profile : LoadProfile }
 loadWithProfile config =
+    loadWithProfileUserNormalizationFlags NormalizationFlags.experimental config
+
+
+loadWithProfileUserNormalizationFlags :
+    NormalizationFlags.NormalizationFlags
+    ->
+        { projectDir : Path
+        , skipPackages : Set String
+        , patchSource : String -> String
+        , patchUserSource : String -> String -> String
+        , extraSourceFiles : List String
+        , extraReachableImports : List String
+        , sourceDirectories : Maybe (List String)
+        , normalizationRoots : Maybe (List String)
+        , packageParseCacheDir : Maybe String
+        }
+    -> BackendTask FatalError { project : InterpreterProject, profile : LoadProfile }
+loadWithProfileUserNormalizationFlags userNormalizationFlags config =
     Do.do
         (withTiming
             (case config.sourceDirectories of
@@ -2510,10 +2725,11 @@ loadWithProfile config =
                                                                                                                     { cacheDir = config.packageParseCacheDir
                                                                                                                     , packageKey = packageSummaryCacheKey allPackageSources
                                                                                                                     , userModulePlans = userModulePlans
+                                                                                                                    , userNormalizationFlags = userNormalizationFlags
                                                                                                                     , userFileContents =
                                                                                                                         userFileContents
                                                                                                                             |> List.filterMap
-                                                                                                                                (\( _, content ) ->
+                                                                                                                               (\( _, content ) ->
                                                                                                                                     DepGraph.parseModuleName content
                                                                                                                                         |> Maybe.map (\name -> ( name, content ))
                                                                                                                                 )
@@ -2601,6 +2817,20 @@ loadWithProfile config =
                                                                                                                                                             baseUserEnvResult
                                                                                                                                                                 |> Maybe.map .stats
                                                                                                                                                                 |> Maybe.withDefault emptyUserNormStats
+
+                                                                                                                                                        packageResolvedEnv =
+                                                                                                                                                            Eval.Module.projectEnvResolved pkgEnv
+
+                                                                                                                                                        finalResolvedEnv =
+                                                                                                                                                            baseUserEnvResult
+                                                                                                                                                                |> Maybe.map (.env >> Eval.Module.projectEnvResolved)
+                                                                                                                                                                |> Maybe.withDefault packageResolvedEnv
+
+                                                                                                                                                        packageResolvedErrorSummary =
+                                                                                                                                                            summarizeResolveErrors packageResolvedEnv.errors
+
+                                                                                                                                                        finalResolvedErrorSummary =
+                                                                                                                                                            summarizeResolveErrors finalResolvedEnv.errors
                                                                                                                                                     in
                                                                                                                                                     { resolveSourceDirectoriesMs = sourceDirectoriesTimed.ms
                                                                                                                                                     , loadPackageSourcesMs = packageSourcesTimed.ms
@@ -2718,6 +2948,14 @@ loadWithProfile config =
                                                                                                                                                     , packageSummaryRejectSamples = packageSummariesInfo.dependencySummaryStats.rejectSamples
                                                                                                                                                     , buildPackageEnvFromSummariesMs = buildPackageEnvFromSummariesMs
                                                                                                                                                     , buildPackageEnvMs = buildPackageEnvMs
+                                                                                                                                                    , packageResolvedErrorsCount = List.length packageResolvedEnv.errors
+                                                                                                                                                    , packageResolvedBodiesCount = FastDict.size packageResolvedEnv.bodies
+                                                                                                                                                    , packageResolvedGlobalsCount = FastDict.size packageResolvedEnv.globals
+                                                                                                                                                    , packageResolvedErrorSummary = packageResolvedErrorSummary
+                                                                                                                                                    , resolvedErrorsCount = List.length finalResolvedEnv.errors
+                                                                                                                                                    , resolvedBodiesCount = FastDict.size finalResolvedEnv.bodies
+                                                                                                                                                    , resolvedGlobalsCount = FastDict.size finalResolvedEnv.globals
+                                                                                                                                                    , resolvedErrorSummary = finalResolvedErrorSummary
                                                                                                                                                     , buildBaseUserEnvMs = buildBaseUserEnvMs
                                                                                                                                                     , userNormModulesPlanned = userNormStats.modulesPlanned
                                                                                                                                                     , userNormTargetFunctions = userNormStats.targetFunctions
@@ -2726,6 +2964,7 @@ loadWithProfile config =
                                                                                                                                                     , userNormCacheExtendedModules = userNormStats.cacheExtendedModules
                                                                                                                                                     , userNormRewrittenFunctions = userNormStats.rewrittenFunctions
                                                                                                                                                     , userNormPrecomputedValues = userNormStats.precomputedValues
+                                                                                                                                                    , userNormDependencySummaryStats = userNormStats.dependencySummaryStats
                                                                                                                                                     , buildSemanticIndexMs = buildSemanticIndexMs
                                                                                                                                                     , cacheInputsMs = sourceInputsTimed.ms
                                                                                                                                                     }
