@@ -289,16 +289,50 @@ function ensureBundledRunner() {
     if (!fs.existsSync(bundledRunnerPath)) {
       throw new Error(`Missing ${bundledRunnerPath}. Remove --skip-bundle or bundle it first.`);
     }
+    injectBlockingStdio();
     return;
   }
 
   if (!forceBundle && !bundledRunnerIsStale()) {
+    injectBlockingStdio();
     return;
   }
 
   runChecked("bunx", ["elm-pages", "bundle-script", "src/TestRunner.elm", "--output", bundledRunnerPath], {
     cwd: repoRoot,
   });
+  injectBlockingStdio();
+}
+
+/**
+ * elm-pages bundle emits `console.log` for `Script.log` and then calls
+ * `process.exit(...)` directly. Node buffers stdout writes to pipes
+ * asynchronously, so when the test summary JSON is >64KB the tail of
+ * the payload gets dropped before the exit drains — producing a
+ * truncated first line that JSON.parse chokes on at byte 65536.
+ *
+ * Flipping stdout/stderr to blocking mode before any log happens makes
+ * the writes synchronous, so every byte is on the pipe by the time
+ * exit() fires. The stub is idempotent and safe to re-inject.
+ */
+function injectBlockingStdio() {
+  const marker = "// external-test-oracle:blocking-stdio";
+  const original = fs.readFileSync(bundledRunnerPath, "utf8");
+  if (original.includes(marker)) {
+    return;
+  }
+
+  const shebang = "#!/usr/bin/env node\n";
+  const preamble =
+    `${marker}\n` +
+    "for (const stream of [process.stdout, process.stderr]) {\n" +
+    "  if (stream && stream._handle && typeof stream._handle.setBlocking === \"function\") {\n" +
+    "    stream._handle.setBlocking(true);\n" +
+    "  }\n" +
+    "}\n";
+
+  const body = original.startsWith(shebang) ? original.slice(shebang.length) : original;
+  fs.writeFileSync(bundledRunnerPath, shebang + preamble + body);
 }
 
 function loadSourceDirs(checkoutDir) {
