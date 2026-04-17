@@ -24,6 +24,7 @@ const bundleInputRoots = [
 const defaultBuildDir = ".elm-build/external-test-oracle";
 
 const suiteSelector = readArg("--suite", "starter");
+const caseSelector = readArg("--case", null);
 const runs = readIntArg("--runs", 1);
 const seed = readIntArg("--seed", 42);
 const fuzzRuns = readIntArg("--fuzz", 100);
@@ -133,7 +134,10 @@ function suiteCheckoutDir(suite) {
 
 function listSuites() {
   for (const suite of externalSuites) {
-    console.log(`${suite.id.padEnd(20)} ${suite.description}`);
+    const suiteCases = getSuiteCases(suite);
+    const caseSummary =
+      suiteCases.length > 1 ? ` [cases: ${suiteCases.map((suiteCase) => suiteCase.id).join(", ")}]` : "";
+    console.log(`${suite.id.padEnd(20)} ${suite.description}${caseSummary}`);
   }
 }
 
@@ -156,6 +160,50 @@ function selectSuites(selector) {
   }
 
   return selected;
+}
+
+function getSuiteCases(suite) {
+  if (Array.isArray(suite.cases) && suite.cases.length > 0) {
+    return suite.cases;
+  }
+
+  return [
+    {
+      id: "default",
+      description: suite.description,
+      globs: suite.globs ?? [],
+      timeoutSecs: suite.timeoutSecs,
+    },
+  ];
+}
+
+function selectSuiteCases(suite) {
+  const suiteCases = getSuiteCases(suite);
+  const requestedIds = splitCsv(caseSelector);
+
+  if (requestedIds.length === 0) {
+    return suiteCases;
+  }
+
+  const requested = new Set(requestedIds);
+  const selected = suiteCases.filter((suiteCase) => requested.has(suiteCase.id));
+
+  if (selected.length !== requested.size) {
+    const foundIds = new Set(selected.map((suiteCase) => suiteCase.id));
+    const missing = [...requested].filter((id) => !foundIds.has(id));
+    throw new Error(`Unknown case id(s) for ${suite.id}: ${missing.join(", ")}`);
+  }
+
+  return selected;
+}
+
+function resolveSuiteCase(suite, suiteCase) {
+  return {
+    id: suiteCase.id,
+    description: suiteCase.description ?? null,
+    globs: globsOverride.length > 0 ? globsOverride : suiteCase.globs ?? suite.globs ?? [],
+    timeoutSecs: timeoutOverride ?? suiteCase.timeoutSecs ?? suite.timeoutSecs,
+  };
 }
 
 function syncSuite(suite) {
@@ -262,25 +310,29 @@ function loadSourceDirs(checkoutDir) {
 }
 
 function clearInterpreterUserCache(checkoutDir) {
-  const buildDir = path.join(checkoutDir, defaultBuildDir);
-  ensureDir(buildDir);
+  // The bundled runner still writes package and user cache artifacts at the
+  // `.elm-build` root, even when `--build` points at a nested subdirectory.
+  const buildRoot = path.join(checkoutDir, ".elm-build");
+  ensureDir(buildRoot);
 
-  for (const entry of fs.readdirSync(buildDir, { withFileTypes: true })) {
+  for (const entry of fs.readdirSync(buildRoot, { withFileTypes: true })) {
     if (entry.name.startsWith("package-")) {
       continue;
     }
 
-    fs.rmSync(path.join(buildDir, entry.name), { recursive: true, force: true });
+    fs.rmSync(path.join(buildRoot, entry.name), { recursive: true, force: true });
   }
+
+  ensureDir(path.join(checkoutDir, defaultBuildDir));
 }
 
 function hasInterpreterPackageCache(checkoutDir) {
-  const buildDir = path.join(checkoutDir, defaultBuildDir);
-  if (!fs.existsSync(buildDir)) {
+  const buildRoot = path.join(checkoutDir, ".elm-build");
+  if (!fs.existsSync(buildRoot)) {
     return false;
   }
 
-  return fs.readdirSync(buildDir).some((entry) => entry.startsWith("package-"));
+  return fs.readdirSync(buildRoot).some((entry) => entry.startsWith("package-"));
 }
 
 function clearElmStuff(checkoutDir) {
@@ -491,11 +543,11 @@ function compareParsedResults(elmTest, interpreter) {
   };
 }
 
-function printRunSummary(run) {
+function printRunSummary(run, indent = "  ") {
   const compareStatus = run.compare.status.toUpperCase();
-  console.log(`  Run ${run.index}: ${compareStatus}`);
-  console.log(`    elm-test: ${formatRunnerSummary(run.elmTest, "elm-test")}`);
-  console.log(`    TestRunner: ${formatRunnerSummary(run.interpreter, "test-runner")}`);
+  console.log(`${indent}Run ${run.index}: ${compareStatus}`);
+  console.log(`${indent}  elm-test: ${formatRunnerSummary(run.elmTest, "elm-test")}`);
+  console.log(`${indent}  TestRunner: ${formatRunnerSummary(run.interpreter, "test-runner")}`);
 
   const skippedFiles =
     run.interpreter.parsed == null
@@ -503,12 +555,12 @@ function printRunSummary(run) {
       : run.interpreter.parsed.files.filter((file) => file.status === "skipped").slice(0, 3);
 
   for (const file of skippedFiles) {
-    console.log(`    skipped: ${file.moduleName}: ${trimText(file.message.replace(/\s+/g, " "), 160)}`);
+    console.log(`${indent}  skipped: ${file.moduleName}: ${trimText(file.message.replace(/\s+/g, " "), 160)}`);
   }
 
   if (run.compare.status === "mismatch") {
     console.log(
-      `    mismatch counts: onlyInElmTest=${run.compare.onlyInElmTest.length}, onlyInInterpreter=${run.compare.onlyInInterpreter.length}, statusMismatches=${run.compare.statusMismatches.length}`
+      `${indent}  mismatch counts: onlyInElmTest=${run.compare.onlyInElmTest.length}, onlyInInterpreter=${run.compare.onlyInInterpreter.length}, statusMismatches=${run.compare.statusMismatches.length}`
     );
   }
 }
@@ -571,6 +623,7 @@ function main() {
   const results = {
     date: new Date().toISOString(),
     suiteSelector,
+    caseSelector,
     runs,
     seed,
     fuzzRuns,
@@ -579,34 +632,58 @@ function main() {
 
   for (const suite of suites) {
     const checkoutDir = suiteCheckoutDir(suite);
-    const timeoutSecs = timeoutOverride ?? suite.timeoutSecs;
-    const globs = globsOverride.length > 0 ? globsOverride : suite.globs ?? [];
+    const selectedCases = selectSuiteCases(suite).map((suiteCase) => resolveSuiteCase(suite, suiteCase));
     const commit = gitStdout(checkoutDir, ["rev-parse", "HEAD"]);
-    const prime = primeInterpreter(checkoutDir, globs, timeoutSecs);
     const suiteResult = {
       id: suite.id,
       repo: suite.repo,
       branch: suite.branch,
       commit,
-      timeoutSecs,
-      globs,
       checkoutDir: path.relative(repoRoot, checkoutDir),
-      primeInterpreter: prime,
-      runs: [],
+      cases: [],
     };
 
     console.log(`\n${suite.id} @ ${commit}`);
-    if (prime != null) {
-      console.log(`  primed interpreter package cache: exit=${prime.exitCode}, wall=${prime.wallMs}ms`);
+
+    for (const suiteCase of selectedCases) {
+      const prime = primeInterpreter(checkoutDir, suiteCase.globs, suiteCase.timeoutSecs);
+      const caseResult = {
+        id: suiteCase.id,
+        description: suiteCase.description,
+        timeoutSecs: suiteCase.timeoutSecs,
+        globs: suiteCase.globs,
+        primeInterpreter: prime,
+        runs: [],
+      };
+
+      if (selectedCases.length > 1 || suiteCase.id !== "default") {
+        const globsLabel = suiteCase.globs.length === 0 ? "auto" : suiteCase.globs.join(",");
+        const descriptionSuffix = suiteCase.description == null ? "" : ` - ${suiteCase.description}`;
+        console.log(`  Case ${suiteCase.id}${descriptionSuffix} [globs=${globsLabel}]`);
+      }
+
+      if (prime != null) {
+        console.log(`    primed interpreter package cache: exit=${prime.exitCode}, wall=${prime.wallMs}ms`);
+      }
+
+      for (let index = 1; index <= runs; index += 1) {
+        const elmTest = runElmTestSuite(checkoutDir, suiteCase.globs, suiteCase.timeoutSecs);
+        const interpreter = runInterpreterSuite(checkoutDir, suiteCase.globs, suiteCase.timeoutSecs);
+        const compare = compareParsedResults(elmTest.parsed, interpreter.parsed);
+        const runResult = { index, elmTest, interpreter, compare };
+        caseResult.runs.push(runResult);
+        printRunSummary(runResult, selectedCases.length > 1 || suiteCase.id !== "default" ? "    " : "  ");
+      }
+
+      suiteResult.cases.push(caseResult);
     }
 
-    for (let index = 1; index <= runs; index += 1) {
-      const elmTest = runElmTestSuite(checkoutDir, globs, timeoutSecs);
-      const interpreter = runInterpreterSuite(checkoutDir, globs, timeoutSecs);
-      const compare = compareParsedResults(elmTest.parsed, interpreter.parsed);
-      const runResult = { index, elmTest, interpreter, compare };
-      suiteResult.runs.push(runResult);
-      printRunSummary(runResult);
+    if (suiteResult.cases.length === 1) {
+      const [onlyCase] = suiteResult.cases;
+      suiteResult.timeoutSecs = onlyCase.timeoutSecs;
+      suiteResult.globs = onlyCase.globs;
+      suiteResult.primeInterpreter = onlyCase.primeInterpreter;
+      suiteResult.runs = onlyCase.runs;
     }
 
     results.suites.push(suiteResult);

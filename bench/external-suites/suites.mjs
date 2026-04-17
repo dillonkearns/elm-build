@@ -31,4 +31,31 @@ export const externalSuites = [
     tags: ["starter", "elm-review-rule"],
     timeoutSecs: 600,
   },
+  {
+    id: "elm-markdown",
+    repo: "https://github.com/dillonkearns/elm-markdown.git",
+    branch: "master",
+    description: "Real-world markdown parser package test suite",
+    tags: ["real-project", "parser-heavy"],
+    timeoutSecs: 120,
+    cases: [
+      {
+        id: "full-suite",
+        description: "Auto-discovered full suite",
+        timeoutSecs: 120,
+      },
+      {
+        id: "helpers",
+        description: "Small targeted helper regression file",
+        globs: ["tests/HelpersTests.elm"],
+        timeoutSecs: 60,
+      },
+      {
+        id: "aggregate",
+        description: "Larger parser-focused aggregate file",
+        globs: ["tests/Tests.elm"],
+        timeoutSecs: 120,
+      },
+    ],
+  },
 ];
