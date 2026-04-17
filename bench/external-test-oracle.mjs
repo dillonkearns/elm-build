@@ -377,6 +377,7 @@ function buildSuiteArgs(checkoutDir, globs) {
   const extraSourceDirs = loadSourceDirs(checkoutDir);
   const interpreterArgs = [
     "--stack-size=8192",
+    "--max-old-space-size=8192",
     bundledRunnerPath,
     "--report",
     "json",
