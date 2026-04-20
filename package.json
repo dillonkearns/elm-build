@@ -1,7 +1,7 @@
 {
     "license": "BSD-3-Clause",
     "devDependencies": {
-        "elm-pages": "^3.3.4",
+        "elm-pages": "file:../elm-pages3",
         "elm-test-rs": "^3.0.2-0"
     },
     "scripts": {
