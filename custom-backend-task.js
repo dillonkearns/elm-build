@@ -1,9 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-// Worker pool lives in our path-dep'd elm-pages3 (`file:../elm-pages3`).
-// When elm-pages 12.2 ships BackendTask.Parallel natively, this import and
-// the `parallelDispatch` shim below can be deleted.
-import * as parallelPool from "elm-pages/generator/src/parallel-worker-pool.js";
 
 function withFsErrorLogging(label, input, task) {
     return task.catch((error) => {
@@ -271,41 +267,20 @@ export async function linkCopies(input) {
     );
 }
 
-// Dispatcher for BackendTask.Parallel.run (see src/BackendTask/Parallel.elm).
-// Takes `{portName, input}` JSON, forwards the call to the Node Worker-thread
-// pool from elm-pages3's parallel-worker-pool.js, and returns whatever the
-// worker's port function returns (normalized to a JSON-serialisable value).
-//
-// JSON in/out keeps the transport simple until elm-pages 12.2 lands
-// BackendTask.Parallel natively with a proper Bytes channel. For the
-// TestRunner workload, per-task payloads are small (paths, names, results),
-// so JSON overhead is immaterial.
-export async function parallelDispatch(input, context) {
-    const { portName, input: portInput } = input;
-    const inputBytes = Buffer.from(JSON.stringify(portInput), "utf8");
-    const outputBytes = await parallelPool.dispatch(
-        portName,
-        inputBytes,
-        context
-    );
-    // Workers may return the Buffer as Uint8Array after structured clone;
-    // normalize before converting to string.
-    const asString = Buffer.isBuffer(outputBytes)
-        ? outputBytes.toString("utf8")
-        : Buffer.from(outputBytes).toString("utf8");
-    return JSON.parse(asString);
-}
-
-// Smoke-test port for BackendTask.Parallel.run — wired to TestParallelShim.elm.
-// Takes {n: Int} JSON, squares it, returns {squared: Int}.
-// Busy-waits 50 ms so we can observe that concurrent calls overlap across
-// worker threads (wall time ≪ N × 50 ms).
+// Worker-pool port for BackendTask.Parallel.run (wired by TestParallelReal.elm).
+// Bytes-mode: takes a 4-byte big-endian uint32, squares it, returns 4 bytes.
+// Busy-waits 50 ms so concurrent calls overlap across worker threads and wall
+// time ≪ N × 50 ms confirms real parallelism.
 export async function squareU32(inputBytes) {
-    const { n } = JSON.parse(inputBytes.toString("utf8"));
+    if (inputBytes.length !== 4) {
+        throw new Error(`squareU32 expected 4 bytes, got ${inputBytes.length}`);
+    }
+    const n = inputBytes.readUInt32BE(0);
     const deadline = Date.now() + 50;
     while (Date.now() < deadline) {
         // spin
     }
-    const result = { squared: (n * n) >>> 0 };
-    return Buffer.from(JSON.stringify(result), "utf8");
+    const out = Buffer.alloc(4);
+    out.writeUInt32BE((n * n) >>> 0, 0);
+    return out;
 }
