@@ -39,6 +39,7 @@ import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import Set
 import TestAnalysis
+import TestRunnerCommon
 import Time
 import Types
 
@@ -174,7 +175,12 @@ task config =
             Do.do
                 (BackendTask.Parallel.worker
                     { workerModule = "TestFileWorker"
-                    , shared = encodeWorkerShared allDirectories testModuleNames
+                    , shared =
+                        TestRunnerCommon.encodeWorkerShared
+                            { projectDir = "."
+                            , sourceDirectories = allDirectories
+                            , testModuleNames = testModuleNames
+                            }
                     }
                 )
             <| \worker ->
@@ -1086,20 +1092,9 @@ runTestFileViaWorker config project worker testFile =
 
 -- ── Worker wire format helpers ──
 --
--- Length-prefixed JSON envelopes for shared / per-task / per-result
--- bytes. Mirrors the helpers in `TestFileWorker.elm` — keep both sides
--- in sync.
-
-
-encodeWorkerShared : List String -> List String -> Bytes
-encodeWorkerShared sourceDirectories testModuleNames =
-    encodeJsonBytes
-        (Json.Encode.object
-            [ ( "projectDir", Json.Encode.string "." )
-            , ( "sourceDirectories", Json.Encode.list Json.Encode.string sourceDirectories )
-            , ( "testModuleNames", Json.Encode.list Json.Encode.string testModuleNames )
-            ]
-        )
+-- Per-task input/output envelopes for `runOn`. Shared payload (sent
+-- once per worker at startup) lives in `TestRunnerCommon` so both
+-- sides reference the same Wire3-derived codec.
 
 
 encodeWorkerTaskInput : { imports : List String, expression : String, sourceOverrides : List String } -> Bytes

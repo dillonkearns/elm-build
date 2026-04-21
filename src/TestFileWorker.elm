@@ -47,42 +47,19 @@ import Json.Encode as Encode
 import Pages.Script as Script exposing (Script)
 import Path
 import TestRunner
+import TestRunnerCommon exposing (WorkerSharedConfig)
 
 
 run : Script
 run =
-    (BackendTask.Parallel.initShared sharedDecoder
+    (BackendTask.Parallel.initShared TestRunnerCommon.workerSharedDecoder
         |> BackendTask.andThen loadProjectFromShared
         |> BackendTask.andThen workerLoop
     )
         |> Script.withoutCliOptions
 
 
-
--- ── Shared payload (sent once per worker at startup) ──
-
-
-type alias SharedConfig =
-    { projectDir : String
-    , sourceDirectories : List String
-    , testModuleNames : List String
-    }
-
-
-sharedDecoder : BD.Decoder SharedConfig
-sharedDecoder =
-    decodeJson sharedConfigJsonDecoder
-
-
-sharedConfigJsonDecoder : Decode.Decoder SharedConfig
-sharedConfigJsonDecoder =
-    Decode.map3 SharedConfig
-        (Decode.field "projectDir" Decode.string)
-        (Decode.field "sourceDirectories" (Decode.list Decode.string))
-        (Decode.field "testModuleNames" (Decode.list Decode.string))
-
-
-loadProjectFromShared : SharedConfig -> BackendTask FatalError InterpreterProject
+loadProjectFromShared : WorkerSharedConfig -> BackendTask FatalError InterpreterProject
 loadProjectFromShared config =
     InterpreterProject.loadWith
         { projectDir = Path.path config.projectDir
