@@ -1005,61 +1005,102 @@ runTestFileViaWorker config project worker testFile =
 
     else
         let
-            suiteExpr =
-                case testValues of
-                    [ single ] ->
-                        testModuleName ++ "." ++ single
-
-                    multiple ->
-                        "Test.describe \"" ++ testModuleName ++ "\" [" ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) multiple) ++ "]"
-
-            evalExpression =
-                "SimpleTestRunner.runToString (" ++ suiteExpr ++ ")"
+            childExpressions : List String
+            childExpressions =
+                planChildExpressions testModuleName testSource testValues
 
             evalImports : List String
             evalImports =
-                [ "SimpleTestRunner", "Test", testModuleName ]
+                -- Expose `Test` (describe / test / fuzz / …) and `Expect`
+                -- so per-child split expressions — which use those names
+                -- unqualified the same way the test source does — resolve.
+                [ "SimpleTestRunner"
+                , "Test exposing (Test, describe, test, fuzz, fuzz2, fuzz3, fuzz4, fuzz5, only, skip, todo, concat)"
+                , "Expect"
+                , "Fuzz"
+                , testModuleName
+                ]
 
             evalSourceOverrides : List String
             evalSourceOverrides =
                 [ simpleTestRunnerSource config ]
 
-            taskInputBytes : Bytes
-            taskInputBytes =
-                encodeWorkerTaskInput
-                    { imports = evalImports
-                    , expression = evalExpression
-                    , sourceOverrides = evalSourceOverrides
-                    }
-        in
-        Do.do
-            (Cache.run { jobs = Nothing }
-                config.buildDirectory
-                (InterpreterProject.evalCachedViaTask project
-                    { imports = evalImports
-                    , expression = evalExpression
-                    , sourceOverrides = evalSourceOverrides
-                    , compute =
-                        BackendTask.Parallel.runOn worker taskInputBytes workerTaskOutputDecoder
-                    }
-                )
-            )
-        <| \cacheResult ->
-        Do.allowFatal (File.rawFile (Path.toString cacheResult.output)) <| \output ->
-        if String.startsWith "ERROR:" output then
-            let
-                message =
-                    String.trim output
-            in
-            Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 500 message ++ ")"))) <| \_ ->
-            BackendTask.succeed (skippedResult message 1)
+            dispatchOne : Cache.HashSet -> String -> BackendTask FatalError String
+            dispatchOne existing expr =
+                let
+                    evalExpression =
+                        "SimpleTestRunner.runToString (" ++ expr ++ ")"
 
-        else
-            case parseTestOutput output of
-                Just parsedOutput ->
+                    taskInputBytes : Bytes
+                    taskInputBytes =
+                        encodeWorkerTaskInput
+                            { imports = evalImports
+                            , expression = evalExpression
+                            , sourceOverrides = evalSourceOverrides
+                            }
+                in
+                Cache.runWith { jobs = Nothing, existing = existing }
+                    config.buildDirectory
+                    (InterpreterProject.evalCachedViaTask project
+                        { imports = evalImports
+                        , expression = evalExpression
+                        , sourceOverrides = evalSourceOverrides
+                        , compute =
+                            BackendTask.Parallel.runOn worker taskInputBytes workerTaskOutputDecoder
+                        }
+                    )
+                    |> BackendTask.andThen
+                        (\cacheResult ->
+                            File.rawFile (Path.toString cacheResult.output)
+                                |> BackendTask.allowFatal
+                        )
+        in
+        Do.do (Cache.listExisting config.buildDirectory) <| \existing ->
+        Do.do
+            (childExpressions
+                |> List.map (dispatchOne existing)
+                |> BackendTask.combine
+            )
+        <| \perChildOutputs ->
+        let
+            firstError : Maybe String
+            firstError =
+                perChildOutputs
+                    |> List.filter (String.startsWith "ERROR:")
+                    |> List.head
+        in
+        case firstError of
+            Just errorOutput ->
+                let
+                    message =
+                        String.trim errorOutput
+                in
+                Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 500 message ++ ")"))) <| \_ ->
+                BackendTask.succeed (skippedResult message 1)
+
+            Nothing ->
+                let
+                    parsedOutputs : List ParsedTestOutput
+                    parsedOutputs =
+                        perChildOutputs
+                            |> List.filterMap parseTestOutput
+
+                    aggregated : ParsedTestOutput
+                    aggregated =
+                        { passed = List.sum (List.map .passed parsedOutputs)
+                        , failed = List.sum (List.map .failed parsedOutputs)
+                        , total = List.sum (List.map .total parsedOutputs)
+                        , tests = List.concatMap .tests parsedOutputs
+                        }
+                in
+                if List.length parsedOutputs /= List.length perChildOutputs then
+                    Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (unexpected output)"))) <| \_ ->
+                    BackendTask.succeed (skippedResult "unexpected output" 1)
+
+                else
                     let
                         normalizedTests =
-                            parsedOutput.tests
+                            aggregated.tests
                                 |> List.map (prefixTestModuleLabel testModuleName)
 
                         failures =
@@ -1067,12 +1108,12 @@ runTestFileViaWorker config project worker testFile =
                                 |> List.filter (not << .passed)
                     in
                     Do.do
-                        (if parsedOutput.failed == 0 then
-                            logIfConsole config (Ansi.Color.fontColor Ansi.Color.green ("  ✓ " ++ testModuleName ++ " (" ++ String.fromInt parsedOutput.passed ++ " passed)"))
+                        (if aggregated.failed == 0 then
+                            logIfConsole config (Ansi.Color.fontColor Ansi.Color.green ("  ✓ " ++ testModuleName ++ " (" ++ String.fromInt aggregated.passed ++ " passed)"))
 
                          else
                             Do.do
-                                (logIfConsole config (Ansi.Color.fontColor Ansi.Color.red ("  ✗ " ++ testModuleName ++ " (" ++ String.fromInt parsedOutput.failed ++ " failed, " ++ String.fromInt parsedOutput.passed ++ " passed)")))
+                                (logIfConsole config (Ansi.Color.fontColor Ansi.Color.red ("  ✗ " ++ testModuleName ++ " (" ++ String.fromInt aggregated.failed ++ " failed, " ++ String.fromInt aggregated.passed ++ " passed)")))
                             <| \_ ->
                             Do.each failures
                                 (\failure ->
@@ -1096,21 +1137,85 @@ runTestFileViaWorker config project worker testFile =
                         { file = testFile
                         , moduleName = testModuleName
                         , status =
-                            if parsedOutput.failed == 0 then
+                            if aggregated.failed == 0 then
                                 "passed"
 
                             else
                                 "failed"
                         , message = ""
-                        , passed = parsedOutput.passed
-                        , failed = parsedOutput.failed
+                        , passed = aggregated.passed
+                        , failed = aggregated.failed
                         , skipped = 0
                         , tests = normalizedTests
                         }
 
+
+{-| Plan the list of eval-suite expressions to dispatch for a single
+test file.
+
+Default: one expression (the file's whole suite) — same behavior as the
+pre-split implementation. Worker pool gets one big task per file.
+
+When a file has exactly one top-level `Test` value (the common
+`all : Test\nall = describe "X" [...]` shape) AND the top-level
+`describe`'s child list has at least `perChildSplitThreshold` items,
+we split: each child becomes its own dispatch. This breaks the Amdahl
+ceiling on cold runs of single-file-dominated suites (e.g. core-extra's
+ListTests has ~70 child describes under one `all` — splitting takes
+the cold-run wall from ~9 s solo down to roughly `9 s / N_workers`).
+
+-}
+planChildExpressions : String -> String -> List String -> List String
+planChildExpressions testModuleName testSource testValues =
+    case testValues of
+        [ single ] ->
+            case TestAnalysis.extractDescribeChildren single testSource of
+                Just children ->
+                    if List.length children >= perChildSplitThreshold then
+                        children
+
+                    else
+                        [ testModuleName ++ "." ++ single ]
+
                 Nothing ->
-                    Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (unexpected output)"))) <| \_ ->
-                    BackendTask.succeed (skippedResult "unexpected output" 1)
+                    [ testModuleName ++ "." ++ single ]
+
+        multiple ->
+            [ "Test.describe \"" ++ testModuleName ++ "\" [" ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) multiple) ++ "]" ]
+
+
+{-| Split a file's top-level `describe` into per-child dispatches when
+its child count meets this threshold. Below this, the per-task overhead
+(dispatch + cache check + IPC) dominates the parallel-mass win.
+
+**Currently disabled (1000)** while the per-child runtime cost is being
+diagnosed. Bench data (core-extra ListTests, 77 children):
+
+    take=3   →  1.7 s eval (works)
+    take=20  →  2.1 s eval (works)
+    take=40  →  4.6 s eval (works)
+    take=60  →  hangs at >>5 min CPU
+    take=77  →  hangs at >>5 min CPU
+
+Linear extrapolation says 60 should be ~7 s. Something nonlinear blows
+up between 40 and 60 children, regardless of `BackendTask.sequence` vs
+`combine` and regardless of `Cache.runWith` wrapping. The `dispatchOne`
+function is exercised correctly (`Debug.log` confirms 77 children
+parsed and the first few dispatches start), so the issue is in the
+per-child eval cost compounding — possibly evaluator state growing
+across many small evals against the same `baseUserEnv`, possibly Node
+Worker queue pressure, possibly something in the cache-key computation
+when many sibling cache entries land in the same directory.
+
+See `.scratch/parallel-ceiling.md` 2026-04-21 entry for the full
+investigation. The per-child split machinery (`planChildExpressions` +
+`dispatchOne` over a `Cache.HashSet`) is left in place as a
+known-good-to-N=40 hook for whatever fix lands.
+
+-}
+perChildSplitThreshold : Int
+perChildSplitThreshold =
+    1000
 
 
 
