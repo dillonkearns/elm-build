@@ -1,4 +1,4 @@
-module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ModuleGraph, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, eval, evalCachedViaTask, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getModuleGraph, getPackageEnv, load, loadWith, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
+module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ModuleGraph, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, eval, evalCachedViaTask, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getModuleGraph, getPackageEnv, load, loadWith, loadWithPreBuiltGraphs, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -965,6 +965,7 @@ benchmarkPackageSummaryCacheCodecs config =
             , sourceDirectories = config.sourceDirectories
             , normalizationRoots = Nothing
             , packageParseCacheDir = Just config.packageParseCacheDir
+            , preBuiltGraphs = Nothing
             }
         )
     <|
@@ -2137,6 +2138,58 @@ loadWith config =
     loadWithUserNormalizationFlags NormalizationFlags.experimental config
 
 
+{-| Like `loadWith`, but skips the `build_graph` phase by using a pre-built
+`depGraph` + `moduleGraph` supplied by the caller.
+
+Intended for parallel-worker pools where the main thread loads the
+project once (computing graphs from scratch) and ships the resulting
+graph state to workers via `BackendTask.Parallel.initShared`. Workers
+then call `loadWithPreBuiltGraphs` with the shipped graphs to skip the
+two expensive parts of `build_graph`:
+
+  1. `DepGraph.buildGraph` over user sources.
+  2. `Elm.Parser.parseToFile` for every user file (populates
+     `moduleGraph.moduleToFile`).
+
+Workers still load package sources, glob/read user files, and re-derive
+cheap downstream values (package module names, topo sort over packages)
+since those depend on inputs the worker has anyway. The save is bounded
+by `buildGraphMs` minus the small residual.
+
+It's the caller's responsibility to make sure `preBuiltGraphs` was
+produced from the same `projectDir`, `sourceDirectories`, `patchSource`,
+and `patchUserSource` settings — mismatches will silently produce a
+project whose graphs disagree with its sources.
+-}
+loadWithPreBuiltGraphs :
+    { projectDir : Path
+    , skipPackages : Set String
+    , patchSource : String -> String
+    , patchUserSource : String -> String -> String
+    , extraSourceFiles : List String
+    , extraReachableImports : List String
+    , sourceDirectories : Maybe (List String)
+    , normalizationRoots : Maybe (List String)
+    , preBuiltGraphs : { depGraph : DepGraph.Graph, moduleGraph : ModuleGraph }
+    }
+    -> BackendTask FatalError InterpreterProject
+loadWithPreBuiltGraphs config =
+    loadWithProfileUserNormalizationFlags NormalizationFlags.experimental
+        { projectDir = config.projectDir
+        , skipPackages = config.skipPackages
+        , patchSource = config.patchSource
+        , patchUserSource = config.patchUserSource
+        , extraSourceFiles = config.extraSourceFiles
+        , extraReachableImports = config.extraReachableImports
+        , sourceDirectories = config.sourceDirectories
+        , normalizationRoots = config.normalizationRoots
+        , packageParseCacheDir =
+            Just (Path.toString config.projectDir ++ "/.elm-build")
+        , preBuiltGraphs = Just config.preBuiltGraphs
+        }
+        |> BackendTask.map .project
+
+
 loadWithUserNormalizationFlags :
     NormalizationFlags.NormalizationFlags
     ->
@@ -2165,6 +2218,7 @@ loadWithUserNormalizationFlags userNormalizationFlags config =
             -- summary cache (including normalized top-level constants) is
             -- persisted across runs without every caller having to opt in.
             Just (Path.toString config.projectDir ++ "/.elm-build")
+        , preBuiltGraphs = Nothing
         }
         |> BackendTask.map .project
 
@@ -2179,6 +2233,7 @@ loadWithProfile :
     , sourceDirectories : Maybe (List String)
     , normalizationRoots : Maybe (List String)
     , packageParseCacheDir : Maybe String
+    , preBuiltGraphs : Maybe { depGraph : DepGraph.Graph, moduleGraph : ModuleGraph }
     }
     -> BackendTask FatalError { project : InterpreterProject, profile : LoadProfile }
 loadWithProfile config =
@@ -2197,6 +2252,7 @@ loadWithProfileUserNormalizationFlags :
         , sourceDirectories : Maybe (List String)
         , normalizationRoots : Maybe (List String)
         , packageParseCacheDir : Maybe String
+        , preBuiltGraphs : Maybe { depGraph : DepGraph.Graph, moduleGraph : ModuleGraph }
         }
     -> BackendTask FatalError { project : InterpreterProject, profile : LoadProfile }
 loadWithProfileUserNormalizationFlags userNormalizationFlags config =
@@ -2294,20 +2350,6 @@ loadWithProfileUserNormalizationFlags userNormalizationFlags config =
                                             Do.do BackendTask.Time.now <|
                                                 \graphStart ->
                                                     let
-                                                        depGraph : DepGraph.Graph
-                                                        depGraph =
-                                                            DepGraph.buildGraph
-                                                                { sourceDirectories = sourceDirectories
-                                                                , files =
-                                                                    userFileContents
-                                                                        |> List.map
-                                                                            (\( filePath, content ) ->
-                                                                                { filePath = filePath
-                                                                                , content = content
-                                                                                }
-                                                                            )
-                                                                }
-
                                                         allUserPaths : List Path
                                                         allUserPaths =
                                                             elmFiles
@@ -2328,33 +2370,68 @@ loadWithProfileUserNormalizationFlags userNormalizationFlags config =
                                                                 )
                                                                 allSourceStrings
 
-                                                        userParsedFiles : Dict String File
-                                                        userParsedFiles =
-                                                            userFileContents
-                                                                |> List.filterMap
-                                                                    (\( _, content ) ->
-                                                                        case Elm.Parser.parseToFile content of
-                                                                            Ok file ->
-                                                                                DepGraph.parseModuleName content
-                                                                                    |> Maybe.map (\name -> ( name, file ))
-
-                                                                            Err _ ->
-                                                                                Nothing
+                                                        -- When `preBuiltGraphs` is provided, skip the two
+                                                        -- expensive parts of `build_graph`: the dep-graph
+                                                        -- construction and the per-user-file `Elm.Parser`
+                                                        -- pass that produces `moduleGraph.moduleToFile`.
+                                                        -- The remaining derivations (allModules, pkgModule
+                                                        -- names, topo sort over packages) are cheap and
+                                                        -- still run on workers — they need access to
+                                                        -- `patchedPackageSources` anyway, which workers
+                                                        -- still load from disk.
+                                                        ( depGraph, moduleGraph, userParsedFiles ) =
+                                                            case config.preBuiltGraphs of
+                                                                Just preBuilt ->
+                                                                    ( preBuilt.depGraph
+                                                                    , preBuilt.moduleGraph
+                                                                    , preBuilt.moduleGraph.moduleToFile
                                                                     )
-                                                                |> Dict.fromList
 
-                                                        moduleGraph : ModuleGraph
-                                                        moduleGraph =
-                                                            { moduleToSource = Dict.fromList allModules
-                                                            , moduleToFile = userParsedFiles
-                                                            , imports =
-                                                                allModules
-                                                                    |> List.map
-                                                                        (\( name, src ) ->
-                                                                            ( name, DepGraph.parseImports src |> Set.fromList )
-                                                                        )
-                                                                    |> Dict.fromList
-                                                            }
+                                                                Nothing ->
+                                                                    let
+                                                                        freshDepGraph : DepGraph.Graph
+                                                                        freshDepGraph =
+                                                                            DepGraph.buildGraph
+                                                                                { sourceDirectories = sourceDirectories
+                                                                                , files =
+                                                                                    userFileContents
+                                                                                        |> List.map
+                                                                                            (\( filePath, content ) ->
+                                                                                                { filePath = filePath
+                                                                                                , content = content
+                                                                                                }
+                                                                                            )
+                                                                                }
+
+                                                                        freshUserParsedFiles : Dict String File
+                                                                        freshUserParsedFiles =
+                                                                            userFileContents
+                                                                                |> List.filterMap
+                                                                                    (\( _, content ) ->
+                                                                                        case Elm.Parser.parseToFile content of
+                                                                                            Ok file ->
+                                                                                                DepGraph.parseModuleName content
+                                                                                                    |> Maybe.map (\name -> ( name, file ))
+
+                                                                                            Err _ ->
+                                                                                                Nothing
+                                                                                    )
+                                                                                |> Dict.fromList
+
+                                                                        freshModuleGraph : ModuleGraph
+                                                                        freshModuleGraph =
+                                                                            { moduleToSource = Dict.fromList allModules
+                                                                            , moduleToFile = freshUserParsedFiles
+                                                                            , imports =
+                                                                                allModules
+                                                                                    |> List.map
+                                                                                        (\( name, src ) ->
+                                                                                            ( name, DepGraph.parseImports src |> Set.fromList )
+                                                                                        )
+                                                                                    |> Dict.fromList
+                                                                            }
+                                                                    in
+                                                                    ( freshDepGraph, freshModuleGraph, freshUserParsedFiles )
 
                                                         allStableSources : List String
                                                         allStableSources =

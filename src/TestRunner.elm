@@ -250,6 +250,7 @@ loadProject config maybeExperiment allDirectories testModuleNames =
             , sourceDirectories = Just allDirectories
             , normalizationRoots = Just testModuleNames
             , packageParseCacheDir = Just ".elm-build"
+            , preBuiltGraphs = Nothing
             }
 
         loadTask : BackendTask FatalError LoadedProject
