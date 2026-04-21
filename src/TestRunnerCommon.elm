@@ -19,29 +19,31 @@ sync between the two sides.
 
 import Bytes exposing (Bytes)
 import Bytes.Decode
-import DepGraph
-import InterpreterProject exposing (ModuleGraph)
 import Lamdera.Wire3 as Wire
 
 
 {-| Payload sent once per worker at startup via `Parallel.initShared`.
 Mirrors the load-config slice both sides need to call
-`InterpreterProject.loadWithPreBuiltGraphs` with matching arguments.
+`InterpreterProject.loadWith` with matching arguments.
 
 The parallel-worker pool ships this payload via SharedArrayBuffer
 (zero-copy across workers — see elm-pages3 commit `300e5c6f`), so heavy
-fields like `depGraph` + `moduleGraph` ride along without the +4 s
-per-worker structured-clone copy that blocked the earlier shipping
-experiment. Workers feed the pre-built graphs into
-`loadWithPreBuiltGraphs` (commit `f1648b6`) to skip `build_graph_ms`.
+fields ride along without per-worker structured-clone copies. But adding
+heavy IR (parsed user `File` ASTs via `moduleGraph.moduleToFile`) ran
+into a separate ceiling: per-worker Lamdera Wire3 **decode** of the
+13.5 MB payload costs 3.4-5.7 s on elm-review — exceeding the ~2 s
+`build_graph_ms` save it would unlock. See `.scratch/parallel-ceiling.md`
+"Tier-2 Option A third attempt — full SAB pipeline" for the bisect.
+
+The infrastructure (`InterpreterProject.loadWithPreBuiltGraphs`,
+elm-pages3 SAB) is in place if a future cheaper codec for `File` ASTs
+makes the round-trip cost competitive with `build_graph_ms`.
 
 -}
 type alias WorkerSharedConfig =
     { projectDir : String
     , sourceDirectories : List String
     , testModuleNames : List String
-    , depGraph : DepGraph.Graph
-    , moduleGraph : ModuleGraph
     }
 
 

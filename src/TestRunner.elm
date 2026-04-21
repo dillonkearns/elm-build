@@ -180,8 +180,6 @@ task config =
                             { projectDir = "."
                             , sourceDirectories = allDirectories
                             , testModuleNames = testModuleNames
-                            , depGraph = InterpreterProject.getDepGraph loaded.project
-                            , moduleGraph = InterpreterProject.getModuleGraph loaded.project
                             }
                     }
                 )
