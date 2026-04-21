@@ -16172,7 +16172,8 @@ loadReviewProjectForRuleInfo config =
                 , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
                 , normalizationRoots = Just [ "ReviewConfig" ]
                 , packageParseCacheDir = Just (Path.toString config.buildDirectory)
-                , preBuiltGraphs = Nothing
+                , preBuiltDepGraph = Nothing
+                , preBuiltModuleGraph = Nothing
                 }
 
         Nothing ->
@@ -16186,7 +16187,8 @@ loadReviewProjectForRuleInfo config =
                 , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
                 , normalizationRoots = Just [ "ReviewConfig" ]
                 , packageParseCacheDir = Just (Path.toString config.buildDirectory)
-                , preBuiltGraphs = Nothing
+                , preBuiltDepGraph = Nothing
+                , preBuiltModuleGraph = Nothing
                 }
     )
         |> BackendTask.map (.project >> InterpreterProject.withEnvMode config.envMode)
@@ -16313,7 +16315,8 @@ loadReviewProjectDetailed config =
                 , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
                 , normalizationRoots = Just [ "ReviewConfig" ]
                 , packageParseCacheDir = Just (Path.toString config.buildDirectory)
-                , preBuiltGraphs = Nothing
+                , preBuiltDepGraph = Nothing
+                , preBuiltModuleGraph = Nothing
                 }
 
         Nothing ->
@@ -16327,7 +16330,8 @@ loadReviewProjectDetailed config =
                 , sourceDirectories = Just [ config.reviewDir ++ "/src" ]
                 , normalizationRoots = Just [ "ReviewConfig" ]
                 , packageParseCacheDir = Just (Path.toString config.buildDirectory)
-                , preBuiltGraphs = Nothing
+                , preBuiltDepGraph = Nothing
+                , preBuiltModuleGraph = Nothing
                 }
     )
         |> BackendTask.map

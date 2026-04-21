@@ -61,7 +61,7 @@ run =
 
 loadProjectFromShared : WorkerSharedConfig -> BackendTask FatalError InterpreterProject
 loadProjectFromShared config =
-    InterpreterProject.loadWith
+    InterpreterProject.loadWithPreBuiltGraphs
         { projectDir = Path.path config.projectDir
         , skipPackages = TestRunner.kernelPackages
         , patchSource = TestRunner.patchSource
@@ -70,6 +70,8 @@ loadProjectFromShared config =
         , extraReachableImports = [ "Test", "Fuzz", "Expect", "Test.Runner" ]
         , sourceDirectories = Just config.sourceDirectories
         , normalizationRoots = Just config.testModuleNames
+        , preBuiltDepGraph = Just config.depGraph
+        , preBuiltModuleGraph = Nothing
         }
 
 

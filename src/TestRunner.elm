@@ -180,6 +180,7 @@ task config =
                             { projectDir = "."
                             , sourceDirectories = allDirectories
                             , testModuleNames = testModuleNames
+                            , depGraph = InterpreterProject.getDepGraph loaded.project
                             }
                     }
                 )
@@ -250,7 +251,8 @@ loadProject config maybeExperiment allDirectories testModuleNames =
             , sourceDirectories = Just allDirectories
             , normalizationRoots = Just testModuleNames
             , packageParseCacheDir = Just ".elm-build"
-            , preBuiltGraphs = Nothing
+            , preBuiltDepGraph = Nothing
+            , preBuiltModuleGraph = Nothing
             }
 
         loadTask : BackendTask FatalError LoadedProject
