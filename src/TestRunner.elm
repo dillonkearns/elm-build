@@ -1,4 +1,7 @@
-module TestRunner exposing (run)
+module TestRunner exposing
+    ( run
+    , kernelPackages, patchSource, simpleTestRunnerSource
+    )
 
 {-| Run an Elm test suite via the interpreter.
 
@@ -17,7 +20,11 @@ import BackendTask.Do as Do
 import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
+import BackendTask.Parallel
 import BackendTask.Time
+import Bytes exposing (Bytes)
+import Bytes.Decode as BD
+import Bytes.Encode as BE
 import Cache
 import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
@@ -25,6 +32,7 @@ import Cli.Program as Program
 import DepGraph
 import FatalError exposing (FatalError)
 import InterpreterProject exposing (InterpreterProject)
+import Json.Decode
 import Json.Encode
 import NormalizationFlags
 import Pages.Script as Script exposing (Script)
@@ -164,9 +172,16 @@ task config =
             Do.do (logIfConsole config ("Found " ++ String.fromInt (List.length testFiles) ++ " test file(s)")) <| \_ ->
             Do.do BackendTask.Time.now <| \startTime ->
             Do.do
+                (BackendTask.Parallel.worker
+                    { workerModule = "TestFileWorker"
+                    , shared = encodeWorkerShared allDirectories testModuleNames
+                    }
+                )
+            <| \worker ->
+            Do.do
                 (testFiles
-                    |> List.map (\testFile -> runTestFile config loaded.project testFile)
-                    |> BackendTask.Extra.sequence
+                    |> List.map (\testFile -> runTestFileViaWorker config loaded.project worker testFile)
+                    |> BackendTask.combine
                 )
             <| \allResults ->
             Do.do BackendTask.Time.now <| \endTime ->
@@ -874,6 +889,263 @@ runTestFile config project testFile =
                 Nothing ->
                     Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (unexpected output)"))) <| \_ ->
                     BackendTask.succeed (skippedResult "unexpected output" 1)
+
+
+{-| Worker variant of `runTestFile`: same orchestration on the main
+thread (file read, test discovery, expression construction, output
+parsing, logging), but the heavy interpreter eval is dispatched to a
+free thread in the `BackendTask.Parallel.worker` pool instead of running
+inline.
+
+v1 deliberately bypasses `Cache.run`; the worker calls
+`InterpreterProject.evalSimple` directly so cold-run wall time benefits
+from real CPU parallelism. Re-introducing the cache layer (so warm runs
+keep their disk-cache speedup) is tracked as B.6 follow-up work.
+
+-}
+runTestFileViaWorker : Config -> InterpreterProject -> BackendTask.Parallel.Worker -> String -> BackendTask FatalError TestFileResult
+runTestFileViaWorker config project worker testFile =
+    Do.allowFatal (File.rawFile testFile) <| \testSource ->
+    let
+        testModuleName : String
+        testModuleName =
+            DepGraph.parseModuleName testSource |> Maybe.withDefault "Tests"
+
+        staticTestValues : List String
+        staticTestValues =
+            TestAnalysis.discoverTestValues testSource
+
+        probeTestValues : () -> { testValues : List String, rejections : String, candidateCount : Int }
+        probeTestValues () =
+            let
+                candidateNames =
+                    TestAnalysis.getCandidateNames testSource
+
+                packageEnv =
+                    InterpreterProject.getPackageEnv project
+
+                probeSources =
+                    let
+                        { userSources } =
+                            InterpreterProject.prepareEvalSources project
+                                { imports = [ "SimpleTestRunner", testModuleName ]
+                                , expression = "\"probe\""
+                                }
+                    in
+                    simpleTestRunnerSource config :: userSources
+
+                probeResults =
+                    candidateNames
+                        |> List.map
+                            (\name ->
+                                ( name, TestAnalysis.probeCandidate packageEnv testModuleName name probeSources )
+                            )
+            in
+            { testValues =
+                probeResults
+                    |> List.filterMap
+                        (\( name, result ) ->
+                            case result of
+                                Ok _ ->
+                                    Just name
+
+                                Err _ ->
+                                    Nothing
+                        )
+            , rejections =
+                probeResults
+                    |> List.filterMap
+                        (\( name, result ) ->
+                            case result of
+                                Err reason ->
+                                    Just (name ++ ": " ++ reason)
+
+                                Ok _ ->
+                                    Nothing
+                        )
+                    |> String.join "; "
+            , candidateCount = List.length candidateNames
+            }
+
+        skippedResult reason skippedCount =
+            { file = testFile
+            , moduleName = testModuleName
+            , status = "skipped"
+            , message = reason
+            , passed = 0
+            , failed = 0
+            , skipped = skippedCount
+            , tests = []
+            }
+
+        { testValues, rejections, candidateCount } =
+            if List.isEmpty staticTestValues then
+                probeTestValues ()
+
+            else
+                { testValues = staticTestValues
+                , rejections = ""
+                , candidateCount = List.length staticTestValues
+                }
+    in
+    if List.isEmpty testValues then
+        Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (skipped: " ++ rejections ++ ")"))) <| \_ ->
+        BackendTask.succeed (skippedResult rejections (max 1 candidateCount))
+
+    else
+        let
+            suiteExpr =
+                case testValues of
+                    [ single ] ->
+                        testModuleName ++ "." ++ single
+
+                    multiple ->
+                        "Test.describe \"" ++ testModuleName ++ "\" [" ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) multiple) ++ "]"
+
+            evalExpression =
+                "SimpleTestRunner.runToString (" ++ suiteExpr ++ ")"
+
+            taskInputBytes : Bytes
+            taskInputBytes =
+                encodeWorkerTaskInput
+                    { imports = [ "SimpleTestRunner", "Test", testModuleName ]
+                    , expression = evalExpression
+                    , sourceOverrides = [ simpleTestRunnerSource config ]
+                    }
+        in
+        Do.do
+            (BackendTask.Parallel.runOn worker taskInputBytes workerTaskOutputDecoder)
+        <| \output ->
+        if String.startsWith "ERROR:" output then
+            let
+                message =
+                    String.trim output
+            in
+            Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (error: " ++ String.left 500 message ++ ")"))) <| \_ ->
+            BackendTask.succeed (skippedResult message 1)
+
+        else
+            case parseTestOutput output of
+                Just parsedOutput ->
+                    let
+                        normalizedTests =
+                            parsedOutput.tests
+                                |> List.map (prefixTestModuleLabel testModuleName)
+
+                        failures =
+                            normalizedTests
+                                |> List.filter (not << .passed)
+                    in
+                    Do.do
+                        (if parsedOutput.failed == 0 then
+                            logIfConsole config (Ansi.Color.fontColor Ansi.Color.green ("  ✓ " ++ testModuleName ++ " (" ++ String.fromInt parsedOutput.passed ++ " passed)"))
+
+                         else
+                            Do.do
+                                (logIfConsole config (Ansi.Color.fontColor Ansi.Color.red ("  ✗ " ++ testModuleName ++ " (" ++ String.fromInt parsedOutput.failed ++ " failed, " ++ String.fromInt parsedOutput.passed ++ " passed)")))
+                            <| \_ ->
+                            Do.each failures
+                                (\failure ->
+                                    logIfConsole config
+                                        (Ansi.Color.fontColor Ansi.Color.red
+                                            ("      FAIL:"
+                                                ++ failure.label
+                                                ++ (if String.isEmpty failure.message then
+                                                        ""
+
+                                                    else
+                                                        " | " ++ failure.message
+                                                   )
+                                            )
+                                        )
+                                )
+                                (\_ -> BackendTask.succeed ())
+                        )
+                    <| \_ ->
+                    BackendTask.succeed
+                        { file = testFile
+                        , moduleName = testModuleName
+                        , status =
+                            if parsedOutput.failed == 0 then
+                                "passed"
+
+                            else
+                                "failed"
+                        , message = ""
+                        , passed = parsedOutput.passed
+                        , failed = parsedOutput.failed
+                        , skipped = 0
+                        , tests = normalizedTests
+                        }
+
+                Nothing ->
+                    Do.do (logIfConsole config (Ansi.Color.fontColor Ansi.Color.yellow ("  ⊘ " ++ testModuleName ++ " (unexpected output)"))) <| \_ ->
+                    BackendTask.succeed (skippedResult "unexpected output" 1)
+
+
+
+-- ── Worker wire format helpers ──
+--
+-- Length-prefixed JSON envelopes for shared / per-task / per-result
+-- bytes. Mirrors the helpers in `TestFileWorker.elm` — keep both sides
+-- in sync.
+
+
+encodeWorkerShared : List String -> List String -> Bytes
+encodeWorkerShared sourceDirectories testModuleNames =
+    encodeJsonBytes
+        (Json.Encode.object
+            [ ( "projectDir", Json.Encode.string "." )
+            , ( "sourceDirectories", Json.Encode.list Json.Encode.string sourceDirectories )
+            , ( "testModuleNames", Json.Encode.list Json.Encode.string testModuleNames )
+            ]
+        )
+
+
+encodeWorkerTaskInput : { imports : List String, expression : String, sourceOverrides : List String } -> Bytes
+encodeWorkerTaskInput input =
+    encodeJsonBytes
+        (Json.Encode.object
+            [ ( "imports", Json.Encode.list Json.Encode.string input.imports )
+            , ( "expression", Json.Encode.string input.expression )
+            , ( "sourceOverrides", Json.Encode.list Json.Encode.string input.sourceOverrides )
+            ]
+        )
+
+
+workerTaskOutputDecoder : BD.Decoder String
+workerTaskOutputDecoder =
+    decodeJsonBytes (Json.Decode.field "output" Json.Decode.string)
+
+
+encodeJsonBytes : Json.Encode.Value -> Bytes
+encodeJsonBytes value =
+    let
+        utf8 : Bytes
+        utf8 =
+            BE.encode (BE.string (Json.Encode.encode 0 value))
+    in
+    BE.encode
+        (BE.sequence
+            [ BE.unsignedInt32 Bytes.BE (Bytes.width utf8)
+            , BE.bytes utf8
+            ]
+        )
+
+
+decodeJsonBytes : Json.Decode.Decoder a -> BD.Decoder a
+decodeJsonBytes jsonDecoder =
+    BD.unsignedInt32 Bytes.BE
+        |> BD.andThen BD.string
+        |> BD.andThen
+            (\jsonStr ->
+                case Json.Decode.decodeString jsonDecoder jsonStr of
+                    Ok value ->
+                        BD.succeed value
+
+                    Err _ ->
+                        BD.fail
+            )
 
 
 {-| Discover test files: use --test if provided, otherwise find all tests/**/*.elm that import Test.
