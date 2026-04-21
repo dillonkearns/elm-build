@@ -1342,136 +1342,146 @@ normalizePerFile :
     -> Eval.Module.ProjectEnv
     -> BackendTask FatalError UserNormBuildResult
 normalizePerFile cacheDir packageKey userNormalizationFlags userModulePlans userFileContents envBeforeNorm =
-    Do.do (ensureDirTask cacheDir) <|
-        \_ ->
-            let
-                flagsKey =
-                    userNormalizationFlagsKey userNormalizationFlags
-            in
-            userModulePlans
+    -- Refactor (2026-04-21): the original implementation did `File.exists`
+    -- then `File.binaryFile` per module inside a serial fold. Each
+    -- BackendTask round-trips through the elm-pages scheduler (Elm ↔ JS),
+    -- and 63 modules × 2 round-trips ≈ 1 s of pure scheduler latency on
+    -- elm-review even though the underlying disk I/O takes <10 ms total.
+    --
+    -- Now: batch all per-module `exists+read` tasks via
+    -- `BackendTask.Extra.combine` (one combined round-trip in practice),
+    -- then run the serial fold over the pre-read `Maybe Bytes` results.
+    -- The fold still needs to be sequential because cache-miss / extension
+    -- branches normalize against the running `env` (one module's
+    -- normalization may use the prior module's bodies), but reads no
+    -- longer add round-trip overhead.
+    Do.do (ensureDirTask cacheDir) <| \_ ->
+        let
+            flagsKey =
+                userNormalizationFlagsKey userNormalizationFlags
+
+            plansWithPaths : List ( UserNormModulePlan, String )
+            plansWithPaths =
+                userModulePlans
+                    |> List.map
+                        (\plan ->
+                            let
+                                moduleKey : String
+                                moduleKey =
+                                    String.join "." (userNormPlanModuleName plan)
+
+                                contentHash : String
+                                contentHash =
+                                    Dict.get moduleKey userFileContents
+                                        |> Maybe.map (FNV1a.hash >> String.fromInt)
+                                        |> Maybe.withDefault "0"
+                            in
+                            ( plan
+                            , cacheDir
+                                ++ "/user-norm-"
+                                ++ userNormCacheVersion
+                                ++ "-"
+                                ++ packageKey
+                                ++ "-"
+                                ++ flagsKey
+                                ++ "-"
+                                ++ moduleKey
+                                ++ "-"
+                                ++ contentHash
+                                ++ ".blob"
+                            )
+                        )
+
+            readCachedBytesTask : BackendTask FatalError (List (Maybe Bytes.Bytes))
+            readCachedBytesTask =
+                plansWithPaths
+                    |> List.map
+                        (\( _, path ) ->
+                            File.exists path
+                                |> BackendTask.allowFatal
+                                |> BackendTask.andThen
+                                    (\exists ->
+                                        if exists then
+                                            File.binaryFile path
+                                                |> BackendTask.allowFatal
+                                                |> BackendTask.map Just
+
+                                        else
+                                            BackendTask.succeed Nothing
+                                    )
+                        )
+                    |> BackendTask.Extra.combine
+        in
+        Do.do readCachedBytesTask <| \maybeCachedBytesList ->
+            List.map2 Tuple.pair plansWithPaths maybeCachedBytesList
                 |> List.foldl
-                    (\userModulePlan resultTask ->
+                    (\( ( userModulePlan, perFilePath ), maybeBytes ) resultTask ->
                         Do.do resultTask <|
                             \resultAcc ->
                                 let
                                     planStats : UserNormStats
                                     planStats =
                                         userNormPlanStats userModulePlan
-
-                                    moduleName : List String
-                                    moduleName =
-                                        userNormPlanModuleName userModulePlan
-
-                                    moduleKey : String
-                                    moduleKey =
-                                        String.join "." moduleName
-
-                                    contentHash : String
-                                    contentHash =
-                                        Dict.get moduleKey userFileContents
-                                            |> Maybe.map (FNV1a.hash >> String.fromInt)
-                                            |> Maybe.withDefault "0"
-
-                                    perFilePath : String
-                                    perFilePath =
-                                        cacheDir
-                                            ++ "/user-norm-"
-                                            ++ userNormCacheVersion
-                                            ++ "-"
-                                            ++ packageKey
-                                            ++ "-"
-                                            ++ flagsKey
-                                            ++ "-"
-                                            ++ moduleKey
-                                            ++ "-"
-                                            ++ contentHash
-                                            ++ ".blob"
                                 in
-                                File.exists perFilePath
-                                    |> BackendTask.allowFatal
-                                    |> BackendTask.andThen
-                                        (\exists ->
-                                            if exists then
-                                                File.binaryFile perFilePath
-                                                    |> BackendTask.allowFatal
-                                                    |> BackendTask.andThen
-                                                        (\bytes ->
-                                                            case decodeUserNormBundle bytes of
-                                                                Just [ entry ] ->
-                                                                    let
-                                                                        envFromCache : Eval.Module.ProjectEnv
-                                                                        envFromCache =
-                                                                            applyUserNormBundle [ entry ] resultAcc.env
+                                case maybeBytes of
+                                    Just bytes ->
+                                        case decodeUserNormBundle bytes of
+                                            Just [ entry ] ->
+                                                let
+                                                    envFromCache : Eval.Module.ProjectEnv
+                                                    envFromCache =
+                                                        applyUserNormBundle [ entry ] resultAcc.env
 
-                                                                        missingTargets : Set String
-                                                                        missingTargets =
-                                                                            missingUserNormTargets userModulePlan entry
-                                                                    in
-                                                                    if Set.isEmpty missingTargets then
-                                                                        BackendTask.succeed
-                                                                            { env = envFromCache
-                                                                            , stats =
-                                                                                combineUserNormStats resultAcc.stats
-                                                                                    { planStats | cacheHitModules = 1 }
+                                                    missingTargets : Set String
+                                                    missingTargets =
+                                                        missingUserNormTargets userModulePlan entry
+                                                in
+                                                if Set.isEmpty missingTargets then
+                                                    BackendTask.succeed
+                                                        { env = envFromCache
+                                                        , stats =
+                                                            combineUserNormStats resultAcc.stats
+                                                                { planStats | cacheHitModules = 1 }
+                                                        }
+
+                                                else
+                                                    let
+                                                        extensionPlan : UserNormModulePlan
+                                                        extensionPlan =
+                                                            { file = userModulePlan.file
+                                                            , targetFunctions = Just missingTargets
+                                                            }
+
+                                                        extensionResult =
+                                                            normalizeOneAndCache userNormalizationFlags extensionPlan envFromCache
+
+                                                        mergedEntry : UserNormCacheEntry
+                                                        mergedEntry =
+                                                            extendUserNormCacheEntry entry
+                                                                (extensionResult.entry.functions
+                                                                    |> List.map (\functionImplementation -> ( Node.value functionImplementation.name, functionImplementation ))
+                                                                    |> FastDict.fromList
+                                                                )
+                                                                (extensionResult.entry.precomputedValues |> FastDict.fromList)
+                                                                missingTargets
+                                                    in
+                                                    writeUserNormEntry perFilePath mergedEntry
+                                                        |> BackendTask.map
+                                                            (\_ ->
+                                                                { env = extensionResult.env
+                                                                , stats =
+                                                                    combineUserNormStats resultAcc.stats
+                                                                        (combineUserNormStats
+                                                                            { planStats
+                                                                                | cacheHitModules = 1
+                                                                                , cacheExtendedModules = 1
                                                                             }
+                                                                            (userNormEntryStats extensionResult.entry extensionResult.dependencySummaryStats)
+                                                                        )
+                                                                }
+                                                            )
 
-                                                                    else
-                                                                        let
-                                                                            extensionPlan : UserNormModulePlan
-                                                                            extensionPlan =
-                                                                                { file = userModulePlan.file
-                                                                                , targetFunctions = Just missingTargets
-                                                                                }
-
-                                                                            extensionResult =
-                                                                                normalizeOneAndCache userNormalizationFlags extensionPlan envFromCache
-
-                                                                            mergedEntry : UserNormCacheEntry
-                                                                            mergedEntry =
-                                                                                extendUserNormCacheEntry entry
-                                                                                    (extensionResult.entry.functions
-                                                                                        |> List.map (\functionImplementation -> ( Node.value functionImplementation.name, functionImplementation ))
-                                                                                        |> FastDict.fromList
-                                                                                    )
-                                                                                    (extensionResult.entry.precomputedValues |> FastDict.fromList)
-                                                                                    missingTargets
-                                                                        in
-                                                                        writeUserNormEntry perFilePath mergedEntry
-                                                                            |> BackendTask.map
-                                                                                (\_ ->
-                                                                                    { env = extensionResult.env
-                                                                                    , stats =
-                                                                                        combineUserNormStats resultAcc.stats
-                                                                                            (combineUserNormStats
-                                                                                                { planStats
-                                                                                                    | cacheHitModules = 1
-                                                                                                    , cacheExtendedModules = 1
-                                                                                                }
-                                                                                                (userNormEntryStats extensionResult.entry extensionResult.dependencySummaryStats)
-                                                                                            )
-                                                                                    }
-                                                                                )
-
-                                                                _ ->
-                                                                    let
-                                                                        normalizeResult =
-                                                                            normalizeOneAndCache userNormalizationFlags userModulePlan resultAcc.env
-                                                                    in
-                                                                    writeUserNormEntry perFilePath normalizeResult.entry
-                                                                        |> BackendTask.map
-                                                                            (\_ ->
-                                                                                { env = normalizeResult.env
-                                                                                , stats =
-                                                                                    combineUserNormStats resultAcc.stats
-                                                                                        (combineUserNormStats
-                                                                                            { planStats | cacheMissModules = 1 }
-                                                                                            (userNormEntryStats normalizeResult.entry normalizeResult.dependencySummaryStats)
-                                                                                        )
-                                                                                }
-                                                                            )
-                                                        )
-
-                                            else
+                                            _ ->
                                                 let
                                                     normalizeResult =
                                                         normalizeOneAndCache userNormalizationFlags userModulePlan resultAcc.env
@@ -1488,7 +1498,24 @@ normalizePerFile cacheDir packageKey userNormalizationFlags userModulePlans user
                                                                     )
                                                             }
                                                         )
-                                        )
+
+                                    Nothing ->
+                                        let
+                                            normalizeResult =
+                                                normalizeOneAndCache userNormalizationFlags userModulePlan resultAcc.env
+                                        in
+                                        writeUserNormEntry perFilePath normalizeResult.entry
+                                            |> BackendTask.map
+                                                (\_ ->
+                                                    { env = normalizeResult.env
+                                                    , stats =
+                                                        combineUserNormStats resultAcc.stats
+                                                            (combineUserNormStats
+                                                                { planStats | cacheMissModules = 1 }
+                                                                (userNormEntryStats normalizeResult.entry normalizeResult.dependencySummaryStats)
+                                                            )
+                                                    }
+                                                )
                     )
                     (BackendTask.succeed
                         { env = envBeforeNorm
