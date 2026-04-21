@@ -19,31 +19,29 @@ sync between the two sides.
 
 import Bytes exposing (Bytes)
 import Bytes.Decode
+import DepGraph
+import InterpreterProject exposing (ModuleGraph)
 import Lamdera.Wire3 as Wire
 
 
 {-| Payload sent once per worker at startup via `Parallel.initShared`.
 Mirrors the load-config slice both sides need to call
-`InterpreterProject.loadWith` with matching arguments.
+`InterpreterProject.loadWithPreBuiltGraphs` with matching arguments.
 
-The parallel-worker pool now ships this payload via SharedArrayBuffer
-(zero-copy across workers — see elm-pages3 commit `300e5c6f` adding
-SAB infrastructure to `parallel-worker-pool.js`), so the per-worker
-structured-clone copy is gone. Heavy fields can be added here without
-the +4 s per-worker copy regression that blocked the earlier
-`moduleGraph` shipping experiment.
-
-When adding heavier fields (e.g. `depGraph` + `moduleGraph` to skip
-`build_graph_ms` on workers), also plumb the worker side to actually
-USE the pre-built data — the SAB infrastructure ships the bytes
-cheaply, but workers still need a `loadWithPreBuiltGraphs` entry that
-skips `build_graph_ms` based on the pre-built input.
+The parallel-worker pool ships this payload via SharedArrayBuffer
+(zero-copy across workers — see elm-pages3 commit `300e5c6f`), so heavy
+fields like `depGraph` + `moduleGraph` ride along without the +4 s
+per-worker structured-clone copy that blocked the earlier shipping
+experiment. Workers feed the pre-built graphs into
+`loadWithPreBuiltGraphs` (commit `f1648b6`) to skip `build_graph_ms`.
 
 -}
 type alias WorkerSharedConfig =
     { projectDir : String
     , sourceDirectories : List String
     , testModuleNames : List String
+    , depGraph : DepGraph.Graph
+    , moduleGraph : ModuleGraph
     }
 
 
