@@ -900,13 +900,18 @@ runTestFile config project testFile =
 {-| Worker variant of `runTestFile`: same orchestration on the main
 thread (file read, test discovery, expression construction, output
 parsing, logging), but the heavy interpreter eval is dispatched to a
-free thread in the `BackendTask.Parallel.worker` pool instead of running
-inline.
+free thread in the `BackendTask.Parallel.worker` pool — only on cache
+miss.
 
-v1 deliberately bypasses `Cache.run`; the worker calls
-`InterpreterProject.evalSimple` directly so cold-run wall time benefits
-from real CPU parallelism. Re-introducing the cache layer (so warm runs
-keep their disk-cache speedup) is tracked as B.6 follow-up work.
+`InterpreterProject.evalCachedViaTask` wraps the per-file dispatch in
+the same `Cache.computeAsync` semantic-hash key that
+`evalWithFileOverrides` uses, so warm reruns hit the on-disk cache and
+short-circuit before the worker is touched. Cold runs miss, dispatch
+to a worker, and the result gets written back to cache for next time.
+
+The cache namespace is shared with `evalWithFileOverrides` (same
+`["interpret-with-file-overrides", interpreterResultCacheVersion]`
+label), so cache files are interchangeable between the two paths.
 
 -}
 runTestFileViaWorker : Config -> InterpreterProject -> BackendTask.Parallel.Worker -> String -> BackendTask FatalError TestFileResult
@@ -1011,17 +1016,36 @@ runTestFileViaWorker config project worker testFile =
             evalExpression =
                 "SimpleTestRunner.runToString (" ++ suiteExpr ++ ")"
 
+            evalImports : List String
+            evalImports =
+                [ "SimpleTestRunner", "Test", testModuleName ]
+
+            evalSourceOverrides : List String
+            evalSourceOverrides =
+                [ simpleTestRunnerSource config ]
+
             taskInputBytes : Bytes
             taskInputBytes =
                 encodeWorkerTaskInput
-                    { imports = [ "SimpleTestRunner", "Test", testModuleName ]
+                    { imports = evalImports
                     , expression = evalExpression
-                    , sourceOverrides = [ simpleTestRunnerSource config ]
+                    , sourceOverrides = evalSourceOverrides
                     }
         in
         Do.do
-            (BackendTask.Parallel.runOn worker taskInputBytes workerTaskOutputDecoder)
-        <| \output ->
+            (Cache.run { jobs = Nothing }
+                config.buildDirectory
+                (InterpreterProject.evalCachedViaTask project
+                    { imports = evalImports
+                    , expression = evalExpression
+                    , sourceOverrides = evalSourceOverrides
+                    , compute =
+                        BackendTask.Parallel.runOn worker taskInputBytes workerTaskOutputDecoder
+                    }
+                )
+            )
+        <| \cacheResult ->
+        Do.allowFatal (File.rawFile (Path.toString cacheResult.output)) <| \output ->
         if String.startsWith "ERROR:" output then
             let
                 message =

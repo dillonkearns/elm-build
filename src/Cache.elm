@@ -3,7 +3,7 @@ module Cache exposing
     , Monad, do, succeed, fail
     , writeFile, run, runWith, listExisting, HashSet
     , map, map2, andThen, combine, combineBy, each, sequence
-    , pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, commandInLinkedDirectory, compute, withFile
+    , pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, commandInLinkedDirectory, compute, computeAsync, withFile
     , withPrefix, timed
     , jobs, triggerDebugger
     )
@@ -33,7 +33,7 @@ module Cache exposing
 
 ## Operations
 
-@docs pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, commandInLinkedDirectory, compute, withFile
+@docs pipeThrough, commandWithFile, commandInReadonlyDirectory, commandInWritableDirectory, commandInLinkedDirectory, compute, computeAsync, withFile
 
 
 ## Output control
@@ -604,6 +604,40 @@ compute label depsHash fn k =
     in
     (derive outputHash <| \{ buildPath } target ->
         BackendTask.allowFatal (Script.writeFile { path = hashToPath buildPath target, body = fn () })
+    )
+        |> andThen k
+
+
+{-| Async variant of `compute`. Same caching semantics — cache key is
+`label` extended over `depsHash`, hit returns the cached file path
+without running the body, miss writes the body's output to the cache —
+but the body runs as a `BackendTask` instead of an inline pure thunk.
+
+Used to wrap dispatches whose computation is itself an async effect:
+the test runner's per-file eval can be dispatched to a parallel
+worker pool, and the cache check still happens on the main thread so
+warm reruns hit cache and skip the worker entirely.
+
+-}
+computeAsync :
+    List String
+    -> FileOrDirectory
+    -> BackendTask FatalError String
+    -> (FileOrDirectory -> Monad a)
+    -> Monad a
+computeAsync label depsHash bodyTask k =
+    let
+        outputHash : FileOrDirectory
+        outputHash =
+            extendHashWith label depsHash
+    in
+    (derive outputHash <| \{ buildPath } target ->
+        bodyTask
+            |> BackendTask.andThen
+                (\body ->
+                    BackendTask.allowFatal
+                        (Script.writeFile { path = hashToPath buildPath target, body = body })
+                )
     )
         |> andThen k
 

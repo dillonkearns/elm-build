@@ -1,4 +1,4 @@
-module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, eval, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
+module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, eval, evalCachedViaTask, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -3496,6 +3496,119 @@ evalWithFileOverrides (InterpreterProject project) { imports, expression, source
                                         ++ "]"
                 )
                 k
+
+
+{-| Cache wrapper around an externally-computed eval result. Same
+semantic-hash key as `evalWithFileOverrides` (no `fileOverrides` —
+worker dispatch can't carry mutation-testing overrides), so cache files
+are interchangeable: a warm run created by `evalWithFileOverrides`
+hits the cache here too, and vice versa.
+
+The `compute` argument is the async work that produces the eval output
+*on cache miss only*. The test runner passes a `BackendTask.Parallel.runOn`
+dispatch here — main thread checks the cache, hits short-circuit and
+the worker pool stays idle; misses dispatch to a worker that runs the
+eval and the result gets written back to cache.
+
+Returns the path to the cached output file (the eval result string),
+ready to be read with `BackendTask.File.rawFile`.
+
+-}
+evalCachedViaTask :
+    InterpreterProject
+    ->
+        { imports : List String
+        , expression : String
+        , sourceOverrides : List String
+        , compute : BackendTask FatalError String
+        }
+    -> Cache.Monad FileOrDirectory
+evalCachedViaTask (InterpreterProject project) { imports, expression, sourceOverrides, compute } =
+    let
+        wrapperSource : String
+        wrapperSource =
+            generateWrapper imports expression
+
+        semanticCacheKey : String
+        semanticCacheKey =
+            buildEvalCacheKey project sourceOverrides wrapperSource
+    in
+    Cache.do (Cache.writeFile semanticCacheKey Cache.succeed) <|
+        \semanticHash ->
+            Cache.computeAsync
+                [ "interpret-with-file-overrides", interpreterResultCacheVersion ]
+                semanticHash
+                compute
+                Cache.succeed
+
+
+{-| Compute the same semantic cache key `evalWithFileOverrides` uses,
+factored out so `evalCachedViaTask` can reproduce it exactly (so the
+two paths share cache files). Always assumes empty `fileOverrides` —
+worker dispatch can't carry per-file source replacements.
+-}
+buildEvalCacheKey :
+    { a
+        | semanticIndex : SemanticHash.DeclarationIndex
+    }
+    -> List String
+    -> String
+    -> String
+buildEvalCacheKey project sourceOverrides wrapperSource =
+    let
+        wrapperDeps : List ( ModuleName, String )
+        wrapperDeps =
+            case Elm.Parser.parseToFile wrapperSource of
+                Ok wrapperFile ->
+                    wrapperFile.declarations
+                        |> List.concatMap
+                            (\(Node _ decl) ->
+                                case decl of
+                                    FunctionDeclaration func ->
+                                        SemanticHash.extractDependencies
+                                            (Node
+                                                { start = { row = 0, column = 0 }, end = { row = 0, column = 0 } }
+                                                (Node.value func.declaration |> .expression |> Node.value)
+                                            )
+
+                                    _ ->
+                                        []
+                            )
+
+                Err _ ->
+                    []
+
+        entryPointHashes : List String
+        entryPointHashes =
+            wrapperDeps
+                |> List.filterMap
+                    (\( modName, funcName ) ->
+                        let
+                            qualName : String
+                            qualName =
+                                if List.isEmpty modName then
+                                    funcName
+
+                                else
+                                    String.join "." modName ++ "." ++ funcName
+                        in
+                        SemanticHash.semanticHashForEntry project.semanticIndex qualName
+                    )
+                |> List.sort
+
+        overrideKey : String
+        overrideKey =
+            -- Always empty for evalCachedViaTask — fileOverrides is unsupported.
+            ""
+
+        sourceOverrideKey : String
+        sourceOverrideKey =
+            sourceOverrides
+                |> List.map (\s -> String.fromInt (FNV1a.hash s))
+                |> String.join "|"
+    in
+    String.join "\n"
+        (entryPointHashes ++ [ overrideKey, sourceOverrideKey, wrapperSource ])
 
 
 {-| Run the test runner's `results` expression against an extended
