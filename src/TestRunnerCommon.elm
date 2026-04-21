@@ -26,27 +26,18 @@ import Lamdera.Wire3 as Wire
 Mirrors the load-config slice both sides need to call
 `InterpreterProject.loadWith` with matching arguments.
 
-NOTE: Two Tier-2 v1 attempts added pre-built load state here:
+The parallel-worker pool now ships this payload via SharedArrayBuffer
+(zero-copy across workers — see elm-pages3 commit `300e5c6f` adding
+SAB infrastructure to `parallel-worker-pool.js`), so the per-worker
+structured-clone copy is gone. Heavy fields can be added here without
+the +4 s per-worker copy regression that blocked the earlier
+`moduleGraph` shipping experiment.
 
-  - **(Lamdera-derived)** Adding `depGraph : DepGraph.Graph` and
-    `moduleGraph : InterpreterProject.ModuleGraph` regressed
-    elm-review cold by +4 s.
-  - **(AstWireCodec)** Replacing `moduleGraph.moduleToFile : Dict String File`
-    with `moduleToFileBytes : Dict String Bytes` (each Bytes encoded
-    via the hand-tuned `AstWireCodec`) didn't help — same +4 s
-    regression on elm-review.
-
-Direct measurement (commit reverted; see `.scratch/parallel-ceiling.md`)
-showed the wire-encode step alone took **1 s for 13.5 MB** of payload
-on elm-review. The data size — not the codec choice — is the
-bottleneck. The 2 s of `build_graph_ms` we'd save in workers is
-mostly eaten by the wire encode + ship cost.
-
-For now, keep `WorkerSharedConfig` lean. A SharedArrayBuffer-backed
-shared payload would let the wire bytes be allocated once and zero-copy
-shared with all workers — the right tier-2 architecture once we're
-ready to invest. Until then, the Cache.run + worker integration's
-warm-run win stands alone.
+When adding heavier fields (e.g. `depGraph` + `moduleGraph` to skip
+`build_graph_ms` on workers), also plumb the worker side to actually
+USE the pre-built data — the SAB infrastructure ships the bytes
+cheaply, but workers still need a `loadWithPreBuiltGraphs` entry that
+skips `build_graph_ms` based on the pre-built input.
 
 -}
 type alias WorkerSharedConfig =
