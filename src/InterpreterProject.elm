@@ -3571,17 +3571,23 @@ evalSimple (InterpreterProject project) { imports, expression, sourceOverrides }
             case project.baseUserEnv of
                 Just baseEnv ->
                     -- Fast path: baseUserEnv already contains every user
-                    -- module loaded from loadWithProfile. Parsing the
-                    -- sourceOverrides + wrapper against that env skips the
-                    -- per-call user-module parse + buildModuleEnv pass.
-                    -- Phase 1a fixed `replaceModuleInEnv` / `extendWithFiles`
-                    -- so the `resolved` sidecar on baseUserEnv stays coherent
-                    -- with `env`, which keeps this path valid for both
-                    -- LegacyAst and ResolvedList* envModes.
-                    Eval.Module.evalWithEnv
-                        baseEnv
-                        (sourceOverrides ++ [ wrapperSource ])
-                        (FunctionOrValue [] "results")
+                    -- module loaded from loadWithProfile. Parse the
+                    -- sourceOverrides + wrapper into Files and route
+                    -- through `evalAdditionalFiles`, which dispatches to
+                    -- the resolved-IR evaluator
+                    -- (`evalWithResolvedIRFromFilesAndIntercepts`) when
+                    -- there are no fileOverrides — the same hot path
+                    -- `evalWithFileOverrides` uses for the test runner's
+                    -- cold cache miss. Going through the string-keyed
+                    -- `evalWithEnv` instead was a 3-4x slowdown on
+                    -- ListTests-sized suites (see
+                    -- .scratch/parallel-ceiling.md, 2026-04-20 profile).
+                    case parseSourcesAsFiles (sourceOverrides ++ [ wrapperSource ]) of
+                        Ok additionalFiles ->
+                            evalAdditionalFiles baseEnv additionalFiles []
+
+                        Err err ->
+                            Err err
 
                 Nothing ->
                     let
@@ -3736,6 +3742,22 @@ combineFileResults results =
         )
         (Ok [])
         results
+
+
+{-| Parse a list of source strings into `Elm.Syntax.File.File` ASTs,
+short-circuiting to a single `Types.ParsingError` on the first parse
+failure. Used by `evalSimple`'s fast path to feed the resolved-IR
+evaluator (which takes pre-parsed Files, not source strings).
+-}
+parseSourcesAsFiles : List String -> Result Types.Error (List File)
+parseSourcesAsFiles sources =
+    sources
+        |> List.map
+            (\src ->
+                Elm.Parser.parseToFile src
+                    |> Result.mapError Types.ParsingError
+            )
+        |> combineFileResults
 
 
 evalErrorKindToString : Types.EvalErrorKind -> String
