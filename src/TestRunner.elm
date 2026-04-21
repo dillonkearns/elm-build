@@ -435,7 +435,21 @@ formatLoadProfile maybeExperimentLabel profile =
     String.join "\n"
         ([ "Load profile:"
          , "  user_norm_experiment=" ++ experimentLabel
+         , "  ─ phase timings ─"
+         , "  resolve_source_directories_ms=" ++ String.fromInt profile.resolveSourceDirectoriesMs
+         , "  load_package_sources_ms=" ++ String.fromInt profile.loadPackageSourcesMs
+         , "  load_package_summary_cache_ms=" ++ String.fromInt profile.loadPackageSummaryCacheMs
+         , "  decode_package_summary_cache_ms=" ++ String.fromInt profile.decodePackageSummaryCacheMs
+         , "  validate_package_summary_cache_ms=" ++ String.fromInt profile.validatePackageSummaryCacheMs
+         , "  write_package_summary_cache_ms=" ++ String.fromInt profile.writePackageSummaryCacheMs
+         , "  glob_user_sources_ms=" ++ String.fromInt profile.globUserSourcesMs
+         , "  read_user_sources_ms=" ++ String.fromInt profile.readUserSourcesMs
+         , "  read_extra_sources_ms=" ++ String.fromInt profile.readExtraSourcesMs
+         , "  build_graph_ms=" ++ String.fromInt profile.buildGraphMs
+         , "  parse_package_sources_ms=" ++ String.fromInt profile.parsePackageSourcesMs
+         , "  build_package_summaries_from_parsed_ms=" ++ String.fromInt profile.buildPackageSummariesFromParsedMs
          , "  build_base_user_env_ms=" ++ String.fromInt profile.buildBaseUserEnvMs
+         , "  ─ counters ─"
          , "  user_norm_modules_planned=" ++ String.fromInt profile.userNormModulesPlanned
             ++ " target_functions="
             ++ String.fromInt profile.userNormTargetFunctions
