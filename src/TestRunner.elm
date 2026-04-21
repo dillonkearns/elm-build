@@ -1172,7 +1172,7 @@ planChildExpressions testModuleName testSource testValues =
             case TestAnalysis.extractDescribeChildren single testSource of
                 Just children ->
                     if List.length children >= perChildSplitThreshold then
-                        children
+                        chunkChildExpressions testModuleName children
 
                     else
                         [ testModuleName ++ "." ++ single ]
@@ -1184,33 +1184,104 @@ planChildExpressions testModuleName testSource testValues =
             [ "Test.describe \"" ++ testModuleName ++ "\" [" ++ String.join ", " (List.map (\v -> testModuleName ++ "." ++ v) multiple) ++ "]" ]
 
 
-{-| Split a file's top-level `describe` into per-child dispatches when
-its child count meets this threshold. Below this, the per-task overhead
-(dispatch + cache check + IPC) dominates the parallel-mass win.
+{-| Group a file's top-level `describe` children into a small number of
+synthetic `describe` chunks, one per dispatch.
 
-**Currently disabled (1000)** while the per-child runtime cost is being
-diagnosed. Bench data (core-extra ListTests, 77 children):
+Per-child dispatch (one `runOn` per child) hangs the runtime at N ≥ 60
+children — see `perChildSplitThreshold` doc + `.scratch/parallel-ceiling.md`.
+Chunking caps in-flight Cache+dispatch chains at `targetChunkCount` so
+the runtime stays in the known-good range while still spreading the
+work across the worker pool.
 
-    take=3   →  1.7 s eval (works)
-    take=20  →  2.1 s eval (works)
-    take=40  →  4.6 s eval (works)
-    take=60  →  hangs at >>5 min CPU
-    take=77  →  hangs at >>5 min CPU
+For ListTests (77 children, pool=4): chunks into 4 synthetic describes
+of ~20 children each. Each chunk dispatches as one `runOn`. Wall
+becomes `max(per-chunk eval) ≈ N_children/N_chunks × per-child-time`
+— for ListTests, ~20 × 110 ms = ~2 s vs the unsplit 9 s solo eval.
 
-Linear extrapolation says 60 should be ~7 s. Something nonlinear blows
-up between 40 and 60 children, regardless of `BackendTask.sequence` vs
-`combine` and regardless of `Cache.runWith` wrapping. The `dispatchOne`
-function is exercised correctly (`Debug.log` confirms 77 children
-parsed and the first few dispatches start), so the issue is in the
-per-child eval cost compounding — possibly evaluator state growing
-across many small evals against the same `baseUserEnv`, possibly Node
-Worker queue pressure, possibly something in the cache-key computation
-when many sibling cache entries land in the same directory.
+-}
+chunkChildExpressions : String -> List String -> List String
+chunkChildExpressions testModuleName children =
+    let
+        n : Int
+        n =
+            List.length children
 
-See `.scratch/parallel-ceiling.md` 2026-04-21 entry for the full
-investigation. The per-child split machinery (`planChildExpressions` +
-`dispatchOne` over a `Cache.HashSet`) is left in place as a
-known-good-to-N=40 hook for whatever fix lands.
+        chunkSize : Int
+        chunkSize =
+            max 1 (ceiling (toFloat n / toFloat targetChunkCount))
+    in
+    children
+        |> chunkList chunkSize
+        |> List.indexedMap
+            (\i chunk ->
+                "Test.describe \""
+                    ++ testModuleName
+                    ++ "/chunk-"
+                    ++ String.fromInt i
+                    ++ "\" ["
+                    ++ String.join ", " chunk
+                    ++ "]"
+            )
+
+
+{-| Greedy fixed-size chunking of a list. `chunkList 3 [1..10]` →
+`[[1,2,3], [4,5,6], [7,8,9], [10]]`. Tail-recursive via List.foldl on
+chunk indices; doesn't preserve original recursion stack like a naïve
+`take/drop` recursion would for big lists.
+-}
+chunkList : Int -> List a -> List (List a)
+chunkList n xs =
+    if List.isEmpty xs then
+        []
+
+    else
+        List.take n xs :: chunkList n (List.drop n xs)
+
+
+{-| Target number of dispatch chunks per file. Set to 4 (matching the
+default `ELM_PAGES_PARALLEL_POOL_SIZE` baseline so each chunk lands on
+its own worker for max wall-clock spread). Configurable later if pool
+size is dialed up; for now this matches the bench machine.
+-}
+targetChunkCount : Int
+targetChunkCount =
+    4
+
+
+{-| Split a file's top-level `describe` into per-chunk dispatches when
+its child count meets this threshold. Below this, single-dispatch is
+cheaper than chunking (each chunk has its own cache check + dispatch
+overhead).
+
+**Currently disabled (1000)** — chunked dispatch hits two layered
+non-linear scaling limits:
+
+  - Per-chunk eval cost explodes when a single chunk wraps **>~10
+    children** (synthetic `describe "X" [child1, …, child15]` hangs
+    even when only 4 chunks total are in flight). The full `all`
+    top-level value evaluates 220 tests in 9 s but a chunk of 15
+    inline children hangs.
+  - Aggregate in-flight cost hits a wall at **>~40 total dispatches
+    across `combine`** (4 chunks × 10 children works in 3.3 s wall;
+    8 chunks × 10 children hangs).
+
+These limits make every reasonable chunk configuration for
+ListTests-sized files (77 children) infeasible:
+
+  - 4 chunks × 20 children → 80 children, OK count, BUT chunk too big
+  - 8 chunks × 10 children → OK chunk size, BUT count too high
+  - 4 chunks × 10 children → only covers 40 of 77
+
+Compile-mode hypothesis ruled out: switching the worker compile from
+`--debug` to `--optimize` reproduces the hang the same way.
+
+The chunked-dispatch infrastructure (`chunkChildExpressions`,
+`chunkList`, `targetChunkCount`) is left in place as a hook for
+when the underlying runtime scaling issue lands. Lowering this
+threshold to ~10 re-enables chunking on ListTests-sized files
+(useful only after the limit is fixed).
+
+See `.scratch/parallel-ceiling.md` 2026-04-21 entry for the bisect.
 
 -}
 perChildSplitThreshold : Int
