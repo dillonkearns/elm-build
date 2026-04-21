@@ -1,4 +1,4 @@
-module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, eval, evalCachedViaTask, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getPackageEnv, load, loadWith, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
+module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ModuleGraph, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, eval, evalCachedViaTask, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getModuleGraph, getPackageEnv, load, loadWith, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -3925,6 +3925,15 @@ precomputedValuesByModule (InterpreterProject project) =
 getDepGraph : InterpreterProject -> DepGraph.Graph
 getDepGraph (InterpreterProject project) =
     project.depGraph
+
+
+{-| Get the module graph (parsed user files + import edges) for the project.
+Used to ship pre-built graph state to worker pools so they can skip
+the `build_graph` phase of `loadWith`.
+-}
+getModuleGraph : InterpreterProject -> ModuleGraph
+getModuleGraph (InterpreterProject project) =
+    project.moduleGraph
 
 
 {-| Prepare the source lists needed for eval, without actually evaluating.

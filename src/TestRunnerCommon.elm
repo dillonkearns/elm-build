@@ -25,6 +25,17 @@ import Lamdera.Wire3 as Wire
 {-| Payload sent once per worker at startup via `Parallel.initShared`.
 Mirrors the load-config slice both sides need to call
 `InterpreterProject.loadWith` with matching arguments.
+
+NOTE: An earlier Tier-2 v1 attempt added `depGraph` and `moduleGraph`
+fields here, intending workers to skip `build_graph_ms`. Lamdera
+auto-derived the codecs cleanly, but wire-encoding `moduleGraph`
+(which contains `Dict String Elm.Syntax.File.File` for every user
+source) added ~4 s wall time on elm-review — more than the 2 s the
+worker would save by skipping `build_graph`. See
+`.scratch/parallel-ceiling.md` for the bisect; the right shape is
+likely a smaller wire payload (depGraph alone, or `moduleGraph` with
+`moduleToFile` re-encoded via the hand-tuned `AstWireCodec`).
+
 -}
 type alias WorkerSharedConfig =
     { projectDir : String

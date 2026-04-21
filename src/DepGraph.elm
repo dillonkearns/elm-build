@@ -1,5 +1,5 @@
 module DepGraph exposing
-    ( Graph
+    ( Graph(..)
     , parseImports
     , parseModuleName
     , filePathToModuleName
