@@ -184,12 +184,19 @@ task config =
                             }
 
                     -- Empirical optimum on 8-file core-extra cold:
-                    -- pool=1 = 2.81 s, pool=2 = 2.95 s, pool=4 = 3.18 s,
-                    -- pool=10 (default) = 5.13 s. Each worker pays a
-                    -- fixed ~1.5 s bundle-parse cost on spawn that
-                    -- doesn't amortize with current per-test eval
-                    -- speed; parallelism is a net loss until the
-                    -- worker bundle slims down.
+                    -- pool=1 = 2.69 s, pool=8 = 4.18 s, pool=10 = 4.13 s.
+                    -- Even after worker-bundle treeshaking
+                    -- (elm-pages3 trimmed `elm-optimize-level-2` →
+                    -- 11 MB → 1.9 MB), the per-worker `loadProject`
+                    -- cost dominates: each extra worker re-loads the
+                    -- project independently and parallel disk + CPU
+                    -- contention erases the parallelism win for
+                    -- typical project sizes.
+                    --
+                    -- Heavier workloads (hundreds of test files with
+                    -- non-trivial per-test eval cost) would
+                    -- eventually benefit from parallelism — bump this
+                    -- when that workload becomes representative.
                     , poolSize = Just 1
                     }
                 )
