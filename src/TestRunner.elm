@@ -17,6 +17,7 @@ Add `--load-profile` to print user-normalization rewrite stats after load.
 import Ansi.Color
 import BackendTask exposing (BackendTask)
 import BackendTask.Do as Do
+import BackendTask.Env
 import BackendTask.Extra
 import BackendTask.File as File
 import BackendTask.Glob as Glob
@@ -67,6 +68,77 @@ type alias UserNormalizationExperiment =
     { label : String
     , flags : NormalizationFlags.NormalizationFlags
     }
+
+
+{-| Runtime-overridable knobs for the chunking + worker-pool behavior.
+Loaded once per `task` invocation by `loadChunkingOverrides`, which
+reads three optional env vars and falls back to `defaultChunkingOverrides`
+when they're unset:
+
+  - `ELM_BUILD_TARGET_CHUNK_COUNT` — number of chunks per chunked file
+  - `ELM_BUILD_PER_CHILD_SPLIT_THRESHOLD` — top-level child count above
+    which a file gets chunked at all
+  - `ELM_BUILD_POOL_SIZE` — `BackendTask.Parallel.worker` pool size
+
+The defaults reproduce the pre-override behavior so existing callers
+see no change. Bench harnesses set the env vars to sweep parameters
+without recompiling.
+
+-}
+type alias ChunkingOverrides =
+    { targetChunkCount : Int
+    , perChildSplitThreshold : Int
+    , poolSize : Int
+    }
+
+
+{-| Defaults for the three knobs.
+
+`perChildSplitThreshold = 1000` keeps chunked dispatch effectively
+disabled in production. Chunked dispatch hits two non-linear cliffs
+documented in `.scratch/parallel-ceiling.md` (2026-04-21):
+
+  - Per-chunk size cap ~10: a wrapper `describe "X" [c1, …, c15]`
+    hangs >5 min main-thread CPU. The full unchunked
+    `all = describe "List.Extra" [c1, …, c77]` evaluates fine in ~9 s.
+  - Aggregate dispatch cap ~40: 4 × 10 = 40 dispatches works
+    (~3.3 s wall); 8 × 10 = 80 hangs.
+
+The investigation + optimization plan lives at
+`~/.claude/plans/recursive-chasing-pearl.md`. The env-var overrides
+exist so the bench harness can sweep configurations without
+recompiling.
+
+-}
+defaultChunkingOverrides : ChunkingOverrides
+defaultChunkingOverrides =
+    { targetChunkCount = 4
+    , perChildSplitThreshold = 1000
+    , poolSize = 2
+    }
+
+
+loadChunkingOverrides : BackendTask FatalError ChunkingOverrides
+loadChunkingOverrides =
+    BackendTask.map3
+        (\maybeTcc maybePcst maybePs ->
+            { targetChunkCount =
+                maybeTcc
+                    |> Maybe.andThen String.toInt
+                    |> Maybe.withDefault defaultChunkingOverrides.targetChunkCount
+            , perChildSplitThreshold =
+                maybePcst
+                    |> Maybe.andThen String.toInt
+                    |> Maybe.withDefault defaultChunkingOverrides.perChildSplitThreshold
+            , poolSize =
+                maybePs
+                    |> Maybe.andThen String.toInt
+                    |> Maybe.withDefault defaultChunkingOverrides.poolSize
+            }
+        )
+        (BackendTask.Env.get "ELM_BUILD_TARGET_CHUNK_COUNT")
+        (BackendTask.Env.get "ELM_BUILD_PER_CHILD_SPLIT_THRESHOLD")
+        (BackendTask.Env.get "ELM_BUILD_POOL_SIZE")
 
 
 type alias LoadedProject =
@@ -158,6 +230,7 @@ task config =
             in
             Do.do (resolveTestFiles config) <| \testFiles ->
             Do.do (resolveTestModuleNames testFiles) <| \testModuleNames ->
+            Do.do loadChunkingOverrides <| \overrides ->
             Do.do (loadProject config maybeExperiment allDirectories testModuleNames) <| \loaded ->
             Do.do
                 (case loaded.profile of
@@ -200,33 +273,21 @@ task config =
                             , baseUserEnvWireBytes = baseUserEnvWireBytes
                             }
 
-                    -- Empirical optimum after step 9 (codec-shipped
-                    -- ProjectEnv removed the per-worker loadProject
-                    -- cost). Cold core-extra A/B (5 runs each):
-                    --
+                    -- Pool=2 is the post-step-9 default (see
+                    -- `defaultChunkingOverrides`). Override at run time
+                    -- via `ELM_BUILD_POOL_SIZE` for benchmark sweeps.
+                    -- Empirical pre-override numbers (5 runs each):
                     --   pool=1 11-file 11026.7 ms   8-file 3498.8 ms
                     --   pool=2 11-file 10546.9 ms   8-file 3382.1 ms  ← best
                     --   pool=3 11-file 10606.4 ms
                     --   pool=4 11-file 10710.8 ms   8-file 3455.5 ms
-                    --
-                    -- Pool=2 splits the workload evenly: ListTests
-                    -- (~9 s solo, the slowest single file) goes to
-                    -- one worker and the remaining 10 files distribute
-                    -- across the other. Past that, oversubscription
-                    -- contention erases the parallelism gain.
-                    --
-                    -- Pre-step-9 the optimum was pool=1 because each
-                    -- additional worker paid ~1.1 s of independent
-                    -- loadProject. With the env now shipped via wire
-                    -- codec, that cost drops to ~80 ms decode and
-                    -- file-level parallelism finally pays off.
-                    , poolSize = Just 2
+                    , poolSize = Just overrides.poolSize
                     }
                 )
             <| \worker ->
             Do.do
                 (testFiles
-                    |> List.map (\testFile -> runTestFileViaWorker config loaded.project worker testFile)
+                    |> List.map (\testFile -> runTestFileViaWorker config overrides loaded.project worker testFile)
                     |> BackendTask.combine
                 )
             <| \allResults ->
@@ -970,8 +1031,8 @@ The cache namespace is shared with `evalWithFileOverrides` (same
 label), so cache files are interchangeable between the two paths.
 
 -}
-runTestFileViaWorker : Config -> InterpreterProject -> BackendTask.Parallel.Worker -> String -> BackendTask FatalError TestFileResult
-runTestFileViaWorker config project worker testFile =
+runTestFileViaWorker : Config -> ChunkingOverrides -> InterpreterProject -> BackendTask.Parallel.Worker -> String -> BackendTask FatalError TestFileResult
+runTestFileViaWorker config overrides project worker testFile =
     Do.allowFatal (File.rawFile testFile) <| \testSource ->
     let
         testModuleName : String
@@ -1063,7 +1124,7 @@ runTestFileViaWorker config project worker testFile =
         let
             childExpressions : List String
             childExpressions =
-                planChildExpressions testModuleName testSource testValues
+                planChildExpressions overrides testModuleName testSource testValues
 
             evalImports : List String
             evalImports =
@@ -1221,14 +1282,14 @@ ListTests has ~70 child describes under one `all` — splitting takes
 the cold-run wall from ~9 s solo down to roughly `9 s / N_workers`).
 
 -}
-planChildExpressions : String -> String -> List String -> List String
-planChildExpressions testModuleName testSource testValues =
+planChildExpressions : ChunkingOverrides -> String -> String -> List String -> List String
+planChildExpressions overrides testModuleName testSource testValues =
     case testValues of
         [ single ] ->
             case TestAnalysis.extractDescribeChildren single testSource of
                 Just children ->
-                    if List.length children >= perChildSplitThreshold then
-                        chunkChildExpressions testModuleName children
+                    if List.length children >= overrides.perChildSplitThreshold then
+                        chunkChildExpressions overrides testModuleName children
 
                     else
                         [ testModuleName ++ "." ++ single ]
@@ -1255,8 +1316,8 @@ becomes `max(per-chunk eval) ≈ N_children/N_chunks × per-child-time`
 — for ListTests, ~20 × 110 ms = ~2 s vs the unsplit 9 s solo eval.
 
 -}
-chunkChildExpressions : String -> List String -> List String
-chunkChildExpressions testModuleName children =
+chunkChildExpressions : ChunkingOverrides -> String -> List String -> List String
+chunkChildExpressions overrides testModuleName children =
     let
         n : Int
         n =
@@ -1264,7 +1325,7 @@ chunkChildExpressions testModuleName children =
 
         chunkSize : Int
         chunkSize =
-            max 1 (ceiling (toFloat n / toFloat targetChunkCount))
+            max 1 (ceiling (toFloat n / toFloat overrides.targetChunkCount))
     in
     children
         |> chunkList chunkSize
@@ -1294,55 +1355,6 @@ chunkList n xs =
         List.take n xs :: chunkList n (List.drop n xs)
 
 
-{-| Target number of dispatch chunks per file. Set to 4 (matching the
-default `ELM_PAGES_PARALLEL_POOL_SIZE` baseline so each chunk lands on
-its own worker for max wall-clock spread). Configurable later if pool
-size is dialed up; for now this matches the bench machine.
--}
-targetChunkCount : Int
-targetChunkCount =
-    4
-
-
-{-| Split a file's top-level `describe` into per-chunk dispatches when
-its child count meets this threshold. Below this, single-dispatch is
-cheaper than chunking (each chunk has its own cache check + dispatch
-overhead).
-
-**Currently disabled (1000)** — chunked dispatch hits two layered
-non-linear scaling limits:
-
-  - Per-chunk eval cost explodes when a single chunk wraps **>~10
-    children** (synthetic `describe "X" [child1, …, child15]` hangs
-    even when only 4 chunks total are in flight). The full `all`
-    top-level value evaluates 220 tests in 9 s but a chunk of 15
-    inline children hangs.
-  - Aggregate in-flight cost hits a wall at **>~40 total dispatches
-    across `combine`** (4 chunks × 10 children works in 3.3 s wall;
-    8 chunks × 10 children hangs).
-
-These limits make every reasonable chunk configuration for
-ListTests-sized files (77 children) infeasible:
-
-  - 4 chunks × 20 children → 80 children, OK count, BUT chunk too big
-  - 8 chunks × 10 children → OK chunk size, BUT count too high
-  - 4 chunks × 10 children → only covers 40 of 77
-
-Compile-mode hypothesis ruled out: switching the worker compile from
-`--debug` to `--optimize` reproduces the hang the same way.
-
-The chunked-dispatch infrastructure (`chunkChildExpressions`,
-`chunkList`, `targetChunkCount`) is left in place as a hook for
-when the underlying runtime scaling issue lands. Lowering this
-threshold to ~10 re-enables chunking on ListTests-sized files
-(useful only after the limit is fixed).
-
-See `.scratch/parallel-ceiling.md` 2026-04-21 entry for the bisect.
-
--}
-perChildSplitThreshold : Int
-perChildSplitThreshold =
-    1000
 
 
 
