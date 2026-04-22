@@ -89,6 +89,7 @@ type alias ChunkingOverrides =
     { targetChunkCount : Int
     , perChildSplitThreshold : Int
     , poolSize : Int
+    , dispatchBatchSize : Int
     }
 
 
@@ -115,13 +116,14 @@ defaultChunkingOverrides =
     { targetChunkCount = 4
     , perChildSplitThreshold = 1000
     , poolSize = 2
+    , dispatchBatchSize = 30
     }
 
 
 loadChunkingOverrides : BackendTask FatalError ChunkingOverrides
 loadChunkingOverrides =
-    BackendTask.map3
-        (\maybeTcc maybePcst maybePs ->
+    BackendTask.map4
+        (\maybeTcc maybePcst maybePs maybeBs ->
             { targetChunkCount =
                 maybeTcc
                     |> Maybe.andThen String.toInt
@@ -134,11 +136,16 @@ loadChunkingOverrides =
                 maybePs
                     |> Maybe.andThen String.toInt
                     |> Maybe.withDefault defaultChunkingOverrides.poolSize
+            , dispatchBatchSize =
+                maybeBs
+                    |> Maybe.andThen String.toInt
+                    |> Maybe.withDefault defaultChunkingOverrides.dispatchBatchSize
             }
         )
         (BackendTask.Env.get "ELM_BUILD_TARGET_CHUNK_COUNT")
         (BackendTask.Env.get "ELM_BUILD_PER_CHILD_SPLIT_THRESHOLD")
         (BackendTask.Env.get "ELM_BUILD_POOL_SIZE")
+        (BackendTask.Env.get "ELM_BUILD_DISPATCH_BATCH_SIZE")
 
 
 type alias LoadedProject =
@@ -1176,7 +1183,7 @@ runTestFileViaWorker config overrides project worker testFile =
         Do.do
             (childExpressions
                 |> List.map (dispatchOne existing)
-                |> BackendTask.combine
+                |> batchedCombine overrides.dispatchBatchSize
             )
         <| \perChildOutputs ->
         let
@@ -1353,6 +1360,51 @@ chunkList n xs =
 
     else
         List.take n xs :: chunkList n (List.drop n xs)
+
+
+{-| `BackendTask.combine` with bounded concurrency: process the input
+in groups of at most `batchSize`, completing each group before starting
+the next. Preserves output order.
+
+The aggregate-dispatch cap measured in 2026-04-22 sits between 60 and
+65 single-child dispatches across `BackendTask.combine` (a chunking
+sweep on `tests/ListTests.elm` truncated to N children: N=60 K=60 P=4
+ran in 4.7 s; N=65 K=65 same shape hung). `combine` builds a wide tree
+of pending Cache+dispatch chains; the runtime work to resolve that tree
+is super-linear past ~60 entries on this hardware.
+
+Batching the calls in groups under the cap keeps the runtime in the
+known-good envelope at the cost of a little wall-clock parallelism
+between batches. For ListTests-shape suites at pool=4 with one
+dispatch per top-level describe child, `batchSize ≈ 30` finishes the
+77-child workload in two batches.
+
+When the per-test split path is disabled (`perChildSplitThreshold`
+default 1000), each test file produces one chunk, so `batchedCombine`
+behaves like a plain `BackendTask.combine` regardless of `batchSize`.
+
+-}
+batchedCombine :
+    Int
+    -> List (BackendTask FatalError a)
+    -> BackendTask FatalError (List a)
+batchedCombine batchSize tasks =
+    if batchSize <= 0 || List.length tasks <= batchSize then
+        BackendTask.combine tasks
+
+    else
+        tasks
+            |> chunkList batchSize
+            |> List.foldl
+                (\batch acc ->
+                    acc
+                        |> BackendTask.andThen
+                            (\done ->
+                                BackendTask.combine batch
+                                    |> BackendTask.map (\res -> done ++ res)
+                            )
+                )
+                (BackendTask.succeed [])
 
 
 
