@@ -36,3 +36,4 @@ timestamp	label	chunk_count	per_child_split	pool_size	iters	status	mean_ms	sd_ms
 2026-04-22T23:04:50Z	listtrim60-NOCHUNK	4	1000	2	1	HANG	TIMEOUT	TIMEOUT	TIMEOUT	TIMEOUT	tests/ListTestsTrimmed.elm
 2026-04-22T23:06:32Z	listtrim60-NOCHUNK-90s	4	1000	2	1	HANG	TIMEOUT	TIMEOUT	TIMEOUT	TIMEOUT	tests/ListTestsTrimmed.elm
 2026-04-22T23:12:47Z	full-nochunk-rebench	4	1000	2	1	OK	10851.6	0.0	10851.6	10851.6	tests/ListTests.elm
+2026-04-22T23:28:11Z	listtests-K4-bypass	4	10	4	1	HANG	TIMEOUT	TIMEOUT	TIMEOUT	TIMEOUT	tests/ListTests.elm

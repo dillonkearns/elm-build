@@ -51,11 +51,29 @@ shift 4
 BUILD_DIR=$(cd "$(dirname "$0")/.." && pwd)
 RUNNER_ELM="$BUILD_DIR/src/TestRunner.elm"
 RESULTS_FILE="$BUILD_DIR/bench/results/testrunner-ab.tsv"
+BUNDLED=${BUNDLED:-0}
+BUNDLED_RUNNER="$BUILD_DIR/dist/TestRunner.mjs"
 
 if [ ! -f "$RUNNER_ELM" ]; then
   echo "TestRunner.elm not found at $RUNNER_ELM" >&2
   exit 1
 fi
+
+if [ "$BUNDLED" = "1" ]; then
+  echo ">> bundling $RUNNER_ELM → $BUNDLED_RUNNER" >&2
+  (cd "$BUILD_DIR" && bunx elm-pages bundle-script src/TestRunner.elm --output "$BUNDLED_RUNNER" >&2) || {
+    echo "bundle-script failed" >&2
+    exit 1
+  }
+fi
+
+INVOKE_CMD() {
+  if [ "$BUNDLED" = "1" ]; then
+    node "$BUNDLED_RUNNER" --test "$TESTS_COMMA"
+  else
+    npx elm-pages run "$RUNNER_ELM" --test "$TESTS_COMMA"
+  fi
+}
 
 mkdir -p "$BUILD_DIR/bench/results"
 if [ ! -f "$RESULTS_FILE" ]; then
@@ -73,7 +91,8 @@ cd "$CORE_EXTRA_DIR"
 
 # Warmup: one untimed run to fill page cache / JIT.
 find .elm-build -maxdepth 1 -type f ! -name 'package-*' -delete
-env $ENV_PREFIX npx elm-pages run "$RUNNER_ELM" --test "$TESTS_COMMA" > /dev/null 2>&1 || true
+env $ENV_PREFIX bash -c "$(declare -f INVOKE_CMD); BUNDLED=$BUNDLED BUNDLED_RUNNER='$BUNDLED_RUNNER' RUNNER_ELM='$RUNNER_ELM' TESTS_COMMA='$TESTS_COMMA' INVOKE_CMD" > /dev/null 2>&1 \
+  || true
 
 SAMPLES_FILE=$(mktemp)
 trap 'rm -f "$SAMPLES_FILE"' EXIT
@@ -82,7 +101,7 @@ echo "=== $LABEL  ($RUNS runs, $ENV_NOTE)" >&2
 for i in $(seq 1 "$RUNS"); do
   find .elm-build -maxdepth 1 -type f ! -name 'package-*' -delete
   t0=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
-  env $ENV_PREFIX npx elm-pages run "$RUNNER_ELM" --test "$TESTS_COMMA" > /dev/null 2>&1
+  env $ENV_PREFIX bash -c "$(declare -f INVOKE_CMD); BUNDLED=$BUNDLED BUNDLED_RUNNER='$BUNDLED_RUNNER' RUNNER_ELM='$RUNNER_ELM' TESTS_COMMA='$TESTS_COMMA' INVOKE_CMD" > /dev/null 2>&1
   t1=$(python3 -c 'import time; print(int(time.monotonic_ns()))')
   elapsed_ms=$(python3 -c "print(($t1 - $t0) / 1_000_000)")
   printf '%s\n' "$elapsed_ms" >> "$SAMPLES_FILE"

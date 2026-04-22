@@ -3,11 +3,17 @@
 #
 # Driver for the investigation in `~/.claude/plans/recursive-chasing-pearl.md`.
 # Each scenario sets ELM_BUILD_TARGET_CHUNK_COUNT, ELM_BUILD_PER_CHILD_SPLIT_THRESHOLD,
-# ELM_BUILD_POOL_SIZE for one run of `npx elm-pages run src/TestRunner.elm`.
+# ELM_BUILD_POOL_SIZE for one run of TestRunner.
 # Successful cells get N iterations; HANG cells get 1 iteration (reproducible).
 #
+# Set BUNDLED=1 to bench against `node dist/TestRunner.mjs` (built via
+# `bunx elm-pages bundle-script`) instead of `npx elm-pages run` — much
+# closer to production wall time (no per-invocation JIT compile of the
+# script). The harness rebuilds the bundle on each invocation so it
+# reflects current `src/` state.
+#
 # Usage:
-#   bash bench/chunking-sweep.sh <label> <core-extra-dir> [runs=5] [hang_timeout_s=60] < scenarios.tsv
+#   [BUNDLED=1] bash bench/chunking-sweep.sh <label> <core-extra-dir> [runs=5] [hang_timeout_s=60] < scenarios.tsv
 #
 # Scenarios on stdin, one per line, TSV columns:
 #   chunk_count  per_child_split  pool_size  suite_files
@@ -43,10 +49,20 @@ HANG_TIMEOUT_S=${4:-60}
 BUILD_DIR=$(cd "$(dirname "$0")/.." && pwd)
 RUNNER_ELM="$BUILD_DIR/src/TestRunner.elm"
 RESULTS_FILE="$BUILD_DIR/bench/results/chunking-sweep.tsv"
+BUNDLED=${BUNDLED:-0}
+BUNDLED_RUNNER="$BUILD_DIR/dist/TestRunner.mjs"
 
 if [ ! -f "$RUNNER_ELM" ]; then
     echo "TestRunner.elm not found at $RUNNER_ELM" >&2
     exit 1
+fi
+
+if [ "$BUNDLED" = "1" ]; then
+    echo ">> bundling $RUNNER_ELM → $BUNDLED_RUNNER" >&2
+    (cd "$BUILD_DIR" && bunx elm-pages bundle-script src/TestRunner.elm --output "$BUNDLED_RUNNER" >&2) || {
+        echo "bundle-script failed" >&2
+        exit 1
+    }
 fi
 
 mkdir -p "$BUILD_DIR/bench/results"
@@ -84,14 +100,25 @@ run_one_iter() {
     # with SIGALRM (exit 142). macOS lacks `setsid` by default, so we
     # don't isolate process groups; reap stragglers via `pkill` after.
     set +e
-    env \
-        ELM_BUILD_TARGET_CHUNK_COUNT="$cc" \
-        ELM_BUILD_PER_CHILD_SPLIT_THRESHOLD="$pcs" \
-        ELM_BUILD_POOL_SIZE="$ps" \
-        perl -e 'alarm shift @ARGV; exec @ARGV' \
-            "$HANG_TIMEOUT_S" \
-            npx elm-pages run "$RUNNER_ELM" --test "$suite" \
-        > /dev/null 2>&1
+    if [ "$BUNDLED" = "1" ]; then
+        env \
+            ELM_BUILD_TARGET_CHUNK_COUNT="$cc" \
+            ELM_BUILD_PER_CHILD_SPLIT_THRESHOLD="$pcs" \
+            ELM_BUILD_POOL_SIZE="$ps" \
+            perl -e 'alarm shift @ARGV; exec @ARGV' \
+                "$HANG_TIMEOUT_S" \
+                node "$BUNDLED_RUNNER" --test "$suite" \
+            > /dev/null 2>&1
+    else
+        env \
+            ELM_BUILD_TARGET_CHUNK_COUNT="$cc" \
+            ELM_BUILD_PER_CHILD_SPLIT_THRESHOLD="$pcs" \
+            ELM_BUILD_POOL_SIZE="$ps" \
+            perl -e 'alarm shift @ARGV; exec @ARGV' \
+                "$HANG_TIMEOUT_S" \
+                npx elm-pages run "$RUNNER_ELM" --test "$suite" \
+            > /dev/null 2>&1
+    fi
     local ec=$?
     set -e
 
