@@ -182,6 +182,15 @@ task config =
                             , testModuleNames = testModuleNames
                             , depGraph = InterpreterProject.getDepGraph loaded.project
                             }
+
+                    -- Empirical optimum on 8-file core-extra cold:
+                    -- pool=1 = 2.81 s, pool=2 = 2.95 s, pool=4 = 3.18 s,
+                    -- pool=10 (default) = 5.13 s. Each worker pays a
+                    -- fixed ~1.5 s bundle-parse cost on spawn that
+                    -- doesn't amortize with current per-test eval
+                    -- speed; parallelism is a net loss until the
+                    -- worker bundle slims down.
+                    , poolSize = Just 1
                     }
                 )
             <| \worker ->
