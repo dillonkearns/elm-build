@@ -30,6 +30,7 @@ import Cli.Option as Option
 import Cli.OptionsParser as OptionsParser
 import Cli.Program as Program
 import DepGraph
+import Eval.Module
 import FatalError exposing (FatalError)
 import InterpreterProject exposing (InterpreterProject)
 import Json.Decode
@@ -37,6 +38,7 @@ import Json.Encode
 import NormalizationFlags
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
+import ProjectEnvWireCodec
 import Set
 import TestAnalysis
 import TestRunnerCommon
@@ -172,6 +174,20 @@ task config =
             <| \_ ->
             Do.do (logIfConsole config ("Found " ++ String.fromInt (List.length testFiles) ++ " test file(s)")) <| \_ ->
             Do.do BackendTask.Time.now <| \startTime ->
+            let
+                baseUserEnvWireBytes : Bytes
+                baseUserEnvWireBytes =
+                    case InterpreterProject.getBaseUserEnv loaded.project of
+                        Just env ->
+                            env
+                                |> Eval.Module.toWireFields
+                                |> ProjectEnvWireCodec.encodeWireFields
+
+                        Nothing ->
+                            -- Empty Bytes signals "no env shipped" — worker
+                            -- falls back to loadWithPreBuiltGraphs.
+                            BE.encode (BE.sequence [])
+            in
             Do.do
                 (BackendTask.Parallel.worker
                     { workerModule = "TestFileWorker"
@@ -181,6 +197,7 @@ task config =
                             , sourceDirectories = allDirectories
                             , testModuleNames = testModuleNames
                             , depGraph = InterpreterProject.getDepGraph loaded.project
+                            , baseUserEnvWireBytes = baseUserEnvWireBytes
                             }
 
                     -- Empirical optimum on 8-file core-extra cold:

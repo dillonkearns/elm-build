@@ -35,12 +35,21 @@ fields ride along without per-worker structured-clone copies.
 cheap. Workers feed it into `loadWithPreBuiltGraphs` to skip
 `DepGraph.buildGraph` (~500 ms - 1 s on heavy projects).
 
-A previous experiment that *also* shipped `moduleGraph.moduleToFile`
+`baseUserEnvWireBytes` (step 9) optionally carries an encoded
+`Eval.Module.WireFields` payload via `ProjectEnvWireCodec`. When
+non-empty, workers skip `loadWithPreBuiltGraphs` entirely and decode
+the env directly via `ProjectEnvWireCodec.decodeWireFields >>=
+Eval.Module.fromWireFields`. Empty `Bytes` (zero-length) means "no
+env shipped" — the worker takes the legacy load path for backward
+compat with callers that haven't opted in.
+
+A previous experiment that shipped *only* `moduleGraph.moduleToFile`
 (the parsed `File` ASTs) regressed elm-review cold by +6 s — per-worker
 Wire3 decode of 13.5 MB at ~2.4 MB/s exceeded the build_graph save.
 See `.scratch/parallel-ceiling.md` "Tier-2 Option A third attempt".
-The `loadWithPreBuiltGraphs` entry accepts each graph independently as
-`Maybe`, so this config can ship just the cheap-to-decode depGraph.
+Step 8a re-measured with range-stripped FunctionImplementation +
+RExpr codecs at 6-7 MB/s: ~30× smaller payload, ~3× faster decode.
+Step 9 wires that codec into the actual handoff path.
 
 -}
 type alias WorkerSharedConfig =
@@ -48,6 +57,7 @@ type alias WorkerSharedConfig =
     , sourceDirectories : List String
     , testModuleNames : List String
     , depGraph : DepGraph.Graph
+    , baseUserEnvWireBytes : Bytes
     }
 
 

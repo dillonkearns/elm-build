@@ -40,12 +40,14 @@ import BackendTask.Parallel
 import Bytes exposing (Bytes)
 import Bytes.Decode as BD
 import Bytes.Encode as BE
+import Eval.Module
 import FatalError exposing (FatalError)
 import InterpreterProject exposing (InterpreterProject)
 import Json.Decode as Decode
 import Json.Encode as Encode
 import Pages.Script as Script exposing (Script)
 import Path
+import ProjectEnvWireCodec
 import TestRunner
 import TestRunnerCommon exposing (WorkerSharedConfig)
 
@@ -61,6 +63,34 @@ run =
 
 loadProjectFromShared : WorkerSharedConfig -> BackendTask FatalError InterpreterProject
 loadProjectFromShared config =
+    -- Step 9 fast path: if main thread shipped a pre-built baseUserEnv via
+    -- the wire codec, decode it and skip loadWithPreBuiltGraphs entirely.
+    -- Empty Bytes means "not shipped" — fall through to the legacy load
+    -- path so workers stay correct on callers that haven't opted in.
+    if Bytes.width config.baseUserEnvWireBytes == 0 then
+        loadProjectViaPreBuiltGraphs config
+
+    else
+        case ProjectEnvWireCodec.decodeWireFields config.baseUserEnvWireBytes of
+            Just wireFields ->
+                BackendTask.succeed
+                    (InterpreterProject.fromBaseUserEnv
+                        { sourceDirectories = config.sourceDirectories
+                        , depGraph = config.depGraph
+                        , baseUserEnv = Eval.Module.fromWireFields wireFields
+                        }
+                    )
+
+            Nothing ->
+                -- Decode failure shouldn't normally happen — codec roundtrip
+                -- is exercised by ProjectEnvWireCodecTest. If it does,
+                -- log via the legacy load fallback rather than failing the
+                -- whole run.
+                loadProjectViaPreBuiltGraphs config
+
+
+loadProjectViaPreBuiltGraphs : WorkerSharedConfig -> BackendTask FatalError InterpreterProject
+loadProjectViaPreBuiltGraphs config =
     InterpreterProject.loadWithPreBuiltGraphs
         { projectDir = Path.path config.projectDir
         , skipPackages = TestRunner.kernelPackages

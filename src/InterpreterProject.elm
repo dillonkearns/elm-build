@@ -1,4 +1,4 @@
-module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ModuleGraph, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, decodeExposed, decodeFunctionImplementationNoRanges, decodeModuleName, encodeExposed, encodeFunctionImplementationNoRanges, encodeModuleName, eval, evalCachedViaTask, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, getDepGraph, getModuleGraph, getPackageEnv, load, loadWith, loadWithPreBuiltGraphs, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
+module InterpreterProject exposing (EnvMode(..), InterpreterProject, LoadProfile, ModuleGraph, ResolveErrorSummary, benchmarkPackageSummaryCacheCodecs, decodeExposed, decodeFunctionImplementationNoRanges, decodeModuleName, encodeExposed, encodeFunctionImplementationNoRanges, encodeModuleName, eval, evalCachedViaTask, evalSimple, evalWith, evalWithCoverage, evalWithFileOverrides, evalWithSourceOverrides, fromBaseUserEnv, getBaseUserEnv, getDepGraph, getModuleGraph, getPackageEnv, load, loadWith, loadWithPreBuiltGraphs, loadWithProfile, loadWithProfileUserNormalizationFlags, loadWithUserNormalizationFlags, precomputedValuesByModule, precomputedValuesCount, prepareAndEval, prepareAndEvalRaw, prepareAndEvalWithIntercepts, prepareAndEvalWithMemoizedFunctions, prepareAndEvalWithValues, prepareAndEvalWithValuesAndMemoizedFunctions, prepareAndEvalWithYield, prepareAndEvalWithYieldAndMemoizedFunctions, prepareAndEvalWithYieldState, prepareEvalSources, withEnvMode)
 
 {-| Evaluate and cache Elm expressions via the pure Elm interpreter.
 
@@ -4003,6 +4003,58 @@ that bypass the caching layer (e.g. benchmarking).
 getPackageEnv : InterpreterProject -> Eval.Module.ProjectEnv
 getPackageEnv (InterpreterProject project) =
     project.packageEnv
+
+
+{-| Get the base user-normalized environment, when present. The TestRunner
+worker pool's main thread reads this and ships it through the wire codec
+so each worker can skip its own `loadWithPreBuiltGraphs` call.
+-}
+getBaseUserEnv : InterpreterProject -> Maybe Eval.Module.ProjectEnv
+getBaseUserEnv (InterpreterProject project) =
+    project.baseUserEnv
+
+
+{-| Construct a minimal `InterpreterProject` from a pre-built
+user-normalized `ProjectEnv` plus the small ambient state the
+`evalSimple` Just-baseUserEnv path needs.
+
+The other `InterpreterProject` fields are zeroed/defaulted because
+the worker-side `evalSimple` path that hits `Just baseUserEnv` only
+accesses `baseUserEnv` itself. Any caller that hits the other path
+(`Nothing` baseUserEnv) on a project built this way is broken by
+construction — the ProjectEnv we received already represents the
+work that path would do.
+
+Used by `TestFileWorker` when the wire payload includes the
+encoded `WireFields`: workers skip `loadWithPreBuiltGraphs`
+entirely and route eval directly through the shipped env.
+
+-}
+fromBaseUserEnv :
+    { sourceDirectories : List String
+    , depGraph : DepGraph.Graph
+    , baseUserEnv : Eval.Module.ProjectEnv
+    }
+    -> InterpreterProject
+fromBaseUserEnv { sourceDirectories, depGraph, baseUserEnv } =
+    InterpreterProject
+        { sourceDirectories = sourceDirectories
+        , inputsByPath = Dict.empty
+        , userFileContents = Dict.empty
+        , depGraph = depGraph
+        , patchedPackageSources = []
+        , extraSources = []
+        , moduleGraph =
+            { moduleToSource = Dict.empty
+            , moduleToFile = Dict.empty
+            , imports = Dict.empty
+            }
+        , packageModuleNames = Set.empty
+        , packageEnv = baseUserEnv
+        , baseUserEnv = Just baseUserEnv
+        , semanticIndex = Dict.empty
+        , envMode = LegacyAst
+        }
 
 
 precomputedValuesCount : InterpreterProject -> Int
