@@ -1394,22 +1394,14 @@ normalizePerFile cacheDir packageKey userNormalizationFlags userModulePlans user
 
             readCachedBytesTask : BackendTask FatalError (List (Maybe Bytes.Bytes))
             readCachedBytesTask =
+                -- `File.optional` collapses the missing-file case to
+                -- `Nothing` via `binaryFile`'s recoverable
+                -- `FileDoesntExist` error. Saves one batched scheduler
+                -- round-trip per `normalizePerFile` call vs the prior
+                -- `File.exists` + conditional read (`exists` had to
+                -- resolve before the scheduler could fire the read).
                 plansWithPaths
-                    |> List.map
-                        (\( _, path ) ->
-                            File.exists path
-                                |> BackendTask.allowFatal
-                                |> BackendTask.andThen
-                                    (\exists ->
-                                        if exists then
-                                            File.binaryFile path
-                                                |> BackendTask.allowFatal
-                                                |> BackendTask.map Just
-
-                                        else
-                                            BackendTask.succeed Nothing
-                                    )
-                        )
+                    |> List.map (\( _, path ) -> File.binaryFile path |> File.optional)
                     |> BackendTask.Extra.combine
         in
         Do.do readCachedBytesTask <| \maybeCachedBytesList ->
