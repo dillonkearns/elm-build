@@ -74,6 +74,19 @@ iterations =
     5
 
 
+{-| Test modules that core-extra exposes and the interpreter can run.
+Matches CoreExtraBenchmark's working set so the normalized ProjectEnv we
+measure matches what TestRunner actually sees on this project.
+-}
+testModuleImports : List String
+testModuleImports =
+    [ "BasicsTests"
+    , "CharTests"
+    , "MaybeTests"
+    , "TripleTests"
+    ]
+
+
 task : BackendTask FatalError ()
 task =
     Do.log "\n=== RExpr Wire3 decode-throughput experiment ===\n" <|
@@ -89,7 +102,7 @@ task =
                             , extraSourceFiles = []
                             , extraReachableImports = []
                             , sourceDirectories = Just [ coreExtraDir ++ "/tests" ]
-                            , normalizationRoots = Nothing
+                            , normalizationRoots = Just testModuleImports
                             }
                         )
                     <|
@@ -236,36 +249,47 @@ benchPrecomputed env =
 
         totalCount =
             Eval.Module.precomputedValuesCount env
-
-        modulesAndValues : List ( String, FastDict.Dict String Types.Value )
-        modulesAndValues =
-            moduleStats
-                |> List.map
-                    (\( moduleKey, _ ) ->
-                        ( moduleKey
-                        , Eval.Module.getModulePrecomputedValues
-                            (String.split "." moduleKey)
-                            env
-                        )
-                    )
-
-        encoded =
-            modulesAndValues
-                |> Wire.encodeList encodePrecomputedModule
-                |> Wire.bytesEncode
-
-        encodedBytes =
-            Bytes.width encoded
     in
     Do.log ("\n--- Slice 3: env.shared.precomputedValues ---") <|
         \_ ->
-            Do.log ("modules=" ++ String.fromInt (List.length moduleStats) ++ " values=" ++ String.fromInt totalCount) <|
-                \_ ->
-                    Do.log ("encoded " ++ formatMB encodedBytes ++ " (lossy — ValueWireCodec covers ~12 of ~17 variants)") <|
-                        \_ ->
-                            Do.do (decodeIterations (\b -> Wire.bytesDecode (Wire.decodeList decodePrecomputedModule) b /= Nothing) encoded []) <|
-                                \samples ->
-                                    reportThroughput encodedBytes samples
+            if totalCount == 0 then
+                Do.log
+                    ("modules=0 values=0 — skipped: precomputedValues live in the USER env after normalization, "
+                        ++ "not in the package env returned by getPackageEnv. Workers can also fall back to "
+                        ++ "live evaluation when missing, so this slice is optional for v1."
+                    )
+                <|
+                    \_ -> BackendTask.succeed ()
+
+            else
+                let
+                    modulesAndValues : List ( String, FastDict.Dict String Types.Value )
+                    modulesAndValues =
+                        moduleStats
+                            |> List.map
+                                (\( moduleKey, _ ) ->
+                                    ( moduleKey
+                                    , Eval.Module.getModulePrecomputedValues
+                                        (String.split "." moduleKey)
+                                        env
+                                    )
+                                )
+
+                    encoded =
+                        modulesAndValues
+                            |> Wire.encodeList encodePrecomputedModule
+                            |> Wire.bytesEncode
+
+                    encodedBytes =
+                        Bytes.width encoded
+                in
+                Do.log ("modules=" ++ String.fromInt (List.length moduleStats) ++ " values=" ++ String.fromInt totalCount) <|
+                    \_ ->
+                        Do.log ("encoded " ++ formatMB encodedBytes ++ " (lossy — ValueWireCodec covers ~12 of ~17 variants)") <|
+                            \_ ->
+                                Do.do (decodeIterations (\b -> Wire.bytesDecode (Wire.decodeList decodePrecomputedModule) b /= Nothing) encoded []) <|
+                                    \samples ->
+                                        reportThroughput encodedBytes samples
 
 
 encodePrecomputedModule : ( String, FastDict.Dict String Types.Value ) -> Wire.Encoder
