@@ -200,21 +200,27 @@ task config =
                             , baseUserEnvWireBytes = baseUserEnvWireBytes
                             }
 
-                    -- Empirical optimum on 8-file core-extra cold:
-                    -- pool=1 = 2.69 s, pool=8 = 4.18 s, pool=10 = 4.13 s.
-                    -- Even after worker-bundle treeshaking
-                    -- (elm-pages3 trimmed `elm-optimize-level-2` →
-                    -- 11 MB → 1.9 MB), the per-worker `loadProject`
-                    -- cost dominates: each extra worker re-loads the
-                    -- project independently and parallel disk + CPU
-                    -- contention erases the parallelism win for
-                    -- typical project sizes.
+                    -- Empirical optimum after step 9 (codec-shipped
+                    -- ProjectEnv removed the per-worker loadProject
+                    -- cost). Cold core-extra A/B (5 runs each):
                     --
-                    -- Heavier workloads (hundreds of test files with
-                    -- non-trivial per-test eval cost) would
-                    -- eventually benefit from parallelism — bump this
-                    -- when that workload becomes representative.
-                    , poolSize = Just 1
+                    --   pool=1 11-file 11026.7 ms   8-file 3498.8 ms
+                    --   pool=2 11-file 10546.9 ms   8-file 3382.1 ms  ← best
+                    --   pool=3 11-file 10606.4 ms
+                    --   pool=4 11-file 10710.8 ms   8-file 3455.5 ms
+                    --
+                    -- Pool=2 splits the workload evenly: ListTests
+                    -- (~9 s solo, the slowest single file) goes to
+                    -- one worker and the remaining 10 files distribute
+                    -- across the other. Past that, oversubscription
+                    -- contention erases the parallelism gain.
+                    --
+                    -- Pre-step-9 the optimum was pool=1 because each
+                    -- additional worker paid ~1.1 s of independent
+                    -- loadProject. With the env now shipped via wire
+                    -- codec, that cost drops to ~80 ms decode and
+                    -- file-level parallelism finally pays off.
+                    , poolSize = Just 2
                     }
                 )
             <| \worker ->
