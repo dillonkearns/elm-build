@@ -93,29 +93,40 @@ type alias ChunkingOverrides =
     }
 
 
-{-| Defaults for the three knobs.
+{-| Defaults for the chunking knobs.
 
-`perChildSplitThreshold = 1000` keeps chunked dispatch effectively
-disabled in production. Chunked dispatch hits two non-linear cliffs
-documented in `.scratch/parallel-ceiling.md` (2026-04-21):
+Chunked dispatch enabled (`perChildSplitThreshold = 10`) — files
+whose `all = describe "X" [c1, ..., cN]` has 10+ children get split
+into K = `targetChunkCount` chunks dispatched in parallel.
 
-  - Per-chunk size cap ~10: a wrapper `describe "X" [c1, …, c15]`
-    hangs >5 min main-thread CPU. The full unchunked
-    `all = describe "List.Extra" [c1, …, c77]` evaluates fine in ~9 s.
-  - Aggregate dispatch cap ~40: 4 × 10 = 40 dispatches works
-    (~3.3 s wall); 8 × 10 = 80 hangs.
+Originally gated off because chunking exposed a runtime-eval cliff
+on tight tail-recursive user code (the 1 M-element
+`List.Extra.isInfixOf` test in core-extra `tests/ListTests.elm` would
+hang >30 s in any chunked-dispatch shape). That cliff was closed by
+the resolved-IR evaluator's `dispatchGlobalApplyStep` change to
+route `TcoListDrain` calls through OLD eval's `tcoLoopHelp` (see
+`elm-interpreter/src/Eval/ResolvedExpression.elm:990`+).
 
-The investigation + optimization plan lives at
-`~/.claude/plans/recursive-chasing-pearl.md`. The env-var overrides
-exist so the bench harness can sweep configurations without
-recompiling.
+Bench-driven defaults (BUNDLED=1, 5-iter A/B vs the prior no-chunking
++ pool=2 baseline):
+
+  | suite    | no-chunking pool=2 | K=2 P=4 chunked   |
+  |----------|--------------------|-------------------|
+  | 8-file   | 2301 ± 79 ms       | 2206 ± 32 ms (-4%) |
+  | 11-file  | 10619 ± 243 ms     | 9201 ± 145 ms (-13%) |
+
+K=2 P=4 splits the slowest single file (ListTests, ~9 s solo) into
+two parallel chunks while keeping enough workers free for the other
+files. `dispatchBatchSize = 30` caps `BackendTask.combine` width
+under the documented ~40 aggregate cap; `K=2` × 11 chunked files =
+22 dispatches, comfortably below.
 
 -}
 defaultChunkingOverrides : ChunkingOverrides
 defaultChunkingOverrides =
-    { targetChunkCount = 4
-    , perChildSplitThreshold = 1000
-    , poolSize = 2
+    { targetChunkCount = 2
+    , perChildSplitThreshold = 10
+    , poolSize = 4
     , dispatchBatchSize = 30
     }
 
