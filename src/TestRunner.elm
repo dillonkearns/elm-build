@@ -40,6 +40,7 @@ import NormalizationFlags
 import Pages.Script as Script exposing (Script)
 import Path exposing (Path)
 import ProjectEnvWireCodec
+import Regex
 import Set
 import TestAnalysis
 import TestRunnerCommon
@@ -1337,16 +1338,37 @@ becomes `max(per-chunk eval) ≈ N_children/N_chunks × per-child-time`
 chunkChildExpressions : ChunkingOverrides -> String -> List String -> List String
 chunkChildExpressions overrides testModuleName children =
     let
-        n : Int
-        n =
-            List.length children
+        k : Int
+        k =
+            max 1 overrides.targetChunkCount
 
-        chunkSize : Int
-        chunkSize =
-            max 1 (ceiling (toFloat n / toFloat overrides.targetChunkCount))
+        chunks : List (List String)
+        chunks =
+            if hasHeavyChild children then
+                -- Heavy literal detected (e.g. `List.repeat 1000000 5`):
+                -- LPT bin-pack to isolate it from the rest. On
+                -- ListTests this drops chunked wall ~100-150 ms.
+                binPackBySize k children
+
+            else
+                -- No heavy literal: sequential split is faster (no
+                -- bin-packing overhead, preserves source order
+                -- which seems to play better with V8 inline caches
+                -- for small uniform-cost workloads). 8-file
+                -- core-extra benches showed ~100 ms regression
+                -- when bin-packing was used unconditionally.
+                let
+                    n : Int
+                    n =
+                        List.length children
+
+                    chunkSize : Int
+                    chunkSize =
+                        max 1 (ceiling (toFloat n / toFloat k))
+                in
+                chunkList chunkSize children
     in
-    children
-        |> chunkList chunkSize
+    chunks
         |> List.indexedMap
             (\i chunk ->
                 "Test.describe \""
@@ -1357,6 +1379,185 @@ chunkChildExpressions overrides testModuleName children =
                     ++ String.join ", " chunk
                     ++ "]"
             )
+
+
+{-| Detect whether any child has an estimated cost much larger than
+the others — the signal for "heavy outlier worth isolating via
+bin-pack." Currently: any child whose `estimateChildCost` exceeds
+50 000 (i.e. a `List.repeat N` or `List.range a b` literal where
+N > 60 000 or b-a > 60 000).
+-}
+hasHeavyChild : List String -> Bool
+hasHeavyChild children =
+    List.any (\c -> estimateChildCost c > 50000) children
+
+
+{-| Greedy LPT (Longest Processing Time first) bin-packing across K
+buckets, using a static cost estimate per child as the weight.
+
+Cost estimate (`estimateChildCost`):
+  - Source length as the baseline (more text usually = more tests).
+  - **Scaled up** when the source contains `List.repeat N _` or
+    `List.range a b` literals where N (or b-a) exceeds 10 000. These
+    construct large concrete lists at eval time, and any subsequent
+    walk on those lists pays per-element interpreter cost
+    (~150-300 µs per cons in tight loops, even with the TcoListDrain
+    fast path).
+
+For ListTests's 77 children, the `isInfixOf` describe contains
+`List.repeat 1000000 5` — without the `List.repeat` boost it gets
+binned with other tests despite being the dominant cost. The
+boost lands it alone in bucket 0; the other 76 describes pack
+into bucket 1. Wall = max(bucket0, bucket1) ≈ max(6.6s, ~3-4s)
+≈ 6.6s vs the ~8.9s sequential chunking sees when the 1M test
+shares a chunk with ~38 other tests.
+
+-}
+binPackBySize : Int -> List String -> List (List String)
+binPackBySize k items =
+    let
+        sorted : List ( Int, String )
+        sorted =
+            items
+                |> List.map (\s -> ( estimateChildCost s, s ))
+                |> List.sortBy (\( size, _ ) -> -size)
+
+        emptyBuckets : List ( Int, List String )
+        emptyBuckets =
+            List.repeat k ( 0, [] )
+
+        assign : ( Int, String ) -> List ( Int, List String ) -> List ( Int, List String )
+        assign ( size, item ) buckets =
+            let
+                ( minIdx, _ ) =
+                    buckets
+                        |> List.indexedMap (\i ( load, _ ) -> ( i, load ))
+                        |> List.foldl
+                            (\( i, load ) ( bestI, bestLoad ) ->
+                                if load < bestLoad then
+                                    ( i, load )
+
+                                else
+                                    ( bestI, bestLoad )
+                            )
+                            ( 0, 99999999999 )
+            in
+            buckets
+                |> List.indexedMap
+                    (\i ( load, contents ) ->
+                        if i == minIdx then
+                            ( load + size, item :: contents )
+
+                        else
+                            ( load, contents )
+                    )
+    in
+    sorted
+        |> List.foldl assign emptyBuckets
+        |> List.map (\( _, contents ) -> List.reverse contents)
+
+
+{-| Static cost estimate for a single child describe's source text.
+
+Baseline is `String.length` — short tests cost less than long ones,
+modulo specific patterns the interpreter walks element-by-element.
+
+The boosts:
+  - `List.repeat N _` → adds `max 0 (N - 10_000)` to the weight.
+    `List.repeat 1_000_000 5` jumps from a tiny source-length weight
+    (~80 chars) to ~990_000, dominating the bin-packing.
+  - `List.range a b` → adds `max 0 (b - a - 10_000)`. Same idea —
+    `List.range 1 10000` is the threshold below which interpreter
+    walks complete in a couple seconds; above it the per-element
+    cost dominates.
+
+Threshold of 10 000 picked from the per-N sweep on
+`countTo 0 (List.repeat N 5)`: completes <2 s at N=10 000, takes
+>10 s at N=50 000+. Below threshold, the cost is small enough that
+mis-binning doesn't matter much.
+
+The regex parsing is loose-by-design — it matches inside string
+literals, comments, etc. False positives are fine (the worst case
+is bin-packing slightly over-eagerly); false negatives are the
+real risk and the regex is permissive enough to catch all real
+calls in core-extra.
+
+-}
+estimateChildCost : String -> Int
+estimateChildCost source =
+    let
+        baseline : Int
+        baseline =
+            String.length source
+
+        repeatBoost : Int
+        repeatBoost =
+            sumLiteralBoost repeatRegex source
+
+        rangeBoost : Int
+        rangeBoost =
+            sumRangeBoost source
+    in
+    baseline + repeatBoost + rangeBoost
+
+
+{-| Sum `max 0 (N - 10_000)` for every `pattern` match capturing an
+integer literal `N`. Pattern must have exactly one capture group.
+The regex is hoisted to a top-level constant so it's only compiled
+once per process, not per child.
+-}
+sumLiteralBoost : Regex.Regex -> String -> Int
+sumLiteralBoost regex source =
+    Regex.find regex source
+        |> List.foldl
+            (\match acc ->
+                case match.submatches of
+                    (Just nStr) :: _ ->
+                        case String.toInt nStr of
+                            Just n ->
+                                acc + max 0 (n - 10000)
+
+                            Nothing ->
+                                acc
+
+                    _ ->
+                        acc
+            )
+            0
+
+
+{-| Sum `max 0 (b - a - 10_000)` for every `List.range a b` match.
+-}
+sumRangeBoost : String -> Int
+sumRangeBoost source =
+    Regex.find rangeRegex source
+        |> List.foldl
+            (\match acc ->
+                case match.submatches of
+                    (Just aStr) :: (Just bStr) :: _ ->
+                        case ( String.toInt aStr, String.toInt bStr ) of
+                            ( Just a, Just b ) ->
+                                acc + max 0 (b - a - 10000)
+
+                            _ ->
+                                acc
+
+                    _ ->
+                        acc
+            )
+            0
+
+
+repeatRegex : Regex.Regex
+repeatRegex =
+    Regex.fromString "List\\.repeat\\s+(\\d+)"
+        |> Maybe.withDefault Regex.never
+
+
+rangeRegex : Regex.Regex
+rangeRegex =
+    Regex.fromString "List\\.range\\s+(\\d+)\\s+(\\d+)"
+        |> Maybe.withDefault Regex.never
 
 
 {-| Greedy fixed-size chunking of a list. `chunkList 3 [1..10]` →
