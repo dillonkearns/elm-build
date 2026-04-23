@@ -1,0 +1,7 @@
+timestamp	label	shape	count	runs	mean_ms	stddev_ms	min_ms	max_ms	ns_per_iter
+2026-04-23T17:10:20Z	baseline-count-1M	count-only	1000000	3	2496.7	50.1	2439.0	2530.0	2497
+2026-04-23T17:11:01Z	baseline-isInfixOf-1M	isInfixOf	1000000	3	7021.7	42.5	6980.0	7065.0	7022
+2026-04-23T17:50:39Z	exp-tcoLoopFast-count	count-only	1000000	5	2486.6	17.0	2466.0	2509.0	2487
+2026-04-23T17:51:33Z	exp-tcoLoopFast-isInfixOf	isInfixOf	1000000	5	6755.8	158.9	6628.0	7009.0	6756
+2026-04-23T17:52:40Z	baseline-clean-5	isInfixOf	1000000	5	6936.2	150.8	6802.0	7159.0	6936
+2026-04-23T17:53:03Z	baseline-count-clean-5	count-only	1000000	5	2527.4	53.6	2480.0	2609.0	2527
